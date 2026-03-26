@@ -397,7 +397,45 @@ with st.sidebar:
             st.success(f"✅ Job **{job_id}** submitted! Processing now...")
         else:
             st.info(f"📋 Job **{job_id}** queued — position **#{queue_pos}**. It will start automatically when the current job finishes.")
-        st.balloons()
+        # Paintbrush celebration animation
+        st.markdown("""
+        <style>
+            @keyframes flyUp {
+                0% { transform: translateY(100vh) rotate(0deg); opacity: 1; }
+                80% { opacity: 1; }
+                100% { transform: translateY(-20vh) rotate(360deg); opacity: 0; }
+            }
+            .paintbrush-container {
+                position: fixed;
+                top: 0; left: 0;
+                width: 100vw; height: 100vh;
+                pointer-events: none;
+                z-index: 999999;
+                overflow: hidden;
+            }
+            .paintbrush {
+                position: absolute;
+                bottom: -60px;
+                font-size: 2.5rem;
+                animation: flyUp 2.5s ease-out forwards;
+            }
+        </style>
+        <div class="paintbrush-container">
+            <span class="paintbrush" style="left:5%; animation-delay:0s;">🖌️</span>
+            <span class="paintbrush" style="left:12%; animation-delay:0.15s;">🎨</span>
+            <span class="paintbrush" style="left:20%; animation-delay:0.3s;">🖌️</span>
+            <span class="paintbrush" style="left:28%; animation-delay:0.1s;">🖌️</span>
+            <span class="paintbrush" style="left:35%; animation-delay:0.45s;">🎨</span>
+            <span class="paintbrush" style="left:42%; animation-delay:0.2s;">🖌️</span>
+            <span class="paintbrush" style="left:50%; animation-delay:0.35s;">🖌️</span>
+            <span class="paintbrush" style="left:58%; animation-delay:0.05s;">🎨</span>
+            <span class="paintbrush" style="left:65%; animation-delay:0.4s;">🖌️</span>
+            <span class="paintbrush" style="left:72%; animation-delay:0.25s;">🖌️</span>
+            <span class="paintbrush" style="left:80%; animation-delay:0.5s;">🎨</span>
+            <span class="paintbrush" style="left:88%; animation-delay:0.15s;">🖌️</span>
+            <span class="paintbrush" style="left:95%; animation-delay:0.35s;">🖌️</span>
+        </div>
+        """, unsafe_allow_html=True)
 
     if not can_submit and uploaded_files:
         st.warning("Please fill in Contact Name and Email.")
