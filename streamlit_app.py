@@ -16,6 +16,7 @@ Deploy (Streamlit Cloud):
 
 import os
 import sys
+import gc
 import json
 import uuid
 import threading
@@ -197,6 +198,42 @@ def _clear_progress(job_id):
         os.remove(progress_path)
 
 
+def _get_memory_mb():
+    """Get current process RSS in MB."""
+    try:
+        import resource
+        # resource.getrusage returns bytes on macOS, KB on Linux
+        rusage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        # Linux returns KB, macOS returns bytes
+        if sys.platform == "darwin":
+            return rusage / (1024 * 1024)
+        return rusage / 1024
+    except Exception:
+        return 0
+
+
+def _force_memory_cleanup():
+    """Aggressive memory cleanup between jobs."""
+    # Clear any cached data in Takeoff_DIRECT module globals
+    try:
+        import Takeoff_DIRECT as td
+        # Clear module-level caches if they exist
+        for attr in dir(td):
+            obj = getattr(td, attr, None)
+            if isinstance(obj, dict) and attr.startswith('_') and len(obj) > 100:
+                obj.clear()
+    except Exception:
+        pass
+    # Force garbage collection (multiple passes to catch circular refs)
+    gc.collect(generation=2)
+    gc.collect(generation=1)
+    gc.collect(generation=0)
+
+
+# Memory limit: leave headroom for Streamlit itself (~300MB)
+MEMORY_LIMIT_MB = int(os.environ.get("NIGHTSHIFT_MEMORY_LIMIT_MB", "700"))
+
+
 def _process_single_job(job_id):
     """Process one job — called by the worker thread."""
     meta = _read_job_meta(job_id)
@@ -209,6 +246,24 @@ def _process_single_job(job_id):
         _dequeue_job(job_id)
         _clear_cancel_flag(job_id)
         return
+
+    # Pre-job memory check — if we're already high, force cleanup first
+    mem_before = _get_memory_mb()
+    if mem_before > MEMORY_LIMIT_MB * 0.8:
+        print(f"⚠️  Pre-job memory high ({mem_before:.0f}MB), forcing cleanup...")
+        _force_memory_cleanup()
+        mem_before = _get_memory_mb()
+        if mem_before > MEMORY_LIMIT_MB:
+            # Still too high — fail the job gracefully instead of OOM crashing
+            meta["status"] = "error"
+            meta["error"] = (
+                f"Insufficient memory ({mem_before:.0f}MB used of {MEMORY_LIMIT_MB}MB limit). "
+                f"Please reboot the app from the Streamlit dashboard to free memory, then retry."
+            )
+            meta["finished"] = datetime.now().isoformat()
+            _write_job_meta(job_id, meta)
+            _dequeue_job(job_id)
+            return
 
     # Update status to running
     meta["status"] = "running"
@@ -241,6 +296,10 @@ def _process_single_job(job_id):
             meta["finished"] = datetime.now().isoformat()
             meta["output_json"] = result.get("output_json_path", "")
             meta["output_pdf"] = result.get("output_pdf_path", "")
+    except MemoryError:
+        meta["status"] = "error"
+        meta["error"] = "Out of memory — PDF too large for free tier. Try a smaller file or reboot the app."
+        meta["finished"] = datetime.now().isoformat()
     except Exception as e:
         if _is_cancelled(job_id):
             meta["status"] = "cancelled"
@@ -256,6 +315,59 @@ def _process_single_job(job_id):
     _clear_progress(job_id)
     # Clean up env var
     os.environ.pop("NIGHTSHIFT_PROGRESS_FILE", None)
+
+    # Post-job cleanup — critical for preventing overnight OOM
+    # 1. Remove uploaded PDF copies (output JSON/PDF already saved separately)
+    for pdf_path in meta.get("pdf_paths", []):
+        try:
+            if os.path.exists(pdf_path) and UPLOAD_DIR in pdf_path:
+                os.remove(pdf_path)
+        except Exception:
+            pass
+    # Remove empty upload subdirectory
+    job_upload_dir = os.path.join(UPLOAD_DIR, job_id)
+    try:
+        if os.path.isdir(job_upload_dir) and not os.listdir(job_upload_dir):
+            os.rmdir(job_upload_dir)
+    except Exception:
+        pass
+
+    # 2. Memory cleanup
+    mem_after = _get_memory_mb()
+    print(f"📊 Job {job_id[:8]} complete. Memory: {mem_before:.0f}MB → {mem_after:.0f}MB")
+    _force_memory_cleanup()
+    mem_cleaned = _get_memory_mb()
+    if mem_cleaned < mem_after:
+        print(f"   🧹 Cleaned {mem_after - mem_cleaned:.0f}MB → {mem_cleaned:.0f}MB")
+
+
+def _cleanup_old_jobs(keep=20):
+    """Remove old completed job metadata and output files, keeping the most recent N."""
+    try:
+        job_files = sorted(
+            Path(JOBS_DIR).glob("*.json"),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        # Skip non-meta files (progress files etc.)
+        meta_files = [f for f in job_files if not f.name.startswith(".")]
+        for old_file in meta_files[keep:]:
+            try:
+                meta = json.loads(old_file.read_text())
+                # Only clean up finished jobs
+                if meta.get("status") not in ("done", "error", "cancelled"):
+                    continue
+                # Remove output files
+                for key in ("output_json", "output_pdf"):
+                    fpath = meta.get(key, "")
+                    if fpath and os.path.exists(fpath):
+                        os.remove(fpath)
+                # Remove meta file
+                old_file.unlink()
+            except Exception:
+                pass
+    except Exception:
+        pass
 
 
 def _worker_loop():
@@ -273,6 +385,9 @@ def _worker_loop():
 
             job_id = queue[0]  # Process oldest first
             _process_single_job(job_id)
+
+            # Clean up old jobs periodically to free disk
+            _cleanup_old_jobs(keep=20)
 
             # Brief pause between jobs
             time.sleep(2)
