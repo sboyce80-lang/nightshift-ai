@@ -180,6 +180,25 @@ def _is_worker_running():
         return False
 
 
+def _get_progress(job_id):
+    """Read the progress file for a running job."""
+    progress_path = os.path.join(JOBS_DIR, f".progress_{job_id}.json")
+    if not os.path.exists(progress_path):
+        return None
+    try:
+        with open(progress_path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _clear_progress(job_id):
+    """Remove the progress file when job completes."""
+    progress_path = os.path.join(JOBS_DIR, f".progress_{job_id}.json")
+    if os.path.exists(progress_path):
+        os.remove(progress_path)
+
+
 def _process_single_job(job_id):
     """Process one job — called by the worker thread."""
     meta = _read_job_meta(job_id)
@@ -197,6 +216,10 @@ def _process_single_job(job_id):
     meta["status"] = "running"
     meta["run_started"] = datetime.now().isoformat()
     _write_job_meta(job_id, meta)
+
+    # Set progress file path so Takeoff_DIRECT can write updates
+    progress_path = os.path.join(JOBS_DIR, f".progress_{job_id}.json")
+    os.environ["NIGHTSHIFT_PROGRESS_FILE"] = progress_path
 
     try:
         from Takeoff_DIRECT import run_analysis
@@ -232,6 +255,9 @@ def _process_single_job(job_id):
 
     _write_job_meta(job_id, meta)
     _dequeue_job(job_id)
+    _clear_progress(job_id)
+    # Clean up env var
+    os.environ.pop("NIGHTSHIFT_PROGRESS_FILE", None)
 
 
 def _worker_loop():
@@ -482,6 +508,8 @@ with tab_active:
             queue = _get_queue()
 
             if status == "running":
+                progress = _get_progress(job_id)
+
                 st.markdown(f"""
                 <div class="status-card status-running">
                     <strong>⏳ Processing:</strong> {job_id}<br/>
@@ -489,11 +517,27 @@ with tab_active:
                 </div>
                 """, unsafe_allow_html=True)
 
-                # Stop button for running jobs
-                if st.button("🛑 Stop Job", key=f"stop_{job_id}", type="secondary"):
-                    _cancel_job(job_id)
-                    st.warning(f"Cancellation requested for **{job_id}**. It will stop after the current extraction step.")
-                    st.rerun()
+                # Progress bar and step label
+                if progress:
+                    pct = progress.get("pct", 0) / 100.0
+                    step_label = progress.get("label", "Processing...")
+                    step_detail = progress.get("detail", "")
+                    step_num = progress.get("step", 0)
+                    total_steps = progress.get("total_steps", 8)
+                    st.progress(pct, text=f"**Step {step_num}/{total_steps}: {step_label}** — {step_detail}")
+                else:
+                    st.progress(0.0, text="**Starting...** Waiting for engine to initialize")
+
+                # Stop + refresh buttons
+                btn_col1, btn_col2, _ = st.columns([1, 1, 4])
+                with btn_col1:
+                    if st.button("🛑 Stop Job", key=f"stop_{job_id}", type="secondary"):
+                        _cancel_job(job_id)
+                        st.warning(f"Cancellation requested for **{job_id}**.")
+                        st.rerun()
+                with btn_col2:
+                    if st.button("🔄 Refresh", key=f"refresh_running_{job_id}"):
+                        st.rerun()
 
             elif status == "queued":
                 st.markdown(f"""
@@ -520,9 +564,10 @@ with tab_active:
                         _cancel_job(job_id)
                         st.rerun()
 
-        st.markdown("")
-        if st.button("🔄 Refresh Status", key="refresh_active"):
-            st.rerun()
+        if not any(v.get("status") == "running" for v in active_jobs.values()):
+            st.markdown("")
+            if st.button("🔄 Refresh Status", key="refresh_active"):
+                st.rerun()
 
 with tab_history:
     completed_jobs = {k: v for k, v in all_jobs.items() if v.get("status") in ("done", "error", "cancelled")}

@@ -33,6 +33,30 @@ import os
 
 
 # ---------------------------------------------------------------------------
+# Job progress tracking (for Streamlit UI)
+# ---------------------------------------------------------------------------
+_PROGRESS_FILE = None  # Set by run_analysis() when called from Streamlit
+
+def _update_progress(step, total_steps, label, detail="", pct=None):
+    """Write progress to a JSON file so the Streamlit UI can display it."""
+    if not _PROGRESS_FILE:
+        return
+    try:
+        progress = {
+            "step": step,
+            "total_steps": total_steps,
+            "label": label,
+            "detail": detail,
+            "pct": pct if pct is not None else round(step / total_steps * 100),
+            "updated": datetime.now().isoformat(),
+        }
+        with open(_PROGRESS_FILE, "w") as f:
+            json.dump(progress, f)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
 # Unit-level templates for multi-family residential estimation
 # ---------------------------------------------------------------------------
 # Each unit type defines: wall_sqft, ceiling_sqft, doors, trim_lf, windows
@@ -7846,6 +7870,13 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                     "rfi_items": rfi_items,
                 }
 
+    # --- Setup progress tracking ---
+    global _PROGRESS_FILE
+    progress_path = os.environ.get("NIGHTSHIFT_PROGRESS_FILE")
+    if progress_path:
+        _PROGRESS_FILE = progress_path
+    TOTAL_STEPS = 8  # schedule scan, inventory, extraction, merge, recalc, costs, json, pdf
+
     print("🎨 NIGHTSHIFT AI - CONSTRUCTION DOCUMENT ANALYZER")
     print("=" * 80)
     if multi_mode:
@@ -7860,6 +7891,8 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     if scope_notes:
         print(f"📋 Scope Notes: {scope_notes}")
 
+    _update_progress(0, TOTAL_STEPS, "Initializing", f"Loading {len(pdf_paths)} PDF(s)...")
+
     # --- Pre-scan for schedule pages (fast, no API cost) ---
     image_schedule_data = None
     try:
@@ -7870,6 +7903,7 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         except ImportError:
             pass
 
+        _update_progress(1, TOTAL_STEPS, "Scanning Schedules", "Detecting door & window schedules...")
         if enable_img_sched:
             for pdf_path_scan in pdf_paths:
                 fname = os.path.basename(pdf_path_scan)
@@ -7912,6 +7946,7 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         image_schedule_data = None
 
     # --- Pre-scan for building inventory from index pages ---
+    _update_progress(2, TOTAL_STEPS, "Building Inventory", "Scanning index pages for building data...")
     building_inventory = None
     try:
         enable_inv_scan = True
@@ -7978,6 +8013,9 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     for i, pdf_path in enumerate(pdf_paths, 1):
         filename = os.path.basename(pdf_path)
         is_fp = _is_floor_plan_file(filename)
+        _update_progress(3, TOTAL_STEPS, "Extracting Rooms",
+                         f"Analyzing PDF {i}/{len(pdf_paths)}: {filename}",
+                         pct=round(25 + (i / len(pdf_paths)) * 35))
         if multi_mode:
             print(f"\n{'─'*80}")
             fp_tag = " [Floor Plan]" if is_fp else ""
@@ -8290,6 +8328,7 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         print(f"\n{'='*80}")
         print(f"🔗 MERGING {len(all_results)} analyses into combined estimate...")
         print(f"{'='*80}")
+        _update_progress(4, TOTAL_STEPS, "Merging Results", f"Combining data from {len(all_results)} files...")
         analysis = merge_analyses(all_results, file_building_counts=file_building_counts)
     else:
         _, analysis = all_results[0]
@@ -8301,6 +8340,7 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         # Schedule overrides applied AFTER all recalculations (see below)
 
     # Normalize scope fields after merge (ensures every room has in_scope)
+    _update_progress(5, TOTAL_STEPS, "Validating & Recalculating", "Applying guardrails and schedule overrides...")
     analysis = _normalize_scope_fields(analysis)
 
     # --- Whitebox / Prime Only exclusion (before validation) ---
@@ -8545,6 +8585,7 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         _pi['_building_inventory_units'] = building_inventory['total_units']
 
     # --- Calculate costs ---
+    _update_progress(6, TOTAL_STEPS, "Calculating Costs", "Applying pricing model...")
     print("\n💰 Calculating costs...")
     costs = calculate_costs(
         analysis.get('aggregated_totals', {}),
@@ -8573,6 +8614,7 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             print(f"   {rfi['number']}. [{rfi['category']}] {q_preview}")
 
     # --- Save JSON ---
+    _update_progress(7, TOTAL_STEPS, "Generating Report", "Saving JSON and creating PDF...")
     output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
     os.makedirs(output_dir, exist_ok=True)
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -8619,6 +8661,7 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         print(f"⚠️  Could not generate PDF report: {e}")
         output_pdf = None
 
+    _update_progress(8, TOTAL_STEPS, "Complete", "Estimate ready!", pct=100)
     print(f"\n✅ ESTIMATE COMPLETE!")
 
     return {
