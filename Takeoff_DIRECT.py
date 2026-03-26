@@ -7766,9 +7766,10 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
                     # Institutional: extracted rooms likely <10% of actual area.
                     # footprint_sqft here = TOTAL gross building area for pricing
                     # (not per-floor). Rider prices: GBA × $3.80/SF.
-                    # Typical senior living: 8,000-15,000 SF per floor.
-                    # Use 10,000 SF/floor as middle estimate for expansions.
-                    footprint_sqft = round(max(_total_ceil * 5, 10000 * _total_stories))
+                    # Typical senior living addition: 7,000-12,000 SF per floor.
+                    # Use 8,500 SF/floor as middle estimate (validated against Rider's
+                    # Edgehill bid: $105K / $3.80 = 27,632 SF / 3 floors = 9,211 SF/floor).
+                    footprint_sqft = round(max(_total_ceil * 5, 8500 * _total_stories))
                     print(f"   📐 Institutional GBA estimate (poor extraction): "
                           f"{footprint_sqft:,.0f} SF total "
                           f"(~{footprint_sqft/_total_stories:,.0f} SF/floor × {_total_stories} stories, "
