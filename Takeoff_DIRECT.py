@@ -7707,6 +7707,19 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     # fraction of rooms (common with large DD-scale PDFs).
     footprint_sqft = _num(project_info.get('footprint_sqft', 0))
 
+    # --- Footprint cross-check for institutional buildings ---
+    # The LLM often underestimates footprint for large institutional projects.
+    # Cross-check against extracted wall area: footprint should be ≥ wall_sqft / (stories × 3.3).
+    # Wall-to-floor ratio of ~3.3× is standard for senior living per Rider.
+    if _is_institutional and footprint_sqft > 0:
+        _xcheck_stories = max(_num(project_info.get('total_stories', 0)), 1)
+        _wall_implied_gba = wall_sqft / 3.3 * _xcheck_stories if wall_sqft > 0 else 0
+        if _wall_implied_gba > footprint_sqft * 1.3:
+            _old_fp = footprint_sqft
+            footprint_sqft = round(_wall_implied_gba)
+            print(f"   📐 Footprint cross-check: boosted {_old_fp:,.0f} → {footprint_sqft:,.0f} SF "
+                  f"(wall area {wall_sqft:,.0f} SF implies larger building)")
+
     # --- Extraction quality detection ---
     # Check for signals that room extraction is severely incomplete:
     # 1. no_floor_plans_found flag set
@@ -8772,10 +8785,13 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     _sf_bt = str(analysis.get("project_info", {}).get("building_type", "")).lower()
     _sf_units_raw = analysis.get("project_info", {}).get("total_units", 0)
     _sf_units = _num(_sf_units_raw) if isinstance(_sf_units_raw, (int, float)) else 0
+    _sf_neg_kw = ("multi", "mixed", "commercial", "apartment",
+                   "senior", "assisted", "living", "facility", "institutional",
+                   "hospital", "medical", "nursing", "dormitor", "hotel")
     _is_sf = (
         any(kw in _sf_bt for kw in ("single", "detached"))
         or (_sf_units <= 2 and isinstance(_sf_units_raw, (int, float))
-            and not any(kw in _sf_bt for kw in ("multi", "mixed", "commercial", "apartment")))
+            and not any(kw in _sf_bt for kw in _sf_neg_kw))
         or _detect_single_family_from_rooms(analysis)
     )
     if _is_sf:
@@ -8885,10 +8901,15 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     total_units_raw = pi.get("total_units", 0)
     total_units = _num(total_units_raw)
     total_units_is_numeric = isinstance(total_units_raw, (int, float))
+    # IMPORTANT: institutional keywords must be excluded here — senior living,
+    # facilities, hospitals etc. with 0 units should NOT be treated as single-family.
+    _sf_negative_kw = ("multi", "mixed", "commercial", "apartment",
+                        "senior", "assisted", "living", "facility", "institutional",
+                        "hospital", "medical", "nursing", "dormitor", "hotel")
     is_single_family = (
         any(kw in building_type_str for kw in ("single", "detached"))
         or (total_units_is_numeric and total_units <= 2
-            and not any(kw in building_type_str for kw in ("multi", "mixed", "commercial", "apartment")))
+            and not any(kw in building_type_str for kw in _sf_negative_kw))
     )
     # Room-based override: detect single-family from actual room inventory
     if not is_single_family and _detect_single_family_from_rooms(analysis):
