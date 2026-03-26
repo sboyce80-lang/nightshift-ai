@@ -1,0 +1,7 @@
+print("=" * 60)
+print("🌙 NIGHTSHIFT AI - INSTALLATION TEST")
+print("=" * 60)
+print("\n✅ Python is working!")
+print("✅ Files are in place!")
+print("\nNext: Set your Claude API key in config.py")
+print("=" * 60)

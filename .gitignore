@@ -1,0 +1,41 @@
+# Credentials — NEVER commit these
+.env
+config.py
+
+# Output & uploads
+output/
+attachments/
+logs/
+data/
+uploads/
+jobs/
+
+# Python
+*.pyc
+__pycache__/
+venv/
+.venv/
+
+# macOS
+.DS_Store
+
+# Streamlit secrets (for local dev)
+.streamlit/secrets.toml
+
+# IDE
+.vscode/
+.idea/
+
+# Deprecated / backup files
+DEP *.py
+*.backup
+*.backup2
+*.save
+config.py.save
+
+# Cache
+.cache/
+.claude/
+
+# Submissions (uploaded via web_app)
+submissions/

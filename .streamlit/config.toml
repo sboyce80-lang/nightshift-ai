@@ -1,0 +1,15 @@
+[server]
+maxUploadSize = 200
+maxMessageSize = 200
+enableXsrfProtection = true
+runOnSave = false
+
+[theme]
+primaryColor = "#2c6fbb"
+backgroundColor = "#ffffff"
+secondaryBackgroundColor = "#f0f4f8"
+textColor = "#1a3a5c"
+font = "sans serif"
+
+[browser]
+gatherUsageStats = false

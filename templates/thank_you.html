@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Estimate Submitted &mdash; Nightshift AI</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <header class="hero">
+        <div class="hero-content">
+            <h1>Nightshift AI</h1>
+            <p class="tagline">RFPs while you sleep</p>
+        </div>
+    </header>
+
+    <main class="thank-you-card">
+        <div class="check-icon">&#9989;</div>
+        <h2>Your Estimate Is Being Prepared</h2>
+        <p>We received <strong>{{ num_files }} PDF{{ 's' if num_files != 1 else '' }}</strong> from <strong>{{ name }}</strong>.</p>
+        <p>Results will be sent to <span class="email-highlight">{{ email }}</span></p>
+
+        <div class="estimate-time">
+            &#9200; Estimated processing time: 2&ndash;5 minutes per document
+        </div>
+
+        <p>Our system is analyzing your architectural drawings right now. You'll receive a detailed painting estimate with line-item pricing in your inbox shortly.</p>
+
+        <a href="{{ url_for('index') }}" class="back-link">&larr; Submit another RFP</a>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 Nightshift AI &mdash; Automated Construction Estimating</p>
+    </footer>
+</body>
+</html>

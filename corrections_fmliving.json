@@ -1,0 +1,90 @@
+{
+  "project_corrections": [
+    {
+      "room_id": "F1-C1A-UNIT1-LIV",
+      "unit_multiplier": 8,
+      "note": "16 duplex buildings, 8 are C1 type → 8x C1-A units"
+    },
+    {
+      "room_id": "F1-C1A-UNIT1-BED",
+      "unit_multiplier": 8,
+      "note": "8x C1-A units"
+    },
+    {
+      "room_id": "F1-C1A-UNIT1-BATH",
+      "unit_multiplier": 8,
+      "note": "8x C1-A units"
+    },
+    {
+      "room_id": "F1-C1A-UNIT1-CLOSET",
+      "unit_multiplier": 8,
+      "note": "8x C1-A units"
+    },
+    {
+      "room_id": "F1-C1A-UNIT1-FOYER",
+      "unit_multiplier": 8,
+      "note": "8x C1-A units"
+    },
+    {
+      "room_id": "F1-C1A-UNIT1-GARAGE",
+      "unit_multiplier": 8,
+      "note": "8x C1-A units"
+    },
+    {
+      "room_id": "F1-C1B-UNIT1-LIV",
+      "unit_multiplier": 8,
+      "note": "16 duplex buildings, 8 are C1 type → 8x C1-B units"
+    },
+    {
+      "room_id": "F1-C1B-UNIT1-BED",
+      "unit_multiplier": 8,
+      "note": "8x C1-B units"
+    },
+    {
+      "room_id": "F1-C1B-UNIT1-BATH",
+      "unit_multiplier": 8,
+      "note": "8x C1-B units"
+    },
+    {
+      "room_id": "F1-C1B-UNIT1-CLOSET",
+      "unit_multiplier": 8,
+      "note": "8x C1-B units"
+    },
+    {
+      "room_id": "F1-C1B-UNIT1-FOYER",
+      "unit_multiplier": 8,
+      "note": "8x C1-B units"
+    },
+    {
+      "room_id": "F1-C1B-UNIT1-GARAGE",
+      "unit_multiplier": 8,
+      "note": "8x C1-B units"
+    },
+    {
+      "room_id": "F0-C2B-UNIT1-STOR",
+      "unit_multiplier": 8,
+      "note": "16 duplex buildings, 8 are C2 type → 8x C2-B basement units"
+    },
+    {
+      "room_id": "F1-C2A-UNIT1-GARAGE",
+      "unit_multiplier": 8,
+      "note": "8x C2-A units"
+    },
+    {
+      "room_id": "F1-C2A-UNIT1-FOYER",
+      "unit_multiplier": 8,
+      "note": "8x C2-A units"
+    },
+    {
+      "room_id": "F1-C2A-UNIT1-PANTRY",
+      "unit_multiplier": 8,
+      "note": "8x C2-A units"
+    },
+    {
+      "room_id": "F1-C2A-UNIT1-STORAGE",
+      "unit_multiplier": 8,
+      "note": "8x C2-A units"
+    }
+  ],
+  "global_corrections": {}
+}

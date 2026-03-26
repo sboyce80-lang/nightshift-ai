@@ -1,0 +1,385 @@
+/* Nightshift AI — Web Form Styles */
+/* Color palette matches existing PDF report branding (json_to_pdf.py) */
+
+:root {
+    --dark-blue: #1e3a5f;
+    --darker-blue: #0f2440;
+    --medium-blue: #2c5282;
+    --accent-amber: #f59e0b;
+    --amber-hover: #d97706;
+    --light-gray: #f7f7f7;
+    --border-gray: #cccccc;
+    --white: #ffffff;
+    --text-dark: #333333;
+    --text-muted: #666666;
+    --error-red: #dc2626;
+    --success-green: #16a34a;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto,
+                 'Helvetica Neue', Arial, sans-serif;
+    color: var(--text-dark);
+    background: var(--light-gray);
+    line-height: 1.6;
+}
+
+/* ── Hero Header ── */
+.hero {
+    background: linear-gradient(135deg, var(--dark-blue) 0%, var(--darker-blue) 100%);
+    color: var(--white);
+    padding: 60px 20px 80px;
+    text-align: center;
+}
+
+.hero h1 {
+    font-size: 3rem;
+    font-weight: 700;
+    margin-bottom: 8px;
+    letter-spacing: -0.5px;
+}
+
+.tagline {
+    font-size: 1.4rem;
+    color: var(--accent-amber);
+    font-style: italic;
+    margin-bottom: 16px;
+    font-weight: 500;
+}
+
+.subtitle {
+    font-size: 1.05rem;
+    color: rgba(255, 255, 255, 0.8);
+    max-width: 520px;
+    margin: 0 auto;
+}
+
+/* ── Form Container ── */
+.form-container {
+    max-width: 720px;
+    margin: -40px auto 40px;
+    background: var(--white);
+    border-radius: 12px;
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.12);
+    padding: 40px;
+    position: relative;
+    z-index: 1;
+}
+
+/* ── Flash Messages ── */
+.flash-messages {
+    margin-bottom: 20px;
+}
+
+.flash {
+    padding: 12px 16px;
+    border-radius: 8px;
+    margin-bottom: 8px;
+    font-size: 0.95rem;
+}
+
+.flash-error {
+    background: #fef2f2;
+    color: var(--error-red);
+    border: 1px solid #fca5a5;
+}
+
+.flash-success {
+    background: #f0fdf4;
+    color: var(--success-green);
+    border: 1px solid #86efac;
+}
+
+.flash-info {
+    background: #eff6ff;
+    color: var(--medium-blue);
+    border: 1px solid #93c5fd;
+}
+
+/* ── Form Sections ── */
+.form-section {
+    margin-bottom: 28px;
+    padding-bottom: 24px;
+    border-bottom: 1px solid #e5e7eb;
+}
+
+.form-section:last-of-type {
+    border-bottom: none;
+    margin-bottom: 24px;
+    padding-bottom: 0;
+}
+
+.form-section h2 {
+    color: var(--dark-blue);
+    font-size: 1.15rem;
+    font-weight: 600;
+    margin-bottom: 16px;
+}
+
+/* ── Form Grid ── */
+.form-row {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 16px;
+}
+
+.form-group {
+    margin-bottom: 14px;
+}
+
+.form-group label {
+    display: block;
+    font-weight: 600;
+    font-size: 0.9rem;
+    color: var(--text-dark);
+    margin-bottom: 6px;
+}
+
+.form-group input,
+.form-group textarea,
+.form-group select {
+    width: 100%;
+    padding: 10px 14px;
+    border: 1.5px solid var(--border-gray);
+    border-radius: 8px;
+    font-size: 0.95rem;
+    font-family: inherit;
+    transition: border-color 0.2s, box-shadow 0.2s;
+    background: var(--white);
+}
+
+.form-group input:focus,
+.form-group textarea:focus {
+    outline: none;
+    border-color: var(--medium-blue);
+    box-shadow: 0 0 0 3px rgba(44, 82, 130, 0.12);
+}
+
+.form-group textarea {
+    resize: vertical;
+    min-height: 80px;
+}
+
+.field-hint {
+    font-size: 0.82rem;
+    color: var(--text-muted);
+    margin-top: 4px;
+}
+
+/* ── File Upload Area ── */
+.file-upload-area {
+    border: 2px dashed var(--border-gray);
+    border-radius: 10px;
+    padding: 36px 20px;
+    text-align: center;
+    cursor: pointer;
+    transition: border-color 0.2s, background 0.2s;
+    position: relative;
+}
+
+.file-upload-area:hover {
+    border-color: var(--medium-blue);
+    background: #f8fafc;
+}
+
+.file-upload-area.drag-over {
+    border-color: var(--accent-amber);
+    background: #fffbeb;
+}
+
+.file-upload-area input[type="file"] {
+    position: absolute;
+    inset: 0;
+    opacity: 0;
+    cursor: pointer;
+}
+
+.file-upload-area .upload-icon {
+    font-size: 2.5rem;
+    margin-bottom: 8px;
+}
+
+.file-upload-area p {
+    color: var(--text-muted);
+    margin-bottom: 4px;
+}
+
+.file-upload-area .file-hint {
+    font-size: 0.8rem;
+    color: #999;
+}
+
+/* ── File List ── */
+#file-list {
+    margin-top: 12px;
+}
+
+.file-item {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 8px 12px;
+    background: var(--light-gray);
+    border-radius: 6px;
+    margin-bottom: 6px;
+    font-size: 0.9rem;
+}
+
+.file-item .file-name {
+    font-weight: 500;
+    color: var(--dark-blue);
+}
+
+.file-item .file-size {
+    color: var(--text-muted);
+    font-size: 0.82rem;
+}
+
+/* ── Submit Button ── */
+.submit-btn {
+    display: block;
+    width: 100%;
+    padding: 16px;
+    background: var(--dark-blue);
+    color: var(--white);
+    border: none;
+    border-radius: 10px;
+    font-size: 1.1rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: background 0.2s, transform 0.1s;
+    letter-spacing: 0.3px;
+}
+
+.submit-btn:hover {
+    background: var(--medium-blue);
+}
+
+.submit-btn:active {
+    transform: scale(0.99);
+}
+
+.submit-btn:disabled {
+    background: var(--border-gray);
+    cursor: not-allowed;
+    transform: none;
+}
+
+.submit-btn .spinner {
+    display: inline-block;
+    width: 18px;
+    height: 18px;
+    border: 2px solid rgba(255, 255, 255, 0.3);
+    border-top-color: var(--white);
+    border-radius: 50%;
+    animation: spin 0.6s linear infinite;
+    margin-right: 8px;
+    vertical-align: middle;
+}
+
+@keyframes spin {
+    to { transform: rotate(360deg); }
+}
+
+/* ── Footer ── */
+footer {
+    text-align: center;
+    padding: 24px 20px;
+    color: var(--text-muted);
+    font-size: 0.85rem;
+}
+
+/* ── Thank You Page ── */
+.thank-you-card {
+    max-width: 600px;
+    margin: -40px auto 40px;
+    background: var(--white);
+    border-radius: 12px;
+    box-shadow: 0 4px 24px rgba(0, 0, 0, 0.12);
+    padding: 48px 40px;
+    text-align: center;
+    position: relative;
+    z-index: 1;
+}
+
+.thank-you-card .check-icon {
+    font-size: 3.5rem;
+    margin-bottom: 16px;
+}
+
+.thank-you-card h2 {
+    color: var(--dark-blue);
+    font-size: 1.6rem;
+    margin-bottom: 12px;
+}
+
+.thank-you-card p {
+    color: var(--text-muted);
+    font-size: 1.02rem;
+    margin-bottom: 10px;
+}
+
+.thank-you-card .email-highlight {
+    color: var(--dark-blue);
+    font-weight: 600;
+}
+
+.thank-you-card .estimate-time {
+    display: inline-block;
+    background: #fffbeb;
+    border: 1px solid var(--accent-amber);
+    color: var(--amber-hover);
+    padding: 8px 20px;
+    border-radius: 8px;
+    font-weight: 600;
+    font-size: 0.95rem;
+    margin: 16px 0;
+}
+
+.back-link {
+    display: inline-block;
+    margin-top: 20px;
+    color: var(--medium-blue);
+    text-decoration: none;
+    font-weight: 500;
+}
+
+.back-link:hover {
+    text-decoration: underline;
+}
+
+/* ── Responsive ── */
+@media (max-width: 640px) {
+    .hero {
+        padding: 40px 16px 60px;
+    }
+
+    .hero h1 {
+        font-size: 2rem;
+    }
+
+    .tagline {
+        font-size: 1.1rem;
+    }
+
+    .form-container,
+    .thank-you-card {
+        margin: -30px 12px 24px;
+        padding: 24px 20px;
+    }
+
+    .form-row {
+        grid-template-columns: 1fr;
+    }
+
+    .submit-btn {
+        font-size: 1rem;
+        padding: 14px;
+    }
+}

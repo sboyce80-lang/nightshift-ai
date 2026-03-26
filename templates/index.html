@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Nightshift AI &mdash; RFPs while you sleep</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <header class="hero">
+        <div class="hero-content">
+            <h1>Nightshift AI</h1>
+            <p class="tagline">RFPs while you sleep</p>
+            <p class="subtitle">Upload your construction documents and receive a detailed painting estimate delivered straight to your inbox.</p>
+        </div>
+    </header>
+
+    <main class="form-container">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}
+        <div class="flash-messages">
+            {% for category, message in messages %}
+            <div class="flash flash-{{ category }}">{{ message }}</div>
+            {% endfor %}
+        </div>
+        {% endif %}
+        {% endwith %}
+
+        <form action="{{ url_for('submit') }}" method="POST"
+              enctype="multipart/form-data" id="rfp-form">
+
+            <section class="form-section">
+                <h2>Contact Information</h2>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="name">Name *</label>
+                        <input type="text" id="name" name="name" required
+                               placeholder="Your full name">
+                    </div>
+                    <div class="form-group">
+                        <label for="email">Email *</label>
+                        <input type="email" id="email" name="email" required
+                               placeholder="you@company.com">
+                    </div>
+                </div>
+                <div class="form-row">
+                    <div class="form-group">
+                        <label for="phone">Phone</label>
+                        <input type="tel" id="phone" name="phone"
+                               placeholder="(555) 123-4567">
+                    </div>
+                    <div class="form-group">
+                        <label for="business_name">Business Name</label>
+                        <input type="text" id="business_name" name="business_name"
+                               placeholder="Company name">
+                    </div>
+                </div>
+            </section>
+
+            <section class="form-section">
+                <h2>Project Documents</h2>
+                <div class="form-group">
+                    <label for="attachments">Upload RFP PDFs *</label>
+                    <div class="file-upload-area" id="drop-zone">
+                        <input type="file" id="attachments" name="attachments"
+                               accept=".pdf,application/pdf" multiple required>
+                        <div class="upload-icon">&#128203;</div>
+                        <p>Drag &amp; drop PDF files here, or click to browse</p>
+                        <p class="file-hint">PDF files only &bull; Up to 25 MB each &bull; Maximum 10 files</p>
+                    </div>
+                    <div id="file-list"></div>
+                </div>
+            </section>
+
+            <section class="form-section">
+                <h2>Project Details</h2>
+                <div class="form-group">
+                    <label for="scope_notes">Scope of Work</label>
+                    <textarea id="scope_notes" name="scope_notes" rows="4"
+                              placeholder="e.g., Interior only, residential floors 2-4, skip basement and mechanical rooms..."></textarea>
+                    <p class="field-hint">Describe the painting scope to help us focus the estimate on the right areas.</p>
+                </div>
+                <div class="form-group">
+                    <label for="deadline">Deadline</label>
+                    <input type="date" id="deadline" name="deadline">
+                    <p class="field-hint">When do you need the estimate by?</p>
+                </div>
+            </section>
+
+            <button type="submit" class="submit-btn" id="submit-btn">
+                Submit for Estimate
+            </button>
+        </form>
+    </main>
+
+    <footer>
+        <p>&copy; 2026 Nightshift AI &mdash; Automated Construction Estimating</p>
+    </footer>
+
+    <script>
+    (function() {
+        const dropZone = document.getElementById('drop-zone');
+        const fileInput = document.getElementById('attachments');
+        const fileList = document.getElementById('file-list');
+        const submitBtn = document.getElementById('submit-btn');
+        const form = document.getElementById('rfp-form');
+
+        // Drag & drop highlighting
+        ['dragenter', 'dragover'].forEach(evt => {
+            dropZone.addEventListener(evt, function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                dropZone.classList.add('drag-over');
+            });
+        });
+
+        ['dragleave', 'drop'].forEach(evt => {
+            dropZone.addEventListener(evt, function(e) {
+                e.preventDefault();
+                e.stopPropagation();
+                dropZone.classList.remove('drag-over');
+            });
+        });
+
+        dropZone.addEventListener('drop', function(e) {
+            const dt = e.dataTransfer;
+            if (dt.files.length > 0) {
+                fileInput.files = dt.files;
+                updateFileList();
+            }
+        });
+
+        // Display file list on selection
+        fileInput.addEventListener('change', updateFileList);
+
+        function updateFileList() {
+            fileList.innerHTML = '';
+            const files = fileInput.files;
+            if (!files || files.length === 0) return;
+
+            for (let i = 0; i < files.length; i++) {
+                const file = files[i];
+                const sizeMB = (file.size / (1024 * 1024)).toFixed(1);
+                const isPDF = file.type === 'application/pdf' ||
+                              file.name.toLowerCase().endsWith('.pdf');
+
+                const item = document.createElement('div');
+                item.className = 'file-item';
+                item.innerHTML =
+                    '<span class="file-name">' +
+                    (isPDF ? '' : '&#9888; ') +
+                    file.name + '</span>' +
+                    '<span class="file-size">' + sizeMB + ' MB</span>';
+
+                if (!isPDF) {
+                    item.style.borderLeft = '3px solid #dc2626';
+                }
+                fileList.appendChild(item);
+            }
+        }
+
+        // Prevent double submit + show spinner
+        form.addEventListener('submit', function() {
+            if (submitBtn.disabled) return false;
+            submitBtn.disabled = true;
+            submitBtn.innerHTML =
+                '<span class="spinner"></span> Uploading...';
+        });
+    })();
+    </script>
+</body>
+</html>
