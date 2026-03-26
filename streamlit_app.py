@@ -259,24 +259,6 @@ def _get_memory_mb():
         return 0
 
 
-def _force_memory_cleanup():
-    """Aggressive memory cleanup between jobs."""
-    # Clear any cached data in Takeoff_DIRECT module globals
-    try:
-        import Takeoff_DIRECT as td
-        # Clear module-level caches if they exist
-        for attr in dir(td):
-            obj = getattr(td, attr, None)
-            if isinstance(obj, dict) and attr.startswith('_') and len(obj) > 100:
-                obj.clear()
-    except Exception:
-        pass
-    # Force garbage collection (multiple passes to catch circular refs)
-    gc.collect(generation=2)
-    gc.collect(generation=1)
-    gc.collect(generation=0)
-
-
 # Memory limit: leave headroom for Streamlit itself (~300MB)
 MEMORY_LIMIT_MB = int(os.environ.get("NIGHTSHIFT_MEMORY_LIMIT_MB", "700"))
 
@@ -344,13 +326,29 @@ def _process_single_job(job_id):
     # Pass API key and progress file via environment
     env = os.environ.copy()
     env["NIGHTSHIFT_PROGRESS_FILE"] = progress_path
+    # Cap memory for subprocess: 750MB (leaves ~250MB for Streamlit + OS)
+    # This ensures the OOM killer targets the subprocess, not the container.
+    _SUB_MEM_LIMIT_MB = 750
+    env["NIGHTSHIFT_MEM_LIMIT_MB"] = str(_SUB_MEM_LIMIT_MB)
+    # Cap tile rendering pages to prevent huge PDFs from consuming all memory
+    env["NIGHTSHIFT_MAX_TILE_PAGES"] = "8"
+
+    def _limit_memory():
+        """Set memory limit on subprocess (Linux only)."""
+        try:
+            import resource
+            limit_bytes = _SUB_MEM_LIMIT_MB * 1024 * 1024
+            resource.setrlimit(resource.RLIMIT_AS, (limit_bytes, limit_bytes))
+        except Exception:
+            pass  # macOS doesn't support RLIMIT_AS; skip
 
     try:
-        print(f"🚀 Starting subprocess for job {job_id[:8]}...")
+        print(f"🚀 Starting subprocess for job {job_id[:8]} (mem limit: {_SUB_MEM_LIMIT_MB}MB)...")
         proc = _sp.Popen(
             cmd, env=env, cwd=PROJECT_ROOT,
             stdout=_sp.PIPE, stderr=_sp.STDOUT,
             text=True, bufsize=1,
+            preexec_fn=_limit_memory,
         )
 
         # Stream output and check for cancellation

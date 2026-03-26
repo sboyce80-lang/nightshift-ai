@@ -1680,7 +1680,7 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
         return None
 
     # Cap at 12 pages max to keep API payload reasonable (12 × 4 = 48 tiles)
-    MAX_PAGES_PER_CALL = 12
+    MAX_PAGES_PER_CALL = int(os.environ.get("NIGHTSHIFT_MAX_TILE_PAGES", "12"))
     if len(floor_plan_pages) > MAX_PAGES_PER_CALL:
         # Prioritize pages with most dimensions (they have the most measurable rooms)
         floor_plan_pages.sort(
