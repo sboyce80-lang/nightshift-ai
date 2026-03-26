@@ -164,6 +164,50 @@ def _clear_cancel_flag(job_id):
 
 
 _WORKER_THREAD = None  # Track actual thread object, not just a lock file
+_STARTUP_CLEANUP_DONE = False  # Only run once per process
+
+
+def _cleanup_stale_queue():
+    """On startup, clean up queue entries from previous crashed sessions.
+    If a job is 'queued' or 'running' but its PDFs no longer exist, mark it as error
+    and remove from queue so it doesn't block new jobs."""
+    global _STARTUP_CLEANUP_DONE
+    if _STARTUP_CLEANUP_DONE:
+        return
+    _STARTUP_CLEANUP_DONE = True
+
+    queue = _get_queue()
+    for job_id in queue:
+        meta = _read_job_meta(job_id)
+        if not meta:
+            # No metadata — orphaned queue entry, just remove it
+            _dequeue_job(job_id)
+            print(f"🧹 Removed orphaned queue entry: {job_id}")
+            continue
+
+        # Check if PDFs still exist
+        pdf_paths = meta.get("pdf_paths", [])
+        pdfs_exist = all(os.path.exists(p) for p in pdf_paths) if pdf_paths else False
+
+        if not pdfs_exist:
+            # PDFs were lost (reboot wiped uploads) — mark as error
+            meta["status"] = "error"
+            meta["error"] = "Upload files lost after app reboot. Please re-submit."
+            meta["finished"] = datetime.now().isoformat()
+            _write_job_meta(job_id, meta)
+            _dequeue_job(job_id)
+            _clear_progress(job_id)
+            _clear_cancel_flag(job_id)
+            print(f"🧹 Cleaned stale job (missing PDFs): {job_id}")
+            continue
+
+        # If job was 'running' when crash happened, reset to 'queued' so it retries
+        if meta.get("status") == "running":
+            meta["status"] = "queued"
+            meta.pop("run_started", None)
+            _write_job_meta(job_id, meta)
+            print(f"🔄 Reset crashed-while-running job to queued: {job_id}")
+
 
 def _is_worker_running():
     """Check if the background worker is alive using the actual thread reference."""
@@ -721,9 +765,10 @@ with st.sidebar:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# ENSURE WORKER IS RUNNING (on every page load)
+# CLEANUP + ENSURE WORKER IS RUNNING (on every page load)
 # ═══════════════════════════════════════════════════════════════════════════════
-_ensure_worker()
+_cleanup_stale_queue()   # Clear orphaned jobs from previous crashes (runs once)
+_ensure_worker()         # Start worker thread if queue has jobs
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
