@@ -282,7 +282,16 @@ MEMORY_LIMIT_MB = int(os.environ.get("NIGHTSHIFT_MEMORY_LIMIT_MB", "700"))
 
 
 def _process_single_job(job_id):
-    """Process one job — called by the worker thread."""
+    """Process one job in a SUBPROCESS so its memory is fully reclaimed on exit.
+
+    This is critical for Streamlit Cloud's 1GB free tier:
+    - Takeoff_DIRECT + PyMuPDF tile rendering can use 500-800MB
+    - Running in-process would crash the Streamlit app
+    - A subprocess isolates all that memory; when it exits, the OS reclaims everything
+    - Even if the subprocess is OOM-killed, the parent Streamlit process survives
+    """
+    import subprocess as _sp
+
     meta = _read_job_meta(job_id)
     if not meta:
         _dequeue_job(job_id)
@@ -294,24 +303,6 @@ def _process_single_job(job_id):
         _clear_cancel_flag(job_id)
         return
 
-    # Pre-job memory check — if we're already high, force cleanup first
-    mem_before = _get_memory_mb()
-    if mem_before > MEMORY_LIMIT_MB * 0.8:
-        print(f"⚠️  Pre-job memory high ({mem_before:.0f}MB), forcing cleanup...")
-        _force_memory_cleanup()
-        mem_before = _get_memory_mb()
-        if mem_before > MEMORY_LIMIT_MB:
-            # Still too high — fail the job gracefully instead of OOM crashing
-            meta["status"] = "error"
-            meta["error"] = (
-                f"Insufficient memory ({mem_before:.0f}MB used of {MEMORY_LIMIT_MB}MB limit). "
-                f"Please reboot the app from the Streamlit dashboard to free memory, then retry."
-            )
-            meta["finished"] = datetime.now().isoformat()
-            _write_job_meta(job_id, meta)
-            _dequeue_job(job_id)
-            return
-
     # Update status to running
     meta["status"] = "running"
     meta["run_started"] = datetime.now().isoformat()
@@ -319,59 +310,138 @@ def _process_single_job(job_id):
 
     # Set progress file path so Takeoff_DIRECT can write updates
     progress_path = os.path.join(JOBS_DIR, f".progress_{job_id}.json")
-    os.environ["NIGHTSHIFT_PROGRESS_FILE"] = progress_path
+
+    # Build subprocess command
+    # Put PDFs in a temp directory that Takeoff_DIRECT can read via --rfp_dir
+    pdf_paths = meta.get("pdf_paths", [])
+    if not pdf_paths:
+        meta["status"] = "error"
+        meta["error"] = "No PDF files provided"
+        meta["finished"] = datetime.now().isoformat()
+        _write_job_meta(job_id, meta)
+        _dequeue_job(job_id)
+        return
+
+    # Use the upload directory as rfp_dir (all PDFs for this job are there)
+    rfp_dir = os.path.dirname(pdf_paths[0])
+
+    cmd = [
+        sys.executable, "-u",
+        os.path.join(PROJECT_ROOT, "Takeoff_DIRECT.py"),
+        "--rfp_dir", rfp_dir,
+        "--contact_name", meta.get("contact_name", ""),
+        "--contact_email", meta.get("contact_email", ""),
+    ]
+    if meta.get("scope_notes"):
+        cmd += ["--scope", meta["scope_notes"]]
+    if meta.get("image_fallback", True):
+        cmd.append("--image-fallback")
+    else:
+        cmd.append("--no-image-fallback")
+    if meta.get("multi_pass", False):
+        cmd.append("--multi-pass")
+
+    # Pass API key and progress file via environment
+    env = os.environ.copy()
+    env["NIGHTSHIFT_PROGRESS_FILE"] = progress_path
 
     try:
-        from Takeoff_DIRECT import run_analysis
-        result = run_analysis(
-            pdf_paths=meta.get("pdf_paths", []),
-            contact_name=meta.get("contact_name", ""),
-            contact_email=meta.get("contact_email", ""),
-            scope_notes=meta.get("scope_notes", ""),
-            image_fallback=meta.get("image_fallback", True),
-            multi_pass=meta.get("multi_pass", False),
+        print(f"🚀 Starting subprocess for job {job_id[:8]}...")
+        proc = _sp.Popen(
+            cmd, env=env, cwd=PROJECT_ROOT,
+            stdout=_sp.PIPE, stderr=_sp.STDOUT,
+            text=True, bufsize=1,
         )
 
-        # Check if cancelled during processing
-        if _is_cancelled(job_id):
-            meta["status"] = "cancelled"
-            meta["finished"] = datetime.now().isoformat()
-            meta["error"] = "Cancelled by user during processing"
-            _clear_cancel_flag(job_id)
-        else:
+        # Stream output and check for cancellation
+        output_lines = []
+        while True:
+            line = proc.stdout.readline()
+            if not line and proc.poll() is not None:
+                break
+            if line:
+                print(f"  [{job_id[:8]}] {line.rstrip()}")
+                output_lines.append(line)
+
+            # Check cancellation every line
+            if _is_cancelled(job_id):
+                proc.terminate()
+                try:
+                    proc.wait(timeout=10)
+                except _sp.TimeoutExpired:
+                    proc.kill()
+                meta["status"] = "cancelled"
+                meta["finished"] = datetime.now().isoformat()
+                meta["error"] = "Cancelled by user during processing"
+                _clear_cancel_flag(job_id)
+                _write_job_meta(job_id, meta)
+                _dequeue_job(job_id)
+                _clear_progress(job_id)
+                return
+
+        exit_code = proc.returncode
+        print(f"📊 Subprocess for {job_id[:8]} exited with code {exit_code}")
+
+        if exit_code == 0:
+            # Find the output files (Takeoff_DIRECT writes to output/ dir)
+            output_json = ""
+            output_pdf = ""
+            output_dir = os.path.join(PROJECT_ROOT, "output")
+            if os.path.isdir(output_dir):
+                # Find the most recent JSON and PDF in output/
+                json_files = sorted(
+                    [f for f in os.listdir(output_dir) if f.endswith(".json")
+                     and f.startswith("construction_analysis")],
+                    key=lambda f: os.path.getmtime(os.path.join(output_dir, f)),
+                    reverse=True,
+                )
+                pdf_files = sorted(
+                    [f for f in os.listdir(output_dir) if f.endswith(".pdf")
+                     and f.startswith("construction_analysis")],
+                    key=lambda f: os.path.getmtime(os.path.join(output_dir, f)),
+                    reverse=True,
+                )
+                if json_files:
+                    output_json = os.path.join(output_dir, json_files[0])
+                if pdf_files:
+                    output_pdf = os.path.join(output_dir, pdf_files[0])
+
             meta["status"] = "done"
             meta["finished"] = datetime.now().isoformat()
-            meta["output_json"] = result.get("output_json_path", "")
-            meta["output_pdf"] = result.get("output_pdf_path", "")
-    except MemoryError:
-        meta["status"] = "error"
-        meta["error"] = "Out of memory — PDF too large for free tier. Try a smaller file or reboot the app."
-        meta["finished"] = datetime.now().isoformat()
-    except Exception as e:
-        if _is_cancelled(job_id):
-            meta["status"] = "cancelled"
-            meta["error"] = "Cancelled by user"
-            _clear_cancel_flag(job_id)
-        else:
+            meta["output_json"] = output_json
+            meta["output_pdf"] = output_pdf
+        elif exit_code == -9 or exit_code == 137:
+            # SIGKILL = OOM killer
             meta["status"] = "error"
-            meta["error"] = str(e)
+            meta["error"] = (
+                "Process killed (likely out of memory). "
+                "This PDF may be too large for the free tier. "
+                "Try splitting it into smaller files or upgrading the plan."
+            )
+            meta["finished"] = datetime.now().isoformat()
+        else:
+            # Extract error from last few lines of output
+            last_lines = "".join(output_lines[-10:]) if output_lines else "No output"
+            meta["status"] = "error"
+            meta["error"] = f"Process exited with code {exit_code}. {last_lines[-500:]}"
+            meta["finished"] = datetime.now().isoformat()
+
+    except Exception as e:
+        meta["status"] = "error"
+        meta["error"] = f"Failed to start processing: {str(e)}"
         meta["finished"] = datetime.now().isoformat()
 
     _write_job_meta(job_id, meta)
     _dequeue_job(job_id)
     _clear_progress(job_id)
-    # Clean up env var
-    os.environ.pop("NIGHTSHIFT_PROGRESS_FILE", None)
 
-    # Post-job cleanup — critical for preventing overnight OOM
-    # 1. Remove uploaded PDF copies (output JSON/PDF already saved separately)
+    # Clean up uploaded PDFs (output is saved separately)
     for pdf_path in meta.get("pdf_paths", []):
         try:
             if os.path.exists(pdf_path) and UPLOAD_DIR in pdf_path:
                 os.remove(pdf_path)
         except Exception:
             pass
-    # Remove empty upload subdirectory
     job_upload_dir = os.path.join(UPLOAD_DIR, job_id)
     try:
         if os.path.isdir(job_upload_dir) and not os.listdir(job_upload_dir):
@@ -379,13 +449,7 @@ def _process_single_job(job_id):
     except Exception:
         pass
 
-    # 2. Memory cleanup
-    mem_after = _get_memory_mb()
-    print(f"📊 Job {job_id[:8]} complete. Memory: {mem_before:.0f}MB → {mem_after:.0f}MB")
-    _force_memory_cleanup()
-    mem_cleaned = _get_memory_mb()
-    if mem_cleaned < mem_after:
-        print(f"   🧹 Cleaned {mem_after - mem_cleaned:.0f}MB → {mem_cleaned:.0f}MB")
+    print(f"✅ Job {job_id[:8]} cleanup complete. Streamlit RSS: {_get_memory_mb():.0f}MB")
 
 
 def _cleanup_old_jobs(keep=20):
