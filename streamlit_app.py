@@ -624,32 +624,76 @@ with tab_history:
 
                             costs = analysis_data.get("cost_estimate", {})
                             line_items = costs.get("line_items", [])
-                            total = costs.get("total_cost", 0)
-                            agg = analysis_data.get("analysis", {}).get("aggregated_totals", {})
-                            rooms = agg.get("total_rooms_found", 0)
-                            wall_sf = agg.get("total_wall_sqft", 0)
+                            total = costs.get("subtotal", 0) or costs.get("total_cost", 0) or 0
+                            analysis = analysis_data.get("analysis", {})
+                            agg = analysis.get("aggregated_totals", {})
+                            pi = analysis.get("project_info", {})
+                            rooms = pi.get("total_rooms_found", 0) or 0
+                            wall_sf = agg.get("total_paintable_wall_sqft", 0) or 0
+                            ceiling_sf = agg.get("total_paintable_ceiling_sqft", 0) or 0
 
-                            with st.expander(f"💰 Estimate Summary — ${total:,.0f}", expanded=False):
-                                mc1, mc2, mc3, mc4 = st.columns(4)
+                            # ── Compute interior vs exterior breakdown ──
+                            interior_total = 0
+                            exterior_total = 0
+                            interior_items = []
+                            exterior_items = []
+                            for li in line_items:
+                                li_total = li.get("total", 0) or li.get("total_cost", 0) or 0
+                                li_name = li.get("item", "") or li.get("description", "")
+                                is_ext = any(kw in li_name.lower() for kw in (
+                                    "ext.", "exterior", "hardie", "azek", "lintel",
+                                    "corner board", "soffit", "cornice", "lift rental"))
+                                if is_ext:
+                                    exterior_total += li_total
+                                    exterior_items.append(li)
+                                else:
+                                    interior_total += li_total
+                                    interior_items.append(li)
+
+                            with st.expander(f"💰 Estimate Summary — ${total:,.0f}", expanded=True):
+                                # Top-level metrics
+                                mc1, mc2, mc3 = st.columns(3)
                                 mc1.metric("Total Estimate", f"${total:,.0f}")
-                                mc2.metric("Rooms Found", f"{rooms}")
-                                mc3.metric("Wall Area", f"{wall_sf:,.0f} SF")
-                                mc4.metric("Line Items", f"{len(line_items)}")
+                                mc2.metric("Interior", f"${interior_total:,.0f}")
+                                mc3.metric("Exterior", f"${exterior_total:,.0f}")
 
+                                mc4, mc5, mc6 = st.columns(3)
+                                mc4.metric("Rooms Found", f"{rooms}")
+                                mc5.metric("Wall Area", f"{wall_sf:,.0f} SF")
+                                mc6.metric("Ceiling Area", f"{ceiling_sf:,.0f} SF")
+
+                                # Interior line items
                                 st.markdown("---")
-                                if line_items:
-                                    table_data = []
-                                    for li in line_items:
-                                        if li.get("total_cost", 0) > 0:
-                                            table_data.append({
-                                                "Line Item": li.get("description", li.get("item", "")),
-                                                "Quantity": f"{li.get('quantity', 0):,.0f}",
-                                                "Unit": li.get("unit", ""),
-                                                "Rate": f"${li.get('unit_rate', 0):,.2f}",
-                                                "Total": f"${li.get('total_cost', 0):,.2f}",
+                                st.markdown(f"**🏠 Interior — ${interior_total:,.0f}**")
+                                if interior_items:
+                                    int_data = []
+                                    for li in interior_items:
+                                        li_total = li.get("total", 0) or li.get("total_cost", 0) or 0
+                                        if li_total > 0:
+                                            int_data.append({
+                                                "Line Item": li.get("item", "") or li.get("description", ""),
+                                                "Qty": f"{li.get('qty', 0) or li.get('quantity', 0):,.0f}",
+                                                "Cost": f"${li.get('cost', 0):,.0f}",
+                                                "Total": f"${li_total:,.0f}",
                                             })
-                                    if table_data:
-                                        st.dataframe(table_data, use_container_width=True, hide_index=True)
+                                    if int_data:
+                                        st.dataframe(int_data, use_container_width=True, hide_index=True)
+
+                                # Exterior line items
+                                if exterior_items:
+                                    st.markdown(f"**🏗️ Exterior — ${exterior_total:,.0f}**")
+                                    ext_data = []
+                                    for li in exterior_items:
+                                        li_total = li.get("total", 0) or li.get("total_cost", 0) or 0
+                                        if li_total > 0:
+                                            ext_data.append({
+                                                "Line Item": li.get("item", "") or li.get("description", ""),
+                                                "Qty": f"{li.get('qty', 0) or li.get('quantity', 0):,.0f}",
+                                                "Cost": f"${li.get('cost', 0):,.0f}",
+                                                "Total": f"${li_total:,.0f}",
+                                            })
+                                    if ext_data:
+                                        st.dataframe(ext_data, use_container_width=True, hide_index=True)
 
                                 rfi = analysis_data.get("rfi_items", [])
                                 if rfi:
