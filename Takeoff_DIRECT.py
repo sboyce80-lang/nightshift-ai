@@ -5158,6 +5158,9 @@ def _deduplicate_rooms(rooms):
     1. Exact room_id match → keep higher detail_score
     2. Normalized unit+type match with dimension similarity (±10%) → keep higher detail
     3. Exact name + similar area (within 50 sqft) → keep higher detail
+    3b. Same normalized type + same floor + similar wall area (±20%) for non-unit rooms
+        (catches cross-chunk duplicates in single-family homes where the same room
+         is extracted with slightly different names/dimensions)
 
     Returns: (deduplicated_rooms, dedup_log)
     """
@@ -5165,11 +5168,39 @@ def _deduplicate_rooms(rooms):
     seen_identity = {}  # dedup_key -> (unit_key, room_type) for tier 2 lookups
     dedup_log = []
 
+    # Helper: normalize room type for fuzzy same-floor matching
+    _TYPE_ALIASES = {
+        "bath": "bathroom", "half bath": "bathroom", "powder room": "bathroom",
+        "full bath": "bathroom", "guest bath": "bathroom", "guest bathroom": "bathroom",
+        "primary bath": "primary bathroom", "master bath": "primary bathroom",
+        "master bathroom": "primary bathroom",
+        "entry": "entry", "mudroom": "entry", "foyer": "entry", "vestibule": "entry",
+        "entry/mudroom": "entry",
+        "hall": "hallway", "corridor": "hallway", "back hall": "hallway",
+        "front hall": "hallway",
+        "office": "studio/office", "study": "studio/office", "den": "studio/office",
+        "studio": "studio/office", "studio/office": "studio/office",
+        "closet": "closet", "primary closet": "primary closet",
+        "walk-in closet": "primary closet", "walk in closet": "primary closet",
+    }
+
+    def _get_room_type_normalized(name):
+        n = name.lower().strip()
+        # Strip trailing numbers (e.g., "Bedroom 201" → "bedroom")
+        n_base = re.sub(r'\s*\d+$', '', n)
+        return _TYPE_ALIASES.get(n_base, n_base)
+
+    def _get_floor_from_rid(rid):
+        """Extract floor indicator from room_id (e.g., 'F1-...' → '1')."""
+        m = re.match(r'F(\d+|B|SB|R|M|PH)', rid, re.IGNORECASE)
+        return m.group(1).upper() if m else ""
+
     for room in rooms:
         rid = room.get("room_id", "")
         rname = room.get("room_name", "")
         dims = room.get("dimensions", {})
         floor_area = _num(dims.get("floor_area_sqft", 0))
+        wall_area = _num(dims.get("wall_area_sqft", 0))
 
         # Skip summary/aggregate entries
         if any(word in rname.lower() for word in ("multiple", "various", "summary", "combined")):
@@ -5264,6 +5295,47 @@ def _deduplicate_rooms(rooms):
                     })
                     matched = True
                     break
+
+            # TIER 3b: Same normalized room TYPE + same floor + similar wall area (±20%)
+            # Catches cross-chunk duplicates in single-family homes where the same
+            # physical room is extracted with slightly different names or dimensions.
+            # e.g., "Back Hall" (216 sqft) from chunk 1 and "Back Hall" (216 sqft) from chunk 2.
+            # Also catches type-aliased matches like "Entry" + "Mudroom" → same entry area,
+            # or "Bathroom" extracted twice from overlapping chunk regions.
+            if not matched and not unit_key:
+                room_floor = _get_floor_from_rid(rid)
+                room_type_norm = _get_room_type_normalized(rname)
+                for existing_key, existing in seen.items():
+                    existing_rid = existing.get("room_id", existing_key)
+                    # Must be on the same floor
+                    e_floor = _get_floor_from_rid(existing_rid)
+                    if not room_floor or not e_floor or room_floor != e_floor:
+                        continue
+                    # Must not be different units
+                    existing_rid_unit = _extract_unit_from_room_id(existing_rid)
+                    if rid_unit and existing_rid_unit and rid_unit != existing_rid_unit:
+                        continue
+                    # Check normalized room type match
+                    e_type_norm = _get_room_type_normalized(existing.get("room_name", ""))
+                    if room_type_norm != e_type_norm:
+                        continue
+                    # Check wall area similarity (±20%) — more lenient than Tier 3
+                    e_wall = _num(existing.get("dimensions", {}).get("wall_area_sqft", 0))
+                    if wall_area > 0 and e_wall > 0:
+                        wall_ratio = min(wall_area, e_wall) / max(wall_area, e_wall)
+                        if wall_ratio >= 0.80:
+                            old_score = _detail_score(existing)
+                            if score > old_score:
+                                seen[existing_key] = room
+                            dedup_log.append({
+                                "kept": seen[existing_key].get("room_id", existing_key),
+                                "removed": rid,
+                                "reason": f"same-floor type match ({room_type_norm}), "
+                                          f"wall ratio {wall_ratio:.2f}"
+                            })
+                            matched = True
+                            break
+
             if not matched:
                 seen[rid] = room
                 seen_identity[rid] = (unit_key, room_type)
@@ -7307,6 +7379,27 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     # --- Cornice: keep if extraction found it, suppress only if zero ---
     # Cornice/brackets are almost always field-painted, even on new construction.
     # Don't suppress — let the extraction decide.
+    # FALLBACK: For single-family homes with 2+ stories and extracted exterior notes
+    # (elevation sheets were parsed) but 0 cornice, estimate from building perimeter.
+    # This handles non-deterministic chunk processing where elevation data is sometimes
+    # missed between runs.
+    if is_single_family and cornice_lf == 0:
+        _sf_footprint = _num(project_info.get('footprint_sqft', 0))
+        _sf_stories = _num(project_info.get('total_stories', 0))
+        # Only apply fallback when we have a footprint and multi-story building
+        if _sf_footprint > 0 and _sf_stories >= 2:
+            # Estimate perimeter from footprint (assume ~1.5:1 aspect ratio)
+            _sf_long = math.sqrt(_sf_footprint * 1.5)
+            _sf_short = _sf_footprint / _sf_long if _sf_long > 0 else 0
+            _sf_perimeter = 2 * (_sf_long + _sf_short)
+            cornice_lf = round(_sf_perimeter)
+        elif wall_sqft > 0 and _sf_stories >= 2:
+            # No footprint available — estimate perimeter from total wall area
+            # Typical residential: wall_area = perimeter × ceiling_height × stories
+            # Average ceiling height ~9ft, 2 stories
+            _est_ceiling = 9.0
+            _est_perimeter = wall_sqft / (_est_ceiling * max(_sf_stories, 2))
+            cornice_lf = round(_est_perimeter)
 
     # --- Base trim: data-driven, not building-type-driven ---
     # Only suppress base trim if the extraction found ZERO trim across all rooms.
@@ -7352,10 +7445,13 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
 
     lift_needed = 1 if exterior.get('lift_required', False) else 0
     int_lift_needed = 1 if exterior.get('interior_lift_required', False) else 0
-    # If any exterior scope exists, require exterior lift
+    # If any exterior scope exists, require exterior lift (unless single-family ≤3 stories)
     has_any_ext = ext_paint_sqft > 0 or hardie_sqft > 0 or azek_lf > 0
     if has_any_ext and lift_needed == 0:
-        lift_needed = 1
+        # Single-family homes ≤3 stories use ladders, not lifts
+        _sf_stories_ext = _num(project_info.get('total_stories', 0))
+        if not (is_single_family and _sf_stories_ext <= 3):
+            lift_needed = 1
 
     pm = PRICING_MODEL
 
@@ -8401,6 +8497,50 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
 
     # --- Whitebox / Prime Only exclusion (before validation) ---
     analysis = _apply_whitebox_exclusion(analysis)
+
+    # --- Accessory structure exclusion for single-family ---
+    # For single-family homes, exclude floors that represent separate structures
+    # (sheds, garages, accessory buildings) that aren't part of the main house
+    # painting scope. Also exclude "Lower Level" / utility-only basement floors
+    # when they contain only utility/mechanical rooms.
+    _sf_bt = str(analysis.get("project_info", {}).get("building_type", "")).lower()
+    _sf_units_raw = analysis.get("project_info", {}).get("total_units", 0)
+    _sf_units = _num(_sf_units_raw) if isinstance(_sf_units_raw, (int, float)) else 0
+    _is_sf = (
+        any(kw in _sf_bt for kw in ("single", "detached"))
+        or (_sf_units <= 2 and isinstance(_sf_units_raw, (int, float)))
+    ) and not any(kw in _sf_bt for kw in ("multi", "mixed", "commercial", "apartment"))
+    if _is_sf:
+        _excluded_floor_names = []
+        _ACCESSORY_KW = ("shed", "accessory", "outbuilding", "detached garage",
+                         "barn", "carport", "pool house", "guest house")
+        _UTILITY_ONLY_KW = ("utility", "mechanical", "boiler", "storage")
+        for floor in list(analysis.get("floors", [])):
+            fname = floor.get("floor_name", "").lower()
+            # Exclude accessory structures
+            if any(kw in fname for kw in _ACCESSORY_KW):
+                _excluded_floor_names.append(floor.get("floor_name", ""))
+                analysis["floors"].remove(floor)
+                continue
+            # Exclude lower level / basement floors that only have utility rooms
+            if "lower level" in fname or "basement" in fname or "foundation" in fname:
+                rooms = floor.get("rooms", [])
+                all_utility = all(
+                    any(kw in r.get("room_name", "").lower() for kw in _UTILITY_ONLY_KW)
+                    for r in rooms
+                ) if rooms else False
+                if all_utility:
+                    _excluded_floor_names.append(floor.get("floor_name", ""))
+                    analysis["floors"].remove(floor)
+                    continue
+        if _excluded_floor_names:
+            print(f"   🏠 Single-family: excluded accessory floors: {_excluded_floor_names}")
+            analysis.setdefault("notes", []).append(
+                f"[Single-Family Scope] Excluded non-main-house floors: "
+                f"{', '.join(_excluded_floor_names)} — not in typical residential painting scope"
+            )
+            # Recalculate totals after floor removal
+            analysis = _recalculate_totals(analysis)
 
     # Run extraction validation checks
     analysis = _validate_extraction(analysis, file_room_counts=file_room_counts)
