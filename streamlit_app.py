@@ -199,15 +199,18 @@ def _clear_progress(job_id):
 
 
 def _get_memory_mb():
-    """Get current process RSS in MB."""
+    """Get current process RSS in MB. Uses /proc on Linux (Streamlit Cloud), resource on macOS."""
     try:
+        # Linux (Streamlit Cloud): read from /proc for accurate current RSS
+        if os.path.exists("/proc/self/status"):
+            with open("/proc/self/status") as f:
+                for line in f:
+                    if line.startswith("VmRSS:"):
+                        return int(line.split()[1]) / 1024  # KB → MB
+        # macOS fallback
         import resource
-        # resource.getrusage returns bytes on macOS, KB on Linux
         rusage = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
-        # Linux returns KB, macOS returns bytes
-        if sys.platform == "darwin":
-            return rusage / (1024 * 1024)
-        return rusage / 1024
+        return rusage / (1024 * 1024)  # bytes → MB on macOS
     except Exception:
         return 0
 
