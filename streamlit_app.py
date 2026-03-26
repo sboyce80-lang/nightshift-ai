@@ -443,12 +443,53 @@ with st.sidebar:
     contact_email = st.text_input("Contact Email *", placeholder="e.g., john@rider.com")
 
     st.markdown("---")
-    uploaded_files = st.file_uploader(
-        "Upload Construction PDFs *",
-        type=["pdf"],
-        accept_multiple_files=True,
-        help="Architectural drawings — floor plans, elevations, schedules. Max 200MB each.",
+
+    upload_mode = st.radio(
+        "Upload Method",
+        ["Individual PDFs", "ZIP Folder"],
+        horizontal=True,
+        help="Upload PDFs one at a time, or a ZIP containing a folder of PDFs.",
     )
+
+    uploaded_files = []
+    if upload_mode == "Individual PDFs":
+        raw_uploads = st.file_uploader(
+            "Upload Construction PDFs *",
+            type=["pdf"],
+            accept_multiple_files=True,
+            help="Architectural drawings — floor plans, elevations, schedules. Max 200MB each.",
+        )
+        if raw_uploads:
+            uploaded_files = raw_uploads
+    else:
+        zip_upload = st.file_uploader(
+            "Upload ZIP folder containing PDFs *",
+            type=["zip"],
+            accept_multiple_files=False,
+            help="A .zip file containing one or more PDF drawings. Subfolders are included.",
+        )
+        if zip_upload:
+            import zipfile
+            import io
+            try:
+                zf = zipfile.ZipFile(io.BytesIO(zip_upload.getvalue()))
+                pdf_names = [n for n in zf.namelist()
+                             if n.lower().endswith(".pdf") and not n.startswith("__MACOSX")]
+                if pdf_names:
+                    st.info(f"Found **{len(pdf_names)}** PDF(s) in ZIP: {', '.join(os.path.basename(n) for n in pdf_names[:5])}{'...' if len(pdf_names) > 5 else ''}")
+                    # Wrap extracted files as file-like objects with .name and .getbuffer()
+                    class _ZipPDF:
+                        def __init__(self, name, data):
+                            self.name = os.path.basename(name)
+                            self._data = data
+                        def getbuffer(self):
+                            return self._data
+                    for pname in pdf_names:
+                        uploaded_files.append(_ZipPDF(pname, zf.read(pname)))
+                else:
+                    st.warning("No PDF files found in the ZIP archive.")
+            except Exception as e:
+                st.error(f"Could not read ZIP file: {e}")
 
     st.markdown("---")
     with st.expander("⚙️ Advanced Options", expanded=False):
