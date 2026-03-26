@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """
-Nightshift AI — Streamlit App
-==============================
+Nightshift AI — Streamlit App (Queue-Based)
+=============================================
 Upload construction PDFs → get automated painting estimates.
+Jobs are queued and processed one at a time to stay within memory limits.
 
 Run:
     streamlit run streamlit_app.py
@@ -17,7 +18,6 @@ import os
 import sys
 import json
 import uuid
-import shutil
 import threading
 import time
 from datetime import datetime
@@ -41,13 +41,217 @@ st.set_page_config(
 UPLOAD_DIR = os.path.join(PROJECT_ROOT, "uploads")
 OUTPUT_DIR = os.path.join(PROJECT_ROOT, "output")
 JOBS_DIR = os.path.join(PROJECT_ROOT, "jobs")
+QUEUE_DIR = os.path.join(PROJECT_ROOT, "jobs", "queue")
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 os.makedirs(JOBS_DIR, exist_ok=True)
+os.makedirs(QUEUE_DIR, exist_ok=True)
 
-# ── Session state init ──
-if "jobs" not in st.session_state:
-    st.session_state.jobs = {}  # {job_id: {status, result, error, ...}}
+# Lock file to track worker state
+WORKER_LOCK = os.path.join(JOBS_DIR, ".worker_lock")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# JOB QUEUE HELPERS
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _read_job_meta(job_id):
+    """Read job metadata from disk."""
+    meta_path = os.path.join(JOBS_DIR, f"{job_id}.json")
+    if not os.path.exists(meta_path):
+        return None
+    try:
+        with open(meta_path, "r") as f:
+            return json.load(f)
+    except Exception:
+        return None
+
+
+def _write_job_meta(job_id, data):
+    """Write job metadata to disk."""
+    meta_path = os.path.join(JOBS_DIR, f"{job_id}.json")
+    with open(meta_path, "w") as f:
+        json.dump(data, f, indent=2)
+
+
+def _enqueue_job(job_id):
+    """Add job to the queue (touch a file in queue dir with timestamp)."""
+    queue_path = os.path.join(QUEUE_DIR, f"{job_id}")
+    with open(queue_path, "w") as f:
+        f.write(datetime.now().isoformat())
+
+
+def _get_queue():
+    """Get ordered list of queued job IDs (oldest first)."""
+    queue_files = sorted(Path(QUEUE_DIR).glob("*"), key=lambda p: p.stat().st_mtime)
+    return [p.name for p in queue_files]
+
+
+def _dequeue_job(job_id):
+    """Remove job from queue."""
+    queue_path = os.path.join(QUEUE_DIR, f"{job_id}")
+    if os.path.exists(queue_path):
+        os.remove(queue_path)
+
+
+def _get_queue_position(job_id):
+    """Return 1-based position in queue, or 0 if not queued."""
+    queue = _get_queue()
+    if job_id in queue:
+        return queue.index(job_id) + 1
+    return 0
+
+
+def _move_queue_position(job_id, direction):
+    """Move a queued job up or down. direction: -1 = higher priority, +1 = lower."""
+    queue = _get_queue()
+    if job_id not in queue:
+        return
+    idx = queue.index(job_id)
+    new_idx = idx + direction
+    if new_idx < 0 or new_idx >= len(queue):
+        return
+    # Swap mtime to reorder — set target position's mtime, then adjust
+    queue[idx], queue[new_idx] = queue[new_idx], queue[idx]
+    # Rewrite queue files with ordered timestamps
+    base_time = time.time() - len(queue)
+    for i, jid in enumerate(queue):
+        qpath = os.path.join(QUEUE_DIR, jid)
+        if os.path.exists(qpath):
+            os.utime(qpath, (base_time + i, base_time + i))
+
+
+def _cancel_job(job_id):
+    """Cancel a queued or running job."""
+    # Remove from queue if queued
+    _dequeue_job(job_id)
+    # Update metadata
+    meta = _read_job_meta(job_id)
+    if meta:
+        meta["status"] = "cancelled"
+        meta["finished"] = datetime.now().isoformat()
+        meta["error"] = "Cancelled by user"
+        _write_job_meta(job_id, meta)
+    # Signal worker to stop current job (write cancel flag)
+    cancel_path = os.path.join(JOBS_DIR, f".cancel_{job_id}")
+    with open(cancel_path, "w") as f:
+        f.write("cancel")
+
+
+def _is_cancelled(job_id):
+    """Check if a job has been flagged for cancellation."""
+    cancel_path = os.path.join(JOBS_DIR, f".cancel_{job_id}")
+    return os.path.exists(cancel_path)
+
+
+def _clear_cancel_flag(job_id):
+    """Remove the cancel flag file."""
+    cancel_path = os.path.join(JOBS_DIR, f".cancel_{job_id}")
+    if os.path.exists(cancel_path):
+        os.remove(cancel_path)
+
+
+def _is_worker_running():
+    """Check if the background worker is alive."""
+    if not os.path.exists(WORKER_LOCK):
+        return False
+    try:
+        with open(WORKER_LOCK, "r") as f:
+            data = json.load(f)
+        # If lock is older than 30 minutes, consider it stale
+        lock_time = datetime.fromisoformat(data.get("started", "2000-01-01"))
+        age_minutes = (datetime.now() - lock_time).total_seconds() / 60
+        if age_minutes > 30:
+            os.remove(WORKER_LOCK)
+            return False
+        return data.get("alive", False)
+    except Exception:
+        return False
+
+
+def _process_single_job(job_id):
+    """Process one job — called by the worker thread."""
+    meta = _read_job_meta(job_id)
+    if not meta:
+        _dequeue_job(job_id)
+        return
+
+    # Check if already cancelled before starting
+    if _is_cancelled(job_id):
+        _dequeue_job(job_id)
+        _clear_cancel_flag(job_id)
+        return
+
+    # Update status to running
+    meta["status"] = "running"
+    meta["run_started"] = datetime.now().isoformat()
+    _write_job_meta(job_id, meta)
+
+    try:
+        from Takeoff_DIRECT import run_analysis
+        result = run_analysis(
+            pdf_paths=meta.get("pdf_paths", []),
+            contact_name=meta.get("contact_name", ""),
+            contact_email=meta.get("contact_email", ""),
+            scope_notes=meta.get("scope_notes", ""),
+            image_fallback=meta.get("image_fallback", True),
+            multi_pass=meta.get("multi_pass", False),
+        )
+
+        # Check if cancelled during processing
+        if _is_cancelled(job_id):
+            meta["status"] = "cancelled"
+            meta["finished"] = datetime.now().isoformat()
+            meta["error"] = "Cancelled by user during processing"
+            _clear_cancel_flag(job_id)
+        else:
+            meta["status"] = "done"
+            meta["finished"] = datetime.now().isoformat()
+            meta["output_json"] = result.get("output_json_path", "")
+            meta["output_pdf"] = result.get("output_pdf_path", "")
+    except Exception as e:
+        if _is_cancelled(job_id):
+            meta["status"] = "cancelled"
+            meta["error"] = "Cancelled by user"
+            _clear_cancel_flag(job_id)
+        else:
+            meta["status"] = "error"
+            meta["error"] = str(e)
+        meta["finished"] = datetime.now().isoformat()
+
+    _write_job_meta(job_id, meta)
+    _dequeue_job(job_id)
+
+
+def _worker_loop():
+    """Background worker — processes queue one job at a time."""
+    # Write lock
+    with open(WORKER_LOCK, "w") as f:
+        json.dump({"alive": True, "started": datetime.now().isoformat()}, f)
+
+    try:
+        while True:
+            queue = _get_queue()
+            if not queue:
+                # No more jobs — worker exits
+                break
+
+            job_id = queue[0]  # Process oldest first
+            _process_single_job(job_id)
+
+            # Brief pause between jobs
+            time.sleep(2)
+    finally:
+        # Clean up lock
+        if os.path.exists(WORKER_LOCK):
+            os.remove(WORKER_LOCK)
+
+
+def _ensure_worker():
+    """Start the worker thread if not already running."""
+    if not _is_worker_running() and _get_queue():
+        thread = threading.Thread(target=_worker_loop, daemon=True)
+        thread.start()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -71,6 +275,7 @@ st.markdown("""
         border-left: 4px solid;
     }
     .status-running { background: #fff8e6; border-color: #f0a500; }
+    .status-queued { background: #e8f0fa; border-color: #2c6fbb; }
     .status-done { background: #e8f8e8; border-color: #1a7a3a; }
     .status-error { background: #fde8e8; border-color: #c0392b; }
     .metric-box {
@@ -133,6 +338,13 @@ with st.sidebar:
 
     st.markdown("---")
 
+    # Queue status in sidebar
+    current_queue = _get_queue()
+    if current_queue:
+        st.warning(f"📊 Queue: {len(current_queue)} job(s) waiting")
+    else:
+        st.success("✅ Queue empty — jobs start immediately")
+
     # Validation
     can_submit = bool(contact_name and contact_email and uploaded_files)
 
@@ -149,71 +361,31 @@ with st.sidebar:
                 out.write(f.getbuffer())
             pdf_paths.append(fpath)
 
-        # ── Register job ──
-        st.session_state.jobs[job_id] = {
-            "status": "running",
+        # ── Save job metadata (queued status) ──
+        meta = {
+            "job_id": job_id,
             "contact_name": contact_name,
             "contact_email": contact_email,
-            "pdf_names": [f.name for f in uploaded_files],
-            "started": datetime.now().isoformat(),
-            "result": None,
-            "error": None,
-            "log_lines": [],
+            "scope_notes": scope_notes,
+            "pdf_paths": pdf_paths,
+            "image_fallback": image_fallback,
+            "multi_pass": multi_pass,
+            "submitted": datetime.now().isoformat(),
+            "status": "queued",
         }
+        _write_job_meta(job_id, meta)
 
-        # ── Save job metadata ──
-        meta_path = os.path.join(JOBS_DIR, f"{job_id}.json")
-        with open(meta_path, "w") as mf:
-            json.dump({
-                "job_id": job_id,
-                "contact_name": contact_name,
-                "contact_email": contact_email,
-                "scope_notes": scope_notes,
-                "pdf_paths": pdf_paths,
-                "started": datetime.now().isoformat(),
-                "status": "running",
-            }, mf, indent=2)
+        # ── Add to queue ──
+        _enqueue_job(job_id)
 
-        # ── Run analysis in background thread ──
-        def _run_job(jid, paths, name, email, scope, img_fb, mp):
-            try:
-                from Takeoff_DIRECT import run_analysis
-                result = run_analysis(
-                    pdf_paths=paths,
-                    contact_name=name,
-                    contact_email=email,
-                    scope_notes=scope,
-                    image_fallback=img_fb,
-                    multi_pass=mp,
-                )
-                st.session_state.jobs[jid]["status"] = "done"
-                st.session_state.jobs[jid]["result"] = result
-                st.session_state.jobs[jid]["finished"] = datetime.now().isoformat()
+        # ── Start worker if needed ──
+        _ensure_worker()
 
-                # Update job file
-                meta = os.path.join(JOBS_DIR, f"{jid}.json")
-                with open(meta, "r") as f:
-                    data = json.load(f)
-                data["status"] = "done"
-                data["finished"] = datetime.now().isoformat()
-                data["output_json"] = result.get("output_json_path", "")
-                data["output_pdf"] = result.get("output_pdf_path", "")
-                with open(meta, "w") as f:
-                    json.dump(data, f, indent=2)
-            except Exception as e:
-                st.session_state.jobs[jid]["status"] = "error"
-                st.session_state.jobs[jid]["error"] = str(e)
-                st.session_state.jobs[jid]["finished"] = datetime.now().isoformat()
-
-        thread = threading.Thread(
-            target=_run_job,
-            args=(job_id, pdf_paths, contact_name, contact_email,
-                  scope_notes, image_fallback, multi_pass),
-            daemon=True,
-        )
-        thread.start()
-
-        st.success(f"✅ Job **{job_id}** submitted! Refresh page to check status.")
+        queue_pos = _get_queue_position(job_id)
+        if queue_pos <= 1:
+            st.success(f"✅ Job **{job_id}** submitted! Processing now...")
+        else:
+            st.info(f"📋 Job **{job_id}** queued — position **#{queue_pos}**. It will start automatically when the current job finishes.")
         st.balloons()
 
     if not can_submit and uploaded_files:
@@ -221,89 +393,114 @@ with st.sidebar:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# ENSURE WORKER IS RUNNING (on every page load)
+# ═══════════════════════════════════════════════════════════════════════════════
+_ensure_worker()
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # MAIN AREA — JOB DASHBOARD
 # ═══════════════════════════════════════════════════════════════════════════════
 
-# ── Load historical jobs from disk ──
-def _load_jobs_from_disk():
-    """Load completed job metadata from jobs/ directory."""
-    disk_jobs = {}
+def _load_all_jobs():
+    """Load all job metadata from disk."""
+    jobs = {}
     for jf in sorted(Path(JOBS_DIR).glob("*.json"), reverse=True):
         try:
             with open(jf) as f:
                 data = json.load(f)
             jid = data.get("job_id", jf.stem)
-            if jid not in st.session_state.jobs:
-                disk_jobs[jid] = {
-                    "status": data.get("status", "unknown"),
-                    "contact_name": data.get("contact_name", ""),
-                    "contact_email": data.get("contact_email", ""),
-                    "pdf_names": [os.path.basename(p) for p in data.get("pdf_paths", [])],
-                    "started": data.get("started", ""),
-                    "finished": data.get("finished", ""),
-                    "result": {
-                        "output_json_path": data.get("output_json", ""),
-                        "output_pdf_path": data.get("output_pdf", ""),
-                    } if data.get("output_json") else None,
-                    "error": data.get("error"),
-                }
+            jobs[jid] = data
         except Exception:
             pass
-    return disk_jobs
+    return jobs
 
-disk_jobs = _load_jobs_from_disk()
-all_jobs = {**disk_jobs, **st.session_state.jobs}  # session takes priority
+all_jobs = _load_all_jobs()
 
 # ── Tabs ──
-tab_active, tab_history = st.tabs(["📊 Active Jobs", "📁 Job History"])
+tab_active, tab_history = st.tabs(["📊 Active & Queued", "📁 Completed"])
 
 with tab_active:
-    running_jobs = {k: v for k, v in all_jobs.items() if v["status"] == "running"}
+    active_jobs = {k: v for k, v in all_jobs.items() if v.get("status") in ("running", "queued")}
 
-    if not running_jobs:
+    if not active_jobs:
         st.info("No active jobs. Upload PDFs in the sidebar to start a new estimate.")
     else:
-        for job_id, job in running_jobs.items():
-            with st.container():
+        for job_id, job in active_jobs.items():
+            status = job.get("status", "unknown")
+            queue_pos = _get_queue_position(job_id)
+            pdf_names = [os.path.basename(p) for p in job.get("pdf_paths", [])]
+            queue = _get_queue()
+
+            if status == "running":
                 st.markdown(f"""
                 <div class="status-card status-running">
-                    <strong>⏳ Running:</strong> {job_id}<br/>
-                    <small>Contact: {job['contact_name']} | Files: {', '.join(job['pdf_names'])} | Started: {job['started']}</small>
+                    <strong>⏳ Processing:</strong> {job_id}<br/>
+                    <small>Contact: {job.get('contact_name', '')} | Files: {', '.join(pdf_names)} | Started: {job.get('run_started', job.get('submitted', ''))}</small>
                 </div>
                 """, unsafe_allow_html=True)
 
-            # Auto-refresh hint for running jobs
-            st.info("⏳ Job is processing. Click the button below to check for updates.")
-            if st.button("🔄 Refresh Status", key=f"refresh_{job_id}"):
-                st.rerun()
+                # Stop button for running jobs
+                if st.button("🛑 Stop Job", key=f"stop_{job_id}", type="secondary"):
+                    _cancel_job(job_id)
+                    st.warning(f"Cancellation requested for **{job_id}**. It will stop after the current extraction step.")
+                    st.rerun()
+
+            elif status == "queued":
+                st.markdown(f"""
+                <div class="status-card status-queued">
+                    <strong>📋 Queued (#{queue_pos}):</strong> {job_id}<br/>
+                    <small>Contact: {job.get('contact_name', '')} | Files: {', '.join(pdf_names)} | Submitted: {job.get('submitted', '')}</small>
+                </div>
+                """, unsafe_allow_html=True)
+
+                # Priority & cancel controls for queued jobs
+                btn_cols = st.columns([1, 1, 1, 3])
+                with btn_cols[0]:
+                    can_move_up = queue_pos > 1 and job_id in queue
+                    if st.button("⬆️ Priority", key=f"up_{job_id}", disabled=not can_move_up):
+                        _move_queue_position(job_id, -1)
+                        st.rerun()
+                with btn_cols[1]:
+                    can_move_down = queue_pos < len(queue) and job_id in queue
+                    if st.button("⬇️ Lower", key=f"down_{job_id}", disabled=not can_move_down):
+                        _move_queue_position(job_id, 1)
+                        st.rerun()
+                with btn_cols[2]:
+                    if st.button("❌ Cancel", key=f"cancel_{job_id}"):
+                        _cancel_job(job_id)
+                        st.rerun()
+
+        st.markdown("")
+        if st.button("🔄 Refresh Status", key="refresh_active"):
+            st.rerun()
 
 with tab_history:
-    completed_jobs = {k: v for k, v in all_jobs.items() if v["status"] in ("done", "error")}
+    completed_jobs = {k: v for k, v in all_jobs.items() if v.get("status") in ("done", "error", "cancelled")}
 
     if not completed_jobs:
         st.info("No completed jobs yet.")
     else:
-        for job_id, job in sorted(completed_jobs.items(), key=lambda x: x[0], reverse=True):
-            is_done = job["status"] == "done"
-            icon = "✅" if is_done else "❌"
+        for job_id, job in completed_jobs.items():
+            is_done = job.get("status") == "done"
+            is_cancelled = job.get("status") == "cancelled"
+            icon = "✅" if is_done else ("🚫" if is_cancelled else "❌")
             css_class = "status-done" if is_done else "status-error"
+            pdf_names = [os.path.basename(p) for p in job.get("pdf_paths", [])]
 
             with st.container():
                 st.markdown(f"""
                 <div class="status-card {css_class}">
                     <strong>{icon} {job_id}</strong><br/>
-                    <small>Contact: {job['contact_name']} ({job['contact_email']}) | Files: {', '.join(job.get('pdf_names', []))}</small>
+                    <small>Contact: {job.get('contact_name', '')} ({job.get('contact_email', '')}) | Files: {', '.join(pdf_names)}</small>
                 </div>
                 """, unsafe_allow_html=True)
 
-                if is_done and job.get("result"):
-                    result = job["result"]
-
+                if is_done:
                     col1, col2 = st.columns(2)
 
-                    # ── Download buttons ──
-                    pdf_path = result.get("output_pdf_path", "")
-                    json_path = result.get("output_json_path", "")
+                    pdf_path = job.get("output_pdf", "")
+                    json_path = job.get("output_json", "")
 
                     if pdf_path and os.path.exists(pdf_path):
                         with open(pdf_path, "rb") as pf:
@@ -325,7 +522,7 @@ with tab_history:
                                 key=f"json_{job_id}",
                             )
 
-                    # ── Show cost summary if JSON available ──
+                    # ── Cost summary ──
                     if json_path and os.path.exists(json_path):
                         try:
                             with open(json_path) as jf:
@@ -334,8 +531,9 @@ with tab_history:
                             costs = analysis_data.get("cost_estimate", {})
                             line_items = costs.get("line_items", [])
                             total = costs.get("total_cost", 0)
-                            rooms = analysis_data.get("analysis", {}).get("aggregated_totals", {}).get("total_rooms_found", 0)
-                            wall_sf = analysis_data.get("analysis", {}).get("aggregated_totals", {}).get("total_wall_sqft", 0)
+                            agg = analysis_data.get("analysis", {}).get("aggregated_totals", {})
+                            rooms = agg.get("total_rooms_found", 0)
+                            wall_sf = agg.get("total_wall_sqft", 0)
 
                             with st.expander(f"💰 Estimate Summary — ${total:,.0f}", expanded=False):
                                 mc1, mc2, mc3, mc4 = st.columns(4)
@@ -345,7 +543,6 @@ with tab_history:
                                 mc4.metric("Line Items", f"{len(line_items)}")
 
                                 st.markdown("---")
-                                # Line item table
                                 if line_items:
                                     table_data = []
                                     for li in line_items:
@@ -360,7 +557,6 @@ with tab_history:
                                     if table_data:
                                         st.dataframe(table_data, use_container_width=True, hide_index=True)
 
-                                # RFI items
                                 rfi = analysis_data.get("rfi_items", [])
                                 if rfi:
                                     st.markdown(f"**📋 RFI Items ({len(rfi)})**")
