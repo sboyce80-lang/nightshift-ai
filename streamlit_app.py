@@ -43,7 +43,7 @@ except Exception:
 # ── Page config (must be first st call) ──
 st.set_page_config(
     page_title="Nightshift AI — Painting Takeoff",
-    page_icon="🎨",
+    page_icon="🖌️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -292,37 +292,128 @@ def _ensure_worker():
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# STYLING
+# FUTURISTIC PAINTBRUSH LOGO (inline SVG)
+# ═══════════════════════════════════════════════════════════════════════════════
+LOGO_SVG = """
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 80" width="56" height="56">
+  <defs>
+    <linearGradient id="brush_glow" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#00d4ff"/>
+      <stop offset="100%" stop-color="#0066cc"/>
+    </linearGradient>
+    <linearGradient id="bristle_grad" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#00d4ff" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#0044aa" stop-opacity="0.6"/>
+    </linearGradient>
+    <filter id="glow">
+      <feGaussianBlur stdDeviation="2" result="blur"/>
+      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+    </filter>
+  </defs>
+  <!-- Handle -->
+  <rect x="52" y="4" width="8" height="34" rx="3" fill="url(#brush_glow)" transform="rotate(25 56 21)" filter="url(#glow)"/>
+  <!-- Ferrule (metal band) -->
+  <rect x="44" y="34" width="14" height="6" rx="1.5" fill="#c0d8f0" transform="rotate(25 51 37)" opacity="0.8"/>
+  <!-- Bristles -->
+  <path d="M28 52 L38 38 L52 42 L42 58 Q36 66 28 60 Z" fill="url(#bristle_grad)" filter="url(#glow)"/>
+  <!-- Paint trail / swoosh -->
+  <path d="M24 58 Q14 64 10 56 Q6 48 16 44 Q22 40 26 48 Z" fill="#00d4ff" opacity="0.5"/>
+  <path d="M12 50 Q4 54 8 62 Q10 66 18 64" stroke="#00d4ff" stroke-width="1.5" fill="none" opacity="0.3"/>
+  <!-- Glow dots -->
+  <circle cx="14" cy="54" r="1.5" fill="#00d4ff" opacity="0.7"/>
+  <circle cx="20" cy="62" r="1" fill="#00d4ff" opacity="0.5"/>
+  <circle cx="8" cy="60" r="1" fill="#00d4ff" opacity="0.4"/>
+</svg>
+"""
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# STYLING — Dark Blue Theme
 # ═══════════════════════════════════════════════════════════════════════════════
 st.markdown("""
 <style>
+    /* ── Global dark overrides ── */
+    .stApp { background-color: #0a1628; }
+    section[data-testid="stSidebar"] { background-color: #0d1f3c; }
+    section[data-testid="stSidebar"] .stMarkdown,
+    section[data-testid="stSidebar"] label { color: #c8ddf0; }
+
+    /* ── Header banner ── */
     .main-header {
-        background: linear-gradient(135deg, #1a3a5c 0%, #2c6fbb 100%);
-        padding: 2rem;
-        border-radius: 12px;
+        background: linear-gradient(135deg, #0d1f3c 0%, #142d54 50%, #0a1628 100%);
+        border: 1px solid rgba(0,212,255,0.15);
+        padding: 1.8rem 2rem;
+        border-radius: 14px;
         margin-bottom: 1.5rem;
-        color: white;
+        display: flex;
+        align-items: center;
+        gap: 1.2rem;
+        box-shadow: 0 0 30px rgba(0,212,255,0.08), inset 0 1px 0 rgba(255,255,255,0.04);
     }
-    .main-header h1 { color: white; margin: 0; font-size: 2rem; }
-    .main-header p { color: #c8ddf0; margin: 0.25rem 0 0 0; font-size: 1rem; }
+    .main-header .logo-wrap { flex-shrink: 0; }
+    .main-header .header-text h1 {
+        color: #e0e8f0;
+        margin: 0;
+        font-size: 2rem;
+        font-weight: 700;
+        letter-spacing: -0.02em;
+    }
+    .main-header .header-text h1 span.accent { color: #00d4ff; }
+    .main-header .header-text p {
+        color: #7a9cc6;
+        margin: 0.3rem 0 0 0;
+        font-size: 0.95rem;
+        letter-spacing: 0.02em;
+    }
+
+    /* ── Status cards — dark variants ── */
     .status-card {
         padding: 1rem 1.5rem;
-        border-radius: 8px;
+        border-radius: 10px;
         margin: 0.5rem 0;
         border-left: 4px solid;
+        color: #e0e8f0;
     }
-    .status-running { background: #fff8e6; border-color: #f0a500; }
-    .status-queued { background: #e8f0fa; border-color: #2c6fbb; }
-    .status-done { background: #e8f8e8; border-color: #1a7a3a; }
-    .status-error { background: #fde8e8; border-color: #c0392b; }
-    .metric-box {
-        background: #f0f4f8;
-        border-radius: 8px;
-        padding: 1rem;
-        text-align: center;
+    .status-card small { color: #8aa4c4; }
+    .status-running { background: rgba(240,165,0,0.08); border-color: #f0a500; }
+    .status-queued  { background: rgba(0,212,255,0.06); border-color: #00d4ff; }
+    .status-done    { background: rgba(0,200,100,0.08); border-color: #00c864; }
+    .status-error   { background: rgba(220,60,60,0.08); border-color: #dc3c3c; }
+
+    /* ── Metric cards ── */
+    [data-testid="stMetric"] {
+        background: rgba(0,212,255,0.04);
+        border: 1px solid rgba(0,212,255,0.1);
+        border-radius: 10px;
+        padding: 0.8rem 1rem;
     }
-    .metric-box h3 { margin: 0; color: #1a3a5c; font-size: 1.8rem; }
-    .metric-box p { margin: 0; color: #666; font-size: 0.85rem; }
+    [data-testid="stMetricLabel"] { color: #7a9cc6 !important; }
+    [data-testid="stMetricValue"] { color: #e0e8f0 !important; }
+
+    /* ── Tabs ── */
+    button[data-baseweb="tab"] { color: #7a9cc6; }
+    button[data-baseweb="tab"][aria-selected="true"] { color: #00d4ff; }
+
+    /* ── Dataframes ── */
+    .stDataFrame { border: 1px solid rgba(0,212,255,0.1); border-radius: 8px; }
+
+    /* ── Expander ── */
+    details summary { color: #e0e8f0 !important; }
+
+    /* ── Download buttons ── */
+    .stDownloadButton button {
+        background: rgba(0,212,255,0.1) !important;
+        border: 1px solid rgba(0,212,255,0.25) !important;
+        color: #00d4ff !important;
+    }
+    .stDownloadButton button:hover {
+        background: rgba(0,212,255,0.2) !important;
+        border-color: #00d4ff !important;
+    }
+
+    /* ── Footer ── */
+    .footer-text { color: #4a6a8a; }
+    .footer-text a { color: #00d4ff; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -330,10 +421,13 @@ st.markdown("""
 # ═══════════════════════════════════════════════════════════════════════════════
 # HEADER
 # ═══════════════════════════════════════════════════════════════════════════════
-st.markdown("""
+st.markdown(f"""
 <div class="main-header">
-    <h1>🎨 Nightshift AI</h1>
-    <p>Automated Construction Painting Estimates from Architectural PDFs</p>
+    <div class="logo-wrap">{LOGO_SVG}</div>
+    <div class="header-text">
+        <h1><span class="accent">Nightshift</span> AI</h1>
+        <p>Automated Construction Painting Estimates from Architectural PDFs</p>
+    </div>
 </div>
 """, unsafe_allow_html=True)
 
@@ -342,7 +436,8 @@ st.markdown("""
 # SIDEBAR — JOB SUBMISSION
 # ═══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
-    st.header("📋 New Estimate")
+    st.markdown(f'<div style="text-align:center;margin-bottom:0.5rem;">{LOGO_SVG}</div>', unsafe_allow_html=True)
+    st.header("New Estimate")
 
     contact_name = st.text_input("Contact Name *", placeholder="e.g., John Smith")
     contact_email = st.text_input("Contact Email *", placeholder="e.g., john@rider.com")
@@ -714,7 +809,7 @@ with tab_history:
 # ═══════════════════════════════════════════════════════════════════════════════
 st.markdown("---")
 st.markdown(
-    "<center><small>Nightshift AI — Automated Painting Estimates &nbsp;|&nbsp; "
-    "Powered by Claude &nbsp;|&nbsp; Confidential</small></center>",
+    '<center><small class="footer-text">Nightshift AI &nbsp;&mdash;&nbsp; Automated Painting Estimates &nbsp;|&nbsp; '
+    'Powered by Claude &nbsp;|&nbsp; Confidential</small></center>',
     unsafe_allow_html=True,
 )
