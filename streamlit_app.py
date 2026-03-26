@@ -491,29 +491,55 @@ def _worker_loop():
         while True:
             queue = _get_queue()
             if not queue:
-                # No more jobs — worker exits
+                print("📭 Worker: queue empty, exiting")
                 break
 
             job_id = queue[0]  # Process oldest first
-            _process_single_job(job_id)
+            print(f"📋 Worker: processing job {job_id[:8]}...")
+            try:
+                _process_single_job(job_id)
+            except Exception as e:
+                print(f"❌ Worker: job {job_id[:8]} failed with exception: {e}")
+                import traceback
+                traceback.print_exc()
+                # Mark job as error so it doesn't block the queue
+                meta = _read_job_meta(job_id)
+                if meta and meta.get("status") not in ("done", "cancelled", "error"):
+                    meta["status"] = "error"
+                    meta["error"] = f"Worker exception: {str(e)}"
+                    meta["finished"] = datetime.now().isoformat()
+                    _write_job_meta(job_id, meta)
+                _dequeue_job(job_id)
+                _clear_progress(job_id)
 
             # Clean up old jobs periodically to free disk
             _cleanup_old_jobs(keep=20)
 
             # Brief pause between jobs
             time.sleep(2)
+    except Exception as e:
+        print(f"❌ Worker loop crashed: {e}")
+        import traceback
+        traceback.print_exc()
     finally:
         # Clean up lock
         if os.path.exists(WORKER_LOCK):
             os.remove(WORKER_LOCK)
+        print("🔒 Worker: lock cleaned up, thread exiting")
 
 
 def _ensure_worker():
     """Start the worker thread if not already running."""
     global _WORKER_THREAD
-    if not _is_worker_running() and _get_queue():
-        _WORKER_THREAD = threading.Thread(target=_worker_loop, daemon=True)
+    queue = _get_queue()
+    worker_alive = _is_worker_running()
+    if not worker_alive and queue:
+        print(f"🚀 Starting worker thread (queue has {len(queue)} job(s), worker alive={worker_alive})")
+        _WORKER_THREAD = threading.Thread(target=_worker_loop, daemon=True, name="nightshift-worker")
         _WORKER_THREAD.start()
+        # Give it a moment to actually start
+        time.sleep(0.5)
+        print(f"   Worker thread started: alive={_WORKER_THREAD.is_alive()}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
