@@ -162,22 +162,20 @@ def _clear_cancel_flag(job_id):
         os.remove(cancel_path)
 
 
+_WORKER_THREAD = None  # Track actual thread object, not just a lock file
+
 def _is_worker_running():
-    """Check if the background worker is alive."""
-    if not os.path.exists(WORKER_LOCK):
-        return False
-    try:
-        with open(WORKER_LOCK, "r") as f:
-            data = json.load(f)
-        # If lock is older than 30 minutes, consider it stale
-        lock_time = datetime.fromisoformat(data.get("started", "2000-01-01"))
-        age_minutes = (datetime.now() - lock_time).total_seconds() / 60
-        if age_minutes > 30:
-            os.remove(WORKER_LOCK)
-            return False
-        return data.get("alive", False)
-    except Exception:
-        return False
+    """Check if the background worker is alive using the actual thread reference."""
+    global _WORKER_THREAD
+    # Primary check: is the thread object alive in THIS process?
+    if _WORKER_THREAD is not None and _WORKER_THREAD.is_alive():
+        return True
+    # Thread is dead or was never started in this process instance.
+    # Clean up any stale lock file left by a previous instance/reboot.
+    if os.path.exists(WORKER_LOCK):
+        os.remove(WORKER_LOCK)
+    _WORKER_THREAD = None
+    return False
 
 
 def _get_progress(job_id):
@@ -286,9 +284,10 @@ def _worker_loop():
 
 def _ensure_worker():
     """Start the worker thread if not already running."""
+    global _WORKER_THREAD
     if not _is_worker_running() and _get_queue():
-        thread = threading.Thread(target=_worker_loop, daemon=True)
-        thread.start()
+        _WORKER_THREAD = threading.Thread(target=_worker_loop, daemon=True)
+        _WORKER_THREAD.start()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
