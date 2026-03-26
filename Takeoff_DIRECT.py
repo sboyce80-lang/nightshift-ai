@@ -2123,12 +2123,21 @@ def _normalize_floor_key(name):
         # Generic template: use the full name to avoid collisions
         return "T_" + re.sub(r'[^a-z0-9]+', '_', n).strip('_')
 
-    # Basement / foundation
-    if "basement" in n or "foundation" in n:
+    # Basement / foundation / lower level
+    if "basement" in n or "foundation" in n or "lower level" in n:
         return "B"
     # Sub-basement
     if "sub-basement" in n or "subbasement" in n or "cellar" in n:
         return "SB"
+    # Word-to-number mapping for written-out ordinals (e.g., "First Floor" → "1")
+    _WORD_TO_NUM = {
+        "first": "1", "second": "2", "third": "3", "fourth": "4",
+        "fifth": "5", "sixth": "6", "seventh": "7", "eighth": "8",
+        "ninth": "9", "tenth": "10", "eleventh": "11", "twelfth": "12",
+    }
+    for word, num in _WORD_TO_NUM.items():
+        if word in n:
+            return num
     # Extract floor number from ordinal or cardinal patterns
     ordinal = re.search(r'(\d+)\s*(?:st|nd|rd|th)\s*(?:floor|flr|fl|story|storey)?', n)
     if ordinal:
@@ -7271,6 +7280,17 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     _scope_ext = str(project_info.get('_scope_notes', '')).lower()
     _siding_needs_paint = _siding_needs_paint or any(kw in _scope_ext for kw in (
         'paint siding', 'hardie paint', 'exterior siding', 'siding painting'))
+    # Negative check: if exterior notes explicitly say siding is factory-finished or
+    # non-paintable material (cork, vinyl, metal, aluminum), suppress siding even if
+    # the LLM extracted Hardie/Azek quantities.
+    _siding_factory_finished = any(kw in _ext_notes for kw in (
+        'cork siding', 'vinyl siding', 'metal siding', 'metal roofing',
+        'aluminum siding', 'composite siding', 'factory finish',
+        'pre-finish', 'prefinish', 'not require painting',
+        'do not require paint', 'does not require paint',
+        'no painting required', 'no paint required'))
+    if _siding_factory_finished:
+        _siding_needs_paint = False
 
     if not _siding_needs_paint:
         # New construction: siding/trim comes factory-finished. Zero out material-specific
