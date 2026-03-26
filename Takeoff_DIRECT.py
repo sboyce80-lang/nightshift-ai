@@ -7234,7 +7234,57 @@ def _get_tiered_rate(item_config, quantity):
     return 0
 
 
-def calculate_costs(aggregated_totals, exterior=None, building_type="", project_info=None):
+def _detect_single_family_from_rooms(analysis):
+    """Detect single-family residential from room names, regardless of LLM building_type.
+
+    The LLM sometimes misclassifies projects (e.g., "Senior living facility expansion"
+    for what is actually a single-family custom home near a senior living campus).
+    Use the actual room inventory to determine if this is a single-family home.
+
+    Criteria: Has typical single-family rooms (master bedroom, kitchen, dining room,
+    foyer/entry) AND total_units <= 2 AND NOT a multi-unit layout (no unit multipliers > 1).
+    """
+    pi = analysis.get("project_info", {})
+    total_units_raw = pi.get("total_units", 0)
+    total_units = _num(total_units_raw) if isinstance(total_units_raw, (int, float)) else 0
+
+    # Multi-unit buildings are never single-family
+    if total_units > 4:
+        return False
+
+    # Check for unit multipliers > 1 (indicates multi-family template)
+    for floor in analysis.get("floors", []):
+        for room in floor.get("rooms", []):
+            mult = room.get("unit_multiplier", 1)
+            if isinstance(mult, (int, float)) and mult > 1:
+                return False
+
+    # Collect all room names
+    all_rooms = []
+    for floor in analysis.get("floors", []):
+        for room in floor.get("rooms", []):
+            all_rooms.append(room.get("room_name", "").lower())
+
+    all_rooms_str = " ".join(all_rooms)
+
+    # Single-family signature: has master bedroom + kitchen + at least 2 of (dining, foyer, closet, bathroom)
+    has_master = any("master" in r or "primary bed" in r for r in all_rooms)
+    has_kitchen = any("kitchen" in r for r in all_rooms)
+    has_dining = any("dining" in r for r in all_rooms)
+    has_foyer = any(kw in all_rooms_str for kw in ("foyer", "entry", "mudroom", "vestibule"))
+    has_closet = any("closet" in r for r in all_rooms)
+    has_bathroom = sum(1 for r in all_rooms if "bath" in r or "powder" in r) >= 1
+
+    supporting = sum([has_dining, has_foyer, has_closet, has_bathroom])
+
+    if has_master and has_kitchen and supporting >= 2:
+        return True
+
+    return False
+
+
+def calculate_costs(aggregated_totals, exterior=None, building_type="", project_info=None,
+                    analysis=None):
     """Calculate costs using Rider Painting pricing model from config.py"""
 
     if exterior is None:
@@ -7245,6 +7295,12 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     # Building-type-aware markup and rate overrides
     bt = str(building_type).lower()
     is_single_family = any(kw in bt for kw in ("single", "detached"))
+    # Room-based override: if the LLM misclassified (e.g., "senior living expansion"
+    # for a single-family home), detect from the actual room inventory.
+    if not is_single_family and analysis:
+        if _detect_single_family_from_rooms(analysis):
+            is_single_family = True
+            print(f"   🏠 Room-based detection: overriding '{building_type}' → single-family")
     is_commercial = "commercial" in bt
 
     # Sub-classify commercial by footprint: large (retail/warehouse) vs small (office/renovation)
@@ -7589,6 +7645,49 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     if lift_needed and int_lift_needed:
         int_lift_needed = 0  # Exterior lift covers interior work too
 
+    # --- Exterior stain items (wood shingles, trim bands, railings) ---
+    # These are distinct from paint — Rider prices stain separately at different rates.
+    # Detected from exterior notes mentioning "stain", "wood shingle", "wood railing".
+    stain_siding_sqft = _num(exterior.get('stain_siding_sqft', 0))
+    stain_trim_lf = _num(exterior.get('stain_trim_lf', 0))
+    stain_railing_lf = _num(exterior.get('stain_railing_lf', 0))
+    # Also detect from exterior notes if stain items were mentioned but not quantified
+    if (stain_siding_sqft == 0 and stain_trim_lf == 0 and
+            any(kw in _ext_notes for kw in ('stain', 'wood shingle', 'cedar shingle',
+                                             'wood siding', 'cedar siding'))):
+        # Try to estimate stain siding from building envelope
+        _stain_footprint = _num(project_info.get('footprint_sqft', 0))
+        _stain_stories = _num(project_info.get('total_stories', 0))
+        if _stain_footprint > 0 and _stain_stories >= 2:
+            _stain_long = math.sqrt(_stain_footprint * 1.5)
+            _stain_short = _stain_footprint / _stain_long if _stain_long > 0 else 0
+            _stain_perimeter = 2 * (_stain_long + _stain_short)
+            stain_siding_sqft = round(_stain_perimeter * 9.0 * _stain_stories * 0.5)  # 50% of facade
+            stain_trim_lf = round(_stain_perimeter * _stain_stories)
+
+    stain_sid_rate = _get_tiered_rate(pm['exterior_stain_siding'], stain_siding_sqft) if 'exterior_stain_siding' in pm else 1.85
+    stain_trim_rate = _get_tiered_rate(pm['exterior_stain_trim'], stain_trim_lf) if 'exterior_stain_trim' in pm else 2.50
+    stain_rail_rate = _get_tiered_rate(pm['exterior_stain_railing'], stain_railing_lf) if 'exterior_stain_railing' in pm else 32.00
+
+    # --- Footprint-based interior pricing fallback ---
+    # When room-by-room extraction is severely incomplete (wall SF < 40% of expected),
+    # use footprint × all-inclusive rate as the interior price instead of individual
+    # line items. This matches how Rider prices large senior living / institutional
+    # projects where room-by-room isn't practical.
+    footprint_sqft = _num(project_info.get('footprint_sqft', 0))
+    _use_footprint_pricing = False
+    _footprint_interior_total = 0
+    if footprint_sqft > 0 and not is_single_family and not is_commercial:
+        # Expected wall area: ~1.2× footprint for residential (per Rider standard)
+        _expected_wall = footprint_sqft * 1.2
+        if wall_sqft < _expected_wall * 0.40:
+            # Room extraction captured <40% of expected — use footprint pricing
+            _fp_rate = _get_tiered_rate(pm['footprint_interior'], footprint_sqft) if 'footprint_interior' in pm else 3.80
+            _footprint_interior_total = footprint_sqft * _fp_rate
+            _use_footprint_pricing = True
+            print(f"   📐 Footprint pricing: {footprint_sqft:,.0f} SF × ${_fp_rate:.2f} = ${_footprint_interior_total:,.0f} "
+                  f"(room extraction only captured {wall_sqft:,.0f}/{_expected_wall:,.0f} expected wall SF)")
+
     line_items = [
         _line(f"Gyp. Walls - {wall_sqft:,.0f} sqft @ ${wall_rate:.2f}", wall_sqft,
               wall_rate, _get_markup('gyp_walls')),
@@ -7642,7 +7741,30 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
               lift_rate, _get_markup('exterior_lift_rental')),
         _line(f"Interior Lift Rental - {int_lift_needed} EA @ ${int_lift_rate:.2f}", int_lift_needed,
               int_lift_rate, _get_markup('interior_lift_rental')),
+        _line(f"Ext. Stain Siding - {stain_siding_sqft:,.0f} sqft @ ${stain_sid_rate:.2f}", stain_siding_sqft,
+              stain_sid_rate, 0.05),
+        _line(f"Ext. Stain Trim Bands - {stain_trim_lf:,.0f} LF @ ${stain_trim_rate:.2f}", stain_trim_lf,
+              stain_trim_rate, 0.05),
+        _line(f"Ext. Stain Railing - {stain_railing_lf:,.0f} LF @ ${stain_rail_rate:.2f}", stain_railing_lf,
+              stain_rail_rate, 0.05),
     ]
+
+    # If footprint pricing is active, replace individual interior line items
+    # with a single footprint-based line. Keep exterior items as-is.
+    if _use_footprint_pricing:
+        _interior_keys = {"Gyp. Walls", "Gyp. Ceilings", "CMU Walls", "Dryfall Ceiling",
+                          "Base Trim", "Doors", "Windows", "Stairs", "Gyp. Between",
+                          "Level 5", "Concrete Sealer", "Painted Columns",
+                          "Wallcovering", "Stained Wood", "Interior Soffits", "Interior Lift"}
+        # Remove individual interior items
+        line_items = [li for li in line_items
+                      if not any(li["item"].startswith(k) for k in _interior_keys)]
+        # Add footprint-based interior line
+        _fp_rate = _get_tiered_rate(pm['footprint_interior'], footprint_sqft) if 'footprint_interior' in pm else 3.80
+        line_items.insert(0, _line(
+            f"Interior (Footprint) - {footprint_sqft:,.0f} sqft @ ${_fp_rate:.2f}",
+            footprint_sqft, _fp_rate, 0.00  # Rider uses 0% markup on footprint pricing
+        ))
 
     subtotal = sum(li["total"] for li in line_items)
 
@@ -7964,7 +8086,8 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                     analysis.get('aggregated_totals', {}),
                     exterior=analysis.get('exterior', {}),
                     building_type=analysis.get('project_info', {}).get('building_type', ''),
-                    project_info=analysis.get('project_info', {})
+                    project_info=analysis.get('project_info', {}),
+                    analysis=analysis,
                 )
                 print_estimate(analysis, costs)
 
@@ -8517,8 +8640,10 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     _sf_units = _num(_sf_units_raw) if isinstance(_sf_units_raw, (int, float)) else 0
     _is_sf = (
         any(kw in _sf_bt for kw in ("single", "detached"))
-        or (_sf_units <= 2 and isinstance(_sf_units_raw, (int, float)))
-    ) and not any(kw in _sf_bt for kw in ("multi", "mixed", "commercial", "apartment"))
+        or (_sf_units <= 2 and isinstance(_sf_units_raw, (int, float))
+            and not any(kw in _sf_bt for kw in ("multi", "mixed", "commercial", "apartment")))
+        or _detect_single_family_from_rooms(analysis)
+    )
     if _is_sf:
         _excluded_floor_names = []
         _ACCESSORY_KW = ("shed", "accessory", "outbuilding", "detached garage",
@@ -8628,9 +8753,14 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     total_units_is_numeric = isinstance(total_units_raw, (int, float))
     is_single_family = (
         any(kw in building_type_str for kw in ("single", "detached"))
-        or (total_units_is_numeric and total_units <= 2)
+        or (total_units_is_numeric and total_units <= 2
+            and not any(kw in building_type_str for kw in ("multi", "mixed", "commercial", "apartment")))
     )
-    if is_single_family and not any(kw in building_type_str for kw in ("multi", "mixed", "commercial", "apartment", "senior", "living")):
+    # Room-based override: detect single-family from actual room inventory
+    if not is_single_family and _detect_single_family_from_rooms(analysis):
+        is_single_family = True
+        print(f"   🏠 Room-based detection: treating as single-family for stair scope")
+    if is_single_family:
         if current_stairs > 0:
             print(f"   🏠 Single-family: excluding {current_stairs} stair sections (not in Rider scope)")
             analysis.setdefault("notes", []).append(
@@ -8796,7 +8926,8 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         analysis.get('aggregated_totals', {}),
         exterior=analysis.get('exterior', {}),
         building_type=analysis.get('project_info', {}).get('building_type', ''),
-        project_info=analysis.get('project_info', {})
+        project_info=analysis.get('project_info', {}),
+        analysis=analysis,
     )
 
     print_estimate(analysis, costs)

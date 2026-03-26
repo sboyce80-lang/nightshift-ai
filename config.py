@@ -252,6 +252,27 @@ PRICING_MODEL = {
         "unit": "sqft", "markup": 0.05,
         "tiers": [{"min_qty": 0, "max_qty": None, "rate": 0.50}],    # Prep/sizing only (not full install)
     },
+    # ── Exterior Stain Items ── (Edgehill: wood shingles, trim bands, railings)
+    # For projects with wood siding/shingles that need staining (not painting).
+    "exterior_stain_siding": {
+        "unit": "sqft", "markup": 0.05,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 1.85}],    # Stain per SF (Rider Edgehill rate)
+    },
+    "exterior_stain_trim": {
+        "unit": "lf", "markup": 0.05,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 2.50}],    # Stained trim bands (Rider Edgehill)
+    },
+    "exterior_stain_railing": {
+        "unit": "lf", "markup": 0.05,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 32.00}],   # Stained wood railing (Rider Edgehill)
+    },
+    # ── Footprint-Based Interior Rate ── (for senior living / large residential)
+    # When room-by-room extraction is incomplete, use footprint × rate as fallback.
+    # $3.80/SF footprint is Rider's all-inclusive interior rate (Edgehill).
+    "footprint_interior": {
+        "unit": "sqft", "markup": 0.00,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 3.80}],    # All-inclusive interior per SF footprint
+    },
     # ── Interior Soffits (GYP drops above wall angle) ──
     "interior_soffit": {
         "unit": "sqft", "markup": 0.06,
