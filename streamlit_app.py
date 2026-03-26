@@ -163,8 +163,11 @@ def _clear_cancel_flag(job_id):
         os.remove(cancel_path)
 
 
-_WORKER_THREAD = None  # Track actual thread object, not just a lock file
 _STARTUP_CLEANUP_DONE = False  # Only run once per process
+
+# Worker thread name — used to find it via threading.enumerate()
+# since Streamlit reruns reset module-level variables.
+_WORKER_THREAD_NAME = "nightshift-worker"
 
 
 def _cleanup_stale_queue():
@@ -209,17 +212,24 @@ def _cleanup_stale_queue():
             print(f"🔄 Reset crashed-while-running job to queued: {job_id}")
 
 
+def _find_worker_thread():
+    """Find the worker thread by name via threading.enumerate().
+    This survives Streamlit reruns because the thread is still alive
+    in the process even though module-level variables get reset."""
+    for t in threading.enumerate():
+        if t.name == _WORKER_THREAD_NAME and t.is_alive():
+            return t
+    return None
+
+
 def _is_worker_running():
-    """Check if the background worker is alive using the actual thread reference."""
-    global _WORKER_THREAD
-    # Primary check: is the thread object alive in THIS process?
-    if _WORKER_THREAD is not None and _WORKER_THREAD.is_alive():
+    """Check if the background worker is alive by scanning live threads."""
+    worker = _find_worker_thread()
+    if worker is not None:
         return True
-    # Thread is dead or was never started in this process instance.
-    # Clean up any stale lock file left by a previous instance/reboot.
+    # No live worker thread found — clean up any stale lock file
     if os.path.exists(WORKER_LOCK):
         os.remove(WORKER_LOCK)
-    _WORKER_THREAD = None
     return False
 
 
@@ -527,17 +537,21 @@ def _worker_loop():
 
 
 def _ensure_worker():
-    """Start the worker thread if not already running."""
-    global _WORKER_THREAD
+    """Start the worker thread if not already running.
+    Uses threading.enumerate() to detect existing worker — survives Streamlit reruns."""
     queue = _get_queue()
-    worker_alive = _is_worker_running()
-    if not worker_alive and queue:
-        print(f"🚀 Starting worker thread (queue has {len(queue)} job(s), worker alive={worker_alive})")
-        _WORKER_THREAD = threading.Thread(target=_worker_loop, daemon=True, name="nightshift-worker")
-        _WORKER_THREAD.start()
-        # Give it a moment to actually start
-        time.sleep(0.5)
-        print(f"   Worker thread started: alive={_WORKER_THREAD.is_alive()}")
+    if not queue:
+        return
+    existing = _find_worker_thread()
+    if existing is not None:
+        print(f"✅ Worker already running: {existing.name} alive={existing.is_alive()}")
+        return
+    print(f"🚀 Starting worker thread (queue has {len(queue)} job(s))")
+    t = threading.Thread(target=_worker_loop, daemon=True, name=_WORKER_THREAD_NAME)
+    t.start()
+    # Give it a moment to actually start
+    time.sleep(0.5)
+    print(f"   Worker thread started: alive={t.is_alive()}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
