@@ -4513,10 +4513,19 @@ def _apply_schedule_overrides(combined):
             room_total_doors = room_doors_fp + room_doors_hm
             if room_total_doors > sched_doors_total:
                 raw_supplement = round(room_total_doors - sched_doors_total)
-                # Cap supplement at 35% of schedule — schedules omit closet doors
-                # but room-level extraction also over-counts due to batch dedup.
-                # Calibrated: Fishkill schedule=120, manual=159 → 33% supplement.
-                max_supplement = round(sched_doors_total * 0.35)
+                # Cap supplement: larger schedules are more complete and need less supplement.
+                # Calibrated from:
+                #   Fishkill: schedule=120, manual=159 → 33% supplement (small schedule)
+                #   364 Main: schedule=153, manual=155 → 1.3% supplement (large schedule)
+                # Scale: ≤100 doors → 35% cap, 150+ doors → 15% cap
+                if sched_doors_total <= 100:
+                    _supp_pct = 0.35
+                elif sched_doors_total >= 150:
+                    _supp_pct = 0.15
+                else:
+                    # Linear interpolation: 100→35%, 150→15%
+                    _supp_pct = 0.35 - (sched_doors_total - 100) / 50 * 0.20
+                max_supplement = round(sched_doors_total * _supp_pct)
                 supplement = min(raw_supplement, max_supplement)
                 agg["total_doors_full_paint"] = agg.get("total_doors_full_paint", 0) + supplement
                 overrides_applied.append(
@@ -7237,58 +7246,85 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     if hardie_sqft > 0:
         ext_paint_sqft = max(0, ext_paint_sqft - hardie_sqft)
 
-    # --- Residential exterior scope adjustments ---
-    # For multi-family residential, cornice is not a separate scope item — it's
-    # included in exterior painting. Manual takeoffs don't price it separately.
+    # --- Data-driven exterior scope adjustments ---
+    # Rather than blanket suppress by building type, check what the extraction
+    # actually found. New construction siding doesn't need painting; only specialty
+    # coatings (Hardie, Azek) that were explicitly specified get priced.
     _is_res_ext = _is_residential_type and not is_commercial
-    if _is_res_ext and cornice_lf > 0:
-        cornice_lf = 0
+
     # Exterior window trim: when Azek trim is present, window casings are already
     # covered by the Azek line item. Suppress to avoid double-counting.
-    if _is_res_ext and azek_lf > 0 and window_trim_lf > 0:
+    if azek_lf > 0 and window_trim_lf > 0:
         window_trim_lf = 0
 
-    # --- Residential base trim suppression ---
-    # Multi-family apartment spray rates ($0.80/SF) include base trim application.
-    # Manual takeoffs for apartments don't price base trim as a separate line item.
-    if is_apartment:
-        trim_lf = 0
+    # --- Hardie/Azek/Lintel: only price if extraction explicitly found siding TYPE ---
+    # The LLM may detect Hardie on elevations, but new construction Hardie comes
+    # factory-primed and doesn't need field painting. Only price siding materials
+    # when the exterior notes explicitly say "paint" or "field finish" for siding.
+    # Check exterior_siding_type and notes for painting indicators.
+    _ext_siding_type = str(exterior.get('exterior_siding_type', '')).lower()
+    _ext_notes = str(exterior.get('notes', '')).lower()
+    _siding_needs_paint = any(kw in _ext_notes for kw in (
+        'paint siding', 'field paint', 'field finish', 'prime and paint',
+        'finish coat', 'two coat', '2 coat', 'topcoat'))
+    # Also check if scope_notes from user mention exterior siding painting
+    _scope_ext = str(project_info.get('_scope_notes', '')).lower()
+    _siding_needs_paint = _siding_needs_paint or any(kw in _scope_ext for kw in (
+        'paint siding', 'hardie paint', 'exterior siding', 'siding painting'))
 
-    # --- Residential CMU wall suppression ---
-    # Residential buildings (apartments, mixed-use) rarely have paintable CMU walls.
-    # CMU extraction on residential plans is typically misclassified partition type.
+    if not _siding_needs_paint:
+        # New construction: siding/trim comes factory-finished. Zero out material-specific
+        # exterior items. Keep generic ext_paint_sqft and cornice (those are always painted).
+        if hardie_sqft > 0:
+            hardie_sqft = 0
+        if azek_lf > 0:
+            azek_lf = 0
+        if corner_lf > 0:
+            corner_lf = 0
+        if steel_lintel_lf_ext > 0:
+            steel_lintel_lf_ext = 0
+
+    # --- Cornice: keep if extraction found it, suppress only if zero ---
+    # Cornice/brackets are almost always field-painted, even on new construction.
+    # Don't suppress — let the extraction decide.
+
+    # --- Base trim: data-driven, not building-type-driven ---
+    # Only suppress base trim if the extraction found ZERO trim across all rooms.
+    # Some apartment buildings have base trim (364 Main: $9,630); others include
+    # it in the spray rate (Fishkill). Let the extraction data decide.
+    # trim_lf is already set from aggregated_totals — leave it as-is.
+
+    # --- CMU walls: only suppress if no CMU rooms found in extraction ---
+    # Some mixed-use buildings (364 Main) have CMU stair towers and elevator shafts.
+    # Only zero out if the extraction likely misclassified partitions.
+    # Check: if CMU SF > 30% of total wall SF, it's probably misclassified.
     if _is_res_ext and cmu_wall_sqft > 0:
-        cmu_wall_sqft = 0
+        _cmu_ratio = cmu_wall_sqft / max(1, wall_sqft)
+        if _cmu_ratio > 0.30:
+            # More than 30% CMU is unrealistic for residential — likely misclassified
+            cmu_wall_sqft = 0
 
     # --- Exterior envelope validation ---
     # Cap siding/paint area against building envelope to prevent over-estimation.
-    # Envelope = perimeter × avg_story_ht × stories × 0.70 (subtract windows/doors).
+    # Only applies when siding materials are being priced.
     _footprint_ext = _num(project_info.get('footprint_sqft', 0))
     _stories_ext = _num(project_info.get('total_stories', 0))
-    if _footprint_ext > 0 and _stories_ext >= 2:
+    if _footprint_ext > 0 and _stories_ext >= 2 and (hardie_sqft > 0 or ext_paint_sqft > 0):
         _long_side = math.sqrt(_footprint_ext * 2)
         _short_side = _footprint_ext / _long_side if _long_side > 0 else 0
         _perimeter = 2 * (_long_side + _short_side)
         _avg_ht = 10  # residential default
-        # Residential buildings have more window/door area (~45%) than commercial (~30%)
         _env_factor = 0.55 if _is_res_ext else 0.70
         _envelope = _perimeter * _avg_ht * _stories_ext * _env_factor
-        # Cap hardie siding to envelope (it's the main cladding, can't exceed envelope)
         if hardie_sqft > _envelope:
             hardie_sqft = round(_envelope)
-        # Cap generic exterior paint to envelope minus hardie (remaining surfaces)
         _remaining_envelope = max(0, _envelope - hardie_sqft)
         if ext_paint_sqft > _remaining_envelope:
             ext_paint_sqft = round(_remaining_envelope)
-        # Cap trim LF: Azek trim typically runs along window/door heads + rake boards.
-        # Residential: ~0.7× perimeter per story (less trim than commercial).
-        # Commercial: ~1.2× perimeter per story.
         _trim_factor = 0.7 if _is_res_ext else 1.2
         _max_trim_lf = round(_perimeter * _stories_ext * _trim_factor)
         if azek_lf > _max_trim_lf:
             azek_lf = _max_trim_lf
-        # Cap lintels: typically ~3-4 LF per window opening, max ~20% of perimeter.
-        # Fishkill manual: 55 LF on ~280 LF perimeter = 0.20.
         _lintel_factor = 0.20 if _is_res_ext else 0.50
         _max_lintel_lf = round(_perimeter * _lintel_factor)
         if steel_lintel_lf_ext > _max_lintel_lf:
