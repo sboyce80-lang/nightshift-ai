@@ -272,11 +272,10 @@ with tab_active:
                 </div>
                 """, unsafe_allow_html=True)
 
-            # Auto-refresh for running jobs
-            st.markdown(
-                '<meta http-equiv="refresh" content="15">',
-                unsafe_allow_html=True,
-            )
+            # Auto-refresh hint for running jobs
+            st.info("⏳ Job is processing. Click the button below to check for updates.")
+            if st.button("🔄 Refresh Status", key=f"refresh_{job_id}"):
+                st.rerun()
 
 with tab_history:
     completed_jobs = {k: v for k, v in all_jobs.items() if v["status"] in ("done", "error")}
