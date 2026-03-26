@@ -7341,6 +7341,9 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     _is_residential_type = any(kw in bt for kw in ("residential", "mixed", "multi", "apartment"))
     is_apartment = _is_residential_type and not is_commercial and _total_units >= 4
     is_non_apartment_residential = _is_residential_type and not is_commercial and not is_apartment
+    _is_institutional = any(kw in bt for kw in
+        ("senior", "assisted", "living", "facility", "institutional",
+         "hospital", "medical", "nursing"))
 
     # Markup: single-family 8%, large commercial 5%, small commercial 8%, multi-family 6% (default)
     if is_single_family:
@@ -7468,26 +7471,31 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     # --- Cornice: keep if extraction found it, suppress only if zero ---
     # Cornice/brackets are almost always field-painted, even on new construction.
     # Don't suppress — let the extraction decide.
-    # FALLBACK: For single-family homes with 2+ stories and extracted exterior notes
-    # (elevation sheets were parsed) but 0 cornice, estimate from building perimeter.
+    # FALLBACK: For buildings with 2+ stories and 0 cornice, estimate from building perimeter.
     # This handles non-deterministic chunk processing where elevation data is sometimes
     # missed between runs.
-    if is_single_family and cornice_lf == 0:
-        _sf_footprint = _num(project_info.get('footprint_sqft', 0))
-        _sf_stories = _num(project_info.get('total_stories', 0))
-        # Only apply fallback when we have a footprint and multi-story building
-        if _sf_footprint > 0 and _sf_stories >= 2:
+    _ext_footprint = _num(project_info.get('footprint_sqft', 0))
+    _ext_stories = _num(project_info.get('total_stories', 0))
+    if cornice_lf == 0 and _ext_stories >= 2:
+        if _ext_footprint > 0:
             # Estimate perimeter from footprint (assume ~1.5:1 aspect ratio)
-            _sf_long = math.sqrt(_sf_footprint * 1.5)
-            _sf_short = _sf_footprint / _sf_long if _sf_long > 0 else 0
-            _sf_perimeter = 2 * (_sf_long + _sf_short)
-            cornice_lf = round(_sf_perimeter)
-        elif wall_sqft > 0 and _sf_stories >= 2:
-            # No footprint available — estimate perimeter from total wall area
-            # Typical residential: wall_area = perimeter × ceiling_height × stories
-            # Average ceiling height ~9ft, 2 stories
+            _ext_long = math.sqrt(_ext_footprint * 1.5)
+            _ext_short = _ext_footprint / _ext_long if _ext_long > 0 else 0
+            _ext_perimeter = 2 * (_ext_long + _ext_short)
+            cornice_lf = round(_ext_perimeter)
+            # For institutional: also estimate window trim and soffits if missing
+            if _is_institutional and window_trim_lf == 0:
+                # ~40 windows typical per floor for senior living, ~7 LF trim per window
+                window_trim_lf = round(_ext_perimeter * _ext_stories * 0.5)
+            if _is_institutional and soffit_sqft == 0:
+                # Soffits typically 2ft wide along perimeter
+                soffit_sqft = round(_ext_perimeter * 2)
+            print(f"   📐 Exterior fallback: cornice {cornice_lf} LF, "
+                  f"window trim {window_trim_lf} LF, soffits {soffit_sqft} SF "
+                  f"(from {_ext_footprint:,.0f} SF footprint perimeter)")
+        elif wall_sqft > 0:
             _est_ceiling = 9.0
-            _est_perimeter = wall_sqft / (_est_ceiling * max(_sf_stories, 2))
+            _est_perimeter = wall_sqft / (_est_ceiling * max(_ext_stories, 2))
             cornice_lf = round(_est_perimeter)
 
     # --- Base trim: data-driven, not building-type-driven ---
@@ -7741,9 +7749,6 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
                 # Extraction is unreliable — use aggressive estimation.
                 # For institutional buildings with poor extraction, rooms represent
                 # a tiny fraction of actual floor area. Use building_type heuristics.
-                _is_institutional = any(kw in building_type for kw in
-                    ("senior", "assisted", "living", "facility", "institutional",
-                     "hospital", "medical", "nursing"))
                 if _is_institutional:
                     # Institutional: extracted rooms likely <10% of actual area.
                     # footprint_sqft here = TOTAL gross building area for pricing
@@ -7774,20 +7779,46 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
 
     _use_footprint_pricing = False
     _footprint_interior_total = 0
-    # Apply footprint fallback for ANY building type when extraction is severely incomplete.
+
     if footprint_sqft > 0 and not is_commercial:
+        if is_single_family:
+            _fp_rate = 1.25
+        else:
+            _fp_rate = _get_tiered_rate(pm['footprint_interior'], footprint_sqft) if 'footprint_interior' in pm else 3.80
+        _footprint_interior_total = footprint_sqft * _fp_rate
+
         _expected_wall = footprint_sqft * 1.2
         _trigger_threshold = 0.40
+
         # For poor-quality extraction, always trigger footprint pricing
         if _extraction_quality == "poor":
             _trigger_threshold = 1.0  # Always trigger
-        if wall_sqft < _expected_wall * _trigger_threshold:
-            if is_single_family:
-                _fp_rate = 1.25
-            else:
-                _fp_rate = _get_tiered_rate(pm['footprint_interior'], footprint_sqft) if 'footprint_interior' in pm else 3.80
-            _footprint_interior_total = footprint_sqft * _fp_rate
             _use_footprint_pricing = True
+        elif wall_sqft < _expected_wall * _trigger_threshold:
+            _use_footprint_pricing = True
+
+        # For institutional buildings: ALWAYS use the higher of room-by-room vs footprint.
+        # Institutional PDFs (senior living, hospitals, etc.) are massive and the LLM
+        # routinely captures only a fraction of units/rooms. Room-by-room may look
+        # "complete enough" (>40% wall area) but still miss most units.
+        # Use footprint as a FLOOR — never let room-by-room undercount.
+        if _is_institutional and not _use_footprint_pricing:
+            # Calculate what room-by-room interior total would be
+            # (rough estimate: walls + ceilings + trim + doors + misc)
+            _room_interior_est = (
+                wall_sqft * wall_rate +
+                ceil_sqft * ceil_rate +
+                trim_lf * trim_rate +
+                doors_full * door_fp_rate +
+                doors_hm * door_hm_rate
+            )
+            if _footprint_interior_total > _room_interior_est * 1.15:
+                # Footprint pricing is >15% higher — extraction likely missed rooms
+                _use_footprint_pricing = True
+                print(f"   📐 Institutional floor check: footprint ${_footprint_interior_total:,.0f} > "
+                      f"room-by-room ${_room_interior_est:,.0f} — using footprint as floor")
+
+        if _use_footprint_pricing:
             print(f"   📐 Footprint pricing: {footprint_sqft:,.0f} SF × ${_fp_rate:.2f} = ${_footprint_interior_total:,.0f} "
                   f"(room extraction: {wall_sqft:,.0f} wall SF, quality: {_extraction_quality})")
 
@@ -7862,8 +7893,8 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
         # Remove individual interior items
         line_items = [li for li in line_items
                       if not any(li["item"].startswith(k) for k in _interior_keys)]
-        # Add footprint-based interior line
-        _fp_rate = _get_tiered_rate(pm['footprint_interior'], footprint_sqft) if 'footprint_interior' in pm else 3.80
+        # Add footprint-based interior line (use _fp_rate already calculated above
+        # which accounts for single-family vs institutional rate differences)
         line_items.insert(0, _line(
             f"Interior (Footprint) - {footprint_sqft:,.0f} sqft @ ${_fp_rate:.2f}",
             footprint_sqft, _fp_rate, 0.00  # Rider uses 0% markup on footprint pricing
