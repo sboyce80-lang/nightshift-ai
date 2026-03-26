@@ -1749,6 +1749,9 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
     for i in range(0, len(all_tiles), MAX_TILES_PER_CALL):
         tile_batches.append(all_tiles[i:i + MAX_TILES_PER_CALL])
 
+    # Free the master list now — batches hold references, all_tiles just held duplicates
+    del all_tiles
+
     all_analysis_results = []
 
     for batch_idx, batch_tiles in enumerate(tile_batches):
@@ -1848,6 +1851,12 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
                     all_analysis_results.append(analysis)
             except json.JSONDecodeError:
                 print(f"   ❌ Enhanced extraction batch: could not parse JSON")
+
+        # Free this batch's tile data after sending (saves ~5-10MB per batch)
+        tile_batches[batch_idx] = None
+
+    # Free the batches list entirely
+    del tile_batches
 
     # Merge batch results if multiple batches
     if not all_analysis_results:

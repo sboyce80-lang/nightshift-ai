@@ -292,9 +292,9 @@ IMAGE_FALLBACK_ENHANCE = True              # Apply contrast/sharpening to render
 # Uses PyMuPDF text-layer pre-extraction + page tiling to read dimensions
 # that Claude can't see at native resolution (1568px downscale limit)
 ENABLE_ENHANCED_EXTRACTION = True          # Use text-layer + tiling for large-format floor plans
-ENHANCED_TILE_DPI = 200                    # DPI for tile rendering (200 keeps tiles under ~4500px)
+ENHANCED_TILE_DPI = 150                    # DPI for tile rendering (150 → ~2800px, still above Claude's 1568px limit; saves ~44% RAM vs 200 DPI)
 ENHANCED_TILE_GRID = (2, 2)                # Default tile grid (4 tiles per page)
-ENHANCED_TILE_GRID_LARGE = (3, 3)          # For very large sheets (>36" both dims, 9 tiles)
+ENHANCED_TILE_GRID_LARGE = (2, 2)          # Was (3, 3)=9 tiles; now (2, 2)=4 tiles to save memory. Still readable at 150 DPI.
 LARGE_FORMAT_THRESHOLD_PT = 2000           # Page size threshold (~28") to trigger enhanced path
 ENHANCED_TILE_OVERLAP_PCT = 0.05           # 5% overlap between tiles
 
