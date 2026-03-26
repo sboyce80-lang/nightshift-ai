@@ -163,21 +163,33 @@ def _clear_cancel_flag(job_id):
         os.remove(cancel_path)
 
 
-_STARTUP_CLEANUP_DONE = False  # Only run once per process
-
 # Worker thread name — used to find it via threading.enumerate()
 # since Streamlit reruns reset module-level variables.
 _WORKER_THREAD_NAME = "nightshift-worker"
+
+# PID-based startup flag — survives Streamlit reruns (same process)
+# but correctly resets on actual reboot (new process).
+_CLEANUP_FLAG_FILE = os.path.join(JOBS_DIR, ".cleanup_done_pid")
 
 
 def _cleanup_stale_queue():
     """On startup, clean up queue entries from previous crashed sessions.
     If a job is 'queued' or 'running' but its PDFs no longer exist, mark it as error
-    and remove from queue so it doesn't block new jobs."""
-    global _STARTUP_CLEANUP_DONE
-    if _STARTUP_CLEANUP_DONE:
-        return
-    _STARTUP_CLEANUP_DONE = True
+    and remove from queue so it doesn't block new jobs.
+    Only runs ONCE per process (PID-based flag file survives Streamlit reruns)."""
+    # Check if cleanup already ran in THIS process
+    my_pid = str(os.getpid())
+    if os.path.exists(_CLEANUP_FLAG_FILE):
+        try:
+            with open(_CLEANUP_FLAG_FILE, "r") as f:
+                stored_pid = f.read().strip()
+            if stored_pid == my_pid:
+                return  # Already cleaned up in this process
+        except Exception:
+            pass
+    # Write our PID so subsequent reruns skip this
+    with open(_CLEANUP_FLAG_FILE, "w") as f:
+        f.write(my_pid)
 
     queue = _get_queue()
     for job_id in queue:
@@ -205,7 +217,9 @@ def _cleanup_stale_queue():
             continue
 
         # If job was 'running' when crash happened, reset to 'queued' so it retries
-        if meta.get("status") == "running":
+        # BUT only if the worker thread is NOT alive (actual crash recovery).
+        # On Streamlit reruns, the worker IS alive — don't reset its active job!
+        if meta.get("status") == "running" and _find_worker_thread() is None:
             meta["status"] = "queued"
             meta.pop("run_started", None)
             _write_job_meta(job_id, meta)
