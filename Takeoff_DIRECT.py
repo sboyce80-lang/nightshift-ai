@@ -7235,18 +7235,36 @@ def _get_tiered_rate(item_config, quantity):
 
 
 def _detect_single_family_from_rooms(analysis):
-    """Detect single-family residential from room names, regardless of LLM building_type.
+    """Detect single-family residential from room names.
 
-    The LLM sometimes misclassifies projects (e.g., "Senior living facility expansion"
-    for what is actually a single-family custom home near a senior living campus).
     Use the actual room inventory to determine if this is a single-family home.
+    BUT respect the LLM building_type when it clearly indicates institutional/commercial —
+    senior living suites often have master bedrooms + kitchens that mimic single-family layouts.
 
     Criteria: Has typical single-family rooms (master bedroom, kitchen, dining room,
-    foyer/entry) AND total_units <= 2 AND NOT a multi-unit layout (no unit multipliers > 1).
+    foyer/entry) AND total_units <= 2 AND NOT a multi-unit layout (no unit multipliers > 1)
+    AND building_type is NOT clearly institutional/commercial.
     """
     pi = analysis.get("project_info", {})
+    building_type_str = str(pi.get("building_type", "")).lower()
     total_units_raw = pi.get("total_units", 0)
     total_units = _num(total_units_raw) if isinstance(total_units_raw, (int, float)) else 0
+
+    # If the LLM building_type clearly indicates institutional/commercial, do NOT
+    # override to single-family. IL/senior suites often look like SF at room level.
+    _institutional_keywords = (
+        "senior", "assisted", "nursing", "memory care", "independent living",
+        "facility", "institutional", "hospital", "medical", "clinic",
+        "school", "dormitor", "hotel", "motel", "resort",
+        "office", "retail", "warehouse", "industrial",
+    )
+    if any(kw in building_type_str for kw in _institutional_keywords):
+        # Exception: if the project_name also contains "home" or "residence" AND
+        # building_type contains "expansion" or "renovation", it might truly be a
+        # large custom home near an institutional campus. But by default, trust the LLM.
+        project_name = str(pi.get("project_name", "")).lower()
+        if not any(kw in project_name for kw in ("home", "residence", "house")):
+            return False
 
     # Multi-unit buildings are never single-family
     if total_units > 4:
@@ -7264,6 +7282,12 @@ def _detect_single_family_from_rooms(analysis):
     for floor in analysis.get("floors", []):
         for room in floor.get("rooms", []):
             all_rooms.append(room.get("room_name", "").lower())
+
+    # Check for institutional room types that would disqualify SF
+    _institutional_rooms = ("nurse", "activity", "common area", "lobby", "reception",
+                            "conference", "office suite", "resident", "unit ")
+    if any(kw in r for r in all_rooms for kw in _institutional_rooms):
+        return False
 
     all_rooms_str = " ".join(all_rooms)
 
@@ -7670,23 +7694,102 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     stain_rail_rate = _get_tiered_rate(pm['exterior_stain_railing'], stain_railing_lf) if 'exterior_stain_railing' in pm else 32.00
 
     # --- Footprint-based interior pricing fallback ---
-    # When room-by-room extraction is severely incomplete (wall SF < 40% of expected),
-    # use footprint × all-inclusive rate as the interior price instead of individual
-    # line items. This matches how Rider prices large senior living / institutional
-    # projects where room-by-room isn't practical.
+    # When room-by-room extraction is severely incomplete, use footprint × all-inclusive
+    # rate as the interior price. This catches cases where the LLM only extracted a
+    # fraction of rooms (common with large DD-scale PDFs).
     footprint_sqft = _num(project_info.get('footprint_sqft', 0))
+
+    # --- Extraction quality detection ---
+    # Check for signals that room extraction is severely incomplete:
+    # 1. no_floor_plans_found flag set
+    # 2. All rooms from same source sheet (especially demo sheets AD*)
+    # 3. Very few rooms for institutional building type
+    _extraction_quality = "normal"
+    if analysis:
+        _no_plans = analysis.get("no_floor_plans_found", False)
+        _all_floors = analysis.get("floors", [])
+        _all_rooms_list = [r for f in _all_floors for r in f.get("rooms", [])]
+        _source_sheets = set(r.get("source_sheet", "") for r in _all_rooms_list)
+        _all_from_demo = all(s.startswith("AD") for s in _source_sheets if s)
+        _room_count = len(_all_rooms_list)
+
+        if _no_plans:
+            _extraction_quality = "poor"
+            print(f"   ⚠️  Extraction quality: POOR — no_floor_plans_found flag set")
+        elif _all_from_demo and _room_count > 0:
+            _extraction_quality = "poor"
+            print(f"   ⚠️  Extraction quality: POOR — all {_room_count} rooms from demolition sheets {_source_sheets}")
+        elif len(_source_sheets) == 1 and _room_count > 5:
+            _extraction_quality = "suspect"
+            print(f"   ⚠️  Extraction quality: SUSPECT — all {_room_count} rooms from single sheet {_source_sheets}")
+
+    # --- Estimate footprint when not provided ---
+    if footprint_sqft == 0 and analysis:
+        _floors = analysis.get("floors", [])
+        _total_stories = _num(project_info.get('total_stories', 0))
+        if _total_stories < 1:
+            _total_stories = max(len(_floors), 1)
+
+        # Sum all ceiling areas across all floors
+        _total_ceil = sum(
+            _num(r.get("dimensions", {}).get("ceiling_area_sqft", 0))
+            for f in _floors for r in f.get("rooms", [])
+        )
+
+        if _total_ceil > 0:
+            if _extraction_quality == "poor":
+                # Extraction is unreliable — use aggressive estimation.
+                # For institutional buildings with poor extraction, rooms represent
+                # a tiny fraction of actual floor area. Use building_type heuristics.
+                _is_institutional = any(kw in building_type for kw in
+                    ("senior", "assisted", "living", "facility", "institutional",
+                     "hospital", "medical", "nursing"))
+                if _is_institutional:
+                    # Institutional: extracted rooms likely <10% of actual area.
+                    # footprint_sqft here = TOTAL gross building area for pricing
+                    # (not per-floor). Rider prices: GBA × $3.80/SF.
+                    # Typical senior living: 8,000-15,000 SF per floor.
+                    # Use 10,000 SF/floor as middle estimate for expansions.
+                    footprint_sqft = round(max(_total_ceil * 5, 10000 * _total_stories))
+                    print(f"   📐 Institutional GBA estimate (poor extraction): "
+                          f"{footprint_sqft:,.0f} SF total "
+                          f"(~{footprint_sqft/_total_stories:,.0f} SF/floor × {_total_stories} stories, "
+                          f"extraction captured only {_total_ceil:,.0f} SF ceiling area)")
+                else:
+                    # Non-institutional but poor extraction: 3x total room area as estimate
+                    footprint_sqft = round(_total_ceil * 3)
+                    print(f"   📐 Estimated GBA (poor extraction): {footprint_sqft:,.0f} SF "
+                          f"(3× total room area)")
+            else:
+                # Normal extraction: rooms typically cover 50-65% of floor plate
+                _avg_floor_area = _total_ceil / _total_stories
+                _coverage = 0.50 if any(kw in building_type for kw in
+                                         ("senior", "assisted", "living", "facility"))  \
+                            else 0.65
+                _est_footprint = round(_avg_floor_area / _coverage)
+                if _est_footprint > _avg_floor_area * 1.2:
+                    footprint_sqft = _est_footprint
+                    print(f"   📐 Estimated footprint: {footprint_sqft:,.0f} SF "
+                          f"(from {_total_ceil:,.0f} SF ceiling / {_total_stories} stories / {_coverage:.0%} coverage)")
+
     _use_footprint_pricing = False
     _footprint_interior_total = 0
-    if footprint_sqft > 0 and not is_single_family and not is_commercial:
-        # Expected wall area: ~1.2× footprint for residential (per Rider standard)
+    # Apply footprint fallback for ANY building type when extraction is severely incomplete.
+    if footprint_sqft > 0 and not is_commercial:
         _expected_wall = footprint_sqft * 1.2
-        if wall_sqft < _expected_wall * 0.40:
-            # Room extraction captured <40% of expected — use footprint pricing
-            _fp_rate = _get_tiered_rate(pm['footprint_interior'], footprint_sqft) if 'footprint_interior' in pm else 3.80
+        _trigger_threshold = 0.40
+        # For poor-quality extraction, always trigger footprint pricing
+        if _extraction_quality == "poor":
+            _trigger_threshold = 1.0  # Always trigger
+        if wall_sqft < _expected_wall * _trigger_threshold:
+            if is_single_family:
+                _fp_rate = 1.25
+            else:
+                _fp_rate = _get_tiered_rate(pm['footprint_interior'], footprint_sqft) if 'footprint_interior' in pm else 3.80
             _footprint_interior_total = footprint_sqft * _fp_rate
             _use_footprint_pricing = True
             print(f"   📐 Footprint pricing: {footprint_sqft:,.0f} SF × ${_fp_rate:.2f} = ${_footprint_interior_total:,.0f} "
-                  f"(room extraction only captured {wall_sqft:,.0f}/{_expected_wall:,.0f} expected wall SF)")
+                  f"(room extraction: {wall_sqft:,.0f} wall SF, quality: {_extraction_quality})")
 
     line_items = [
         _line(f"Gyp. Walls - {wall_sqft:,.0f} sqft @ ${wall_rate:.2f}", wall_sqft,
