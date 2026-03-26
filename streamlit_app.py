@@ -29,6 +29,17 @@ import streamlit as st
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, PROJECT_ROOT)
 
+# ── Bridge Streamlit secrets → environment variables ──
+# Streamlit Cloud stores secrets in st.secrets, not os.environ.
+# config.py and Takeoff_DIRECT.py read from os.environ, so we bridge here.
+try:
+    if hasattr(st, "secrets"):
+        for key in ("ANTHROPIC_API_KEY", "CLAUDE_API_KEY"):
+            if key in st.secrets and key not in os.environ:
+                os.environ[key] = st.secrets[key]
+except Exception:
+    pass
+
 # ── Page config (must be first st call) ──
 st.set_page_config(
     page_title="Nightshift AI — Painting Takeoff",

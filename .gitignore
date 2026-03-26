@@ -1,6 +1,5 @@
 # Credentials — NEVER commit these
 .env
-config.py
 
 # Output & uploads
 output/
