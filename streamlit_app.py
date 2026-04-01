@@ -21,8 +21,12 @@ import json
 import uuid
 import threading
 import time
+import smtplib
 from datetime import datetime
 from pathlib import Path
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.application import MIMEApplication
 
 import streamlit as st
 
@@ -35,7 +39,9 @@ sys.path.insert(0, PROJECT_ROOT)
 # config.py and Takeoff_DIRECT.py read from os.environ, so we bridge here.
 try:
     if hasattr(st, "secrets"):
-        for key in ("ANTHROPIC_API_KEY", "CLAUDE_API_KEY"):
+        for key in ("ANTHROPIC_API_KEY", "CLAUDE_API_KEY",
+                     "EMAIL_ADDRESS", "EMAIL_APP_PASSWORD",
+                     "EMAIL_SMTP_SERVER", "EMAIL_SMTP_PORT"):
             if key in st.secrets and key not in os.environ:
                 os.environ[key] = st.secrets[key]
 except Exception:
@@ -47,6 +53,13 @@ st.set_page_config(
     page_icon="🖌️",
     layout="wide",
     initial_sidebar_state="expanded",
+)
+
+# ── Email / company config (loaded after secrets bridge) ──
+from config import (
+    EMAIL_ADDRESS, EMAIL_APP_PASSWORD,
+    EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT,
+    COMPANY_NAME, COMPANY_EMAIL, COMPANY_PHONE,
 )
 
 # ── Directories ──
@@ -287,6 +300,109 @@ def _get_memory_mb():
 MEMORY_LIMIT_MB = int(os.environ.get("NIGHTSHIFT_MEMORY_LIMIT_MB", "700"))
 
 
+def _send_result_email(meta):
+    """Email completed proposal (PDF + JSON) to the contact on file."""
+    if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD:
+        print("⚠️  SMTP not configured — skipping email delivery")
+        return
+
+    contact_name = meta.get("contact_name", "")
+    contact_email = meta.get("contact_email", "")
+    if not contact_email:
+        print("⚠️  No contact email on job — skipping email delivery")
+        return
+
+    # Read the output JSON for summary data
+    output_json_path = meta.get("output_json", "")
+    costs = {}
+    analysis = {}
+    if output_json_path and os.path.exists(output_json_path):
+        try:
+            with open(output_json_path, "r") as f:
+                data = json.load(f)
+            costs = data.get("cost_estimate", {})
+            analysis = data.get("analysis", {})
+        except Exception:
+            pass
+
+    totals = analysis.get("aggregated_totals", {})
+    project = analysis.get("project_info", {})
+
+    items_text = ""
+    for item in costs.get("line_items", []):
+        if item.get("qty", 0) > 0:
+            items_text += f"  - {item['item']}: ${item['total']:,.2f}\n"
+
+    body = f"""Hi {contact_name},
+
+Thank you for submitting your construction documents through Nightshift AI. Your painting estimate is ready.
+
+PROJECT SUMMARY
+  Floors analyzed: {project.get('total_floors_analyzed', 'N/A')}
+  Rooms found:     {project.get('total_rooms_found', 'N/A')}
+
+MEASUREMENTS EXTRACTED
+  Paintable walls:    {totals.get('total_paintable_wall_sqft', 0):,.0f} sq ft
+  Paintable ceilings: {totals.get('total_paintable_ceiling_sqft', 0):,.0f} sq ft
+  Base trim:          {totals.get('total_base_trim_lf', 0):,.0f} linear feet
+  Doors (full paint): {totals.get('total_doors_full_paint', 0):,.0f}
+  Doors (HM panel):   {totals.get('total_doors_hm_panel', 0):,.0f}
+  Windows (painted):  {totals.get('total_windows_painted_interior', 0):,.0f}
+  Stair sections:     {totals.get('total_stair_sections', 0):,.0f}
+
+COST ESTIMATE
+{items_text}  TOTAL: ${costs.get('subtotal', 0):,.2f}
+
+IMPORTANT: This is a preliminary estimate generated automatically from your
+drawings. A formal proposal will follow after review.
+
+The detailed analysis is attached as a PDF report.
+
+Best regards,
+{COMPANY_NAME}
+{COMPANY_PHONE}
+{COMPANY_EMAIL}
+"""
+
+    msg = MIMEMultipart()
+    msg["From"] = f"{COMPANY_NAME} <{EMAIL_ADDRESS}>"
+    msg["To"] = f"{contact_name} <{contact_email}>"
+    msg["Subject"] = "Nightshift AI - Your Painting Estimate is Ready"
+    msg.attach(MIMEText(body, "plain"))
+
+    # Attach PDF report
+    pdf_path = meta.get("output_pdf", "")
+    if pdf_path and os.path.exists(pdf_path):
+        with open(pdf_path, "rb") as f:
+            att = MIMEApplication(f.read(), _subtype="pdf")
+            att.add_header(
+                "Content-Disposition", "attachment",
+                filename=os.path.basename(pdf_path),
+            )
+            msg.attach(att)
+
+    # Attach JSON analysis
+    if output_json_path and os.path.exists(output_json_path):
+        with open(output_json_path, "rb") as f:
+            att = MIMEApplication(f.read(), _subtype="json")
+            att.add_header(
+                "Content-Disposition", "attachment",
+                filename=os.path.basename(output_json_path),
+            )
+            msg.attach(att)
+
+    try:
+        with smtplib.SMTP(EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
+            server.send_message(msg)
+        print(f"📧 Result email sent to {contact_email}")
+    except Exception as exc:
+        print(f"❌ Failed to send result email: {exc}")
+
+
 def _process_single_job(job_id):
     """Process one job in a SUBPROCESS so its memory is fully reclaimed on exit.
 
@@ -432,6 +548,9 @@ def _process_single_job(job_id):
             meta["finished"] = datetime.now().isoformat()
             meta["output_json"] = output_json
             meta["output_pdf"] = output_pdf
+
+            # Email the completed proposal to the contact
+            _send_result_email(meta)
         elif exit_code == -9 or exit_code == 137:
             # SIGKILL = OOM killer
             meta["status"] = "error"

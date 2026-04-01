@@ -70,6 +70,26 @@ UNIT_TEMPLATES = {
 # Default unit mix when specific breakdown is unavailable
 UNIT_MIX_DEFAULT = {"studio": 0.25, "1br": 0.40, "2br": 0.25, "3br": 0.10}
 
+# Secondary space templates — estimated dimensions for closets, halls, and entries
+# that the AI consistently misses during floor plan extraction.
+# Wall sqft assumes 9.5ft ceiling height × perimeter, minus door openings.
+SECONDARY_SPACE_TEMPLATES = {
+    "closet":         {"wall_sqft": 190, "ceiling_sqft": 24,  "trim_lf": 20, "doors": 1},
+    "walk_in_closet": {"wall_sqft": 266, "ceiling_sqft": 48,  "trim_lf": 28, "doors": 1},
+    "entry_hall":     {"wall_sqft": 228, "ceiling_sqft": 48,  "trim_lf": 28, "doors": 0},
+    "unit_hall":      {"wall_sqft": 380, "ceiling_sqft": 80,  "trim_lf": 40, "doors": 0},
+}
+
+# Expected total rooms and secondary space breakdown per unit type.
+# Primary rooms (LDK, bed, bath) are almost always extracted; secondary
+# spaces (closets, halls, entries) are what Claude consistently misses.
+EXPECTED_ROOMS_PER_UNIT = {
+    "studio": {"total_rooms": 4,  "secondary": [("closet", 1), ("entry_hall", 1)]},
+    "1br":    {"total_rooms": 7,  "secondary": [("closet", 2), ("walk_in_closet", 1), ("entry_hall", 1)]},
+    "2br":    {"total_rooms": 9,  "secondary": [("closet", 2), ("walk_in_closet", 1), ("entry_hall", 1), ("unit_hall", 1)]},
+    "3br":    {"total_rooms": 11, "secondary": [("closet", 3), ("walk_in_closet", 1), ("entry_hall", 1), ("unit_hall", 1)]},
+}
+
 # Footprint-based estimation constants (calibrated to Rider Painting / Chestnut)
 # Paintable residential unit area as fraction of gross floor area.
 # Excludes corridors, mechanical, structure, retail — which are NOT painted.
@@ -439,27 +459,35 @@ def _load_pdf_for_api(pdf_path, _client_for_validation=None):
             print(f"   🔍 Page filter: all {total} pages are painting-relevant")
     # else: PyMuPDF not available or empty result — no filtering
 
-    # --- Quick path: try the (filtered) file ---
-    with open(effective_path, 'rb') as f:
-        raw = f.read()
-    pdf_data = base64.standard_b64encode(raw).decode("utf-8")
+    # --- Quick path: check raw file size BEFORE base64 encoding ---
+    # base64 inflates by ~33%, so 3MB raw ≈ 4MB encoded.
+    # Check file size first to avoid MemoryError on large PDFs.
+    raw_size = os.path.getsize(effective_path)
+    raw_size_b64_est = raw_size * 4 / 3  # estimated base64 size
 
-    if len(pdf_data) <= MAX_B64_BYTES:
+    if raw_size_b64_est <= MAX_B64_BYTES:
+        # Small enough — safe to load and encode in one shot
+        with open(effective_path, 'rb') as f:
+            raw = f.read()
+        pdf_data = base64.standard_b64encode(raw).decode("utf-8")
         print(f"✅ PDF loaded ({len(pdf_data)/1024/1024:.1f} MB encoded)")
         _cleanup_filtered_tmp(_filtered_tmp_path)
         return pdf_data
 
-    # --- Large file: split into 5-page chunks ---
+    # --- Large file: split into chunks (do NOT base64-encode the whole thing) ---
     try:
         reader = PyPDF2.PdfReader(effective_path)
         total_pages = len(reader.pages)
     except Exception:
-        # Can't read with PyPDF2 — send raw
+        # Can't read with PyPDF2 — have to load raw as last resort
+        with open(effective_path, 'rb') as f:
+            raw = f.read()
+        pdf_data = base64.standard_b64encode(raw).decode("utf-8")
         print(f"✅ PDF loaded ({len(pdf_data)/1024/1024:.1f} MB encoded, could not split)")
         _cleanup_filtered_tmp(_filtered_tmp_path)
         return pdf_data
 
-    raw_mb = len(pdf_data) / 1024 / 1024
+    raw_mb = raw_size_b64_est / 1024 / 1024
     print(f"📐 PDF is large ({total_pages} pages, {raw_mb:.1f} MB)")
 
     # Deterministic chunk plan — same PDF always produces same chunks
@@ -473,7 +501,8 @@ def _load_pdf_for_api(pdf_path, _client_for_validation=None):
 
     if not chunk_info:
         print(f"   ⚠️  Could not split — sending original")
-        return pdf_data
+        with open(effective_path, 'rb') as f:
+            return base64.standard_b64encode(f.read()).decode("utf-8")
 
     # First chunk is returned for the primary API call
     first_path, first_offset = chunk_info[0]
@@ -4604,6 +4633,48 @@ def _apply_schedule_overrides(combined):
                 # Subtract storefront marks from full_paint (most likely category)
                 current_fp = _num(agg.get("total_doors_full_paint", 0))
                 adjusted_fp = max(0, current_fp - sf_count)
+
+                # Safety floor: don't let storefront filter eliminate ALL full_paint
+                # doors for commercial buildings that clearly have interior doors.
+                # Count rooms that are obviously interior spaces with doors.
+                building_type_sf = str(pi.get("building_type", "")).lower()
+                is_commercial_sf = any(kw in building_type_sf for kw in (
+                    "commercial", "dealership", "retail", "office", "industrial"))
+
+                if adjusted_fp == 0 and is_commercial_sf:
+                    INTERIOR_ROOM_KW = (
+                        "office", "break", "toilet", "restroom", "locker",
+                        "janitor", "conference", "it ", "dispatch", "f&i",
+                        "lunch", "storage", "closet")
+                    interior_door_rooms = 0
+                    for floor in combined.get("floors", []):
+                        for room in floor.get("rooms", []):
+                            if not room.get("in_scope", True):
+                                continue
+                            rname = str(room.get("room_name", "")).lower()
+                            if any(kw in rname for kw in INTERIOR_ROOM_KW):
+                                dr = _num(room.get("elements", {}).get(
+                                    "doors_full_paint", 0))
+                                if dr > 0:
+                                    mult = max(1, int(_num(
+                                        room.get("unit_multiplier", 1))))
+                                    interior_door_rooms += mult
+
+                    if interior_door_rooms > 0:
+                        # Use interior room count as floor, but don't exceed
+                        # the pre-filter schedule count (schedule is authoritative)
+                        door_floor = min(interior_door_rooms, current_fp)
+                        if door_floor > 0:
+                            adjusted_fp = door_floor
+                            overrides_applied.append(
+                                f"Storefront filter safety: restored {door_floor} "
+                                f"full_paint doors for interior rooms (offices, "
+                                f"break rooms, toilets, etc.). Filter would have "
+                                f"set count to 0.")
+                            print(f"   🔧 Storefront safety: restored {door_floor} "
+                                  f"interior doors (from {interior_door_rooms} "
+                                  f"interior rooms)")
+
                 agg["total_doors_full_paint"] = adjusted_fp
                 overrides_applied.append(
                     f"Storefront door filter: removed {sf_count} storefront marks "
@@ -4789,6 +4860,206 @@ def _apply_schedule_overrides(combined):
     return combined
 
 
+def _detect_unit_mix(analysis):
+    """Extract unit type mix from room-level unit_type fields, or fall back to UNIT_MIX_DEFAULT."""
+    type_counts = {}
+    for floor in analysis.get("floors", []):
+        for room in floor.get("rooms", []):
+            if not room.get("in_scope", True):
+                continue
+            ut = str(room.get("unit_type", "")).strip().lower()
+            if not ut or ut in ("common", "common_area", "common area"):
+                continue
+            mult = max(1, int(_num(room.get("unit_multiplier", 1))))
+            # Normalize to template keys
+            if "studio" in ut or "efficiency" in ut:
+                key = "studio"
+            elif "3" in ut or "three" in ut:
+                key = "3br"
+            elif "2" in ut or "two" in ut:
+                key = "2br"
+            else:
+                key = "1br"
+            # Count unique unit types (not rooms — we want unit type proportions)
+            type_counts[key] = type_counts.get(key, 0) + mult
+
+    if not type_counts:
+        # Fallback: check notes for unit type mentions
+        all_notes = " ".join(str(n) for n in analysis.get("notes", [])).lower()
+        has_types = {}
+        for kw, key in [("studio", "studio"), ("1br", "1br"), ("1 br", "1br"),
+                        ("one bedroom", "1br"), ("2br", "2br"), ("2 br", "2br"),
+                        ("two bedroom", "2br"), ("3br", "3br"), ("3 br", "3br")]:
+            if kw in all_notes:
+                has_types[key] = 1
+        if has_types:
+            total = len(has_types)
+            return {k: 1.0 / total for k in has_types}
+        return dict(UNIT_MIX_DEFAULT)
+
+    total = sum(type_counts.values()) or 1
+    return {k: v / total for k, v in type_counts.items()}
+
+
+def _supplement_missing_secondary_spaces(analysis):
+    """
+    Detect missing secondary spaces (closets, entry halls, unit hallways)
+    using rooms-per-unit density. When density is low, supplement wall/ceiling/trim
+    with estimated secondary space area per missing room.
+
+    Safety: Only supplements when rooms-per-unit density confirms under-extraction.
+    Caps total supplement at 45% of current extracted totals to prevent runaway.
+    """
+    pi = analysis.get("project_info", {})
+    agg = analysis.get("aggregated_totals", {})
+
+    # Gate: only for residential multi-family with 4+ units
+    building_type = str(pi.get("building_type", "")).lower()
+    is_residential = any(kw in building_type for kw in
+                         ("residential", "mixed", "multi", "apartment", "condo"))
+    total_units = int(_num(pi.get("total_units", 0)))
+    if not is_residential or total_units < 4:
+        return analysis
+
+    # Skip if footprint fallback was used (already has full estimates)
+    if analysis.get("_used_footprint_fallback"):
+        return analysis
+
+    # --- Count effective rooms and detect secondary spaces already extracted ---
+    effective_rooms = 0
+    secondary_found = 0
+    SECONDARY_KW = ("closet", "clo", "wic", "walk-in", "hall", "entry",
+                     "foyer", "vestibule", "mudroom", "pantry", "linen")
+
+    for floor in analysis.get("floors", []):
+        for room in floor.get("rooms", []):
+            if not room.get("in_scope", True):
+                continue
+            mult = max(1, int(_num(room.get("unit_multiplier", 1))))
+            effective_rooms += mult
+            rname = str(room.get("room_name", "")).lower()
+            if any(kw in rname for kw in SECONDARY_KW):
+                secondary_found += mult
+
+    rooms_per_unit = effective_rooms / total_units if total_units > 0 else 0
+
+    # --- Determine expected rooms from unit mix ---
+    unit_mix = _detect_unit_mix(analysis)
+    weighted_expected = sum(
+        EXPECTED_ROOMS_PER_UNIT.get(utype, EXPECTED_ROOMS_PER_UNIT["1br"])["total_rooms"] * share
+        for utype, share in unit_mix.items()
+    )
+
+    density_ratio = rooms_per_unit / weighted_expected if weighted_expected > 0 else 1.0
+    secondary_per_unit = secondary_found / total_units if total_units > 0 else 0
+
+    if density_ratio >= 0.85:
+        analysis.setdefault("notes", []).append(
+            f"[Secondary Space Check] Rooms/unit={rooms_per_unit:.1f}, "
+            f"expected={weighted_expected:.1f}, density={density_ratio:.0%}. "
+            f"No supplement needed."
+        )
+        print(f"   🏠 Secondary space check: {rooms_per_unit:.1f} rooms/unit "
+              f"({density_ratio:.0%} density) — OK, no supplement")
+        return analysis
+
+    # --- Calculate supplement ---
+    supplement_wall = 0
+    supplement_ceil = 0
+    supplement_trim = 0
+    supplement_doors = 0
+    supplement_details = []
+
+    for utype, share in unit_mix.items():
+        unit_count = round(total_units * share)
+        if unit_count == 0:
+            continue
+
+        expected = EXPECTED_ROOMS_PER_UNIT.get(utype, EXPECTED_ROOMS_PER_UNIT["1br"])
+        expected_total = expected["total_rooms"]
+
+        # How many rooms extracted per unit of this type?
+        extracted_per_unit = round(expected_total * density_ratio)
+        missing_per_unit = max(0, expected_total - extracted_per_unit)
+
+        # Reduce by secondary spaces already found
+        expected_secondary_count = sum(c for _, c in expected["secondary"])
+        if secondary_per_unit > 0 and expected_secondary_count > 0:
+            already_ratio = min(1.0, secondary_per_unit / expected_secondary_count)
+            missing_per_unit = max(0, missing_per_unit - round(expected_secondary_count * already_ratio))
+
+        if missing_per_unit == 0:
+            continue
+
+        # Distribute missing rooms across secondary space types proportionally
+        total_sec = sum(c for _, c in expected["secondary"])
+        for space_type, count in expected["secondary"]:
+            proportion = count / total_sec if total_sec > 0 else 0
+            missing_of_type = max(1, round(missing_per_unit * proportion))
+            tmpl = SECONDARY_SPACE_TEMPLATES[space_type]
+
+            add_wall = tmpl["wall_sqft"] * missing_of_type * unit_count
+            add_ceil = tmpl["ceiling_sqft"] * missing_of_type * unit_count
+            add_trim = tmpl["trim_lf"] * missing_of_type * unit_count
+            add_doors = tmpl["doors"] * missing_of_type * unit_count
+
+            supplement_wall += add_wall
+            supplement_ceil += add_ceil
+            supplement_trim += add_trim
+            supplement_doors += add_doors
+            supplement_details.append(
+                f"{missing_of_type}x {space_type}/unit × {unit_count} {utype}"
+            )
+
+    if supplement_wall == 0:
+        return analysis
+
+    # --- Safety cap: limit supplement to 45% of current extracted totals ---
+    MAX_SUPPLEMENT_RATIO = 0.45
+    current_wall = _num(agg.get("total_paintable_wall_sqft", 0))
+    current_ceil = _num(agg.get("total_paintable_ceiling_sqft", 0))
+    current_trim = _num(agg.get("total_base_trim_lf", 0))
+
+    if current_wall > 0:
+        wall_cap = round(current_wall * MAX_SUPPLEMENT_RATIO)
+        if supplement_wall > wall_cap:
+            scale = wall_cap / supplement_wall
+            supplement_wall = wall_cap
+            supplement_ceil = round(supplement_ceil * scale)
+            supplement_trim = round(supplement_trim * scale)
+            supplement_doors = round(supplement_doors * scale)
+            supplement_details.append(f"Capped at {MAX_SUPPLEMENT_RATIO:.0%} of extracted")
+
+    # --- Apply supplement ---
+    agg["total_paintable_wall_sqft"] = current_wall + supplement_wall
+    agg["total_paintable_ceiling_sqft"] = current_ceil + supplement_ceil
+    agg["total_base_trim_lf"] = current_trim + supplement_trim
+    agg["total_doors_full_paint"] = _num(agg.get("total_doors_full_paint", 0)) + supplement_doors
+    analysis["aggregated_totals"] = agg
+
+    analysis["_secondary_space_supplement"] = {
+        "wall_added": supplement_wall,
+        "ceil_added": supplement_ceil,
+        "trim_added": supplement_trim,
+        "doors_added": supplement_doors,
+        "density_ratio": density_ratio,
+        "rooms_per_unit": rooms_per_unit,
+    }
+
+    analysis.setdefault("notes", []).append(
+        f"[Secondary Space Supplement] Rooms/unit={rooms_per_unit:.1f} vs "
+        f"expected={weighted_expected:.1f} ({density_ratio:.0%} density). "
+        f"Added estimated secondary spaces: +{supplement_wall:,} wall sqft, "
+        f"+{supplement_ceil:,} ceiling sqft, +{supplement_trim:,} trim LF, "
+        f"+{supplement_doors} doors. [{'; '.join(supplement_details)}]"
+    )
+    print(f"   🏠 Secondary space supplement: +{supplement_wall:,} wall, "
+          f"+{supplement_ceil:,} ceil, +{supplement_trim:,} trim "
+          f"({density_ratio:.0%} room density, {rooms_per_unit:.1f} rooms/unit)")
+
+    return analysis
+
+
 def _validate_and_boost_walls(analysis):
     """
     Cross-check wall area against building metrics and boost if under-extracted.
@@ -4831,8 +5102,14 @@ def _validate_and_boost_walls(analysis):
             # Perimeter-derived total is higher — some wall area was lost in aggregation
             boost_factor = perimeter_wall / current_wall
 
-            # Same safety cap as footprint-based boost
+            # Safety cap — elevated when secondary space supplement confirmed
+            # under-extraction via room density (independent of footprint accuracy).
             MAX_BOOST_FACTOR = 1.30
+            sec_supp = analysis.get("_secondary_space_supplement")
+            if sec_supp and sec_supp.get("density_ratio", 1.0) < 0.70:
+                MAX_BOOST_FACTOR = 1.60
+            elif sec_supp and sec_supp.get("density_ratio", 1.0) < 0.85:
+                MAX_BOOST_FACTOR = 1.45
             if boost_factor > MAX_BOOST_FACTOR:
                 analysis.setdefault("notes", []).append(
                     f"[Perimeter Wall Boost Cap] Computed boost {boost_factor:.2f}x exceeds "
@@ -4863,7 +5140,11 @@ def _validate_and_boost_walls(analysis):
                 print(f"   📐 Perimeter wall boost: {current_wall:,} -> {boosted_wall:,} sqft "
                       f"({boost_factor:.2f}x, from perimeter data)")
 
-            return analysis  # Used perimeter-based; skip footprint-based
+            return analysis  # Perimeter boost applied; skip footprint-based
+
+    # If perimeter data existed but didn't trigger a boost (e.g. secondary space
+    # supplement raised aggregated above perimeter-derived), fall through to
+    # footprint-based boost which uses an independent expected-ratio calculation.
 
     # --- Mode 2: Footprint-based boost (fallback) ---
 
@@ -4910,13 +5191,16 @@ def _validate_and_boost_walls(analysis):
         boost_target = expected_wall
         boost_factor = boost_target / current_wall if current_wall > 0 else 1.0
 
-        # SAFETY CAP: Limit boost factor to 1.30x maximum.
-        # Footprint extraction by the LLM is unreliable (±36% variance observed).
-        # Without a cap, a bad footprint can produce boost factors of 1.5-1.6x,
-        # causing $30-40K swings on large multi-family projects.
-        # 1.30x covers the legitimate extraction gap (typically 10-20% under) while
-        # preventing runaway inflation from footprint errors.
+        # SAFETY CAP: Limit boost factor.
+        # Default 1.30x because footprint extraction is unreliable (±36% variance).
+        # Elevated when secondary space supplement confirmed under-extraction via
+        # room density (independent signal — safe to allow larger correction).
         MAX_BOOST_FACTOR = 1.30
+        sec_supp = analysis.get("_secondary_space_supplement")
+        if sec_supp and sec_supp.get("density_ratio", 1.0) < 0.70:
+            MAX_BOOST_FACTOR = 1.60
+        elif sec_supp and sec_supp.get("density_ratio", 1.0) < 0.85:
+            MAX_BOOST_FACTOR = 1.45
         if boost_factor > MAX_BOOST_FACTOR:
             analysis.setdefault("notes", []).append(
                 f"[Wall Boost Cap] Computed boost factor {boost_factor:.2f}x exceeds "
@@ -7328,8 +7612,29 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     is_commercial = "commercial" in bt
 
     # Sub-classify commercial by footprint: large (retail/warehouse) vs small (office/renovation)
+    # Primary: footprint > 10K SF.  Secondary: total wall area > 10K SF (catches bad footprint
+    # extraction — e.g., Mazda footprint=4K but showroom alone is 4,104 SF, walls=44K).
     _footprint = _num(project_info.get('footprint_sqft', 0))
-    is_large_commercial = is_commercial and _footprint > 10000
+    _total_wall_area = _num(aggregated_totals.get('total_paintable_wall_sqft', 0)) + \
+                       _num(aggregated_totals.get('total_cmu_wall_sqft', 0))
+    is_large_commercial = is_commercial and (_footprint > 10000 or _total_wall_area > 10000)
+
+    # Footprint sanity check: if extracted room floor area on any single floor exceeds
+    # the footprint, the LLM mis-estimated footprint (e.g., Mazda: showroom alone=4,104 SF
+    # but footprint_sqft=4,000).  Correct to max(footprint, largest_floor_area).
+    if analysis and _footprint > 0:
+        _floors = analysis.get('floors', [])
+        for _fl in _floors:
+            _fl_area = sum(_num(r.get('dimensions', {}).get('floor_area_sqft', 0))
+                          for r in _fl.get('rooms', []))
+            if _fl_area > _footprint * 1.5:  # >50% over = clearly wrong
+                _old_fp = _footprint
+                _footprint = round(_fl_area)
+                print(f"   📐 Footprint corrected: {_old_fp:,.0f} → {_footprint:,.0f} SF "
+                      f"(floor '{_fl.get('floor_name', '?')}' room area = {_fl_area:,.0f} SF)")
+                # Re-evaluate large commercial with corrected footprint
+                if is_commercial and _footprint > 10000:
+                    is_large_commercial = True
 
     # Detect apartment vs non-apartment residential (senior living, renovations, expansions)
     # Apartment buildings have total_units >= 4 — they get volume rates ($0.80/SF) due to
@@ -8869,6 +9174,12 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     if analysis.get("schedule_data"):
         analysis = _apply_schedule_overrides(analysis)
 
+    # --- Secondary space supplement (closets, halls, entries) ---
+    # Uses rooms-per-unit density to detect missing secondary spaces and
+    # supplements wall/ceiling/trim with estimated area. Must run BEFORE
+    # perimeter cross-check and wall boost so those operate on supplemented totals.
+    analysis = _supplement_missing_secondary_spaces(analysis)
+
     # --- Perimeter-based wall cross-check (must run BEFORE wall boost) ---
     # Computes perimeter-derived wall totals and stores in _perimeter_cross_check
     # for _validate_and_boost_walls() to use as preferred boost source.
@@ -8876,7 +9187,8 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
 
     # --- Wall area validation + boost (for residential multi-family) ---
     # Uses perimeter-based boost (preferred) or footprint-based (fallback).
-    # Must come AFTER _recalculate_totals and perimeter cross-check.
+    # Boost cap elevated when secondary space supplement confirmed under-extraction.
+    # Must come AFTER _recalculate_totals, secondary supplement, and perimeter cross-check.
     analysis = _validate_and_boost_walls(analysis)
 
     # --- Commercial window exclusion (after all overrides/boosts) ---
