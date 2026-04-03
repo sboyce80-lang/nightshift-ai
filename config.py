@@ -284,7 +284,19 @@ PRICING_MODEL = {
 }
 
 # =============================================================================
-# Email Ingestion Settings (Outlook / Office 365)
+# Small Commercial / Renovation Rate Overrides
+# =============================================================================
+# Used when building is commercial but not large enough for large-commercial rates.
+# Calibrated from BFCU Glenmont. Adjust here — no need to edit Takeoff_DIRECT.py.
+SMALL_COMMERCIAL_RATES = {
+    "wall_rate": 1.40,
+    "ceil_rate": 1.40,
+    "door_fp_rate": 155.00,
+    "door_hm_rate": 110.00,
+}
+
+# =============================================================================
+# Email Ingestion Settings (Gmail)
 # =============================================================================
 # Credentials come from .env file — never hardcode passwords here.
 #

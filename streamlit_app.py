@@ -44,7 +44,7 @@ try:
                      "EMAIL_SMTP_SERVER", "EMAIL_SMTP_PORT",
                      "INTERNAL_NOTIFY_EMAIL"):
             if key in st.secrets and key not in os.environ:
-                os.environ[key] = st.secrets[key]
+                os.environ[key] = str(st.secrets[key])
 except Exception:
     pass
 
@@ -403,6 +403,7 @@ Best regards,
         print(f"📧 Result email sent to {contact_email}")
     except Exception as exc:
         print(f"❌ Failed to send result email: {exc}")
+        meta["email_error"] = f"Customer email failed: {exc}"
 
 
 def _send_internal_notification(meta):
@@ -488,6 +489,7 @@ PDF and JSON reports are attached (if available).
         print(f"📧 Internal notification sent to {INTERNAL_NOTIFY_EMAIL}")
     except Exception as exc:
         print(f"❌ Failed to send internal notification: {exc}")
+        meta["internal_email_error"] = f"Internal email failed: {exc}"
 
 
 def _process_single_job(job_id):

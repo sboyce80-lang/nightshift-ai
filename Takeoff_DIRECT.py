@@ -25,7 +25,7 @@ import time
 import hashlib
 from pathlib import Path
 import PyPDF2
-from config import CLAUDE_API_KEY, PRICING_MODEL
+from config import CLAUDE_API_KEY, PRICING_MODEL, SMALL_COMMERCIAL_RATES
 import anthropic
 import base64
 from datetime import datetime
@@ -4831,7 +4831,7 @@ def _apply_schedule_overrides(combined):
                 envelope = perimeter * avg_story_ht * stories * 0.70
                 ext_paint_est = round(envelope)
                 exterior["exterior_paint_sqft"] = ext_paint_est
-                if not exterior.get("lift_required"):
+                if not exterior.get("lift_required") and stories >= 2:
                     exterior["lift_required"] = True
                 overrides_applied.append(
                     f"Exterior painting safety net: estimated {ext_paint_est:,.0f} sqft "
@@ -5447,16 +5447,47 @@ def _extract_unit_from_room_id(room_id):
 def _deduplicate_rooms(rooms):
     """
     Remove duplicate rooms from a merged list.
-    Three-tier deduplication:
+    Five-tier deduplication:
     1. Exact room_id match → keep higher detail_score
     2. Normalized unit+type match with dimension similarity (±10%) → keep higher detail
     3. Exact name + similar area (within 50 sqft) → keep higher detail
     3b. Same normalized type + same floor + similar wall area (±20%) for non-unit rooms
         (catches cross-chunk duplicates in single-family homes where the same room
          is extracted with slightly different names/dimensions)
+    4. Cross-sheet duplicate detection — same room name or type on different source sheets
+       with similar wall area (±30%). Keeps version from sheet with more rooms.
 
     Returns: (deduplicated_rooms, dedup_log)
     """
+    # ── Pre-pass: count rooms per source sheet and detect detail sheets ──
+    sheet_room_counts = {}  # sheet_name -> count of rooms
+    sheet_room_names = {}   # sheet_name -> set of lowercased room names
+    for room in rooms:
+        sheet = (room.get("source_sheet") or "").strip()
+        if not sheet or sheet.lower() in ("unknown", ""):
+            continue
+        sheet_room_counts[sheet] = sheet_room_counts.get(sheet, 0) + 1
+        sheet_room_names.setdefault(sheet, set()).add(
+            room.get("room_name", "").lower().strip())
+
+    # Detect detail/enlarged sheets: ≤4 rooms AND all room names appear on a larger sheet
+    detail_sheets = set()
+    for sheet, names in sheet_room_names.items():
+        count = sheet_room_counts.get(sheet, 0)
+        if count > 4:
+            continue  # Not a detail sheet
+        # Check if all names from this sheet appear on a bigger sheet
+        for other_sheet, other_names in sheet_room_names.items():
+            if other_sheet == sheet:
+                continue
+            if sheet_room_counts.get(other_sheet, 0) <= count:
+                continue  # Other sheet is not larger
+            if names.issubset(other_names):
+                detail_sheets.add(sheet)
+                break
+    if detail_sheets:
+        print(f"   🔍 Dedup: detected detail sheets (deprioritized): {detail_sheets}")
+
     seen = {}  # dedup_key -> room dict
     seen_identity = {}  # dedup_key -> (unit_key, room_type) for tier 2 lookups
     dedup_log = []
@@ -5628,6 +5659,86 @@ def _deduplicate_rooms(rooms):
                             })
                             matched = True
                             break
+
+            # TIER 4: Cross-sheet duplicate detection
+            # Same room name or normalized type on a DIFFERENT source sheet,
+            # with wall area within ±30%. Keeps the version from the sheet
+            # with more rooms (primary floor plan, not detail/enlarged).
+            if not matched:
+                room_sheet = (room.get("source_sheet") or "").strip()
+                room_name_lc = rname.lower().strip()
+                room_type_norm = _get_room_type_normalized(rname)
+                room_floor = _get_floor_from_rid(rid)
+                for existing_key, existing in list(seen.items()):
+                    e_sheet = (existing.get("source_sheet") or "").strip()
+                    # Must be from different sheets
+                    if not room_sheet or not e_sheet or room_sheet == e_sheet:
+                        continue
+                    # Must be on the same floor
+                    existing_rid = existing.get("room_id", existing_key)
+                    e_floor = _get_floor_from_rid(existing_rid)
+                    if room_floor and e_floor and room_floor != e_floor:
+                        continue
+                    # Must not be different units
+                    existing_rid_unit = _extract_unit_from_room_id(existing_rid)
+                    if rid_unit and existing_rid_unit and rid_unit != existing_rid_unit:
+                        continue
+                    # Name or type must match
+                    e_name_lc = existing.get("room_name", "").lower().strip()
+                    e_type_norm = _get_room_type_normalized(existing.get("room_name", ""))
+                    name_match = (room_name_lc == e_name_lc and room_name_lc != "")
+                    type_match = (room_type_norm == e_type_norm and room_type_norm != "")
+                    if not name_match and not type_match:
+                        continue
+                    # Wall area within ±30%
+                    e_wall = _num(existing.get("dimensions", {}).get("wall_area_sqft", 0))
+                    if wall_area <= 0 or e_wall <= 0:
+                        continue
+                    wall_ratio = min(wall_area, e_wall) / max(wall_area, e_wall)
+                    if wall_ratio < 0.70:
+                        continue
+                    # Match found — decide which to keep:
+                    # Prefer sheet with more rooms (primary plan), then detail_score
+                    room_sheet_count = sheet_room_counts.get(room_sheet, 0)
+                    e_sheet_count = sheet_room_counts.get(e_sheet, 0)
+                    room_is_detail = room_sheet in detail_sheets
+                    e_is_detail = e_sheet in detail_sheets
+                    old_score = _detail_score(existing)
+                    keep_new = False
+                    if room_is_detail and not e_is_detail:
+                        keep_new = False  # Existing is from primary sheet
+                    elif e_is_detail and not room_is_detail:
+                        keep_new = True  # New room is from primary sheet
+                    elif room_sheet_count > e_sheet_count:
+                        keep_new = True  # New room is from sheet with more rooms
+                    elif room_sheet_count < e_sheet_count:
+                        keep_new = False
+                    else:
+                        keep_new = score > old_score  # Tie: keep higher detail
+
+                    match_type = "name" if name_match else "type"
+                    if keep_new:
+                        dedup_log.append({
+                            "kept": rid,
+                            "removed": existing.get("room_id", existing_key),
+                            "reason": f"cross-sheet {match_type} match "
+                                      f"({room_sheet} vs {e_sheet}), "
+                                      f"wall ratio {wall_ratio:.2f}, "
+                                      f"kept sheet with {room_sheet_count} rooms"
+                        })
+                        seen[existing_key] = room
+                        seen_identity[existing_key] = (unit_key, room_type)
+                    else:
+                        dedup_log.append({
+                            "kept": existing.get("room_id", existing_key),
+                            "removed": rid,
+                            "reason": f"cross-sheet {match_type} match "
+                                      f"({room_sheet} vs {e_sheet}), "
+                                      f"wall ratio {wall_ratio:.2f}, "
+                                      f"kept sheet with {e_sheet_count} rooms"
+                        })
+                    matched = True
+                    break
 
             if not matched:
                 seen[rid] = room
@@ -7847,12 +7958,18 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
 
     lift_needed = 1 if exterior.get('lift_required', False) else 0
     int_lift_needed = 1 if exterior.get('interior_lift_required', False) else 0
+
+    # Single-story buildings never need exterior lifts (ladders suffice)
+    _total_stories_lift = _num(project_info.get('total_stories', 1))
+    if _total_stories_lift <= 1 and lift_needed:
+        lift_needed = 0
+
     # If any exterior scope exists, require exterior lift (unless single-family ≤3 stories)
     has_any_ext = ext_paint_sqft > 0 or hardie_sqft > 0 or azek_lf > 0
     if has_any_ext and lift_needed == 0:
         # Single-family homes ≤3 stories use ladders, not lifts
         _sf_stories_ext = _num(project_info.get('total_stories', 0))
-        if not (is_single_family and _sf_stories_ext <= 3):
+        if not (is_single_family and _sf_stories_ext <= 3) and _sf_stories_ext >= 2:
             lift_needed = 1
 
     pm = PRICING_MODEL
@@ -7922,11 +8039,11 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
                 if wall_sqft > max_wall_sqft:
                     wall_sqft = max_wall_sqft
         else:
-            # Small commercial / renovation rates (calibrated from BFCU Glenmont)
-            wall_rate = 1.40   # Standard interior painting rate
-            ceil_rate = 1.40
-            door_fp_rate = 155.00  # Commercial door rate
-            door_hm_rate = 110.00  # HM frame-only rate (Rider BFCU)
+            # Small commercial / renovation rates (from config.py SMALL_COMMERCIAL_RATES)
+            wall_rate = SMALL_COMMERCIAL_RATES["wall_rate"]
+            ceil_rate = SMALL_COMMERCIAL_RATES["ceil_rate"]
+            door_fp_rate = SMALL_COMMERCIAL_RATES["door_fp_rate"]
+            door_hm_rate = SMALL_COMMERCIAL_RATES["door_hm_rate"]
 
     # Non-apartment residential rate overrides (senior living, care facilities, expansions)
     # These buildings lack the spray-application efficiency of repetitive apartment units.
