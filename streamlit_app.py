@@ -847,6 +847,10 @@ with st.sidebar:
         help="Upload PDFs one at a time, or a ZIP containing a folder of PDFs.",
     )
 
+    # Upload key counter — incremented after submission to clear the file uploader
+    if "upload_key" not in st.session_state:
+        st.session_state.upload_key = 0
+
     uploaded_files = []
     if upload_mode == "Individual PDFs":
         raw_uploads = st.file_uploader(
@@ -854,6 +858,7 @@ with st.sidebar:
             type=["pdf"],
             accept_multiple_files=True,
             help="Architectural drawings — floor plans, elevations, schedules. Max 200MB each.",
+            key=f"pdf_uploader_{st.session_state.upload_key}",
         )
         if raw_uploads:
             uploaded_files = raw_uploads
@@ -863,6 +868,7 @@ with st.sidebar:
             type=["zip"],
             accept_multiple_files=False,
             help="A .zip file containing one or more PDF drawings. Subfolders are included.",
+            key=f"zip_uploader_{st.session_state.upload_key}",
         )
         if zip_upload:
             import zipfile
@@ -949,6 +955,9 @@ with st.sidebar:
 
         # ── Start worker if needed ──
         _ensure_worker()
+
+        # Clear the file uploader for the next submission
+        st.session_state.upload_key += 1
 
         queue_pos = _get_queue_position(job_id)
         if queue_pos <= 1:
