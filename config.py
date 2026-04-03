@@ -290,9 +290,9 @@ PRICING_MODEL = {
 #
 EMAIL_ADDRESS       = os.environ.get("EMAIL_ADDRESS", "")
 EMAIL_APP_PASSWORD  = os.environ.get("EMAIL_APP_PASSWORD", "")
-EMAIL_IMAP_SERVER   = os.environ.get("EMAIL_IMAP_SERVER", "outlook.office365.com")
+EMAIL_IMAP_SERVER   = os.environ.get("EMAIL_IMAP_SERVER", "imap.gmail.com")
 EMAIL_IMAP_PORT     = int(os.environ.get("EMAIL_IMAP_PORT", "993"))
-EMAIL_SMTP_SERVER   = os.environ.get("EMAIL_SMTP_SERVER", "smtp.office365.com")
+EMAIL_SMTP_SERVER   = os.environ.get("EMAIL_SMTP_SERVER", "smtp.gmail.com")
 EMAIL_SMTP_PORT     = int(os.environ.get("EMAIL_SMTP_PORT", "587"))
 EMAIL_WATCH_FOLDER  = os.environ.get("EMAIL_WATCH_FOLDER", "INBOX")
 EMAIL_POLL_INTERVAL = int(os.environ.get("EMAIL_POLL_INTERVAL", "60"))
