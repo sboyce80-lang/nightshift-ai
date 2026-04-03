@@ -41,7 +41,8 @@ try:
     if hasattr(st, "secrets"):
         for key in ("ANTHROPIC_API_KEY", "CLAUDE_API_KEY",
                      "EMAIL_ADDRESS", "EMAIL_APP_PASSWORD",
-                     "EMAIL_SMTP_SERVER", "EMAIL_SMTP_PORT"):
+                     "EMAIL_SMTP_SERVER", "EMAIL_SMTP_PORT",
+                     "INTERNAL_NOTIFY_EMAIL"):
             if key in st.secrets and key not in os.environ:
                 os.environ[key] = st.secrets[key]
 except Exception:
@@ -61,6 +62,7 @@ from config import (
     EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT,
     COMPANY_NAME, COMPANY_EMAIL, COMPANY_PHONE,
 )
+INTERNAL_NOTIFY_EMAIL = os.environ.get("INTERNAL_NOTIFY_EMAIL", "")
 
 # ── Directories ──
 UPLOAD_DIR = os.path.join(PROJECT_ROOT, "uploads")
@@ -403,6 +405,91 @@ Best regards,
         print(f"❌ Failed to send result email: {exc}")
 
 
+def _send_internal_notification(meta):
+    """Email a copy of the completed estimate to the internal team."""
+    if not INTERNAL_NOTIFY_EMAIL or not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD:
+        print("⚠️  Internal notification skipped — INTERNAL_NOTIFY_EMAIL or SMTP not configured")
+        return
+
+    job_id = meta.get("job_id", "unknown")
+    contact_name = meta.get("contact_name", "N/A")
+    contact_email = meta.get("contact_email", "N/A")
+    status = meta.get("status", "unknown")
+
+    # Build summary from output JSON
+    output_json_path = meta.get("output_json", "")
+    summary_lines = ""
+    total_cost = "N/A"
+    if output_json_path and os.path.exists(output_json_path):
+        try:
+            with open(output_json_path, "r") as f:
+                data = json.load(f)
+            costs = data.get("cost_estimate", {})
+            analysis = data.get("analysis", {})
+            totals = analysis.get("aggregated_totals", {})
+            project = analysis.get("project_info", {})
+            total_cost = f"${costs.get('subtotal', 0):,.2f}"
+            summary_lines = (
+                f"  Floors analyzed: {project.get('total_floors_analyzed', 'N/A')}\n"
+                f"  Rooms found:     {project.get('total_rooms_found', 'N/A')}\n"
+                f"  Wall sqft:       {totals.get('total_paintable_wall_sqft', 0):,.0f}\n"
+                f"  Ceiling sqft:    {totals.get('total_paintable_ceiling_sqft', 0):,.0f}\n"
+                f"  Doors:           {totals.get('total_doors_full_paint', 0):,.0f}\n"
+            )
+        except Exception:
+            pass
+
+    error_info = ""
+    if status == "error":
+        error_info = f"\nERROR: {meta.get('error', 'Unknown error')}\n"
+
+    body = f"""Nightshift AI — Job Complete
+
+Job ID:   {job_id}
+Status:   {status.upper()}
+Contact:  {contact_name} ({contact_email})
+Submitted: {meta.get('submitted', 'N/A')}
+Finished:  {meta.get('finished', 'N/A')}
+{error_info}
+ESTIMATE TOTAL: {total_cost}
+
+{summary_lines}
+PDF and JSON reports are attached (if available).
+"""
+
+    msg = MIMEMultipart()
+    msg["From"] = f"{COMPANY_NAME} <{EMAIL_ADDRESS}>"
+    msg["To"] = INTERNAL_NOTIFY_EMAIL
+    msg["Subject"] = f"[Nightshift AI] {status.upper()}: {contact_name} — {total_cost}"
+    msg.attach(MIMEText(body, "plain"))
+
+    # Attach PDF report
+    pdf_path = meta.get("output_pdf", "")
+    if pdf_path and os.path.exists(pdf_path):
+        with open(pdf_path, "rb") as f:
+            att = MIMEApplication(f.read(), _subtype="pdf")
+            att.add_header("Content-Disposition", "attachment", filename=os.path.basename(pdf_path))
+            msg.attach(att)
+
+    # Attach JSON analysis
+    if output_json_path and os.path.exists(output_json_path):
+        with open(output_json_path, "rb") as f:
+            att = MIMEApplication(f.read(), _subtype="json")
+            att.add_header("Content-Disposition", "attachment", filename=os.path.basename(output_json_path))
+            msg.attach(att)
+
+    try:
+        with smtplib.SMTP(EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
+            server.send_message(msg)
+        print(f"📧 Internal notification sent to {INTERNAL_NOTIFY_EMAIL}")
+    except Exception as exc:
+        print(f"❌ Failed to send internal notification: {exc}")
+
+
 def _process_single_job(job_id):
     """Process one job in a SUBPROCESS so its memory is fully reclaimed on exit.
 
@@ -551,6 +638,7 @@ def _process_single_job(job_id):
 
             # Email the completed proposal to the contact
             _send_result_email(meta)
+            _send_internal_notification(meta)
         elif exit_code == -9 or exit_code == 137:
             # SIGKILL = OOM killer
             meta["status"] = "error"
@@ -575,6 +663,10 @@ def _process_single_job(job_id):
     _write_job_meta(job_id, meta)
     _dequeue_job(job_id)
     _clear_progress(job_id)
+
+    # Send internal notification for errors (success notification is sent above)
+    if meta.get("status") == "error":
+        _send_internal_notification(meta)
 
     # Clean up uploaded PDFs (output is saved separately)
     for pdf_path in meta.get("pdf_paths", []):
