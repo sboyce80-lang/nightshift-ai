@@ -566,12 +566,17 @@ def _process_single_job(job_id):
     # Pass API key and progress file via environment
     env = os.environ.copy()
     env["NIGHTSHIFT_PROGRESS_FILE"] = progress_path
-    # Cap memory for subprocess: 750MB (leaves ~250MB for Streamlit + OS)
-    # This ensures the OOM killer targets the subprocess, not the container.
-    _SUB_MEM_LIMIT_MB = 750
+    # Memory limit for subprocess.
+    # Streamlit Cloud free tier: 1GB total. We give the subprocess as much as
+    # possible (1.5GB virtual address space) because PyMuPDF needs headroom for
+    # large DD-scale architectural pages. The OS reclaims everything when the
+    # subprocess exits, so the parent Streamlit process stays safe.
+    # Note: RLIMIT_AS caps virtual address space (not RSS), so 1.5GB is fine
+    # even on a 1GB host — only resident pages count against physical RAM.
+    _SUB_MEM_LIMIT_MB = 1536
     env["NIGHTSHIFT_MEM_LIMIT_MB"] = str(_SUB_MEM_LIMIT_MB)
-    # Cap tile rendering pages to prevent huge PDFs from consuming all memory
-    env["NIGHTSHIFT_MAX_TILE_PAGES"] = "8"
+    # Allow more tile pages for large-format PDFs
+    env["NIGHTSHIFT_MAX_TILE_PAGES"] = "12"
 
     def _limit_memory():
         """Set memory limit on subprocess (Linux only)."""
