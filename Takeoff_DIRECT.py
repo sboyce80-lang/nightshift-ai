@@ -7611,15 +7611,13 @@ def _num(val):
 
 
 def _apply_rate_overrides(rate_overrides):
-    """Build a modified copy of PRICING_MODEL with CLI rate overrides applied.
+    """Build a modified copy of PRICING_MODEL with rate/markup overrides applied.
 
-    rate_overrides is a dict mapping shorthand keys to values:
-        {"wall_rate": 1.50, "door_rate": 200, "markup": 0.08, ...}
-
-    Supported keys:
-        wall_rate, ceiling_rate, door_rate, window_rate, trim_rate, stair_rate,
-        cmu_rate, dryfall_rate, concrete_rate, column_rate,
-        markup (global override for all items)
+    rate_overrides is a dict that supports:
+      1. Shorthand keys: {"wall_rate": 1.50, "door_rate": 200}
+      2. Direct PRICING_MODEL keys: {"gyp_walls": 1.50, "exterior_cornice": 25.00}
+      3. Per-item markup: {"markup_gyp_walls": 0.08}  (prefix "markup_" + PM key)
+      4. Global markup: {"markup": 0.08}  (applies to all items)
     """
     import copy
     pm = copy.deepcopy(PRICING_MODEL)
@@ -7638,14 +7636,28 @@ def _apply_rate_overrides(rate_overrides):
         "column_rate":   "painted_columns",
     }
 
-    for key, pm_key in _rate_map.items():
-        if key in rate_overrides and pm_key in pm:
-            new_rate = float(rate_overrides[key])
-            # Set all tiers to the flat override rate
+    for key, val in rate_overrides.items():
+        # Skip non-rate keys
+        if key == "markup":
+            continue
+        if key.startswith("markup_"):
+            continue
+
+        # Resolve to PRICING_MODEL key
+        pm_key = _rate_map.get(key, key)  # try shorthand first, else use key directly
+        if pm_key in pm:
+            new_rate = float(val)
             for tier in pm[pm_key]["tiers"]:
                 tier["rate"] = new_rate
 
-    # Global markup override
+    # Per-item markup overrides (markup_gyp_walls, markup_exterior_cornice, etc.)
+    for key, val in rate_overrides.items():
+        if key.startswith("markup_"):
+            pm_key = key[len("markup_"):]
+            if pm_key in pm:
+                pm[pm_key]["markup"] = float(val)
+
+    # Global markup override (applies to all items not already overridden above)
     if "markup" in rate_overrides:
         new_markup = float(rate_overrides["markup"])
         for item_key in pm:
@@ -10090,6 +10102,20 @@ def main():
 
     # Build rate_overrides dict from CLI flags
     rate_overrides = {}
+
+    # Load from JSON file/string first (--rate-overrides-json)
+    _ro_json = args.get('rate-overrides-json', '')
+    if _ro_json:
+        try:
+            if os.path.exists(_ro_json):
+                with open(_ro_json) as f:
+                    rate_overrides = json.load(f)
+            else:
+                rate_overrides = json.loads(_ro_json)
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"⚠️  Could not parse --rate-overrides-json: {e}")
+
+    # Individual CLI flags override JSON values
     _rate_flag_map = {
         'wall-rate': 'wall_rate',
         'ceiling-rate': 'ceiling_rate',

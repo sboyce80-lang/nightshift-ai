@@ -62,6 +62,7 @@ from config import (
     EMAIL_ADDRESS, EMAIL_APP_PASSWORD,
     EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT,
     COMPANY_NAME, COMPANY_EMAIL, COMPANY_PHONE,
+    PRICING_MODEL,
 )
 INTERNAL_NOTIFY_EMAIL = os.environ.get("INTERNAL_NOTIFY_EMAIL", "")
 
@@ -553,6 +554,15 @@ def _process_single_job(job_id):
     if meta.get("multi_pass", False):
         cmd.append("--multi-pass")
 
+    # Pass pricing overrides as JSON string via --rate-overrides-json
+    _all_overrides = {}
+    for pm_key, rate_val in meta.get("rate_overrides", {}).items():
+        _all_overrides[pm_key] = rate_val
+    for pm_key, markup_val in meta.get("markup_overrides", {}).items():
+        _all_overrides[f"markup_{pm_key}"] = markup_val
+    if _all_overrides:
+        cmd += ["--rate-overrides-json", json.dumps(_all_overrides)]
+
     # Pass API key and progress file via environment
     env = os.environ.copy()
     env["NIGHTSHIFT_PROGRESS_FILE"] = progress_path
@@ -1006,6 +1016,82 @@ with st.sidebar:
             help="Run floor plans twice, keep best extraction. Slower but more accurate.",
         )
 
+    with st.expander("💲 Pricing (adjust rates before running)", expanded=False):
+        st.caption("These are the rates Rider Painting uses for estimates. "
+                   "Adjust any values below — they'll be applied to this job only.")
+
+        # Build the editable pricing table from PRICING_MODEL
+        _pricing_display = [
+            ("gyp_walls",          "Gyp. Walls",          "sqft"),
+            ("gyp_ceilings",       "Gyp. Ceilings",       "sqft"),
+            ("base_trim",          "Base Trim",            "LF"),
+            ("doors_full_paint",   "Doors (Full Paint)",   "ea"),
+            ("doors_hm_panel",     "Doors (HM Panel)",     "ea"),
+            ("doors_frame_only",   "Doors (Frame Only)",   "ea"),
+            ("windows",            "Windows",              "ea"),
+            ("stairs",             "Stairs",               "ea"),
+            ("cmu_walls_full",     "CMU Walls (Full)",     "sqft"),
+            ("dryfall_ceiling",    "Dryfall Ceiling",      "sqft"),
+            ("concrete_sealer",    "Concrete Sealer",      "sqft"),
+            ("painted_columns",    "Painted Columns",      "ea"),
+            ("wallcovering_install","Wallcovering Install", "sqft"),
+            ("stained_wood",       "Stained Wood",         "sqft"),
+            ("exterior_cornice",   "Ext. Cornice",         "LF"),
+            ("exterior_window_trim","Ext. Window Trim",    "LF"),
+            ("exterior_painting",  "Ext. Painting",        "sqft"),
+            ("exterior_hardie_siding","Ext. Hardie Siding","sqft"),
+            ("exterior_lift_rental","Ext. Lift Rental",    "ea"),
+        ]
+
+        _pricing_rows = []
+        for pm_key, label, unit in _pricing_display:
+            if pm_key in PRICING_MODEL:
+                cfg = PRICING_MODEL[pm_key]
+                # Show the highest-tier rate as default (most common for larger projects)
+                default_rate = cfg["tiers"][-1]["rate"] if cfg["tiers"] else 0
+                default_markup = cfg["markup"]
+                _pricing_rows.append({
+                    "_key": pm_key,
+                    "Item": label,
+                    "Unit": f"/{unit}",
+                    "Rate ($)": default_rate,
+                    "Markup (%)": round(default_markup * 100, 1),
+                })
+
+        pricing_df = pd.DataFrame(_pricing_rows)
+        edited_pricing = st.data_editor(
+            pricing_df[["Item", "Unit", "Rate ($)", "Markup (%)"]],
+            column_config={
+                "Item": st.column_config.TextColumn("Item", disabled=True, width="medium"),
+                "Unit": st.column_config.TextColumn("Unit", disabled=True, width="small"),
+                "Rate ($)": st.column_config.NumberColumn("Rate ($)", format="$%.2f", min_value=0.0, step=0.01),
+                "Markup (%)": st.column_config.NumberColumn("Markup (%)", format="%.1f", min_value=0.0, max_value=100.0, step=0.5),
+            },
+            use_container_width=True,
+            hide_index=True,
+            key="pricing_editor",
+            num_rows="fixed",
+        )
+
+        # Detect changes from defaults
+        _rate_overrides = {}
+        _markup_overrides = {}
+        if edited_pricing is not None:
+            for i, row in enumerate(_pricing_rows):
+                pm_key = row["_key"]
+                orig_rate = row["Rate ($)"]
+                orig_markup = row["Markup (%)"]
+                new_rate = edited_pricing.iloc[i]["Rate ($)"]
+                new_markup = edited_pricing.iloc[i]["Markup (%)"]
+                if abs(new_rate - orig_rate) > 0.001:
+                    _rate_overrides[pm_key] = new_rate
+                if abs(new_markup - orig_markup) > 0.01:
+                    _markup_overrides[pm_key] = new_markup / 100.0
+
+        if _rate_overrides or _markup_overrides:
+            changes = len(_rate_overrides) + len(_markup_overrides)
+            st.success(f"{changes} pricing adjustment(s) will be applied to this job.")
+
     st.markdown("---")
 
     # Queue status in sidebar
@@ -1043,6 +1129,11 @@ with st.sidebar:
             "submitted": datetime.now().isoformat(),
             "status": "queued",
         }
+        # Include pricing overrides if any were adjusted
+        if _rate_overrides:
+            meta["rate_overrides"] = _rate_overrides
+        if _markup_overrides:
+            meta["markup_overrides"] = _markup_overrides
         _write_job_meta(job_id, meta)
 
         # ── Add to queue ──
