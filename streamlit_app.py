@@ -934,93 +934,138 @@ st.markdown(f"""
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# SIDEBAR — JOB SUBMISSION
+# SIDEBAR — Branding only
 # ═══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
     st.markdown(f'<div style="text-align:center;margin-bottom:0.5rem;">{LOGO_SVG}</div>', unsafe_allow_html=True)
+    st.markdown("#### Nightshift AI")
+    st.caption("Automated painting estimates from architectural PDFs")
+    st.markdown("---")
+    current_queue = _get_queue()
+    if current_queue:
+        st.warning(f"📊 Queue: {len(current_queue)} job(s) waiting")
+    else:
+        st.success("✅ Queue empty — jobs start immediately")
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# CLEANUP + ENSURE WORKER IS RUNNING (on every page load)
+# ═══════════════════════════════════════════════════════════════════════════════
+_cleanup_stale_queue()   # Clear orphaned jobs from previous crashes (runs once)
+_ensure_worker()         # Start worker thread if queue has jobs
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# MAIN AREA — JOB DASHBOARD
+# ═══════════════════════════════════════════════════════════════════════════════
+
+def _load_all_jobs():
+    """Load all job metadata from disk."""
+    jobs = {}
+    for jf in sorted(Path(JOBS_DIR).glob("*.json"), reverse=True):
+        try:
+            with open(jf) as f:
+                data = json.load(f)
+            jid = data.get("job_id", jf.stem)
+            jobs[jid] = data
+        except Exception:
+            pass
+    return jobs
+
+all_jobs = _load_all_jobs()
+
+# ── Tabs ──
+tab_new, tab_active, tab_history = st.tabs(["🖌️ New Estimate", "📊 Active & Queued", "📁 Completed"])
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# TAB: NEW ESTIMATE
+# ═══════════════════════════════════════════════════════════════════════════════
+with tab_new:
     st.header("New Estimate")
 
-    contact_name = st.text_input("Contact Name *", placeholder="e.g., John Smith")
-    contact_email = st.text_input("Contact Email *", placeholder="e.g., john@rider.com")
+    col_left, col_right = st.columns([1, 1])
 
-    st.markdown("---")
+    with col_left:
+        contact_name = st.text_input("Contact Name *", placeholder="e.g., John Smith")
+        contact_email = st.text_input("Contact Email *", placeholder="e.g., john@rider.com")
 
-    upload_mode = st.radio(
-        "Upload Method",
-        ["Individual PDFs", "ZIP Folder"],
-        horizontal=True,
-        help="Upload PDFs one at a time, or a ZIP containing a folder of PDFs.",
-    )
+        st.markdown("---")
 
-    # Upload key counter — incremented after submission to clear the file uploader
-    if "upload_key" not in st.session_state:
-        st.session_state.upload_key = 0
-
-    uploaded_files = []
-    if upload_mode == "Individual PDFs":
-        raw_uploads = st.file_uploader(
-            "Upload Construction PDFs *",
-            type=["pdf"],
-            accept_multiple_files=True,
-            help="Architectural drawings — floor plans, elevations, schedules. Max 200MB each.",
-            key=f"pdf_uploader_{st.session_state.upload_key}",
-        )
-        if raw_uploads:
-            uploaded_files = raw_uploads
-    else:
-        zip_upload = st.file_uploader(
-            "Upload ZIP folder containing PDFs *",
-            type=["zip"],
-            accept_multiple_files=False,
-            help="A .zip file containing one or more PDF drawings. Subfolders are included.",
-            key=f"zip_uploader_{st.session_state.upload_key}",
-        )
-        if zip_upload:
-            import zipfile
-            import io
-            try:
-                zf = zipfile.ZipFile(io.BytesIO(zip_upload.getvalue()))
-                pdf_names = [n for n in zf.namelist()
-                             if n.lower().endswith(".pdf") and not n.startswith("__MACOSX")]
-                if pdf_names:
-                    st.info(f"Found **{len(pdf_names)}** PDF(s) in ZIP: {', '.join(os.path.basename(n) for n in pdf_names[:5])}{'...' if len(pdf_names) > 5 else ''}")
-                    # Wrap extracted files as file-like objects with .name and .getbuffer()
-                    class _ZipPDF:
-                        def __init__(self, name, data):
-                            self.name = os.path.basename(name)
-                            self._data = data
-                        def getbuffer(self):
-                            return self._data
-                    for pname in pdf_names:
-                        uploaded_files.append(_ZipPDF(pname, zf.read(pname)))
-                else:
-                    st.warning("No PDF files found in the ZIP archive.")
-            except Exception as e:
-                st.error(f"Could not read ZIP file: {e}")
-
-    st.markdown("---")
-    with st.expander("⚙️ Advanced Options", expanded=False):
-        scope_notes = st.text_area(
-            "Scope Notes",
-            placeholder="e.g., Residential floors 2-4 only, skip basement",
-            help="Optional free-form notes to guide the extraction.",
-        )
-        image_fallback = st.checkbox(
-            "Image Fallback",
-            value=True,
-            help="Render large pages as images when native PDF extraction fails.",
-        )
-        multi_pass = st.checkbox(
-            "Multi-Pass Extraction",
-            value=False,
-            help="Run floor plans twice, keep best extraction. Slower but more accurate.",
+        upload_mode = st.radio(
+            "Upload Method",
+            ["Individual PDFs", "ZIP Folder"],
+            horizontal=True,
+            help="Upload PDFs one at a time, or a ZIP containing a folder of PDFs.",
         )
 
-    with st.expander("💲 Pricing (adjust rates before running)", expanded=False):
+        # Upload key counter — incremented after submission to clear the file uploader
+        if "upload_key" not in st.session_state:
+            st.session_state.upload_key = 0
+
+        uploaded_files = []
+        if upload_mode == "Individual PDFs":
+            raw_uploads = st.file_uploader(
+                "Upload Construction PDFs *",
+                type=["pdf"],
+                accept_multiple_files=True,
+                help="Architectural drawings — floor plans, elevations, schedules. Max 200MB each.",
+                key=f"pdf_uploader_{st.session_state.upload_key}",
+            )
+            if raw_uploads:
+                uploaded_files = raw_uploads
+        else:
+            zip_upload = st.file_uploader(
+                "Upload ZIP folder containing PDFs *",
+                type=["zip"],
+                accept_multiple_files=False,
+                help="A .zip file containing one or more PDF drawings. Subfolders are included.",
+                key=f"zip_uploader_{st.session_state.upload_key}",
+            )
+            if zip_upload:
+                import zipfile
+                import io
+                try:
+                    zf = zipfile.ZipFile(io.BytesIO(zip_upload.getvalue()))
+                    pdf_names = [n for n in zf.namelist()
+                                 if n.lower().endswith(".pdf") and not n.startswith("__MACOSX")]
+                    if pdf_names:
+                        st.info(f"Found **{len(pdf_names)}** PDF(s) in ZIP: {', '.join(os.path.basename(n) for n in pdf_names[:5])}{'...' if len(pdf_names) > 5 else ''}")
+                        class _ZipPDF:
+                            def __init__(self, name, data):
+                                self.name = os.path.basename(name)
+                                self._data = data
+                            def getbuffer(self):
+                                return self._data
+                        for pname in pdf_names:
+                            uploaded_files.append(_ZipPDF(pname, zf.read(pname)))
+                    else:
+                        st.warning("No PDF files found in the ZIP archive.")
+                except Exception as e:
+                    st.error(f"Could not read ZIP file: {e}")
+
+        st.markdown("---")
+        with st.expander("⚙️ Advanced Options", expanded=False):
+            scope_notes = st.text_area(
+                "Scope Notes",
+                placeholder="e.g., Residential floors 2-4 only, skip basement",
+                help="Optional free-form notes to guide the extraction.",
+            )
+            image_fallback = st.checkbox(
+                "Image Fallback",
+                value=True,
+                help="Render large pages as images when native PDF extraction fails.",
+            )
+            multi_pass = st.checkbox(
+                "Multi-Pass Extraction",
+                value=False,
+                help="Run floor plans twice, keep best extraction. Slower but more accurate.",
+            )
+
+    with col_right:
+        st.markdown("#### Pricing — Rates & Markups")
         st.caption("These are the rates Rider Painting uses for estimates. "
-                   "Adjust any values below — they'll be applied to this job only.")
+                   "Adjust any values below — changes apply to this job only.")
 
-        # Build the editable pricing table from PRICING_MODEL
         _pricing_display = [
             ("gyp_walls",          "Gyp. Walls",          "sqft"),
             ("gyp_ceilings",       "Gyp. Ceilings",       "sqft"),
@@ -1047,7 +1092,6 @@ with st.sidebar:
         for pm_key, label, unit in _pricing_display:
             if pm_key in PRICING_MODEL:
                 cfg = PRICING_MODEL[pm_key]
-                # Show the highest-tier rate as default (most common for larger projects)
                 default_rate = cfg["tiers"][-1]["rate"] if cfg["tiers"] else 0
                 default_markup = cfg["markup"]
                 _pricing_rows.append({
@@ -1073,7 +1117,6 @@ with st.sidebar:
             num_rows="fixed",
         )
 
-        # Detect changes from defaults
         _rate_overrides = {}
         _markup_overrides = {}
         if edited_pricing is not None:
@@ -1092,20 +1135,11 @@ with st.sidebar:
             changes = len(_rate_overrides) + len(_markup_overrides)
             st.success(f"{changes} pricing adjustment(s) will be applied to this job.")
 
+    # ── Submit button (full width below columns) ──
     st.markdown("---")
-
-    # Queue status in sidebar
-    current_queue = _get_queue()
-    if current_queue:
-        st.warning(f"📊 Queue: {len(current_queue)} job(s) waiting")
-    else:
-        st.success("✅ Queue empty — jobs start immediately")
-
-    # Validation
     can_submit = bool(contact_name and contact_email and uploaded_files)
 
     if st.button("🚀 Generate Estimate", type="primary", use_container_width=True, disabled=not can_submit):
-        # ── Save uploaded PDFs ──
         job_id = datetime.now().strftime("%Y%m%d_%H%M%S") + "_" + uuid.uuid4().hex[:6]
         job_dir = os.path.join(UPLOAD_DIR, job_id)
         os.makedirs(job_dir, exist_ok=True)
@@ -1117,7 +1151,6 @@ with st.sidebar:
                 out.write(f.getbuffer())
             pdf_paths.append(fpath)
 
-        # ── Save job metadata (queued status) ──
         meta = {
             "job_id": job_id,
             "contact_name": contact_name,
@@ -1129,20 +1162,15 @@ with st.sidebar:
             "submitted": datetime.now().isoformat(),
             "status": "queued",
         }
-        # Include pricing overrides if any were adjusted
         if _rate_overrides:
             meta["rate_overrides"] = _rate_overrides
         if _markup_overrides:
             meta["markup_overrides"] = _markup_overrides
         _write_job_meta(job_id, meta)
 
-        # ── Add to queue ──
         _enqueue_job(job_id)
-
-        # ── Start worker if needed ──
         _ensure_worker()
 
-        # Clear the file uploader for the next submission
         st.session_state.upload_key += 1
 
         queue_pos = _get_queue_position(job_id)
@@ -1150,7 +1178,6 @@ with st.sidebar:
             st.success(f"✅ Job **{job_id}** submitted! Processing now...")
         else:
             st.info(f"📋 Job **{job_id}** queued — position **#{queue_pos}**. It will start automatically when the current job finishes.")
-        # Paintbrush celebration animation
         st.markdown("""
         <style>
             @keyframes flyUp {
@@ -1193,41 +1220,11 @@ with st.sidebar:
     if not can_submit and uploaded_files:
         st.warning("Please fill in Contact Name and Email.")
 
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# CLEANUP + ENSURE WORKER IS RUNNING (on every page load)
-# ═══════════════════════════════════════════════════════════════════════════════
-_cleanup_stale_queue()   # Clear orphaned jobs from previous crashes (runs once)
-_ensure_worker()         # Start worker thread if queue has jobs
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# MAIN AREA — JOB DASHBOARD
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _load_all_jobs():
-    """Load all job metadata from disk."""
-    jobs = {}
-    for jf in sorted(Path(JOBS_DIR).glob("*.json"), reverse=True):
-        try:
-            with open(jf) as f:
-                data = json.load(f)
-            jid = data.get("job_id", jf.stem)
-            jobs[jid] = data
-        except Exception:
-            pass
-    return jobs
-
-all_jobs = _load_all_jobs()
-
-# ── Tabs ──
-tab_active, tab_history = st.tabs(["📊 Active & Queued", "📁 Completed"])
-
 with tab_active:
     active_jobs = {k: v for k, v in all_jobs.items() if v.get("status") in ("running", "queued")}
 
     if not active_jobs:
-        st.info("No active jobs. Upload PDFs in the sidebar to start a new estimate.")
+        st.info("No active jobs. Submit PDFs in the **New Estimate** tab to start.")
     else:
         for job_id, job in active_jobs.items():
             status = job.get("status", "unknown")
