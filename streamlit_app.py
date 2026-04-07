@@ -28,6 +28,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
 
+import pandas as pd
 import streamlit as st
 
 # ── Ensure imports from project root ──
@@ -1287,9 +1288,36 @@ with tab_history:
                                     interior_items.append(li)
 
                             with st.expander(f"💰 Estimate Summary — ${total:,.0f}", expanded=True):
+                                # ── Build editable line item tables ──
+                                def _build_editable_df(items):
+                                    """Build a DataFrame with original + adjustable columns."""
+                                    rows = []
+                                    for li in items:
+                                        li_total = li.get("total", 0) or li.get("total_cost", 0) or 0
+                                        if li_total <= 0:
+                                            continue
+                                        qty = float(li.get("qty", 0) or li.get("quantity", 0) or 0)
+                                        cost = float(li.get("cost", 0) or 0)
+                                        markup = float(li.get("markup", 0) or 0)
+                                        rate = round(cost / qty, 2) if qty > 0 else 0.0
+                                        markup_pct = round(markup / cost, 4) if cost > 0 else 0.06
+                                        rows.append({
+                                            "Line Item": li.get("item", "") or li.get("description", ""),
+                                            "Orig Qty": qty,
+                                            "Orig Rate": rate,
+                                            "Adjusted Qty": qty,
+                                            "Adjusted Rate": rate,
+                                            "_markup_pct": markup_pct,
+                                            "Orig Total": float(li_total),
+                                        })
+                                    return pd.DataFrame(rows) if rows else None
+
+                                int_df = _build_editable_df(interior_items)
+                                ext_df = _build_editable_df(exterior_items)
+
                                 # Top-level metrics
                                 mc1, mc2, mc3 = st.columns(3)
-                                mc1.metric("Total Estimate", f"${total:,.0f}")
+                                mc1.metric("Original Estimate", f"${total:,.0f}")
                                 mc2.metric("Interior", f"${interior_total:,.0f}")
                                 mc3.metric("Exterior", f"${exterior_total:,.0f}")
 
@@ -1298,38 +1326,115 @@ with tab_history:
                                 mc5.metric("Wall Area", f"{wall_sf:,.0f} SF")
                                 mc6.metric("Ceiling Area", f"{ceiling_sf:,.0f} SF")
 
-                                # Interior line items
                                 st.markdown("---")
-                                st.markdown(f"**🏠 Interior — ${interior_total:,.0f}**")
-                                if interior_items:
-                                    int_data = []
-                                    for li in interior_items:
-                                        li_total = li.get("total", 0) or li.get("total_cost", 0) or 0
-                                        if li_total > 0:
-                                            int_data.append({
-                                                "Line Item": li.get("item", "") or li.get("description", ""),
-                                                "Qty": f"{li.get('qty', 0) or li.get('quantity', 0):,.0f}",
-                                                "Cost": f"${li.get('cost', 0):,.0f}",
-                                                "Total": f"${li_total:,.0f}",
-                                            })
-                                    if int_data:
-                                        st.dataframe(int_data, use_container_width=True, hide_index=True)
+                                st.info("Edit the **Adjusted Qty** and **Adjusted Rate** columns to see updated totals. Original values are locked for reference.")
 
-                                # Exterior line items
-                                if exterior_items:
-                                    st.markdown(f"**🏗️ Exterior — ${exterior_total:,.0f}**")
-                                    ext_data = []
-                                    for li in exterior_items:
-                                        li_total = li.get("total", 0) or li.get("total_cost", 0) or 0
-                                        if li_total > 0:
-                                            ext_data.append({
-                                                "Line Item": li.get("item", "") or li.get("description", ""),
-                                                "Qty": f"{li.get('qty', 0) or li.get('quantity', 0):,.0f}",
-                                                "Cost": f"${li.get('cost', 0):,.0f}",
-                                                "Total": f"${li_total:,.0f}",
-                                            })
-                                    if ext_data:
-                                        st.dataframe(ext_data, use_container_width=True, hide_index=True)
+                                # ── Interior line items (editable) ──
+                                st.markdown(f"**🏠 Interior — Original: ${interior_total:,.0f}**")
+                                adj_int_total = interior_total
+                                if int_df is not None and not int_df.empty:
+                                    edited_int = st.data_editor(
+                                        int_df[["Line Item", "Orig Qty", "Orig Rate", "Adjusted Qty", "Adjusted Rate"]],
+                                        column_config={
+                                            "Line Item": st.column_config.TextColumn("Line Item", disabled=True, width="large"),
+                                            "Orig Qty": st.column_config.NumberColumn("Orig Qty", disabled=True, format="%.0f"),
+                                            "Orig Rate": st.column_config.NumberColumn("Orig Rate ($)", disabled=True, format="$%.2f"),
+                                            "Adjusted Qty": st.column_config.NumberColumn("Adjusted Qty", format="%.0f", min_value=0),
+                                            "Adjusted Rate": st.column_config.NumberColumn("Adjusted Rate ($)", format="$%.2f", min_value=0.0, step=0.01),
+                                        },
+                                        use_container_width=True,
+                                        hide_index=True,
+                                        key=f"int_edit_{job_id}",
+                                        num_rows="fixed",
+                                    )
+                                    # Recalculate from edited values
+                                    if edited_int is not None:
+                                        _adj_cost = edited_int["Adjusted Qty"] * edited_int["Adjusted Rate"]
+                                        _adj_markup = _adj_cost * int_df["_markup_pct"]
+                                        _adj_line_totals = (_adj_cost + _adj_markup).round(2)
+                                        adj_int_total = _adj_line_totals.sum()
+
+                                        # Show per-line adjusted totals
+                                        summary_int = pd.DataFrame({
+                                            "Line Item": edited_int["Line Item"],
+                                            "Adjusted Total": _adj_line_totals,
+                                            "Orig Total": int_df["Orig Total"],
+                                            "Change": _adj_line_totals - int_df["Orig Total"],
+                                        })
+                                        has_changes = (summary_int["Change"].abs() > 0.01).any()
+                                        if has_changes:
+                                            changed = summary_int[summary_int["Change"].abs() > 0.01]
+                                            st.dataframe(
+                                                changed[["Line Item", "Orig Total", "Adjusted Total", "Change"]],
+                                                column_config={
+                                                    "Line Item": st.column_config.TextColumn("Line Item", width="large"),
+                                                    "Orig Total": st.column_config.NumberColumn("Orig Total", format="$%.0f"),
+                                                    "Adjusted Total": st.column_config.NumberColumn("Adjusted Total", format="$%.0f"),
+                                                    "Change": st.column_config.NumberColumn("Change", format="$%+.0f"),
+                                                },
+                                                use_container_width=True,
+                                                hide_index=True,
+                                            )
+                                    st.markdown(f"**Adjusted Interior Total: ${adj_int_total:,.0f}**")
+
+                                # ── Exterior line items (editable) ──
+                                adj_ext_total = exterior_total
+                                if ext_df is not None and not ext_df.empty:
+                                    st.markdown("---")
+                                    st.markdown(f"**🏗️ Exterior — Original: ${exterior_total:,.0f}**")
+                                    edited_ext = st.data_editor(
+                                        ext_df[["Line Item", "Orig Qty", "Orig Rate", "Adjusted Qty", "Adjusted Rate"]],
+                                        column_config={
+                                            "Line Item": st.column_config.TextColumn("Line Item", disabled=True, width="large"),
+                                            "Orig Qty": st.column_config.NumberColumn("Orig Qty", disabled=True, format="%.0f"),
+                                            "Orig Rate": st.column_config.NumberColumn("Orig Rate ($)", disabled=True, format="$%.2f"),
+                                            "Adjusted Qty": st.column_config.NumberColumn("Adjusted Qty", format="%.0f", min_value=0),
+                                            "Adjusted Rate": st.column_config.NumberColumn("Adjusted Rate ($)", format="$%.2f", min_value=0.0, step=0.01),
+                                        },
+                                        use_container_width=True,
+                                        hide_index=True,
+                                        key=f"ext_edit_{job_id}",
+                                        num_rows="fixed",
+                                    )
+                                    if edited_ext is not None:
+                                        _adj_cost = edited_ext["Adjusted Qty"] * edited_ext["Adjusted Rate"]
+                                        _adj_markup = _adj_cost * ext_df["_markup_pct"]
+                                        _adj_line_totals = (_adj_cost + _adj_markup).round(2)
+                                        adj_ext_total = _adj_line_totals.sum()
+
+                                        summary_ext = pd.DataFrame({
+                                            "Line Item": edited_ext["Line Item"],
+                                            "Adjusted Total": _adj_line_totals,
+                                            "Orig Total": ext_df["Orig Total"],
+                                            "Change": _adj_line_totals - ext_df["Orig Total"],
+                                        })
+                                        has_changes = (summary_ext["Change"].abs() > 0.01).any()
+                                        if has_changes:
+                                            changed = summary_ext[summary_ext["Change"].abs() > 0.01]
+                                            st.dataframe(
+                                                changed[["Line Item", "Orig Total", "Adjusted Total", "Change"]],
+                                                column_config={
+                                                    "Line Item": st.column_config.TextColumn("Line Item", width="large"),
+                                                    "Orig Total": st.column_config.NumberColumn("Orig Total", format="$%.0f"),
+                                                    "Adjusted Total": st.column_config.NumberColumn("Adjusted Total", format="$%.0f"),
+                                                    "Change": st.column_config.NumberColumn("Change", format="$%+.0f"),
+                                                },
+                                                use_container_width=True,
+                                                hide_index=True,
+                                            )
+                                    st.markdown(f"**Adjusted Exterior Total: ${adj_ext_total:,.0f}**")
+
+                                # ── Adjusted grand total ──
+                                st.markdown("---")
+                                adj_grand = adj_int_total + adj_ext_total
+                                delta = adj_grand - total
+                                t1, t2 = st.columns(2)
+                                t1.metric("Adjusted Total Estimate", f"${adj_grand:,.0f}",
+                                          delta=f"${delta:+,.0f}" if abs(delta) > 0.01 else None,
+                                          delta_color="normal")
+                                if abs(delta) > 0.01:
+                                    pct = (delta / total * 100) if total else 0
+                                    t2.metric("Change", f"{pct:+.1f}%")
 
                                 rfi = analysis_data.get("rfi_items", [])
                                 if rfi:

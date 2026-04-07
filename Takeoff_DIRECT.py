@@ -7610,6 +7610,50 @@ def _num(val):
     return 0
 
 
+def _apply_rate_overrides(rate_overrides):
+    """Build a modified copy of PRICING_MODEL with CLI rate overrides applied.
+
+    rate_overrides is a dict mapping shorthand keys to values:
+        {"wall_rate": 1.50, "door_rate": 200, "markup": 0.08, ...}
+
+    Supported keys:
+        wall_rate, ceiling_rate, door_rate, window_rate, trim_rate, stair_rate,
+        cmu_rate, dryfall_rate, concrete_rate, column_rate,
+        markup (global override for all items)
+    """
+    import copy
+    pm = copy.deepcopy(PRICING_MODEL)
+
+    # Map shorthand keys → PRICING_MODEL item keys
+    _rate_map = {
+        "wall_rate":     "gyp_walls",
+        "ceiling_rate":  "gyp_ceilings",
+        "door_rate":     "doors_full_paint",
+        "window_rate":   "windows",
+        "trim_rate":     "base_trim",
+        "stair_rate":    "stairs",
+        "cmu_rate":      "cmu_walls_full",
+        "dryfall_rate":  "dryfall_ceiling",
+        "concrete_rate": "concrete_sealer",
+        "column_rate":   "painted_columns",
+    }
+
+    for key, pm_key in _rate_map.items():
+        if key in rate_overrides and pm_key in pm:
+            new_rate = float(rate_overrides[key])
+            # Set all tiers to the flat override rate
+            for tier in pm[pm_key]["tiers"]:
+                tier["rate"] = new_rate
+
+    # Global markup override
+    if "markup" in rate_overrides:
+        new_markup = float(rate_overrides["markup"])
+        for item_key in pm:
+            pm[item_key]["markup"] = new_markup
+
+    return pm
+
+
 def _get_tiered_rate(item_config, quantity):
     """Return the unit rate for the tier matching the given quantity.
 
@@ -7703,8 +7747,12 @@ def _detect_single_family_from_rooms(analysis):
 
 
 def calculate_costs(aggregated_totals, exterior=None, building_type="", project_info=None,
-                    analysis=None):
-    """Calculate costs using Rider Painting pricing model from config.py"""
+                    analysis=None, pricing_model_override=None):
+    """Calculate costs using Rider Painting pricing model from config.py.
+
+    If pricing_model_override is provided (a dict with the same structure as
+    PRICING_MODEL), it is used instead of the global PRICING_MODEL.
+    """
 
     if exterior is None:
         exterior = {}
@@ -7773,7 +7821,7 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
         """Return markup for an item — override for single-family, else use config default."""
         if markup_override is not None:
             return markup_override
-        return PRICING_MODEL[item_key]['markup']
+        return pm[item_key]['markup']
 
     def _line(label, qty, unit_cost, markup_pct):
         cost = qty * unit_cost
@@ -7972,7 +8020,7 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
         if not (is_single_family and _sf_stories_ext <= 3) and _sf_stories_ext >= 2:
             lift_needed = 1
 
-    pm = PRICING_MODEL
+    pm = pricing_model_override if pricing_model_override else PRICING_MODEL
 
     # Resolve tiered rates based on actual project quantities
     wall_rate   = _get_tiered_rate(pm['gyp_walls'], wall_sqft)
@@ -8555,6 +8603,343 @@ def print_estimate(analysis, costs):
         for note in notes:
             print(f"  • {note}")
 
+def interactive_adjustments(analysis, costs, pricing_model_used=None):
+    """Post-run interactive CLI for adjusting pricing, measurements, counts, and scope.
+
+    Displays a menu loop allowing the user to modify values and immediately see
+    recalculated costs.  Returns the final (analysis, costs, pricing_model_used,
+    adjustments_log) tuple.
+    """
+    import copy
+    if pricing_model_used is None:
+        pricing_model_used = copy.deepcopy(PRICING_MODEL)
+    else:
+        pricing_model_used = copy.deepcopy(pricing_model_used)
+
+    adjustments_log = []
+    totals = analysis.get('aggregated_totals', {})
+    exterior = analysis.get('exterior', {})
+
+    def _recalc():
+        nonlocal costs
+        costs = calculate_costs(
+            totals,
+            exterior=exterior,
+            building_type=analysis.get('project_info', {}).get('building_type', ''),
+            project_info=analysis.get('project_info', {}),
+            analysis=analysis,
+            pricing_model_override=pricing_model_used,
+        )
+        print_estimate(analysis, costs)
+
+    def _prompt(msg):
+        try:
+            return input(msg).strip()
+        except (EOFError, KeyboardInterrupt):
+            return ""
+
+    # ── Measurement key labels ──
+    _meas_keys = [
+        ("total_paintable_wall_sqft",       "Gyp. Walls (sqft)"),
+        ("total_paintable_ceiling_sqft",    "Gyp. Ceilings (sqft)"),
+        ("total_cmu_wall_sqft",             "CMU Walls (sqft)"),
+        ("total_dryfall_ceiling_sqft",      "Dryfall Ceiling (sqft)"),
+        ("total_base_trim_lf",              "Base Trim (LF)"),
+        ("total_concrete_floor_sqft",       "Concrete Floor (sqft)"),
+        ("total_wallcovering_sqft",         "Wallcovering (sqft)"),
+        ("total_stained_wood_sqft",         "Stained Wood (sqft)"),
+        ("total_soffit_sqft",               "Interior Soffits (sqft)"),
+        ("total_gyp_between_stairs_sqft",   "Gyp. Between Stairs (sqft)"),
+        ("total_level_5_finish_sqft",       "Level 5 Finish (sqft)"),
+    ]
+
+    _count_keys = [
+        ("total_doors_full_paint",          "Doors (Full Paint)"),
+        ("total_doors_hm_panel",            "Doors (HM Panel)"),
+        ("total_doors_frame_only",          "Doors (Frame Only)"),
+        ("total_windows_painted_interior",  "Windows (Painted Int.)"),
+        ("total_windows_all",               "Windows (All)"),
+        ("total_stair_sections",            "Stair Sections"),
+        ("total_painted_columns_ea",        "Painted Columns"),
+    ]
+
+    # ── Rate shorthand → PRICING_MODEL key ──
+    _rate_items = [
+        ("gyp_walls",          "Gyp. Walls"),
+        ("gyp_ceilings",       "Gyp. Ceilings"),
+        ("base_trim",          "Base Trim"),
+        ("doors_full_paint",   "Doors (Full Paint)"),
+        ("doors_hm_panel",     "Doors (HM Panel)"),
+        ("doors_frame_only",   "Doors (Frame Only)"),
+        ("windows",            "Windows"),
+        ("stairs",             "Stairs"),
+        ("cmu_walls_full",     "CMU Walls"),
+        ("dryfall_ceiling",    "Dryfall Ceiling"),
+        ("concrete_sealer",    "Concrete Sealer"),
+        ("painted_columns",    "Painted Columns"),
+        ("wallcovering_install", "Wallcovering Install"),
+        ("stained_wood",       "Stained Wood"),
+        ("exterior_cornice",   "Ext. Cornice"),
+        ("exterior_window_trim","Ext. Window Trim"),
+        ("exterior_painting",  "Ext. Painting"),
+        ("exterior_lift_rental","Ext. Lift Rental"),
+    ]
+
+    while True:
+        print("\n┌─────────────────────────────────────────┐")
+        print("│  ADJUSTMENT MENU                        │")
+        print("│                                         │")
+        print("│  1. Adjust Pricing (rates & markups)    │")
+        print("│  2. Adjust Measurements (sqft, LF)      │")
+        print("│  3. Adjust Counts (doors, windows, etc) │")
+        print("│  4. Other (exclude rooms, custom items) │")
+        print("│  5. Regenerate PDF with current values  │")
+        print("│  6. Save & Exit                         │")
+        print("│  0. Exit without saving adjustments     │")
+        print("└─────────────────────────────────────────┘")
+
+        choice = _prompt("\nSelect option: ")
+
+        # ── 1. PRICING ──
+        if choice == "1":
+            while True:
+                print("\n── PRICING: Current Rates & Markups ──")
+                valid_items = []
+                for i, (pm_key, label) in enumerate(_rate_items, 1):
+                    if pm_key in pricing_model_used:
+                        cfg = pricing_model_used[pm_key]
+                        rate = cfg["tiers"][-1]["rate"] if cfg["tiers"] else 0
+                        markup = cfg["markup"]
+                        unit = cfg.get("unit", "")
+                        print(f"  {i:>2}. {label:<28} ${rate:>10,.2f}/{unit}  "
+                              f"(markup: {markup*100:.1f}%)")
+                        valid_items.append((i, pm_key, label))
+
+                print(f"\n  Type '<number> <new_rate>' to change a rate")
+                print(f"  Type '<number> markup <pct>' to change markup (e.g. '1 markup 8')")
+                print(f"  Type 'back' to return to main menu")
+                inp = _prompt("\n  > ")
+                if inp.lower() in ("back", "b", ""):
+                    break
+
+                parts = inp.split()
+                try:
+                    idx = int(parts[0])
+                    match = next((pm_key for i, pm_key, _ in valid_items if i == idx), None)
+                    if not match:
+                        print("  Invalid item number.")
+                        continue
+
+                    if len(parts) >= 3 and parts[1].lower() == "markup":
+                        new_markup = float(parts[2]) / 100.0
+                        old_markup = pricing_model_used[match]["markup"]
+                        pricing_model_used[match]["markup"] = new_markup
+                        adjustments_log.append(
+                            f"Markup {match}: {old_markup*100:.1f}% → {new_markup*100:.1f}%")
+                        print(f"  ✓ Markup updated")
+                    elif len(parts) >= 2:
+                        new_rate = float(parts[1])
+                        old_rate = pricing_model_used[match]["tiers"][-1]["rate"]
+                        for tier in pricing_model_used[match]["tiers"]:
+                            tier["rate"] = new_rate
+                        adjustments_log.append(
+                            f"Rate {match}: ${old_rate:,.2f} → ${new_rate:,.2f}")
+                        print(f"  ✓ Rate updated")
+                    else:
+                        print("  Usage: <number> <new_rate>  or  <number> markup <pct>")
+                        continue
+
+                    _recalc()
+                except (ValueError, IndexError):
+                    print("  Invalid input. Use: <number> <new_rate>")
+
+        # ── 2. MEASUREMENTS ──
+        elif choice == "2":
+            while True:
+                print("\n── MEASUREMENTS: Current Values ──")
+                for i, (key, label) in enumerate(_meas_keys, 1):
+                    val = _num(totals.get(key, 0))
+                    print(f"  {i:>2}. {label:<32} {val:>12,.0f}")
+
+                print(f"\n  Type '<number> <new_value>' to change")
+                print(f"  Type 'back' to return to main menu")
+                inp = _prompt("\n  > ")
+                if inp.lower() in ("back", "b", ""):
+                    break
+
+                parts = inp.split()
+                try:
+                    idx = int(parts[0]) - 1
+                    new_val = float(parts[1].replace(",", ""))
+                    if 0 <= idx < len(_meas_keys):
+                        key, label = _meas_keys[idx]
+                        old_val = _num(totals.get(key, 0))
+                        totals[key] = new_val
+                        adjustments_log.append(
+                            f"Measurement {label}: {old_val:,.0f} → {new_val:,.0f}")
+                        print(f"  ✓ {label} updated: {old_val:,.0f} → {new_val:,.0f}")
+                        _recalc()
+                    else:
+                        print("  Invalid item number.")
+                except (ValueError, IndexError):
+                    print("  Invalid input. Use: <number> <new_value>")
+
+        # ── 3. COUNTS ──
+        elif choice == "3":
+            while True:
+                print("\n── COUNTS: Current Values ──")
+                for i, (key, label) in enumerate(_count_keys, 1):
+                    val = _num(totals.get(key, 0))
+                    print(f"  {i:>2}. {label:<32} {val:>8,.0f}")
+
+                print(f"\n  Type '<number> <new_value>' to change")
+                print(f"  Type 'back' to return to main menu")
+                inp = _prompt("\n  > ")
+                if inp.lower() in ("back", "b", ""):
+                    break
+
+                parts = inp.split()
+                try:
+                    idx = int(parts[0]) - 1
+                    new_val = float(parts[1].replace(",", ""))
+                    if 0 <= idx < len(_count_keys):
+                        key, label = _count_keys[idx]
+                        old_val = _num(totals.get(key, 0))
+                        totals[key] = new_val
+                        adjustments_log.append(
+                            f"Count {label}: {old_val:,.0f} → {new_val:,.0f}")
+                        print(f"  ✓ {label} updated: {old_val:,.0f} → {new_val:,.0f}")
+                        _recalc()
+                    else:
+                        print("  Invalid item number.")
+                except (ValueError, IndexError):
+                    print("  Invalid input. Use: <number> <new_value>")
+
+        # ── 4. OTHER ──
+        elif choice == "4":
+            while True:
+                print("\n── OTHER ADJUSTMENTS ──")
+                print("  1. Exclude a room by ID")
+                print("  2. Include a room by ID (force in-scope)")
+                print("  3. Change building type")
+                print("  4. Add custom line item")
+                print("  5. List rooms")
+                print("  Type 'back' to return to main menu")
+                inp = _prompt("\n  > ")
+                if inp.lower() in ("back", "b", ""):
+                    break
+
+                if inp == "1":
+                    rid = _prompt("  Room ID to exclude: ")
+                    if not rid:
+                        continue
+                    found = False
+                    for floor in analysis.get("floors", []):
+                        for room in floor.get("rooms", []):
+                            if room.get("room_id", "") == rid:
+                                room["in_scope"] = False
+                                room["scope_exclusion_reason"] = "Excluded via interactive adjustment"
+                                found = True
+                    if found:
+                        # Recalculate totals from rooms
+                        _recalculate_totals(analysis)
+                        totals = analysis.get('aggregated_totals', {})
+                        adjustments_log.append(f"Room excluded: {rid}")
+                        print(f"  ✓ Room {rid} excluded")
+                        _recalc()
+                    else:
+                        print(f"  Room ID '{rid}' not found.")
+
+                elif inp == "2":
+                    rid = _prompt("  Room ID to include: ")
+                    if not rid:
+                        continue
+                    found = False
+                    for floor in analysis.get("floors", []):
+                        for room in floor.get("rooms", []):
+                            if room.get("room_id", "") == rid:
+                                room["in_scope"] = True
+                                room["scope_exclusion_reason"] = ""
+                                found = True
+                    if found:
+                        _recalculate_totals(analysis)
+                        totals = analysis.get('aggregated_totals', {})
+                        adjustments_log.append(f"Room included: {rid}")
+                        print(f"  ✓ Room {rid} included")
+                        _recalc()
+                    else:
+                        print(f"  Room ID '{rid}' not found.")
+
+                elif inp == "3":
+                    current_bt = analysis.get('project_info', {}).get('building_type', 'unknown')
+                    print(f"  Current building type: {current_bt}")
+                    new_bt = _prompt("  New building type: ")
+                    if new_bt:
+                        analysis.setdefault('project_info', {})['building_type'] = new_bt
+                        adjustments_log.append(
+                            f"Building type: {current_bt} → {new_bt}")
+                        print(f"  ✓ Building type updated")
+                        _recalc()
+
+                elif inp == "4":
+                    desc = _prompt("  Line item description: ")
+                    qty_s = _prompt("  Quantity: ")
+                    rate_s = _prompt("  Unit rate ($): ")
+                    markup_s = _prompt("  Markup % (default 6): ") or "6"
+                    try:
+                        qty = float(qty_s.replace(",", ""))
+                        rate = float(rate_s.replace(",", ""))
+                        markup_pct = float(markup_s) / 100.0
+                        cost = qty * rate
+                        markup = cost * markup_pct
+                        item = {
+                            "item": desc,
+                            "qty": qty,
+                            "cost": round(cost, 2),
+                            "markup": round(markup, 2),
+                            "total": round(cost + markup, 2),
+                        }
+                        costs["line_items"].append(item)
+                        costs["subtotal"] = round(
+                            sum(li["total"] for li in costs["line_items"]), 2)
+                        adjustments_log.append(
+                            f"Custom line item added: {desc} — ${item['total']:,.2f}")
+                        print(f"  ✓ Added: {desc} — ${item['total']:,.2f}")
+                        print_estimate(analysis, costs)
+                    except ValueError:
+                        print("  Invalid numbers.")
+
+                elif inp == "5":
+                    for floor in analysis.get("floors", []):
+                        print(f"\n  Floor: {floor.get('floor_name', '?')}")
+                        for room in floor.get("rooms", []):
+                            scope = "IN" if room.get("in_scope", True) else "OUT"
+                            rid = room.get("room_id", "?")
+                            rname = room.get("room_name", "?")
+                            mult = room.get("unit_multiplier", 1)
+                            mult_s = f" (×{mult})" if mult > 1 else ""
+                            print(f"    [{scope}] {rid} — {rname}{mult_s}")
+
+        # ── 5. REGENERATE PDF ──
+        elif choice == "5":
+            print("\n  Regenerating PDF...")
+            # Save updated JSON and regenerate PDF
+            return analysis, costs, pricing_model_used, adjustments_log, True  # regenerate=True
+
+        # ── 6. SAVE & EXIT ──
+        elif choice == "6":
+            return analysis, costs, pricing_model_used, adjustments_log, True  # regenerate=True
+
+        # ── 0. EXIT WITHOUT SAVING ──
+        elif choice == "0":
+            return analysis, costs, pricing_model_used, adjustments_log, False  # don't regenerate
+
+        else:
+            print("  Invalid option. Enter 1-6 or 0.")
+
+    return analysis, costs, pricing_model_used, adjustments_log, False
+
+
 def analyze_and_parse(client, pdf_path, scope_notes="", schedule_hints=None,
                       building_inventory=None):
     """Analyze a single PDF and return parsed JSON. Returns (path, analysis_dict) or None on failure."""
@@ -8578,7 +8963,8 @@ def analyze_and_parse(client, pdf_path, scope_notes="", schedule_hints=None,
 
 def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                   corrections_path=None, use_cache=False, multi_pass=False,
-                  image_fallback=True, schedule_estimation=True):
+                  image_fallback=True, schedule_estimation=True,
+                  rate_overrides=None, interactive=False):
     """
     Programmatic entry point for the analysis pipeline.
     Called by email_processor.py (or any external caller).
@@ -8650,6 +9036,12 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                     analysis = _apply_corrections(analysis, corrections)
                     analysis = _recalculate_totals(analysis)
 
+                # Apply pre-run rate overrides (cached path)
+                pricing_model_used = None
+                if rate_overrides:
+                    pricing_model_used = _apply_rate_overrides(rate_overrides)
+                    print(f"\n📊 Rate overrides applied: {', '.join(rate_overrides.keys())}")
+
                 # Re-run cost calculation (uses current pricing from config.py)
                 print("\n💰 Calculating costs...")
                 costs = calculate_costs(
@@ -8658,8 +9050,20 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                     building_type=analysis.get('project_info', {}).get('building_type', ''),
                     project_info=analysis.get('project_info', {}),
                     analysis=analysis,
+                    pricing_model_override=pricing_model_used,
                 )
                 print_estimate(analysis, costs)
+
+                # Interactive adjustment mode (cached path)
+                adjustments_log = []
+                if interactive:
+                    print("\n🔧 Entering interactive adjustment mode...")
+                    analysis, costs, pricing_model_used, adjustments_log, _ = \
+                        interactive_adjustments(analysis, costs, pricing_model_used)
+                    if adjustments_log:
+                        analysis.setdefault("notes", []).append(
+                            f"[Adjustments] {len(adjustments_log)} manual adjustment(s) applied"
+                        )
 
                 validation = _validate_cost_estimate(analysis, costs)
                 if validation["warnings"]:
@@ -8696,7 +9100,8 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                     "analysis": analysis,
                     "cost_estimate": costs,
                     "validation": validation,
-                    "pricing_model": PRICING_MODEL,
+                    "pricing_model": pricing_model_used if pricing_model_used else PRICING_MODEL,
+                    "adjustments_applied": adjustments_log if adjustments_log else None,
                     "rfi_items": rfi_items if rfi_items else None,
                 }
                 with open(output_json, 'w') as f:
@@ -9504,6 +9909,16 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         _pi = analysis.setdefault('project_info', {})
         _pi['_building_inventory_units'] = building_inventory['total_units']
 
+    # --- Apply pre-run rate overrides ---
+    pricing_model_used = None
+    if rate_overrides:
+        pricing_model_used = _apply_rate_overrides(rate_overrides)
+        overridden = [k for k in rate_overrides if k != "markup"]
+        if overridden:
+            print(f"\n📊 Rate overrides applied: {', '.join(overridden)}")
+        if "markup" in rate_overrides:
+            print(f"   Global markup override: {float(rate_overrides['markup'])*100:.1f}%")
+
     # --- Calculate costs ---
     _update_progress(6, TOTAL_STEPS, "Calculating Costs", "Applying pricing model...")
     print("\n💰 Calculating costs...")
@@ -9513,9 +9928,22 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         building_type=analysis.get('project_info', {}).get('building_type', ''),
         project_info=analysis.get('project_info', {}),
         analysis=analysis,
+        pricing_model_override=pricing_model_used,
     )
 
     print_estimate(analysis, costs)
+
+    # --- Interactive adjustment mode ---
+    adjustments_log = []
+    if interactive:
+        print("\n🔧 Entering interactive adjustment mode...")
+        print("   You can modify pricing, measurements, counts, and scope.")
+        analysis, costs, pricing_model_used, adjustments_log, regenerate = \
+            interactive_adjustments(analysis, costs, pricing_model_used)
+        if adjustments_log:
+            analysis.setdefault("notes", []).append(
+                f"[Adjustments] {len(adjustments_log)} manual adjustment(s) applied"
+            )
 
     # --- Validate cost estimate ---
     validation = _validate_cost_estimate(analysis, costs)
@@ -9561,7 +9989,8 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         "analysis": analysis,
         "cost_estimate": costs,
         "validation": validation,
-        "pricing_model": PRICING_MODEL,
+        "pricing_model": pricing_model_used if pricing_model_used else PRICING_MODEL,
+        "adjustments_applied": adjustments_log if adjustments_log else None,
         "rfi_items": rfi_items if rfi_items else None,
     }
 
@@ -9593,6 +10022,7 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         "contact": {"name": contact_name, "email": contact_email},
         "document": document_ref,
         "rfi_items": rfi_items,
+        "adjustments_applied": adjustments_log if adjustments_log else None,
     }
 
 
@@ -9615,6 +10045,15 @@ def main():
         print('  --no-image-fallback  Disable image fallback')
         print('  --schedule-estimation  Estimate from Room Finish Schedules when floor plans missing (default: ON)')
         print('  --no-schedule-estimation  Disable schedule-based estimation')
+        print("\nAdjustment flags (pre-run rate overrides):")
+        print('  --interactive         Enable post-run interactive adjustment menu')
+        print('  --wall-rate 1.50      Override gyp wall rate ($/sqft)')
+        print('  --ceiling-rate 1.50   Override ceiling rate ($/sqft)')
+        print('  --door-rate 200       Override door (full paint) rate ($/ea)')
+        print('  --window-rate 425     Override window rate ($/ea)')
+        print('  --trim-rate 3.25      Override base trim rate ($/LF)')
+        print('  --stair-rate 1500     Override stair rate ($/ea)')
+        print('  --markup 0.08         Override global markup (decimal, e.g. 0.08 = 8%)')
         sys.exit(1)
 
     # Parse boolean flags (no value) separately from key-value pairs
@@ -9625,7 +10064,8 @@ def main():
         arg = sys.argv[i]
         if arg in ('--cache', '--no-cache', '--clear-cache', '--multi-pass',
                     '--image-fallback', '--no-image-fallback',
-                    '--schedule-estimation', '--no-schedule-estimation'):
+                    '--schedule-estimation', '--no-schedule-estimation',
+                    '--interactive'):
             bool_flags.add(arg[2:])  # strip '--'
             i += 1
         elif arg.startswith('--') and i + 1 < len(sys.argv):
@@ -9646,6 +10086,27 @@ def main():
     multi_pass = 'multi-pass' in bool_flags
     image_fallback = 'no-image-fallback' not in bool_flags  # default ON
     schedule_estimation = 'no-schedule-estimation' not in bool_flags  # default ON
+    interactive = 'interactive' in bool_flags
+
+    # Build rate_overrides dict from CLI flags
+    rate_overrides = {}
+    _rate_flag_map = {
+        'wall-rate': 'wall_rate',
+        'ceiling-rate': 'ceiling_rate',
+        'door-rate': 'door_rate',
+        'window-rate': 'window_rate',
+        'trim-rate': 'trim_rate',
+        'stair-rate': 'stair_rate',
+        'markup': 'markup',
+    }
+    for flag, key in _rate_flag_map.items():
+        if flag in args:
+            try:
+                rate_overrides[key] = float(args[flag])
+            except ValueError:
+                print(f"⚠️  Invalid value for --{flag}: {args[flag]} (must be a number)")
+    if not rate_overrides:
+        rate_overrides = None
 
     # Build list of PDFs to process
     if rfp_dir:
@@ -9676,7 +10137,9 @@ def main():
                      scope_notes=scope_notes, corrections_path=corrections_path,
                      use_cache=use_cache, multi_pass=multi_pass,
                      image_fallback=image_fallback,
-                     schedule_estimation=schedule_estimation)
+                     schedule_estimation=schedule_estimation,
+                     rate_overrides=rate_overrides,
+                     interactive=interactive)
 
     except anthropic.RateLimitError:
         print("\n❌ API rate limit exceeded after multiple retries")
