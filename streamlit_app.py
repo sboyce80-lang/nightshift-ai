@@ -1315,16 +1315,9 @@ with tab_history:
                                 int_df = _build_editable_df(interior_items)
                                 ext_df = _build_editable_df(exterior_items)
 
-                                # Top-level metrics
-                                mc1, mc2, mc3 = st.columns(3)
-                                mc1.metric("Original Estimate", f"${total:,.0f}")
-                                mc2.metric("Interior", f"${interior_total:,.0f}")
-                                mc3.metric("Exterior", f"${exterior_total:,.0f}")
-
-                                mc4, mc5, mc6 = st.columns(3)
-                                mc4.metric("Rooms Found", f"{rooms}")
-                                mc5.metric("Wall Area", f"{wall_sf:,.0f} SF")
-                                mc6.metric("Ceiling Area", f"{ceiling_sf:,.0f} SF")
+                                # Reserve a container at the top for summary metrics
+                                # (populated after editors compute adjusted totals)
+                                summary_container = st.container()
 
                                 st.markdown("---")
                                 st.info("Edit the **Adjusted Qty** and **Adjusted Rate** columns to see updated totals. Original values are locked for reference.")
@@ -1424,17 +1417,41 @@ with tab_history:
                                             )
                                     st.markdown(f"**Adjusted Exterior Total: ${adj_ext_total:,.0f}**")
 
-                                # ── Adjusted grand total ──
-                                st.markdown("---")
+                                # ── Populate the summary container at the top ──
                                 adj_grand = adj_int_total + adj_ext_total
                                 delta = adj_grand - total
-                                t1, t2 = st.columns(2)
-                                t1.metric("Adjusted Total Estimate", f"${adj_grand:,.0f}",
-                                          delta=f"${delta:+,.0f}" if abs(delta) > 0.01 else None,
-                                          delta_color="normal")
-                                if abs(delta) > 0.01:
-                                    pct = (delta / total * 100) if total else 0
-                                    t2.metric("Change", f"{pct:+.1f}%")
+                                has_adjustments = abs(delta) > 0.01
+                                int_delta = adj_int_total - interior_total
+                                ext_delta = adj_ext_total - exterior_total
+
+                                with summary_container:
+                                    # Row 1: Original values
+                                    mc1, mc2, mc3 = st.columns(3)
+                                    mc1.metric("Original Estimate", f"${total:,.0f}")
+                                    mc2.metric("Interior (Orig)", f"${interior_total:,.0f}")
+                                    mc3.metric("Exterior (Orig)", f"${exterior_total:,.0f}")
+
+                                    # Row 2: Adjusted values (with deltas)
+                                    ac1, ac2, ac3 = st.columns(3)
+                                    ac1.metric("Adjusted Estimate", f"${adj_grand:,.0f}",
+                                               delta=f"${delta:+,.0f}" if has_adjustments else None,
+                                               delta_color="normal")
+                                    ac2.metric("Interior (Adj)", f"${adj_int_total:,.0f}",
+                                               delta=f"${int_delta:+,.0f}" if abs(int_delta) > 0.01 else None,
+                                               delta_color="normal")
+                                    ac3.metric("Exterior (Adj)", f"${adj_ext_total:,.0f}",
+                                               delta=f"${ext_delta:+,.0f}" if abs(ext_delta) > 0.01 else None,
+                                               delta_color="normal")
+
+                                    # Row 3: Project info
+                                    mc4, mc5, mc6 = st.columns(3)
+                                    mc4.metric("Rooms Found", f"{rooms}")
+                                    mc5.metric("Wall Area", f"{wall_sf:,.0f} SF")
+                                    mc6.metric("Ceiling Area", f"{ceiling_sf:,.0f} SF")
+
+                                    if has_adjustments:
+                                        pct = (delta / total * 100) if total else 0
+                                        st.markdown(f"**Overall Change: {pct:+.1f}%**")
 
                                 rfi = analysis_data.get("rfi_items", [])
                                 if rfi:
