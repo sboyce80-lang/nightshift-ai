@@ -800,37 +800,19 @@ def _ensure_worker():
 # ═══════════════════════════════════════════════════════════════════════════════
 # FUTURISTIC PAINTBRUSH LOGO (inline SVG)
 # ═══════════════════════════════════════════════════════════════════════════════
-LOGO_SVG = """
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 90" width="56" height="63">
-  <defs>
-    <linearGradient id="helm_grad" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#1a8fd4"/>
-      <stop offset="100%" stop-color="#0e5a8a"/>
-    </linearGradient>
-  </defs>
-  <!-- Plume -->
-  <path d="M36 2 L40 16 L44 2 L40 8 Z" fill="#2ecc71"/>
-  <path d="M33 6 L37 18 L40 16 L36 2 Z" fill="#27ae60"/>
-  <path d="M44 2 L43 18 L47 6 Z" fill="#27ae60"/>
-  <!-- Helmet dome -->
-  <ellipse cx="40" cy="38" rx="24" ry="28" fill="url(#helm_grad)" opacity="0.9"/>
-  <!-- Eye slit -->
-  <path d="M18 40 L38 36 L62 40 L38 44 Z" fill="#0a2540"/>
-  <!-- Nose guard -->
-  <path d="M36 44 L40 70 L44 44 Z" fill="#0a2540"/>
-  <!-- Cheek guards -->
-  <path d="M16 42 L22 72 L30 62 L24 44 Z" fill="url(#helm_grad)" opacity="0.7"/>
-  <path d="M64 42 L58 72 L50 62 L56 44 Z" fill="url(#helm_grad)" opacity="0.7"/>
-  <!-- Chin gap -->
-  <path d="M30 62 L40 76 L50 62 L40 70 Z" fill="#0a2540"/>
-  <!-- Blueprint grid lines on helmet -->
-  <line x1="20" y1="30" x2="60" y2="30" stroke="#4db8e8" stroke-width="0.4" opacity="0.3"/>
-  <line x1="22" y1="35" x2="58" y2="35" stroke="#4db8e8" stroke-width="0.4" opacity="0.3"/>
-  <line x1="30" y1="18" x2="30" y2="55" stroke="#4db8e8" stroke-width="0.4" opacity="0.3"/>
-  <line x1="50" y1="18" x2="50" y2="55" stroke="#4db8e8" stroke-width="0.4" opacity="0.3"/>
-  <line x1="40" y1="14" x2="40" y2="36" stroke="#4db8e8" stroke-width="0.4" opacity="0.3"/>
-</svg>
-"""
+# Load the Knight Shift helmet logo as base64 for inline HTML embedding
+def _load_logo_b64():
+    """Load the helmet logo PNG and return as a base64 data URI img tag."""
+    import base64
+    logo_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "static", "logo_helm.png")
+    try:
+        with open(logo_path, "rb") as f:
+            b64 = base64.b64encode(f.read()).decode()
+        return f'<img src="data:image/png;base64,{b64}" width="56" height="72" alt="Knight Shift">'
+    except FileNotFoundError:
+        return '<div style="width:56px;height:72px;"></div>'
+
+LOGO_SVG = _load_logo_b64()
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
