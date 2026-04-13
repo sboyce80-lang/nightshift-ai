@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Nightshift AI — Web Form for RFP Submission
+Knight Shift — Web Form for RFP Submission
 =============================================
 Flask application that provides a branded web form for submitting
 construction document PDFs for automated painting estimates.
@@ -180,7 +180,7 @@ def _send_result_email(contact_info, result):
 
     body = f"""Hi {contact_info['name']},
 
-Thank you for submitting your construction documents through Nightshift AI. Your painting estimate is ready.
+Thank you for submitting your construction documents through Knight Shift. Your painting estimate is ready.
 
 PROJECT SUMMARY
   Floors analyzed: {project.get('total_floors_analyzed', 'N/A')}
@@ -213,7 +213,7 @@ Best regards,
     msg = MIMEMultipart()
     msg["From"] = f"{COMPANY_NAME} <{EMAIL_ADDRESS}>"
     msg["To"] = f"{contact_info['name']} <{contact_info['email']}>"
-    msg["Subject"] = "Nightshift AI - Your Painting Estimate is Ready"
+    msg["Subject"] = "Knight Shift - Your Painting Estimate is Ready"
     msg.attach(MIMEText(body, "plain"))
 
     # Attach PDF report
@@ -258,7 +258,7 @@ def _send_error_email(contact_info, error_msg):
 
     body = f"""Hi {contact_info['name']},
 
-Thank you for submitting your construction documents through Nightshift AI.
+Thank you for submitting your construction documents through Knight Shift.
 
 Unfortunately, our system encountered an issue processing your documents:
   {error_msg}
@@ -275,7 +275,7 @@ Best regards,
     msg = MIMEMultipart()
     msg["From"] = f"{COMPANY_NAME} <{EMAIL_ADDRESS}>"
     msg["To"] = f"{contact_info['name']} <{contact_info['email']}>"
-    msg["Subject"] = "Nightshift AI - Issue Processing Your Documents"
+    msg["Subject"] = "Knight Shift - Issue Processing Your Documents"
     msg.attach(MIMEText(body, "plain"))
 
     try:
@@ -438,5 +438,5 @@ def server_error(e):
 _start_worker()
 
 if __name__ == "__main__":
-    logger.info("Starting Nightshift AI web form on port %d", WEB_PORT)
+    logger.info("Starting Knight Shift web form on port %d", WEB_PORT)
     app.run(host="0.0.0.0", port=WEB_PORT, debug=True)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Nightshift AI — Streamlit App (Queue-Based)
+Knight Shift — Streamlit App (Queue-Based)
 =============================================
 Upload construction PDFs → get automated painting estimates.
 Jobs are queued and processed one at a time to stay within memory limits.
@@ -51,8 +51,8 @@ except Exception:
 
 # ── Page config (must be first st call) ──
 st.set_page_config(
-    page_title="Nightshift AI — Painting Takeoff",
-    page_icon="🖌️",
+    page_title="Knight Shift — Painting Takeoff",
+    page_icon="🛡️",
     layout="wide",
     initial_sidebar_state="expanded",
 )
@@ -339,7 +339,7 @@ def _send_result_email(meta):
 
     body = f"""Hi {contact_name},
 
-Thank you for submitting your construction documents through Nightshift AI. Your painting estimate is ready.
+Thank you for submitting your construction documents through Knight Shift. Your painting estimate is ready.
 
 PROJECT SUMMARY
   Floors analyzed: {project.get('total_floors_analyzed', 'N/A')}
@@ -371,7 +371,7 @@ Best regards,
     msg = MIMEMultipart()
     msg["From"] = f"{COMPANY_NAME} <{EMAIL_ADDRESS}>"
     msg["To"] = f"{contact_name} <{contact_email}>"
-    msg["Subject"] = "Nightshift AI - Your Painting Estimate is Ready"
+    msg["Subject"] = "Knight Shift - Your Painting Estimate is Ready"
     msg.attach(MIMEText(body, "plain"))
 
     # Attach PDF report
@@ -446,7 +446,7 @@ def _send_internal_notification(meta):
     if status == "error":
         error_info = f"\nERROR: {meta.get('error', 'Unknown error')}\n"
 
-    body = f"""Nightshift AI — Job Complete
+    body = f"""Knight Shift — Job Complete
 
 Job ID:   {job_id}
 Status:   {status.upper()}
@@ -463,7 +463,7 @@ PDF and JSON reports are attached (if available).
     msg = MIMEMultipart()
     msg["From"] = f"{COMPANY_NAME} <{EMAIL_ADDRESS}>"
     msg["To"] = INTERNAL_NOTIFY_EMAIL
-    msg["Subject"] = f"[Nightshift AI] {status.upper()}: {contact_name} — {total_cost}"
+    msg["Subject"] = f"[Knight Shift] {status.upper()}: {contact_name} — {total_cost}"
     msg.attach(MIMEText(body, "plain"))
 
     # Attach PDF report
@@ -801,34 +801,34 @@ def _ensure_worker():
 # FUTURISTIC PAINTBRUSH LOGO (inline SVG)
 # ═══════════════════════════════════════════════════════════════════════════════
 LOGO_SVG = """
-<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 80" width="56" height="56">
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 80 90" width="56" height="63">
   <defs>
-    <linearGradient id="brush_glow" x1="0%" y1="0%" x2="100%" y2="100%">
-      <stop offset="0%" stop-color="#00d4ff"/>
-      <stop offset="100%" stop-color="#0066cc"/>
+    <linearGradient id="helm_grad" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1a8fd4"/>
+      <stop offset="100%" stop-color="#0e5a8a"/>
     </linearGradient>
-    <linearGradient id="bristle_grad" x1="0%" y1="0%" x2="0%" y2="100%">
-      <stop offset="0%" stop-color="#00d4ff" stop-opacity="0.9"/>
-      <stop offset="100%" stop-color="#0044aa" stop-opacity="0.6"/>
-    </linearGradient>
-    <filter id="glow">
-      <feGaussianBlur stdDeviation="2" result="blur"/>
-      <feComposite in="SourceGraphic" in2="blur" operator="over"/>
-    </filter>
   </defs>
-  <!-- Handle -->
-  <rect x="52" y="4" width="8" height="34" rx="3" fill="url(#brush_glow)" transform="rotate(25 56 21)" filter="url(#glow)"/>
-  <!-- Ferrule (metal band) -->
-  <rect x="44" y="34" width="14" height="6" rx="1.5" fill="#c0d8f0" transform="rotate(25 51 37)" opacity="0.8"/>
-  <!-- Bristles -->
-  <path d="M28 52 L38 38 L52 42 L42 58 Q36 66 28 60 Z" fill="url(#bristle_grad)" filter="url(#glow)"/>
-  <!-- Paint trail / swoosh -->
-  <path d="M24 58 Q14 64 10 56 Q6 48 16 44 Q22 40 26 48 Z" fill="#00d4ff" opacity="0.5"/>
-  <path d="M12 50 Q4 54 8 62 Q10 66 18 64" stroke="#00d4ff" stroke-width="1.5" fill="none" opacity="0.3"/>
-  <!-- Glow dots -->
-  <circle cx="14" cy="54" r="1.5" fill="#00d4ff" opacity="0.7"/>
-  <circle cx="20" cy="62" r="1" fill="#00d4ff" opacity="0.5"/>
-  <circle cx="8" cy="60" r="1" fill="#00d4ff" opacity="0.4"/>
+  <!-- Plume -->
+  <path d="M36 2 L40 16 L44 2 L40 8 Z" fill="#2ecc71"/>
+  <path d="M33 6 L37 18 L40 16 L36 2 Z" fill="#27ae60"/>
+  <path d="M44 2 L43 18 L47 6 Z" fill="#27ae60"/>
+  <!-- Helmet dome -->
+  <ellipse cx="40" cy="38" rx="24" ry="28" fill="url(#helm_grad)" opacity="0.9"/>
+  <!-- Eye slit -->
+  <path d="M18 40 L38 36 L62 40 L38 44 Z" fill="#0a2540"/>
+  <!-- Nose guard -->
+  <path d="M36 44 L40 70 L44 44 Z" fill="#0a2540"/>
+  <!-- Cheek guards -->
+  <path d="M16 42 L22 72 L30 62 L24 44 Z" fill="url(#helm_grad)" opacity="0.7"/>
+  <path d="M64 42 L58 72 L50 62 L56 44 Z" fill="url(#helm_grad)" opacity="0.7"/>
+  <!-- Chin gap -->
+  <path d="M30 62 L40 76 L50 62 L40 70 Z" fill="#0a2540"/>
+  <!-- Blueprint grid lines on helmet -->
+  <line x1="20" y1="30" x2="60" y2="30" stroke="#4db8e8" stroke-width="0.4" opacity="0.3"/>
+  <line x1="22" y1="35" x2="58" y2="35" stroke="#4db8e8" stroke-width="0.4" opacity="0.3"/>
+  <line x1="30" y1="18" x2="30" y2="55" stroke="#4db8e8" stroke-width="0.4" opacity="0.3"/>
+  <line x1="50" y1="18" x2="50" y2="55" stroke="#4db8e8" stroke-width="0.4" opacity="0.3"/>
+  <line x1="40" y1="14" x2="40" y2="36" stroke="#4db8e8" stroke-width="0.4" opacity="0.3"/>
 </svg>
 """
 
@@ -864,9 +864,9 @@ st.markdown("""
         font-weight: 700;
         letter-spacing: -0.02em;
     }
-    .main-header .header-text h1 span.accent { color: #00d4ff; }
+    .main-header .header-text h1 span.accent { color: #1a8fd4; }
     .main-header .header-text p {
-        color: #7a9cc6;
+        color: #2ecc71;
         margin: 0.3rem 0 0 0;
         font-size: 0.95rem;
         letter-spacing: 0.02em;
@@ -931,8 +931,8 @@ st.markdown(f"""
 <div class="main-header">
     <div class="logo-wrap">{LOGO_SVG}</div>
     <div class="header-text">
-        <h1><span class="accent">Nightshift</span> AI</h1>
-        <p>Automated Construction Painting Estimates from Architectural PDFs</p>
+        <h1><span class="accent">Knight</span> Shift</h1>
+        <p>Forged by Willpower</p>
     </div>
 </div>
 """, unsafe_allow_html=True)
@@ -943,8 +943,8 @@ st.markdown(f"""
 # ═══════════════════════════════════════════════════════════════════════════════
 with st.sidebar:
     st.markdown(f'<div style="text-align:center;margin-bottom:0.5rem;">{LOGO_SVG}</div>', unsafe_allow_html=True)
-    st.markdown("#### Nightshift AI")
-    st.caption("Automated painting estimates from architectural PDFs")
+    st.markdown("#### Knight Shift")
+    st.caption("Forged by Willpower")
     st.markdown("---")
     current_queue = _get_queue()
     if current_queue:
@@ -1565,7 +1565,7 @@ with tab_history:
 # ═══════════════════════════════════════════════════════════════════════════════
 st.markdown("---")
 st.markdown(
-    '<center><small class="footer-text">Nightshift AI &nbsp;&mdash;&nbsp; Automated Painting Estimates &nbsp;|&nbsp; '
+    '<center><small class="footer-text">Knight Shift &nbsp;&mdash;&nbsp; Forged by Willpower &nbsp;|&nbsp; '
     'Powered by Claude &nbsp;|&nbsp; Confidential</small></center>',
     unsafe_allow_html=True,
 )

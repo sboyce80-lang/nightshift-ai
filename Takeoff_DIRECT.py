@@ -25,7 +25,7 @@ import time
 import hashlib
 from pathlib import Path
 import PyPDF2
-from config import CLAUDE_API_KEY, PRICING_MODEL, SMALL_COMMERCIAL_RATES
+from config import CLAUDE_API_KEY, PRICING_MODEL, SMALL_COMMERCIAL_RATES, PCA_CONSTANTS
 import anthropic
 import base64
 from datetime import datetime
@@ -2656,15 +2656,14 @@ For each room:
   Common locations: entryways, foyers, hallways, great rooms, formal dining rooms (especially in
   high-end single-family homes). If found, set "level_5_finish_sqft" to 1 (it's priced per
   occurrence, not per sqft). Set to 0 if not specified anywhere in the documents.
-- Concrete floor sealer: if a room has a concrete floor that requires sealer, record the floor area
-  in "concrete_floor_sqft". This includes:
-  * Residential: garages, parking, basements with concrete floors
-  * Commercial: service bays, service areas, parts rooms, parts receiving, mechanical rooms,
-    warehouse areas, receiving docks, maintenance areas — ANY back-of-house area with concrete floors
-  * Check the FINISH SCHEDULE "Floor Finish" column for concrete, sealed concrete, or epoxy coating
-  * When the room is a service/parts/mechanical area, DEFAULT to concrete floor unless finish
-    schedule explicitly shows a different floor type (carpet, tile, VCT, etc.)
-  Set concrete_floor_sqft = floor_area_sqft for qualifying rooms. Set to 0 if not a concrete floor.
+- Concrete floor sealer: ONLY record concrete_floor_sqft when the specs EXPLICITLY call out
+  sealcoating, concrete sealer, epoxy coating, or floor coating. A bare concrete floor alone
+  does NOT qualify — the project must specifically require a sealer/coating application.
+  * Check the FINISH SCHEDULE "Floor Finish" column for: "sealed concrete", "concrete sealer",
+    "epoxy", "epoxy coating", "floor coating", "sealcoat", "floor sealer"
+  * Do NOT assume concrete floors need sealer — only include when specs explicitly state it
+  * If the finish schedule just says "concrete" or "conc." with no sealer reference, set to 0
+  Set concrete_floor_sqft = floor_area_sqft ONLY for rooms with explicit sealer spec. Set to 0 otherwise.
 
 Columns: Count painted structural columns visible on floor plans.
   - ONLY count columns marked with paint references (PT-?, "painted columns",
@@ -4173,11 +4172,18 @@ def _estimate_from_room_finish_schedule(room_schedule_data, schedule_data=None):
         return True  # Default to having base trim
 
     def _is_concrete_floor(floor_finish):
-        """Determine if floor needs concrete sealer."""
+        """Determine if floor needs concrete sealer.
+        Only returns True when specs explicitly call out sealcoating/sealer/epoxy —
+        a bare concrete floor alone does NOT qualify (paint scope only).
+        """
         if not floor_finish:
             return False
         ff = floor_finish.lower()
-        return any(kw in ff for kw in ("concrete", "sealed concrete", "concrete sealer"))
+        # Must have explicit sealer/coating spec — bare "concrete" alone is not enough
+        return any(kw in ff for kw in (
+            "sealed concrete", "concrete sealer", "seal concrete",
+            "epoxy", "epoxy coating", "floor coating", "floor sealer",
+            "concrete coating", "sealcoat", "seal coat"))
 
     # Determine building multiplier
     n_buildings = bi.get("total_identical_buildings", 1) if ENABLE_BUILDING_MULTIPLIER else 1
@@ -4408,13 +4414,13 @@ def _estimate_from_room_finish_schedule(room_schedule_data, schedule_data=None):
                 "stair_sections": 0,
                 "gyp_between_stairs_sqft": 0,
                 "level_5_finish_sqft": 0,
-                "concrete_floor_sqft": round(garage_sqft, 2),
+                "concrete_floor_sqft": 0,  # Only if specs explicitly call out sealcoating
                 "painted_columns_ea": 0,
                 "wallcovering_sqft": 0,
                 "stained_wood_sqft": 0,
                 "soffit_sqft": 0,
             },
-            "notes": f"Garage concrete sealer ({n_buildings}x buildings × {garage_sqft:,.0f} sqft/building = {garage_sqft * n_buildings:,.0f} sqft total)",
+            "notes": f"Parking garage ({n_buildings}x buildings × {garage_sqft:,.0f} sqft/building). Concrete sealer excluded unless specs explicitly require it.",
             "source": "schedule_estimate",
             "estimated_dimensions": True,
             "in_scope": True,
@@ -6389,11 +6395,26 @@ def _recalculate_totals(analysis):
             multiplier = _extract_multiplier_from_notes(room)
 
             # Walls — only if paintable material
+            # PCA Rule #8: Deduct door openings from wall area.
+            # Standard doors (3'x7' = 21 SF) are deducted from wall area.
+            # Standard windows (< 100 SF) are NOT deducted per PCA Rule #8.
+            # PCA Rule #9: Cabinets, tubs, showers are NOT deducted.
+            _room_door_count = (
+                _num(elems.get("doors_full_paint", 0)) +
+                _num(elems.get("doors_hm_panel", 0)) +
+                _num(elems.get("doors_frame_only", 0))
+            )
+            if "doors" in elems and "doors_full_paint" not in elems:
+                _room_door_count += _num(elems.get("doors", 0))
+            _door_opening_deduction = _room_door_count * PCA_CONSTANTS["std_door_opening_sf"]
+            _raw_wall_area = _num(dims.get("wall_area_sqft", 0))
+            _adjusted_wall_area = max(0, _raw_wall_area - _door_opening_deduction)
+
             wall_mat = str(mats.get("walls", "")).lower()
             if "cmu" in wall_mat:
-                total_cmu_wall += _num(dims.get("wall_area_sqft", 0)) * multiplier
+                total_cmu_wall += _adjusted_wall_area * multiplier
             elif any(kw in wall_mat for kw in ("gyp", "gwb", "gypsum", "paintable")):
-                total_wall += _num(dims.get("wall_area_sqft", 0)) * multiplier
+                total_wall += _adjusted_wall_area * multiplier
 
             # Ceilings — only if explicitly marked painted
             ceil_mat = str(mats.get("ceiling", "")).lower()
@@ -6460,20 +6481,10 @@ def _recalculate_totals(analysis):
             # Level 5 finish
             total_level_5 += _num(elems.get("level_5_finish_sqft", 0)) * multiplier
 
-            # Concrete floor sealer (garages, basements, mechanical rooms)
-            # For mixed-use/residential buildings, only count specific room types —
-            # not entire floor footprints or generic spaces
+            # Concrete floor sealer — only when specs explicitly call out sealcoating.
+            # A bare concrete floor does NOT qualify; must have sealer/epoxy/coating spec.
             _conc_sqft = _num(elems.get("concrete_floor_sqft", 0))
             if _conc_sqft > 0:
-                _bt_conc = str(analysis.get("project_info", {}).get("building_type", "")).lower()
-                _is_res_conc = any(kw in _bt_conc for kw in (
-                    "residential", "mixed", "multi", "apartment"))
-                if _is_res_conc:
-                    _conc_room_ok = any(kw in rname_lower for kw in (
-                        "garage", "parking", "mechanical", "boiler", "storage",
-                        "utility", "janitor", "maintenance", "trash"))
-                    if not _conc_room_ok:
-                        _conc_sqft = 0  # Skip concrete for non-qualifying rooms
                 total_concrete_floor += _conc_sqft * multiplier
 
             # Painted columns (commercial)
@@ -6487,6 +6498,34 @@ def _recalculate_totals(analysis):
 
             # Interior soffits (GYP drywall drops)
             total_soffit += _num(elems.get("soffit_sqft", 0)) * multiplier
+
+    # ── PCA Room SF Cross-Check (informational) ──
+    # Validate extracted room areas against PCA Section 4D formula:
+    # Expected total = perimeter × ceiling_height + (length × width) for ceiling
+    # Flag rooms with >25% deviation as potentially misread.
+    for floor in analysis.get("floors", []):
+        for room in floor.get("rooms", []):
+            if not room.get("in_scope", True):
+                continue
+            dims = room.get("dimensions", {})
+            _r_len = _num(dims.get("length_feet", 0))
+            _r_wid = _num(dims.get("width_feet", 0))
+            _r_clg = _num(dims.get("ceiling_height_feet", 0))
+            if _r_len > 0 and _r_wid > 0 and _r_clg > 0:
+                _pca_perimeter = 2 * (_r_len + _r_wid)
+                _pca_wall = _pca_perimeter * _r_clg
+                _pca_ceiling = _r_len * _r_wid
+                _pca_expected = _pca_wall + _pca_ceiling
+                _extracted_wall = _num(dims.get("wall_area_sqft", 0))
+                _extracted_ceil = _num(dims.get("ceiling_area_sqft", 0))
+                _extracted_total = _extracted_wall + _extracted_ceil
+                if _extracted_total > 0 and _pca_expected > 0:
+                    _deviation = abs(_extracted_total - _pca_expected) / _pca_expected
+                    if _deviation > 0.25:
+                        existing_note = str(room.get("notes", ""))
+                        room["notes"] = (existing_note +
+                            f" [PCA check: expected {_pca_expected:.0f} SF, got {_extracted_total:.0f} SF"
+                            f" ({_deviation:.0%} deviation)]").strip()
 
     # ── Unit-Count Fallback Safety Net ──
     # When LLM extracted building metadata (total_units > 0) but failed to
@@ -7863,10 +7902,8 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     stair_sections = _num(aggregated_totals.get('total_stair_sections', 0))
     gyp_stairs = _num(aggregated_totals.get('total_gyp_between_stairs_sqft', 0))
 
-    # Specialty finishes
-    level_5 = _num(aggregated_totals.get('total_level_5_finish_sqft', 0))
-    # Level 5 is priced per occurrence (each area), not per sqft
-    level_5_count = 1 if level_5 > 0 else 0
+    # Specialty finishes — Level 5 skim coat priced per SF (PCA Section 6D)
+    level_5_sqft = _num(aggregated_totals.get('total_level_5_finish_sqft', 0))
 
     # Concrete sealer (garages, basements)
     concrete_sqft = _num(aggregated_totals.get('total_concrete_floor_sqft', 0))
@@ -8046,7 +8083,7 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     win_rate    = _get_tiered_rate(pm['windows'], windows)
     stair_rate  = _get_tiered_rate(pm['stairs'], stair_sections)
     gyps_rate   = _get_tiered_rate(pm['gyp_between_stairs'], gyp_stairs)
-    l5_rate     = _get_tiered_rate(pm['level_5_finish'], level_5_count)
+    l5_rate     = _get_tiered_rate(pm['level_5_finish'], level_5_sqft)
     conc_rate   = _get_tiered_rate(pm['concrete_sealer'], concrete_sqft)
     col_rate    = _get_tiered_rate(pm['painted_columns'], columns_ea)
     # Wallcovering rate: use prep rate ($0.50/SF) for bathroom heuristic, full install ($9/SF) otherwise
@@ -8114,6 +8151,23 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
         wall_rate = 1.05   # Higher labor density than apartments, spray efficiency is lower
         ceil_rate = 1.05
         win_rate = 120.00  # Factory-finished windows: trim paint only (not full interior paint)
+
+    # --- PCA Section 5D: Multi-story productivity adjustment ---
+    # Productivity diminishes 1-2% per floor above 4th due to material handling,
+    # elevator waits, and tool retrieval. Applied to area-based rates only.
+    _total_stories_pca = _num(project_info.get('total_stories', 1))
+    _pca_start = PCA_CONSTANTS["height_productivity_start_floor"]
+    if _total_stories_pca > _pca_start:
+        _floors_above = _total_stories_pca - _pca_start
+        _height_factor = min(
+            _floors_above * PCA_CONSTANTS["height_productivity_loss_per_floor"],
+            PCA_CONSTANTS["height_productivity_max_loss"]
+        )
+        wall_rate *= (1 + _height_factor)
+        ceil_rate *= (1 + _height_factor)
+        cmu_rate *= (1 + _height_factor)
+        dryfall_rate *= (1 + _height_factor)
+        print(f"   PCA height adj: {_total_stories_pca} stories, +{_height_factor:.1%} to area rates")
 
     # --- Multi-family wall/ceiling area cap ---
     # LLM extraction is non-deterministic across tile batches. Batch template dedup
@@ -8341,7 +8395,7 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
               stair_rate, _get_markup('stairs')),
         _line(f"Gyp. Between Stairs - {gyp_stairs:,.0f} sqft @ ${gyps_rate:.2f}", gyp_stairs,
               gyps_rate, _get_markup('gyp_between_stairs')),
-        _line(f"Level 5 Finish - {level_5_count} EA @ ${l5_rate:.2f}", level_5_count,
+        _line(f"Level 5 Finish - {level_5_sqft:,.0f} sqft @ ${l5_rate:.2f}", level_5_sqft,
               l5_rate, _get_markup('level_5_finish')),
         _line(f"Concrete Sealer - {concrete_sqft:,.0f} sqft @ ${conc_rate:.2f}", concrete_sqft,
               conc_rate, _get_markup('concrete_sealer')),
@@ -8498,7 +8552,43 @@ def _validate_cost_estimate(analysis, cost_estimate):
                        f"Typical commercial HM count is 10-15 for a building this size."
         })
 
-    # 5. Data quality score (0-100)
+    # 5. PCA cross-checks using industry multipliers
+    # Door SF cross-check: total door paintable SF should be ~3-12% of wall area
+    if door_total > 0 and wall_sqft > 0:
+        _pca_door_sf = PCA_CONSTANTS.get("door_flush_sf", 42)
+        _pca_frame_sf = PCA_CONSTANTS.get("door_frame_sf", 34)
+        _total_door_sf = (
+            _num(agg.get('total_doors_full_paint', 0)) * (_pca_door_sf + _pca_frame_sf) +
+            _num(agg.get('total_doors_hm_panel', 0)) * _pca_door_sf +
+            _num(agg.get('total_doors_frame_only', 0)) * _pca_frame_sf
+        )
+        _door_wall_ratio = _total_door_sf / wall_sqft if wall_sqft > 0 else 0
+        if _door_wall_ratio > 0.15:
+            warnings.append({
+                "severity": "medium",
+                "item": "Door Count (PCA)",
+                "message": f"Door surface area ({_total_door_sf:,.0f} SF at PCA multipliers) is "
+                           f"{_door_wall_ratio:.0%} of wall area. Typical range is 3-12%. "
+                           f"Possible over-count of doors."
+            })
+
+    # Stair section cross-check: each section ≈ 240 SF (12 risers × 20 SF/riser)
+    stair_sections = _num(agg.get('total_stair_sections', 0))
+    if stair_sections > 0:
+        _pca_stair_sf = (PCA_CONSTANTS.get("stair_risers_per_section", 12)
+                         * PCA_CONSTANTS.get("stair_sf_per_riser", 20))
+        _total_stair_sf = stair_sections * _pca_stair_sf
+        _stair_cost = stair_sections * 1500  # Current flat rate
+        if subtotal > 0 and _stair_cost / subtotal > 0.15:
+            warnings.append({
+                "severity": "medium",
+                "item": "Stairs (PCA)",
+                "message": f"{stair_sections:.0f} stair sections = {_total_stair_sf:,.0f} SF "
+                           f"(PCA: {_pca_stair_sf} SF/section). Stair cost is "
+                           f"{_stair_cost/subtotal:.0%} of total — verify section count."
+            })
+
+    # 6. Data quality score (0-100)
     quality_score = 100
     for w in warnings:
         if w["severity"] == "high":
@@ -8511,6 +8601,92 @@ def _validate_cost_estimate(analysis, cost_estimate):
         "warnings": warnings,
         "data_quality_score": quality_score,
         "warning_count": len(warnings),
+    }
+
+
+def _compute_labor_hours(analysis):
+    """Compute PCA-based labor hour estimates for the project.
+
+    Returns a dict suitable for JSON serialization and PDF rendering.
+    """
+    totals = analysis.get('aggregated_totals', {})
+    _pca_labor = PCA_CONSTANTS.get("labor_rates", {})
+    if not _pca_labor:
+        return {}
+
+    _wall_sf = _num(totals.get('total_paintable_wall_sqft', 0))
+    _ceil_sf = _num(totals.get('total_paintable_ceiling_sqft', 0))
+    _cmu_sf = _num(totals.get('total_cmu_wall_sqft', 0))
+    _dryfall_sf = _num(totals.get('total_dryfall_ceiling_sqft', 0))
+    _trim_lf = _num(totals.get('total_base_trim_lf', 0))
+    _doors_f = _num(totals.get('total_doors_full_paint', 0))
+    _doors_h = _num(totals.get('total_doors_hm_panel', 0))
+    _doors_fr = _num(totals.get('total_doors_frame_only', 0))
+    _wins = _num(totals.get('total_windows_painted_interior', 0))
+    _stairs = _num(totals.get('total_stair_sections', 0))
+    _wc_sf = _num(totals.get('total_wallcovering_sqft', 0))
+
+    _pca_door_sf = PCA_CONSTANTS.get("door_flush_sf", 42)
+    _pca_frame_sf = PCA_CONSTANTS.get("door_frame_sf", 34)
+    _pca_win_sf = PCA_CONSTANTS.get("window_sf_default", 32)
+    _pca_stair_sf = (PCA_CONSTANTS.get("stair_risers_per_section", 12)
+                     * PCA_CONSTANTS.get("stair_sf_per_riser", 20))
+
+    categories = []
+
+    def _add(name, surface_sf, rate_key, coats=2):
+        rate = _pca_labor.get(rate_key, 0)
+        if surface_sf > 0 and rate > 0:
+            hrs = (surface_sf / rate) * coats
+            categories.append({
+                "category": name,
+                "surface_sf": round(surface_sf),
+                "rate_sf_hr": rate,
+                "coats": coats,
+                "hours": round(hrs, 1),
+            })
+
+    _add("Walls (GYP)", _wall_sf, "gyp_walls_spray_1st")
+    _add("Ceilings (GYP)", _ceil_sf, "gyp_ceilings_spray")
+    _add("CMU Walls", _cmu_sf, "cmu_spray")
+    _add("Dryfall Ceiling", _dryfall_sf, "dryfall_spray", coats=1)
+    _add("Base Trim", _trim_lf * 1.0, "base_trim_brush", coats=1)  # 1 SF/LF
+
+    # Doors: convert count to SF via PCA multipliers
+    if _doors_f > 0:
+        _df_sf = _doors_f * (_pca_door_sf + _pca_frame_sf)
+        _add("Doors (Full Paint)", _df_sf, "doors_steel_spray_1st")
+    if _doors_h > 0:
+        _dh_sf = _doors_h * _pca_door_sf
+        _add("Doors (HM Panel)", _dh_sf, "doors_steel_spray_1st")
+    if _doors_fr > 0:
+        _dfr_sf = _doors_fr * _pca_frame_sf
+        _add("Doors (Frame Only)", _dfr_sf, "doors_steel_spray_1st")
+
+    # Windows: convert count to SF
+    if _wins > 0:
+        _win_total_sf = _wins * _pca_win_sf
+        _add("Windows", _win_total_sf, "windows_brush_1st")
+
+    # Stairs
+    if _stairs > 0:
+        _stair_total_sf = _stairs * _pca_stair_sf
+        _add("Stairs", _stair_total_sf, "stairs_brush_1st")
+
+    # Wallcovering
+    if _wc_sf > 0:
+        _add("Wallcovering", _wc_sf, "wallcovering_54in", coats=1)
+
+    prod_hours = sum(c["hours"] for c in categories)
+    setup_hours = round(prod_hours * 0.15, 1)
+    total_hours = round(prod_hours + setup_hours, 1)
+
+    return {
+        "categories": categories,
+        "production_hours": round(prod_hours, 1),
+        "setup_cleanup_hours": setup_hours,
+        "total_hours": total_hours,
+        "crew_days": round(total_hours / 8, 1),
     }
 
 
@@ -8541,18 +8717,55 @@ def print_estimate(analysis, costs):
             print(f"  • {detail.get('room_name', detail.get('room_id', '?'))}"
                   f" ({ut}) × {detail['unit_multiplier']} units")
 
-    # Show room breakdown by floor
+    # Show room breakdown by floor (with dimensions, materials, and elements)
     print(f"\n🏢 ROOM BREAKDOWN BY FLOOR:")
     for floor in analysis.get('floors', []):
         print(f"\n  {floor['floor_name']}:")
         for room in floor.get('rooms', []):
             dims = room.get('dimensions', {})
+            mats = room.get('materials', {})
+            elems = room.get('elements', {})
             multiplier = _extract_multiplier_from_notes(room)
-            mult_label = f" (×{multiplier} units)" if multiplier > 1 else ""
-            print(f"    • {room.get('room_name', room.get('room_id', 'Unknown'))}{mult_label}")
-            print(f"      {dims.get('length_feet', 0)}' x {dims.get('width_feet', 0)}'"
+            mult_label = f" (x{multiplier} units)" if multiplier > 1 else ""
+            _rname = room.get('room_name', room.get('room_id', 'Unknown'))
+            _sheet = room.get('source_sheet', '')
+            _sheet_label = f" [{_sheet}]" if _sheet else ""
+
+            # Line 1: Room name, dimensions, materials
+            _wall_mat = str(mats.get('walls', '-'))[:6]
+            _ceil_mat = str(mats.get('ceiling', '-'))[:6]
+            _ceil_ptd = "painted" if mats.get('ceiling_painted', False) else "not ptd"
+            print(f"    {_rname}{mult_label}{_sheet_label}")
+            print(f"      Dims: {dims.get('length_feet', 0)}' x {dims.get('width_feet', 0)}'"
                   f" x {dims.get('ceiling_height_feet', 0)}'"
-                  f" = {_num(dims.get('floor_area_sqft', 0)):,.0f} sqft")
+                  f"  |  Walls: {_wall_mat}  |  Ceil: {_ceil_mat} ({_ceil_ptd})")
+
+            # Line 2: Surfaces
+            _w_sf = _num(dims.get('wall_area_sqft', 0))
+            _c_sf = _num(dims.get('ceiling_area_sqft', 0))
+            _t_lf = _num(elems.get('base_trim_lf', 0))
+            print(f"      Surfaces: {_w_sf:,.0f} wall SF  |  {_c_sf:,.0f} ceil SF  |  {_t_lf:,.0f} trim LF")
+
+            # Line 3: Elements (only if any non-zero)
+            _dr_fp = _num(elems.get('doors_full_paint', 0))
+            _dr_hm = _num(elems.get('doors_hm_panel', 0))
+            _dr_fr = _num(elems.get('doors_frame_only', 0))
+            _win = _num(elems.get('windows_painted_interior', 0))
+            _st = _num(elems.get('stair_sections', 0))
+            _wc = _num(elems.get('wallcovering_sqft', 0))
+            _sw = _num(elems.get('stained_wood_sqft', 0))
+            _sof = _num(elems.get('soffit_sqft', 0))
+            elem_parts = []
+            if _dr_fp > 0: elem_parts.append(f"{int(_dr_fp)} dr-FP")
+            if _dr_hm > 0: elem_parts.append(f"{int(_dr_hm)} dr-HM")
+            if _dr_fr > 0: elem_parts.append(f"{int(_dr_fr)} dr-Fr")
+            if _win > 0: elem_parts.append(f"{int(_win)} win")
+            if _st > 0: elem_parts.append(f"{int(_st)} stairs")
+            if _wc > 0: elem_parts.append(f"{_wc:,.0f} WC-sf")
+            if _sw > 0: elem_parts.append(f"{_sw:,.0f} stain-sf")
+            if _sof > 0: elem_parts.append(f"{_sof:,.0f} soffit-sf")
+            if elem_parts:
+                print(f"      Elements: {' | '.join(elem_parts)}")
 
     # Aggregated totals
     totals = analysis.get('aggregated_totals', {})
@@ -8592,6 +8805,59 @@ def print_estimate(analysis, costs):
     print("=" * 86)
     print(f"{'TOTAL PROJECT COST:':<67} ${costs['subtotal']:>16,.2f}")
     print("=" * 86)
+
+    # PCA-based estimated labor hours (informational, not used for pricing)
+    _pca_labor = PCA_CONSTANTS.get("labor_rates", {})
+    if _pca_labor:
+        _wall_sf = _num(totals.get('total_paintable_wall_sqft', 0))
+        _ceil_sf = _num(totals.get('total_paintable_ceiling_sqft', 0))
+        _cmu_sf = _num(totals.get('total_cmu_wall_sqft', 0))
+        _dryfall_sf = _num(totals.get('total_dryfall_ceiling_sqft', 0))
+        _trim_lf = _num(totals.get('total_base_trim_lf', 0))
+        _doors_f = _num(totals.get('total_doors_full_paint', 0))
+        _doors_h = _num(totals.get('total_doors_hm_panel', 0))
+        _doors_fr = _num(totals.get('total_doors_frame_only', 0))
+        _wins = _num(totals.get('total_windows_painted_interior', 0))
+        _stairs = _num(totals.get('total_stair_sections', 0))
+        _wc_sf = _num(totals.get('total_wallcovering_sqft', 0))
+
+        _pca_door_sf = PCA_CONSTANTS.get("door_flush_sf", 42)
+        _pca_frame_sf = PCA_CONSTANTS.get("door_frame_sf", 34)
+        _pca_win_sf = PCA_CONSTANTS.get("window_sf_default", 32)
+        _pca_stair_sf = (PCA_CONSTANTS.get("stair_risers_per_section", 12)
+                         * PCA_CONSTANTS.get("stair_sf_per_riser", 20))
+
+        # Calculate hours per category (assumes spray for walls/ceilings, 2 coats)
+        _est = {}
+        _spray_wall_rate = _pca_labor.get("gyp_walls_spray_1st", 650)
+        _spray_wall_add = _pca_labor.get("gyp_walls_spray_add", 750)
+        _est["Walls (GYP)"] = (_wall_sf / _spray_wall_rate) + (_wall_sf / _spray_wall_add) if _wall_sf > 0 else 0
+        _est["Ceilings (GYP)"] = (_ceil_sf / _pca_labor.get("gyp_ceilings_spray", 650)) * 2 if _ceil_sf > 0 else 0
+        _est["CMU Walls"] = (_cmu_sf / _pca_labor.get("cmu_spray", 488)) * 2 if _cmu_sf > 0 else 0
+        _est["Dryfall Ceiling"] = _dryfall_sf / _pca_labor.get("dryfall_spray", 400) if _dryfall_sf > 0 else 0
+        _est["Base Trim"] = (_trim_lf * 1.0) / _pca_labor.get("base_trim_brush", 100) if _trim_lf > 0 else 0
+        _est["Doors (full)"] = ((_doors_f * _pca_door_sf) / _pca_labor.get("doors_steel_spray_1st", 200)) * 2 if _doors_f > 0 else 0
+        _est["Doors (HM panel)"] = ((_doors_h * _pca_door_sf * 0.5) / _pca_labor.get("doors_steel_spray_1st", 200)) * 2 if _doors_h > 0 else 0
+        _est["Doors (frame)"] = ((_doors_fr * _pca_frame_sf) / _pca_labor.get("doors_steel_spray_1st", 200)) * 2 if _doors_fr > 0 else 0
+        _est["Windows"] = ((_wins * _pca_win_sf) / _pca_labor.get("windows_brush_1st", 85)) * 2 if _wins > 0 else 0
+        _est["Stairs"] = ((_stairs * _pca_stair_sf) / _pca_labor.get("stairs_brush_1st", 100)) * 2 if _stairs > 0 else 0
+        _est["Wallcovering"] = _wc_sf / _pca_labor.get("wallcovering_54in", 45) if _wc_sf > 0 else 0
+
+        _total_prod_hrs = sum(_est.values())
+        # Add 15% for setup, cleanup, mobilization per PCA guidelines
+        _total_adjusted_hrs = _total_prod_hrs * 1.15
+
+        if _total_prod_hrs > 0:
+            print(f"\n  ESTIMATED LABOR HOURS (PCA Production Rates):")
+            for _cat, _hrs in _est.items():
+                if _hrs > 0:
+                    print(f"  {'  ' + _cat + ':':<30} {_hrs:>8.1f} hrs")
+            print(f"  {'-'*38}")
+            print(f"  {'  Production Hours:':<30} {_total_prod_hrs:>8.1f} hrs")
+            print(f"  {'  + Setup/Cleanup (15%):':<30} {_total_prod_hrs * 0.15:>8.1f} hrs")
+            print(f"  {'  TOTAL ESTIMATED HOURS:':<30} {_total_adjusted_hrs:>8.1f} hrs")
+            _crew_days = _total_adjusted_hrs / 8  # 8-hour days
+            print(f"  {'  (1-person days):':<30} {_crew_days:>8.1f} days")
 
     # Scope summary
     scope_summary = analysis.get('scope_summary', {})
@@ -8969,7 +9235,9 @@ def analyze_and_parse(client, pdf_path, scope_notes="", schedule_hints=None,
             print(f"   Raw (first 500 chars): {result_text[:500]}")
             return None
     except Exception as e:
+        import traceback
         print(f"\n❌ Error analyzing {filename}: {e}")
+        print(f"   Traceback: {traceback.format_exc()}")
         return None
 
 
@@ -9003,6 +9271,22 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     """
     if not pdf_paths:
         raise ValueError("No PDF paths provided")
+
+    # --- Pre-flight checks ---
+    # Verify PDF files exist and are readable
+    for p in pdf_paths:
+        if not os.path.isfile(p):
+            print(f"❌ PDF file not found: {p}")
+        else:
+            size_mb = os.path.getsize(p) / (1024 * 1024)
+            print(f"   ✓ {os.path.basename(p)} ({size_mb:.1f} MB)")
+
+    # Verify API key is set
+    if not CLAUDE_API_KEY:
+        raise ValueError(
+            "CLAUDE_API_KEY not set. Set the CLAUDE_API_KEY or ANTHROPIC_API_KEY "
+            "environment variable in your Render service settings."
+        )
 
     multi_mode = len(pdf_paths) > 1
     client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
@@ -9592,7 +9876,16 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             print(f"      ✓ {f}")
 
     if not all_results:
-        raise ValueError("No PDFs could be analysed successfully")
+        _failed_list = ", ".join(os.path.basename(p) for p in pdf_paths)
+        _skip_list = ", ".join(files_skipped) if files_skipped else "none"
+        raise ValueError(
+            f"No PDFs could be analysed successfully. "
+            f"Files attempted: {_failed_list}. "
+            f"Files skipped: {_skip_list}. "
+            f"Check the logs above for per-file error messages (❌ lines). "
+            f"Common causes: missing API key, PDF files not found, "
+            f"API errors (rate limit, auth), or missing dependencies (PyMuPDF)."
+        )
 
     # --- Merge or use single result ---
     if multi_mode:
@@ -10000,6 +10293,7 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         "building_inventory": building_inventory if building_inventory else None,
         "analysis": analysis,
         "cost_estimate": costs,
+        "labor_hours_estimate": _compute_labor_hours(analysis),
         "validation": validation,
         "pricing_model": pricing_model_used if pricing_model_used else PRICING_MODEL,
         "adjustments_applied": adjustments_log if adjustments_log else None,

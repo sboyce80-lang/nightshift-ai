@@ -12,10 +12,12 @@ from reportlab.platypus import (
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER, TA_RIGHT
 
-DARK_BLUE = HexColor('#1e3a5f')
-MEDIUM_BLUE = HexColor('#2c5282')
-LIGHT_GRAY = HexColor('#f7f7f7')
-BORDER_GRAY = HexColor('#cccccc')
+# Knight Shift brand colors — blueprint blue + emerald green on dark
+DARK_BLUE = HexColor('#0a2540')      # Deep navy (near-black from logo background)
+MEDIUM_BLUE = HexColor('#1a6fb5')    # Blueprint blue (spartan helmet)
+ACCENT_GREEN = HexColor('#2ecc71')   # Emerald green (helmet plume / tagline)
+LIGHT_GRAY = HexColor('#f0f4f8')     # Cool gray tint
+BORDER_GRAY = HexColor('#c0cad8')    # Blue-gray border
 WHITE = HexColor('#ffffff')
 WARN_BG = HexColor('#fff8e1')
 AMBER_DARK = HexColor('#f59e0b')
@@ -177,7 +179,13 @@ def json_to_pdf(json_path, pdf_path):
     story = []
 
     # ── Title ──
-    story.append(Paragraph("Construction Analysis Report", styles['DocTitle']))
+    story.append(Paragraph("KNIGHT SHIFT", styles['DocTitle']))
+    story.append(Paragraph(
+        '<font color="#2ecc71"><b>FORGED BY WILLPOWER</b></font>',
+        ParagraphStyle('_tagline', parent=styles['Normal'], fontSize=9,
+                       alignment=TA_CENTER, spaceAfter=12,
+                       textColor=ACCENT_GREEN)
+    ))
     subtitle_parts = []
     if project.get('project_name'):
         subtitle_parts.append(project['project_name'])
@@ -185,7 +193,7 @@ def json_to_pdf(json_path, pdf_path):
         subtitle_parts.append(project['location'])
     if subtitle_parts:
         story.append(Paragraph(" &mdash; ".join(subtitle_parts), styles['DocSubtitle']))
-    story.append(HRFlowable(width="100%", thickness=1, color=DARK_BLUE))
+    story.append(HRFlowable(width="100%", thickness=2, color=MEDIUM_BLUE))
     story.append(Spacer(1, 12))
 
     # ── Contact & Document Info ──
@@ -334,58 +342,63 @@ def json_to_pdf(json_path, pdf_path):
                     f"{floor_name} ({len(rooms)} rooms)", styles['SubHead']
                 ))
 
-            # Updated headers: doors as FP/HM, windows as painted, ceiling painted flag, multiplier, source sheet
-            room_rows = [['Room', 'Walls', 'Ceil', 'Ptd?',
-                          'Trim', 'Dr FP', 'Dr HM', 'Win P', 'Mult', 'Sheet']]
+            # ── Table 1: Surface Measurements (dimensions + areas + materials) ──
+            surf_rows = [['Room', 'Dimensions', 'Wall Mat', 'Wall SF',
+                          'Ceil Mat', 'Ceil SF', 'Trim LF', 'Mult', 'Sheet']]
             for room in rooms:
                 dims = room.get('dimensions', {})
                 elems = room.get('elements', {})
                 mats = room.get('materials', {})
                 name = room.get('room_name', room.get('room_id', '-'))
-                if len(name) > 25:
-                    name = name[:23] + '..'
+                if len(name) > 22:
+                    name = name[:20] + '..'
 
-                # Doors: new schema or fallback to old
-                dr_fp = _safe_num(elems.get('doors_full_paint', 0))
-                dr_hm = _safe_num(elems.get('doors_hm_panel', 0))
-                if dr_fp == 0 and dr_hm == 0 and 'doors' in elems:
-                    dr_fp = _safe_num(elems.get('doors', 0))
+                _l = _safe_num(dims.get('length_feet', 0))
+                _w = _safe_num(dims.get('width_feet', 0))
+                _h = _safe_num(dims.get('ceiling_height_feet', 0))
+                if _l > 0 and _w > 0 and _h > 0:
+                    dim_str = f"{_l:.0f}x{_w:.0f}x{_h:.0f}"
+                elif _l > 0 and _w > 0:
+                    dim_str = f"{_l:.0f}x{_w:.0f}"
+                else:
+                    dim_str = "-"
 
-                # Windows: painted interior or fallback
-                win_p = _safe_num(elems.get('windows_painted_interior', 0))
-                if win_p == 0 and 'windows' in elems and 'windows_painted_interior' not in elems:
-                    win_p = _safe_num(elems.get('windows', 0))
+                wall_mat_str = str(mats.get('walls', '-'))[:6]
+                ceil_mat_raw = str(mats.get('ceiling', '-'))
+                ceil_ptd = mats.get('ceiling_painted', False)
+                ceil_mat_str = ceil_mat_raw[:6]
+                if not ceil_ptd and ceil_mat_str != '-':
+                    ceil_mat_str = f"{ceil_mat_str}*"  # Asterisk = not painted
 
-                ceil_ptd = 'Y' if mats.get('ceiling_painted', False) else 'N'
-                sheet = str(room.get('source_sheet', '-'))[:8]
-
-                # Unit multiplier
                 mult = _extract_multiplier_from_notes_pdf(room)
                 mult_str = f"x{mult}" if mult > 1 else "1"
+                sheet = str(room.get('source_sheet', '-'))[:8]
 
-                room_rows.append([
+                surf_rows.append([
                     name,
+                    dim_str,
+                    wall_mat_str,
                     f"{_safe_num(dims.get('wall_area_sqft')):,.0f}",
+                    ceil_mat_str,
                     f"{_safe_num(dims.get('ceiling_area_sqft')):,.0f}",
-                    ceil_ptd,
                     f"{_safe_num(elems.get('base_trim_lf')):,.0f}",
-                    str(int(dr_fp)),
-                    str(int(dr_hm)),
-                    str(int(win_p)),
                     mult_str,
                     sheet,
                 ])
 
-            col_widths = [1.3*inch, 0.5*inch, 0.5*inch, 0.3*inch,
-                          0.45*inch, 0.35*inch, 0.35*inch, 0.35*inch, 0.4*inch, 0.55*inch]
-            t = Table(room_rows, colWidths=col_widths, repeatRows=1)
-            t.setStyle(TableStyle([
+            surf_cw = [1.15*inch, 0.6*inch, 0.45*inch, 0.5*inch,
+                        0.45*inch, 0.45*inch, 0.45*inch, 0.3*inch, 0.55*inch]
+            t1 = Table(surf_rows, colWidths=surf_cw, repeatRows=1)
+            t1.setStyle(TableStyle([
                 ('BACKGROUND', (0, 0), (-1, 0), DARK_BLUE),
                 ('TEXTCOLOR', (0, 0), (-1, 0), WHITE),
                 ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
                 ('FONTSIZE', (0, 0), (-1, -1), 7),
                 ('LEADING', (0, 0), (-1, -1), 9),
-                ('ALIGN', (1, 0), (9, -1), 'RIGHT'),
+                ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
+                ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+                ('ALIGN', (2, 0), (2, -1), 'CENTER'),
+                ('ALIGN', (4, 0), (4, -1), 'CENTER'),
                 ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
                 ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
                 ('TOPPADDING', (0, 0), (-1, -1), 3),
@@ -396,7 +409,95 @@ def json_to_pdf(json_path, pdf_path):
                 ('ROWBACKGROUNDS', (0, 1), (-1, -1), [WHITE, LIGHT_GRAY]),
             ]))
             story.append(Spacer(1, 2))
-            story.append(t)
+            story.append(t1)
+
+            # ── Table 2: Elements & Counts (doors, windows, specialty items) ──
+            # Only show if any room on this floor has non-zero elements beyond trim
+            _has_elements = False
+            for room in rooms:
+                elems = room.get('elements', {})
+                dr_fp = _safe_num(elems.get('doors_full_paint', elems.get('doors', 0)))
+                dr_hm = _safe_num(elems.get('doors_hm_panel', 0))
+                dr_fr = _safe_num(elems.get('doors_frame_only', 0))
+                win_p = _safe_num(elems.get('windows_painted_interior', elems.get('windows', 0)))
+                stairs = _safe_num(elems.get('stair_sections', 0))
+                wc = _safe_num(elems.get('wallcovering_sqft', 0))
+                stwood = _safe_num(elems.get('stained_wood_sqft', 0))
+                soffit = _safe_num(elems.get('soffit_sqft', 0))
+                conc = _safe_num(elems.get('concrete_floor_sqft', 0))
+                cols = _safe_num(elems.get('painted_columns_ea', 0))
+                l5 = _safe_num(elems.get('level_5_finish_sqft', 0))
+                if any(v > 0 for v in [dr_fp, dr_hm, dr_fr, win_p, stairs,
+                                        wc, stwood, soffit, conc, cols, l5]):
+                    _has_elements = True
+                    break
+
+            if _has_elements:
+                elem_rows = [['Room', 'Dr FP', 'Dr HM', 'Dr Fr', 'Win P',
+                              'Stairs', 'WC SF', 'Stained', 'Soffit', 'Conc', 'Cols', 'L5 SF']]
+                for room in rooms:
+                    elems = room.get('elements', {})
+                    name = room.get('room_name', room.get('room_id', '-'))
+                    if len(name) > 18:
+                        name = name[:16] + '..'
+
+                    dr_fp = _safe_num(elems.get('doors_full_paint', 0))
+                    dr_hm = _safe_num(elems.get('doors_hm_panel', 0))
+                    dr_fr = _safe_num(elems.get('doors_frame_only', 0))
+                    if dr_fp == 0 and dr_hm == 0 and 'doors' in elems and 'doors_full_paint' not in elems:
+                        dr_fp = _safe_num(elems.get('doors', 0))
+                    win_p = _safe_num(elems.get('windows_painted_interior', 0))
+                    if win_p == 0 and 'windows' in elems and 'windows_painted_interior' not in elems:
+                        win_p = _safe_num(elems.get('windows', 0))
+
+                    def _elem_str(val, is_sf=False):
+                        if val == 0:
+                            return '-'
+                        return f"{val:,.0f}" if is_sf else str(int(val))
+
+                    elem_rows.append([
+                        name,
+                        _elem_str(dr_fp),
+                        _elem_str(dr_hm),
+                        _elem_str(dr_fr),
+                        _elem_str(win_p),
+                        _elem_str(_safe_num(elems.get('stair_sections', 0))),
+                        _elem_str(_safe_num(elems.get('wallcovering_sqft', 0)), True),
+                        _elem_str(_safe_num(elems.get('stained_wood_sqft', 0)), True),
+                        _elem_str(_safe_num(elems.get('soffit_sqft', 0)), True),
+                        _elem_str(_safe_num(elems.get('concrete_floor_sqft', 0)), True),
+                        _elem_str(_safe_num(elems.get('painted_columns_ea', 0))),
+                        _elem_str(_safe_num(elems.get('level_5_finish_sqft', 0)), True),
+                    ])
+
+                elem_cw = [1.0*inch, 0.35*inch, 0.35*inch, 0.35*inch, 0.35*inch,
+                           0.4*inch, 0.5*inch, 0.5*inch, 0.45*inch, 0.45*inch, 0.35*inch, 0.45*inch]
+                t2 = Table(elem_rows, colWidths=elem_cw, repeatRows=1)
+                t2.setStyle(TableStyle([
+                    ('BACKGROUND', (0, 0), (-1, 0), MEDIUM_BLUE),
+                    ('TEXTCOLOR', (0, 0), (-1, 0), WHITE),
+                    ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+                    ('FONTSIZE', (0, 0), (-1, -1), 6.5),
+                    ('LEADING', (0, 0), (-1, -1), 8),
+                    ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
+                    ('ALIGN', (0, 0), (0, -1), 'LEFT'),
+                    ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+                    ('BOTTOMPADDING', (0, 0), (-1, -1), 2),
+                    ('TOPPADDING', (0, 0), (-1, -1), 2),
+                    ('LEFTPADDING', (0, 0), (-1, -1), 2),
+                    ('RIGHTPADDING', (0, 0), (-1, -1), 2),
+                    ('BOX', (0, 0), (-1, -1), 0.5, BORDER_GRAY),
+                    ('INNERGRID', (0, 0), (-1, -1), 0.25, BORDER_GRAY),
+                    ('ROWBACKGROUNDS', (0, 1), (-1, -1), [WHITE, LIGHT_GRAY]),
+                ]))
+                story.append(Spacer(1, 2))
+                story.append(t2)
+
+            # Legend note for ceiling material asterisk
+            story.append(Paragraph(
+                '<i>* = ceiling not painted (ACT, exposed, etc.)</i>',
+                styles['Note']
+            ))
 
         # ── Unit Multiplication Summary ──
         unit_mult = analysis.get('unit_multiplication', {})
@@ -794,6 +895,69 @@ def json_to_pdf(json_path, pdf_path):
         story.append(Spacer(1, 4))
         story.append(t)
 
+    # ── Estimated Labor Hours (PCA Production Rates) ──
+    labor_hours = data.get('labor_hours_estimate', {})
+    lh_categories = labor_hours.get('categories', [])
+    if lh_categories:
+        story.append(Spacer(1, 8))
+        story.append(Paragraph("Estimated Labor Hours", styles['SectionHead']))
+        story.append(HRFlowable(width="100%", thickness=0.5, color=BORDER_GRAY))
+        story.append(Spacer(1, 4))
+        story.append(Paragraph(
+            '<i>Based on PCA (Painting Contractors Association) production rates. '
+            'Assumes airless spray for walls/ceilings, brush for trim/windows. '
+            'Actual hours may vary based on job conditions.</i>',
+            styles['Note']
+        ))
+
+        lh_rows = [['Category', 'Surface (SF)', 'Rate (SF/HR)', 'Est. Hours']]
+        for cat in lh_categories:
+            if cat.get('hours', 0) > 0:
+                lh_rows.append([
+                    cat.get('category', ''),
+                    f"{cat.get('surface_sf', 0):,.0f}",
+                    f"{cat.get('rate_sf_hr', 0):,.0f}",
+                    f"{cat.get('hours', 0):,.1f}",
+                ])
+
+        prod_hrs = labor_hours.get('production_hours', 0)
+        setup_hrs = labor_hours.get('setup_cleanup_hours', 0)
+        total_hrs = labor_hours.get('total_hours', 0)
+
+        lh_rows.append(['', '', 'Production Hours:', f"{prod_hrs:,.1f}"])
+        lh_rows.append(['', '', '+ Setup/Cleanup (15%):', f"{setup_hrs:,.1f}"])
+        lh_rows.append(['', '', 'TOTAL HOURS:', f"{total_hrs:,.1f}"])
+
+        lh_cw = [1.8*inch, 1.0*inch, 1.2*inch, 0.8*inch]
+        lh_tbl = Table(lh_rows, colWidths=lh_cw, repeatRows=1)
+        lh_tbl.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), DARK_BLUE),
+            ('TEXTCOLOR', (0, 0), (-1, 0), WHITE),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTNAME', (2, -3), (3, -1), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+            ('TOPPADDING', (0, 0), (-1, -1), 4),
+            ('LEFTPADDING', (0, 0), (-1, -1), 6),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 6),
+            ('BOX', (0, 0), (-1, -1), 0.5, BORDER_GRAY),
+            ('INNERGRID', (0, 0), (-1, -4), 0.25, BORDER_GRAY),
+            ('LINEABOVE', (0, -3), (-1, -3), 0.5, BORDER_GRAY),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -4), [WHITE, LIGHT_GRAY]),
+        ]))
+        story.append(Spacer(1, 4))
+        story.append(lh_tbl)
+
+        crew_days = labor_hours.get('crew_days', 0)
+        if crew_days > 0:
+            story.append(Spacer(1, 4))
+            story.append(Paragraph(
+                f'<i>Equivalent to approximately {crew_days:.1f} person-days (8-hour days).</i>',
+                styles['Note']
+            ))
+
     # ── Pricing Model ──
     if pricing:
         story.append(Spacer(1, 8))
@@ -814,7 +978,7 @@ def json_to_pdf(json_path, pdf_path):
             ('window_sill_apron',   'Window Sill/Apron',    '/ea'),
             ('stairs',              'Stairs',               '/section'),
             ('gyp_between_stairs',  'Gyp Between Stairs',   '/sqft'),
-            ('level_5_finish',      'Level 5 Finish',       '/ea'),
+            ('level_5_finish',      'Level 5 Finish',       '/sqft'),
             ('exterior_cornice',    'Exterior Cornice',     '/LF'),
             ('exterior_window_trim','Ext. Window Trim',     '/LF'),
             ('exterior_soffit_fascia', 'Ext. Soffit/Fascia', '/sqft'),

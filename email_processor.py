@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Nightshift AI - Email-Based PDF Ingestion Service
+Knight Shift - Email-Based PDF Ingestion Service
 ==================================================
 Monitors an Outlook / Office 365 mailbox for RFP emails with PDF attachments.
 Processes PDFs through the Takeoff_DIRECT analysis pipeline.
@@ -581,8 +581,8 @@ def send_test_email():
     msg = MIMEMultipart()
     msg["From"] = f"{COMPANY_NAME} <{EMAIL_ADDRESS}>"
     msg["To"] = EMAIL_ADDRESS
-    msg["Subject"] = "Nightshift AI - SMTP Test"
-    body = f"""This is a test email from the Nightshift AI Email Processor.
+    msg["Subject"] = "Knight Shift - SMTP Test"
+    body = f"""This is a test email from the Knight Shift Email Processor.
 
 If you are reading this, your SMTP configuration is working correctly.
 
@@ -606,7 +606,7 @@ Timestamp: {datetime.now().isoformat()}
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Nightshift AI — Email PDF Ingestion Service"
+        description="Knight Shift — Email PDF Ingestion Service"
     )
     parser.add_argument("--once", action="store_true", help="Process once and exit")
     parser.add_argument("--test", action="store_true", help="Send test email to verify SMTP")

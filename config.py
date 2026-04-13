@@ -148,8 +148,8 @@ PRICING_MODEL = {
     },
     # ── Specialty ──
     "level_5_finish": {
-        "unit": "ea", "markup": 0.06,
-        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 1600.00}],
+        "unit": "sqft", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 0.55}],    # PCA: skim coat per SF (was $1,600/ea)
     },
     # ── Exterior ── (Items 30-31, 46-47)
     "exterior_cornice": {
@@ -281,6 +281,72 @@ PRICING_MODEL = {
             {"min_qty": 3500, "max_qty": None,  "rate": 0.80},
         ],
     },
+}
+
+# =============================================================================
+# PCA Cost & Estimating Guide Vol. 2 — Industry Constants
+# =============================================================================
+# Source: PDCA/PCA Cost and Estimating Guide Volume 2: Rates and Tables
+# (Third Edition). These constants are used for measurement validation,
+# labor hour estimation, and cross-checking extracted quantities.
+#
+PCA_CONSTANTS = {
+    # ── Section 4B: Common Estimating Multipliers ──
+    "door_flush_sf": 42,              # Standard flush door surface area (SF)
+    "door_frame_sf": 34,              # Standard doorframe surface area (SF)
+    "door_paneled_sf": 50,            # Paneled door (estimated from PCA rates)
+    "stair_sf_per_riser": 20,         # Steel stairs & railing: 20 SF per riser
+    "stair_risers_per_section": 12,   # Typical risers per stair flight section
+    "fire_escape_sf_per_riser": 15,
+
+    # ── Section 3: Standards of Measurement — Opening Deduction Rules ──
+    # Rule #8: Small openings disregarded. Floor-to-ceiling openings > 5ft wide
+    #          deducted. All openings >= 100 SF deducted.
+    # Rule #9: Cabinets, tubs, showers NOT deducted.
+    "opening_deduct_min_sf": 100,     # Deduct openings >= 100 SF
+    "opening_deduct_ftc_width": 5,    # Deduct floor-to-ceiling openings > 5ft wide
+    "std_door_opening_sf": 21,        # Standard 3'0" x 7'0" door = 21 SF
+    "std_window_opening_sf": 15,      # Standard 3'0" x 5'0" window = 15 SF (< 100 SF, NOT deducted per Rule #8)
+
+    # ── Section 5C: Labor Production Rates (SF/HR) — mid-range values ──
+    # Used for informational labor hour estimates, not pricing.
+    # Rates assume airless spray unless noted. Include normal cut-in with brush.
+    "labor_rates": {
+        "gyp_walls_spray_1st": 650,   # Drywall smooth, spray, 1st coat
+        "gyp_walls_spray_add": 750,   # Drywall smooth, spray, additional coat
+        "gyp_walls_roll_1st": 337,    # Drywall smooth, roll, 1st coat
+        "gyp_walls_roll_add": 375,    # Drywall smooth, roll, additional coat
+        "gyp_ceilings_spray": 650,    # Ceiling spray (same as walls)
+        "base_trim_brush": 100,       # Interior trim, brush (SF/HR, 1 SF/LF)
+        "doors_steel_spray_1st": 200, # Steel doors flush, spray, 1st coat
+        "doors_steel_spray_add": 250, # Steel doors flush, spray, additional
+        "doors_wood_spray_1st": 200,  # Wood doors flush, spray, 1st coat
+        "doors_wood_brush_1st": 84,   # Wood doors flush, brush, 1st coat
+        "windows_brush_1st": 85,      # Window sash + trim, brush, 1st coat
+        "cmu_spray": 488,             # CMU smooth, spray, average
+        "cmu_roll": 300,              # CMU smooth, roll, average
+        "dryfall_spray": 400,         # Acoustical/dryfall ceiling spray
+        "stairs_brush_1st": 100,      # Metal stairs & railings, brush, 1st coat
+        "wallcovering_54in": 45,      # 54" vinyl WC, hand (SF/HR)
+    },
+
+    # ── Section 5D: Production Rate Adjustments ──
+    # Multi-story buildings: productivity diminishes 1-2% per floor due to
+    # material handling, elevator waits, tool retrieval. Applied to area-based
+    # rates only (walls, ceilings), not per-unit items (doors, windows).
+    "height_productivity_loss_per_floor": 0.015,  # 1.5% per floor above threshold
+    "height_productivity_max_loss": 0.20,          # Cap at 20% total loss
+    "height_productivity_start_floor": 4,          # Apply starting at floor 5
+
+    # ── Section 4C: Window Sash & Trim SF (non-operable, 1 side, 1 lite) ──
+    # Key: "WxH" (width x height in feet), Value: total SF of sash + trim
+    "window_sf_table": {
+        "1x1": 8,  "1x2": 12, "1x3": 16, "1x4": 20,
+        "2x2": 16, "2x3": 20, "2x4": 24, "2x5": 28, "2x6": 32, "2x7": 36,
+        "3x3": 24, "3x4": 28, "3x5": 32, "3x6": 36, "3x7": 40,
+        "4x4": 32, "4x5": 35, "4x6": 40, "4x8": 48,
+    },
+    "window_sf_default": 32,          # Default for unknown size (3x5 equivalent)
 }
 
 # =============================================================================
