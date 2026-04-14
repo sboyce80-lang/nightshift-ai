@@ -7,10 +7,15 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
-    <header class="hero">
+    <header class="hero hero-compact">
         <div class="hero-content">
-            <h1>Knight Shift</h1>
-            <p class="tagline">Forged by Willpower</p>
+            <div class="hero-logo-wrap">
+                <img src="{{ url_for('static', filename='logo_helm.png') }}" alt="Knight Shift helm" class="hero-logo">
+                <div class="hero-text-overlay">
+                    <h1>Knight&nbsp;Shift</h1>
+                    <p class="tagline">Forged by Willpower</p>
+                </div>
+            </div>
         </div>
     </header>
 
@@ -20,17 +25,76 @@
         <p>We received <strong>{{ num_files }} PDF{{ 's' if num_files != 1 else '' }}</strong> from <strong>{{ name }}</strong>.</p>
         <p>Results will be sent to <span class="email-highlight">{{ email }}</span></p>
 
+        <div class="progress-tracker" id="progress-tracker">
+            <div class="progress-bar-wrap">
+                <div class="progress-bar" id="progress-bar" style="width: 5%"></div>
+            </div>
+            <div class="progress-steps">
+                <div class="prog-step active" id="step-upload">
+                    <div class="prog-dot"></div>
+                    <span>Uploaded</span>
+                </div>
+                <div class="prog-step" id="step-scan">
+                    <div class="prog-dot"></div>
+                    <span>Scanning</span>
+                </div>
+                <div class="prog-step" id="step-extract">
+                    <div class="prog-dot"></div>
+                    <span>Measuring</span>
+                </div>
+                <div class="prog-step" id="step-price">
+                    <div class="prog-dot"></div>
+                    <span>Pricing</span>
+                </div>
+                <div class="prog-step" id="step-done">
+                    <div class="prog-dot"></div>
+                    <span>Delivered</span>
+                </div>
+            </div>
+            <p class="progress-status" id="progress-status">Analyzing your documents...</p>
+        </div>
+
         <div class="estimate-time">
             &#9200; Estimated processing time: 2&ndash;5 minutes per document
         </div>
 
-        <p>Our system is analyzing your architectural drawings right now. You'll receive a detailed painting estimate with line-item pricing in your inbox shortly.</p>
+        <p>Our AI is reading every room, door, window, and finish on your drawings. You'll receive a detailed painting estimate with line-item pricing in your inbox shortly.</p>
 
-        <a href="{{ url_for('index') }}" class="back-link">&larr; Submit another RFP</a>
+        <a href="{{ url_for('index') }}" class="back-link">&larr; Submit another project</a>
     </main>
 
     <footer>
         <p>&copy; 2026 Knight Shift &mdash; Forged by Willpower</p>
     </footer>
+
+    <script>
+    (function() {
+        // Simulated progress animation (real polling can be added later
+        // when the backend exposes a status endpoint)
+        const bar = document.getElementById('progress-bar');
+        const status = document.getElementById('progress-status');
+        const steps = [
+            { pct: 15, step: 'step-scan', text: 'Scanning document structure...' },
+            { pct: 35, step: 'step-extract', text: 'Measuring rooms and surfaces...' },
+            { pct: 65, step: 'step-extract', text: 'Extracting doors, windows, finishes...' },
+            { pct: 85, step: 'step-price', text: 'Calculating pricing...' },
+            { pct: 100, step: 'step-done', text: 'Estimate complete! Check your email.' },
+        ];
+
+        let i = 0;
+        function advance() {
+            if (i >= steps.length) return;
+            const s = steps[i];
+            bar.style.width = s.pct + '%';
+            status.textContent = s.text;
+            document.getElementById(s.step).classList.add('active');
+            i++;
+            if (i < steps.length) {
+                setTimeout(advance, 3000 + Math.random() * 4000);
+            }
+        }
+        setTimeout(advance, 2000);
+    })();
+    </script>
 </body>
 </html>

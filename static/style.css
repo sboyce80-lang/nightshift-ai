@@ -36,19 +36,23 @@ body {
 .hero {
     background: linear-gradient(135deg, var(--dark-blue) 0%, var(--darker-blue) 100%);
     color: var(--white);
-    padding: 60px 20px 80px;
+    padding: 36px 20px 60px;
     text-align: center;
+}
+
+.hero.hero-compact {
+    padding: 24px 20px 50px;
 }
 
 /* ── Hero Logo + Text Overlay ── */
 .hero-logo-wrap {
     position: relative;
     display: inline-block;
-    margin-bottom: 12px;
+    margin-bottom: 8px;
 }
 
 .hero-logo {
-    height: 340px;
+    height: 180px;
     width: auto;
     opacity: 0.20;
     mix-blend-mode: screen;
@@ -68,15 +72,16 @@ body {
 }
 
 .hero h1 {
-    font-size: 3rem;
+    font-size: 2.6rem;
     font-weight: 700;
-    margin-bottom: 8px;
+    margin-bottom: 4px;
     letter-spacing: -0.5px;
     text-shadow: 0 2px 12px rgba(0, 0, 0, 0.5);
+    white-space: nowrap;
 }
 
 .tagline {
-    font-size: 1.4rem;
+    font-size: 1.15rem;
     color: var(--accent-green);
     font-style: italic;
     margin-bottom: 0;
@@ -86,9 +91,64 @@ body {
 
 .subtitle {
     font-size: 1.05rem;
-    color: rgba(255, 255, 255, 0.8);
-    max-width: 520px;
+    color: rgba(255, 255, 255, 0.85);
+    max-width: 540px;
+    margin: 8px auto 0;
+}
+
+.trust-line {
+    font-size: 0.82rem;
+    color: rgba(255, 255, 255, 0.45);
+    margin-top: 10px;
+    letter-spacing: 0.02em;
+}
+
+/* ── How It Works ── */
+.how-it-works {
+    background: var(--white);
+    border-bottom: 1px solid #e5e7eb;
+    padding: 28px 20px;
+}
+
+.steps-row {
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    gap: 12px;
+    max-width: 780px;
     margin: 0 auto;
+}
+
+.step {
+    flex: 1;
+    text-align: center;
+    max-width: 220px;
+}
+
+.step-icon {
+    font-size: 2rem;
+    margin-bottom: 6px;
+}
+
+.step h3 {
+    font-size: 0.95rem;
+    font-weight: 700;
+    color: var(--dark-blue);
+    margin-bottom: 4px;
+}
+
+.step p {
+    font-size: 0.82rem;
+    color: var(--text-muted);
+    line-height: 1.4;
+}
+
+.step-arrow {
+    font-size: 1.5rem;
+    color: var(--accent-green);
+    font-weight: 700;
+    padding-top: 20px;
+    flex-shrink: 0;
 }
 
 /* ── Form Container ── */
@@ -272,12 +332,37 @@ body {
     font-size: 0.82rem;
 }
 
+/* ── Checkbox / Radio Rows ── */
+.checkbox-row {
+    display: flex;
+    gap: 24px;
+    flex-wrap: wrap;
+}
+
+.check-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-weight: 500;
+    font-size: 0.95rem;
+    color: var(--text-dark);
+    cursor: pointer;
+}
+
+.check-label input[type="checkbox"],
+.check-label input[type="radio"] {
+    width: 18px;
+    height: 18px;
+    accent-color: var(--accent-green);
+    cursor: pointer;
+}
+
 /* ── Submit Button ── */
 .submit-btn {
     display: block;
     width: 100%;
     padding: 16px;
-    background: var(--dark-blue);
+    background: var(--accent-green);
     color: var(--white);
     border: none;
     border-radius: 10px;
@@ -289,7 +374,7 @@ body {
 }
 
 .submit-btn:hover {
-    background: var(--medium-blue);
+    background: var(--accent-green-hover);
 }
 
 .submit-btn:active {
@@ -363,9 +448,9 @@ footer {
 
 .thank-you-card .estimate-time {
     display: inline-block;
-    background: #fffbeb;
-    border: 1px solid var(--accent-amber);
-    color: var(--amber-hover);
+    background: #f0f7ff;
+    border: 1px solid var(--medium-blue);
+    color: var(--dark-blue);
     padding: 8px 20px;
     border-radius: 8px;
     font-weight: 600;
@@ -385,18 +470,105 @@ footer {
     text-decoration: underline;
 }
 
+/* ── Progress Tracker (Thank You page) ── */
+.progress-tracker {
+    margin: 24px 0;
+    padding: 20px;
+    background: var(--light-gray);
+    border-radius: 10px;
+    border: 1px solid var(--border-gray);
+}
+
+.progress-bar-wrap {
+    width: 100%;
+    height: 8px;
+    background: #e2e8f0;
+    border-radius: 4px;
+    overflow: hidden;
+    margin-bottom: 16px;
+}
+
+.progress-bar {
+    height: 100%;
+    background: linear-gradient(90deg, var(--medium-blue), var(--accent-green));
+    border-radius: 4px;
+    transition: width 1.5s ease;
+}
+
+.progress-steps {
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: 12px;
+}
+
+.prog-step {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 4px;
+    opacity: 0.35;
+    transition: opacity 0.5s;
+}
+
+.prog-step.active {
+    opacity: 1;
+}
+
+.prog-dot {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: var(--border-gray);
+    transition: background 0.5s;
+}
+
+.prog-step.active .prog-dot {
+    background: var(--accent-green);
+}
+
+.prog-step span {
+    font-size: 0.72rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+
+.progress-status {
+    text-align: center;
+    font-size: 0.9rem;
+    color: var(--medium-blue);
+    font-weight: 500;
+    margin: 0;
+}
+
 /* ── Responsive ── */
 @media (max-width: 640px) {
     .hero {
-        padding: 40px 16px 60px;
+        padding: 28px 16px 44px;
     }
 
+    .hero-logo { height: 140px; }
+
     .hero h1 {
-        font-size: 2rem;
+        font-size: 1.8rem;
     }
 
     .tagline {
-        font-size: 1.1rem;
+        font-size: 1rem;
+    }
+
+    .subtitle { font-size: 0.92rem; }
+
+    .steps-row {
+        flex-direction: column;
+        align-items: center;
+        gap: 16px;
+    }
+
+    .step-arrow {
+        transform: rotate(90deg);
+        padding: 0;
     }
 
     .form-container,
@@ -412,5 +584,13 @@ footer {
     .submit-btn {
         font-size: 1rem;
         padding: 14px;
+    }
+
+    .progress-steps {
+        gap: 4px;
+    }
+
+    .prog-step span {
+        font-size: 0.62rem;
     }
 }

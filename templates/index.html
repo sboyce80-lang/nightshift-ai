@@ -12,13 +12,36 @@
             <div class="hero-logo-wrap">
                 <img src="{{ url_for('static', filename='logo_helm.png') }}" alt="Knight Shift helm" class="hero-logo">
                 <div class="hero-text-overlay">
-                    <h1>Knight Shift</h1>
+                    <h1>Knight&nbsp;Shift</h1>
                     <p class="tagline">Forged by Willpower</p>
                 </div>
             </div>
-            <p class="subtitle">Upload your construction documents and receive a detailed painting estimate delivered straight to your inbox.</p>
+            <p class="subtitle">AI-powered painting estimates from architectural drawings &mdash; delivered in minutes, not days.</p>
+            <p class="trust-line">Powered by Rider Painting &mdash; 30+ years of commercial &amp; residential painting experience</p>
         </div>
     </header>
+
+    <section class="how-it-works">
+        <div class="steps-row">
+            <div class="step">
+                <div class="step-icon">&#128203;</div>
+                <h3>1. Upload PDFs</h3>
+                <p>Drop your architectural drawings &mdash; floor plans, schedules, elevations</p>
+            </div>
+            <div class="step-arrow">&#8594;</div>
+            <div class="step">
+                <div class="step-icon">&#128736;</div>
+                <h3>2. AI Measures</h3>
+                <p>Every room, wall, door, and window is extracted and measured automatically</p>
+            </div>
+            <div class="step-arrow">&#8594;</div>
+            <div class="step">
+                <div class="step-icon">&#128233;</div>
+                <h3>3. Estimate Delivered</h3>
+                <p>Line-item pricing with labor hours lands in your inbox in minutes</p>
+            </div>
+        </div>
+    </section>
 
     <main class="form-container">
         {% with messages = get_flashed_messages(with_categories=true) %}
@@ -48,17 +71,10 @@
                                placeholder="you@company.com">
                     </div>
                 </div>
-                <div class="form-row">
-                    <div class="form-group">
-                        <label for="phone">Phone</label>
-                        <input type="tel" id="phone" name="phone"
-                               placeholder="(555) 123-4567">
-                    </div>
-                    <div class="form-group">
-                        <label for="business_name">Business Name</label>
-                        <input type="text" id="business_name" name="business_name"
-                               placeholder="Company name">
-                    </div>
+                <div class="form-group">
+                    <label for="business_name">Business Name</label>
+                    <input type="text" id="business_name" name="business_name"
+                           placeholder="Company name (optional)">
                 </div>
             </section>
 
@@ -80,15 +96,32 @@
             <section class="form-section">
                 <h2>Project Details</h2>
                 <div class="form-group">
-                    <label for="scope_notes">Scope of Work</label>
-                    <textarea id="scope_notes" name="scope_notes" rows="4"
-                              placeholder="e.g., Interior only, residential floors 2-4, skip basement and mechanical rooms..."></textarea>
-                    <p class="field-hint">Describe the painting scope to help us focus the estimate on the right areas.</p>
+                    <label>Scope *</label>
+                    <div class="checkbox-row">
+                        <label class="check-label">
+                            <input type="checkbox" name="scope_interior" value="1" checked> Interior
+                        </label>
+                        <label class="check-label">
+                            <input type="checkbox" name="scope_exterior" value="1"> Exterior
+                        </label>
+                    </div>
                 </div>
                 <div class="form-group">
-                    <label for="deadline">Deadline</label>
-                    <input type="date" id="deadline" name="deadline">
-                    <p class="field-hint">When do you need the estimate by?</p>
+                    <label>Project Type</label>
+                    <div class="checkbox-row">
+                        <label class="check-label">
+                            <input type="radio" name="project_type" value="new_construction" checked> New Construction
+                        </label>
+                        <label class="check-label">
+                            <input type="radio" name="project_type" value="repaint"> Repaint
+                        </label>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label for="scope_notes">Additional Notes</label>
+                    <textarea id="scope_notes" name="scope_notes" rows="2"
+                              placeholder="e.g., Skip basement and mechanical rooms, residential floors only..."></textarea>
+                    <p class="field-hint">Optional &mdash; anything else to help focus the estimate.</p>
                 </div>
             </section>
 
