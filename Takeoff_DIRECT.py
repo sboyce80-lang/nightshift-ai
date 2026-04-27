@@ -26,6 +26,7 @@ import hashlib
 from pathlib import Path
 import PyPDF2
 from config import CLAUDE_API_KEY, PRICING_MODEL, SMALL_COMMERCIAL_RATES, PCA_CONSTANTS
+from will_synthesis import run_will_synthesis
 import anthropic
 import base64
 from datetime import datetime
@@ -10267,6 +10268,36 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             q_preview = rfi['question'][:80] + ('...' if len(rfi['question']) > 80 else '')
             print(f"   {rfi['number']}. [{rfi['category']}] {q_preview}")
 
+    # --- Will Synthesis: senior estimator review with bounded edit authority ---
+    will_result = run_will_synthesis(
+        analysis=analysis,
+        cost_estimate=costs,
+        rfi_items=rfi_items,
+        validation=validation,
+        client=client,
+    )
+    if will_result.get("will_synthesis"):
+        will_rfis = will_result.get("new_rfis", [])
+        next_num = (max((r.get("number", 0) for r in rfi_items), default=0) + 1
+                    if rfi_items else 1)
+        for rfi in will_rfis:
+            rfi["number"] = next_num
+            next_num += 1
+        rfi_items = (rfi_items or []) + will_rfis
+
+        for adj in will_result.get("adjustments_log", []):
+            adjustments_log.append(
+                f"Will adjusted {adj['category']}: "
+                f"{adj['from_value']:,.0f} → {adj['to_value']:,.0f} "
+                f"(${adj['delta_dollars']:+,.0f}) — {adj['reason']}"
+            )
+
+        validation = _validate_cost_estimate(analysis, costs)
+    elif will_result.get("error"):
+        analysis.setdefault("notes", []).append(
+            f"[Will Synthesis] Skipped: {will_result['error']}"
+        )
+
     # --- Save JSON ---
     _update_progress(7, TOTAL_STEPS, "Generating Report", "Saving JSON and creating PDF...")
     output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
@@ -10298,6 +10329,9 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         "pricing_model": pricing_model_used if pricing_model_used else PRICING_MODEL,
         "adjustments_applied": adjustments_log if adjustments_log else None,
         "rfi_items": rfi_items if rfi_items else None,
+        "will_synthesis": will_result.get("will_synthesis") if 'will_result' in dir() else None,
+        "will_adjustments_log": will_result.get("adjustments_log") if 'will_result' in dir() else None,
+        "will_rejected_log": will_result.get("rejected_log") if 'will_result' in dir() else None,
     }
 
     with open(output_json, 'w') as f:
@@ -10329,6 +10363,7 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         "document": document_ref,
         "rfi_items": rfi_items,
         "adjustments_applied": adjustments_log if adjustments_log else None,
+        "will_synthesis": will_result.get("will_synthesis") if 'will_result' in dir() else None,
     }
 
 
