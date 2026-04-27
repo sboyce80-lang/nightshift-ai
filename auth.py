@@ -220,13 +220,17 @@ def require_auth(view_func):
         import sys, os
         env_secret = os.environ.get("CLERK_SECRET_KEY", "")
         from config import CLERK_SECRET_KEY as cfg_secret
-        print(
+        debug_msg = (
             f"!!! REQ DEBUG sub={clerk_user_id!r} "
             f"env_secret_len={len(env_secret)} env_secret_pfx={env_secret[:12]!r} "
             f"cfg_secret_len={len(cfg_secret)} cfg_secret_pfx={cfg_secret[:12]!r} "
-            f"pid={os.getpid()}",
-            file=sys.stderr, flush=True,
+            f"pid={os.getpid()}"
         )
+        print(debug_msg, file=sys.stdout, flush=True)
+        sys.stdout.flush()
+        # Also log via Flask's logger which gunicorn captures
+        from flask import current_app
+        current_app.logger.warning(debug_msg)
         try:
             g.clerk_user_id = clerk_user_id
             g.clerk_claims = claims
