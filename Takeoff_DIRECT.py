@@ -1743,7 +1743,7 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
         if is_large:
             w_in = w_pt / 72.0
             h_in = h_pt / 72.0
-            if min(w_in, h_in) > 36:
+            if max(w_in, h_in) > 36:
                 grid = ENHANCED_TILE_GRID_LARGE
             else:
                 grid = ENHANCED_TILE_GRID
@@ -1774,7 +1774,7 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
 
     # Phase 3: Send tiles to Claude in batches if needed
     # Max ~20 tiles per API call (each ~1-2MB base64 → ~5MB per tile in request)
-    MAX_TILES_PER_CALL = 8  # ~2 pages of 4 tiles each; keeps payload under API limit
+    MAX_TILES_PER_CALL = 9  # one full 3×3 page or two 2×2 pages per call
     tile_batches = []
     for i in range(0, len(all_tiles), MAX_TILES_PER_CALL):
         tile_batches.append(all_tiles[i:i + MAX_TILES_PER_CALL])
@@ -2463,6 +2463,33 @@ def _merge_chunk_responses(texts, page_offsets=None):
             if epi.get(key) and not cpi.get(key):
                 cpi[key] = epi[key]
 
+        # Prevailing wage merge: a "yes" finding from any chunk wins; otherwise
+        # union the indicators / source pages so Will sees the full evidence trail.
+        epw = epi.get("prevailing_wage") if isinstance(epi.get("prevailing_wage"), dict) else None
+        if epw:
+            cpw = cpi.setdefault("prevailing_wage", {
+                "applies": "unknown", "county": None,
+                "wage_schedule_basis": None, "indicators": [], "source_pages": []
+            })
+            applies_priority = {"yes": 2, "no": 1, "unknown": 0}
+            if applies_priority.get(str(epw.get("applies", "unknown")).lower(), 0) > \
+               applies_priority.get(str(cpw.get("applies", "unknown")).lower(), 0):
+                cpw["applies"] = epw.get("applies", "unknown")
+            if epw.get("county") and not cpw.get("county"):
+                cpw["county"] = epw["county"]
+            if epw.get("wage_schedule_basis") and not cpw.get("wage_schedule_basis"):
+                cpw["wage_schedule_basis"] = epw["wage_schedule_basis"]
+            existing_inds = set(cpw.get("indicators", []) or [])
+            for ind in (epw.get("indicators") or []):
+                if ind and ind not in existing_inds:
+                    cpw.setdefault("indicators", []).append(ind)
+                    existing_inds.add(ind)
+            existing_pages = set(cpw.get("source_pages", []) or [])
+            for pg in (epw.get("source_pages") or []):
+                if pg not in existing_pages:
+                    cpw.setdefault("source_pages", []).append(pg)
+                    existing_pages.add(pg)
+
         # Merge notes (deduplicate)
         existing_notes = set(combined.get("notes", []))
         for n in extra.get("notes", []):
@@ -2570,6 +2597,29 @@ Report this in project_info as additional fields: "building_type", "total_storie
 This classification is CRITICAL — a 20-unit mixed-use building requires extracting 100+
 rooms across multiple floors, not just 10-20 rooms like a single-family home.
 
+STEP 0b: PREVAILING WAGE / PUBLIC WORKS DETECTION (do this with STEP 0)
+Scan the title sheet, general notes, specifications cover, front-end docs, and any
+addenda for indicators that this is a prevailing-wage / public-works project:
+- Owner is a government agency, municipality, school district, housing authority,
+  state university, MTA/transit, federal building, military, NYCHA, DASNY, etc.
+- Explicit mentions: "prevailing wage", "Davis-Bacon", "Davis-Bacon Act",
+  "NYS Labor Law §220", "Section 220", "public work", "public works", "PW",
+  "wage schedule", "wage determination", "certified payroll", "PLA",
+  "project labor agreement", "apprenticeship requirements"
+- County / locality references tied to a wage schedule (e.g. "Westchester County
+  Wage Schedule", "NYC DOL Schedule", "USDOL Wage Determination")
+Report findings in project_info.prevailing_wage with this shape:
+  "prevailing_wage": {
+    "applies": "yes" | "no" | "unknown",
+    "county": "<county/jurisdiction or null>",
+    "wage_schedule_basis": "<e.g. NYS DOL §220, USDOL Davis-Bacon, or null>",
+    "indicators": ["<short snippet 1>", "<short snippet 2>"],
+    "source_pages": [<page numbers>]
+  }
+Default to "unknown" if no indicators are found — do NOT guess "no" unless the
+documents explicitly state it is private / non-prevailing-wage work. This flag
+materially impacts labor cost; missing it is the single biggest pricing risk.
+
 STEP 1: IDENTIFY ALL PAGES (these pages have been pre-filtered for painting relevance)
 - Floor plans (Basement, 1st, 2nd, 3rd…) — typically A-100 through A-199 series
 - Door/window schedules (A-500 series) — CRITICAL for accurate door counts
@@ -2648,8 +2698,72 @@ If you only list "Living/Dining/Kitchen" for a 2BR unit, you are missing 60%+ of
 
 For each room:
 - Read dimension callouts (e.g. 20'-0" × 15'-6")
-- Read ceiling height callouts (CLG HT: 9'-0")
-- Calculate: Wall Area = Perimeter × Ceiling Height
+- Ceiling heights — PULL FROM BUILDING SECTIONS (PRIMARY SOURCE). MAKE NO ASSUMPTIONS.
+  Building Sections show a vertical cut through the building with floor-to-ceiling
+  and floor-to-floor dimensions labeled per level. IDENTIFY THEM BY CONTENT, not by
+  sheet number — different jobs use different numbering conventions. Look for any
+  sheet whose title block, drawing title, or detail label reads "BUILDING SECTION",
+  "BUILDING SECTIONS", "WALL SECTION", "TRANSVERSE SECTION", "LONGITUDINAL SECTION",
+  "CROSS SECTION", "SECTION A", "SECTION B", or simply shows a vertical cut through
+  the building with stacked floors and ceiling lines. Sheet numbers vary by job
+  (A-300 series, A-400 series, A-500 series, AS-101, A2.10, X-201, etc.) — do NOT
+  assume a specific number; use whatever sheet on this job actually contains the
+  Building Sections.
+  PRIORITY ORDER for determining each room's ceiling height:
+    1. Building Section drawing — read the labeled ceiling height (or floor-to-ceiling
+       dimension) for the floor/area where that room lives. Examples of labels you
+       will see: "9'-0" CLG", "CLG HT 10'-0"", "T.O. SLAB to U/S CLG = 9'-6"",
+       "FIN. CLG.", or a vertical dimension string between Finish Floor and Ceiling.
+       USE THIS VALUE EXACTLY.
+    2. RCP / floor plan CLG HT callout for that specific room (e.g. "CLG HT: 9'-0"").
+       USE THE CALLOUT VALUE EXACTLY.
+    3. If no labeled ceiling height appears anywhere, MEASURE IT from a Building
+       Section using the drawing's scale. Find the title block scale (e.g. 1/4" = 1'-0",
+       3/8" = 1'-0", 1/8" = 1'-0") or the graphic scale bar on that section. Measure
+       the vertical distance from finish floor to underside of ceiling on the section,
+       convert using the scale, and record that value. Note in the room's "notes"
+       field that the ceiling height was scaled from a section (which sheet).
+  DO NOT estimate, round, or assume a default ceiling height (no defaulting to 8',
+  9', 9'-6", or 10'). DO NOT use the "typical residential" assumption. Every ceiling
+  height must trace back to a labeled section, a labeled CLG HT callout, or a
+  scale-based measurement off a Building Section.
+  If multiple rooms share the same floor and the section shows one floor-to-ceiling
+  dimension for that floor, apply that exact value to each room on that floor —
+  unless the section/RCP shows a different height (drop ceiling, vault, soffit) for
+  a specific room.
+- Calculate: Wall Area = WALL PERIMETER × Wall Height
+  WALL PERIMETER (LF) is the field "perimeter_lf" on each room and is the foundation
+  of every wall calculation downstream (paint sqft, base trim LF, wallcovering split).
+  Get it wrong and every wall number for the room is wrong.
+- LINEAR PATH METHOD — how to derive WALL PERIMETER (REQUIRED — do NOT shortcut to 2×(L+W)):
+  Trace the WALL PERIMETER as a sequence of linear paths from point A to point B along
+  each wall segment that bounds the room, then sum the segment lengths. The sum IS
+  the room's wall perimeter in linear feet. This is the ONLY correct way to measure
+  non-rectangular rooms.
+  * Walk every wall segment: along the long wall, around each jog/alcove/bay/notch,
+    around closet bump-outs, into and out of every recess, and back to the start.
+    Each segment is one linear path; the wall perimeter is their sum.
+  * For an L-shaped or T-shaped room, the wall perimeter is the sum of ALL outer-edge
+    segments (typically 6+ segments), NOT 2×(bounding-box length + width).
+  * For a room with an alcove (e.g. window seat, built-in nook), include the two
+    side walls and the back wall of the alcove in the wall perimeter — do NOT cut
+    the corner across the alcove opening.
+  * Final calc chain (all three numbers must come from the plans, NEVER estimated):
+      sum of linear paths  =  WALL PERIMETER (LF)
+      WALL PERIMETER × Wall Height  =  Wall Area (sqft)
+    Record the LF total as "perimeter_lf" and use the SAME LF for base_trim_lf.
+- SHARED INTERIOR WALLS — COUNT IN BOTH ROOMS' WALL PERIMETERS:
+  An interior partition wall has TWO painted faces, one in each adjoining room.
+  Each room's WALL PERIMETER must include the full length of every wall that bounds
+  it, even when the wall is shared with another room. Do NOT split a shared wall's
+  LF between the two rooms, and do NOT count it in only one room.
+  * Example: a 12'-long wall between Bedroom 1 and the Hallway contributes 12 LF
+    to Bedroom 1's wall perimeter AND 12 LF to the Hallway's wall perimeter
+    (24 LF of paintable wall surface total at that wall, since both faces are painted).
+  * This applies to: unit demising walls, bedroom/bath partitions, closet walls,
+    corridor walls, kitchen/living separators — every interior partition.
+  * Exception: exterior walls and walls bounding non-paintable space (mech shafts,
+    elevator shafts) only contribute to the one interior room they bound.
 - Calculate: Ceiling Area = Length × Width (only if ceiling_painted = true)
 - Base trim LF = room perimeter (assume base trim in ALL rooms with gyp walls)
 - Level 5 finish: Check the FINISH SCHEDULE, wall type legends, and room notes for "Level 5",
@@ -2724,6 +2838,13 @@ CRITICAL WALL LINEAR FOOTAGE VALIDATION:
 - COMMON ERROR: Measuring only the unit bounding box perimeter instead of all interior walls.
   A 2BR apartment with living room, 2 bedrooms, 2 bathrooms, kitchen, and closets has
   significantly MORE wall LF than just the unit's outer perimeter.
+- DOUBLE-COUNTING IS REQUIRED FOR SHARED INTERIOR WALLS — NOT AN ERROR:
+  When summing per-room perimeters, a wall between two rooms WILL appear in both
+  rooms' perimeter totals. This is correct: each face of that wall is a separate
+  paintable surface. Do NOT "deduplicate" shared walls when totaling LF or wall sqft.
+  The only walls that should appear once are exterior walls and walls bounding
+  non-paintable space (shafts, chases). Floor totals naturally exceed the floor's
+  outer envelope by 2-3× because of this — that is the expected ratio.
 
 SOURCE TRACKING — for each room, also provide:
 - "source_page": the PDF page number (1-based) where this room's floor plan appears
@@ -2910,7 +3031,14 @@ IMPORTANT RULES:
     "building_type": "mixed-use",
     "total_stories": 3,
     "total_units": 20,
-    "footprint_sqft": 10000
+    "footprint_sqft": 10000,
+    "prevailing_wage": {
+      "applies": "unknown",
+      "county": null,
+      "wage_schedule_basis": null,
+      "indicators": [],
+      "source_pages": []
+    }
   },
   "floors": [
     {
@@ -3550,7 +3678,20 @@ Your task: Extract the ROOM FINISH SCHEDULE and BUILDING INFORMATION from this d
    - has_garage: Whether the building has a parking garage (true/false)
    - garage_floor_area_sqft: If garage area is noted anywhere, include it (0 if unknown)
    - has_pool: Whether this is a pool/amenities building
-   - ceiling_height_ft: Default ceiling height if noted in specs (0 if unknown)
+   - ceiling_height_ft: Ceiling height in feet — PULL FROM BUILDING SECTIONS.
+     Identify Building Sections by their CONTENT, not by a fixed sheet number — they
+     may live on A-300, A-400, AS-101, A2.10, or any other sheet on this job. Look
+     for any sheet whose title block, drawing title, or detail label reads
+     "BUILDING SECTION(S)", "WALL SECTION", "TRANSVERSE SECTION", "LONGITUDINAL
+     SECTION", "CROSS SECTION", "SECTION A/B/etc.", or that shows a vertical cut
+     through the building with stacked floors and ceiling lines.
+     Read the labeled ceiling height (e.g. "9'-0" CLG", "CLG HT 10'-0"",
+     "T.O. SLAB to U/S CLG = 9'-6"") and convert to decimal feet.
+     If no ceiling height label is present anywhere in the document, MEASURE IT from a
+     Building Section using the drawing's scale (1/4" = 1'-0", 1/8" = 1'-0", etc.) or
+     the graphic scale bar — measure floor-to-underside-of-ceiling vertically and convert.
+     DO NOT default to 8', 9', or 9'-6". Do NOT assume. If you cannot read a label and
+     cannot measure from a section, set this to 0 and add a note explaining why.
 
 3. COMMON AREA ROOMS: Also extract common area rooms (lobbies, corridors, stairwells, mechanical rooms,
    trash rooms, storage rooms) that appear in the finish schedule. These exist once per floor, not per unit.
@@ -4033,6 +4174,250 @@ def _merge_building_inventories(inventories):
         print(f"   • {name} [{code}]: {count} building(s), {units} unit(s) each")
 
     return result
+
+
+# ---------------------------------------------------------------------------
+# Phase 1 — Project Overview Extraction (G-series / coversheet pages)
+# ---------------------------------------------------------------------------
+
+def _extract_project_overview(client, pdf_paths, classifications_by_pdf=None):
+    """
+    Phase 1 of the Rider workflow: read General Notes / Coversheet (G/T-series)
+    pages FIRST to establish project scope and scale before any measurement work.
+
+    Sends only G-series and Title pages — identified via _classify_pdf_pages() —
+    to Claude with a focused prompt for project_name, scope_summary, total_gsf,
+    building_count, stories, occupancy, and the scope-of-work narrative typically
+    found on coversheets.
+
+    Args:
+        client: Anthropic client
+        pdf_paths: list of PDF file paths (multi-volume projects supported)
+        classifications_by_pdf: optional dict {pdf_path: classifications}.
+                                If None, classify on the fly.
+
+    Returns:
+        dict (or None on failure):
+        {
+            "project_name": str,
+            "scope_summary": str,         # 1-3 sentence narrative
+            "scope_of_work": str,         # raw scope notes from G-pages
+            "total_gsf": int or None,
+            "building_count": int or None,
+            "stories": int or None,       # typical stories per building
+            "occupancy_type": str,        # e.g. "R-2", "B", "A-3"
+            "unit_count": int or None,
+            "source_pdfs": [str],
+            "source_pages": {pdf_path: [page_indices]},
+        }
+    """
+    print(f"\n📘 Phase 1: Extracting Project Overview from G-series / coversheets...")
+
+    # 1. Identify G/T-series pages across all PDFs (cap to first 3 per PDF)
+    page_picks = {}  # pdf_path -> [page_indices]
+    for pdf_path in pdf_paths:
+        cls = (classifications_by_pdf or {}).get(pdf_path)
+        if cls is None:
+            try:
+                cls = _classify_pdf_pages(pdf_path)
+            except Exception:
+                cls = []
+        g_pages = []
+        for entry in cls:
+            disc = entry.get("discipline", "")
+            if disc in ("General", "Title") and entry.get("include"):
+                g_pages.append(entry["page_index"])
+            if len(g_pages) >= 3:
+                break
+        if g_pages:
+            page_picks[pdf_path] = g_pages
+
+    if not page_picks:
+        print(f"   ⚠️  No G-series / Title pages identified — skipping Phase 1")
+        return None
+
+    # 2. Pre-extract text from those pages (PyMuPDF, zero API cost) and render images
+    try:
+        import fitz
+    except ImportError:
+        fitz = None
+
+    pretext_parts = []
+    image_blocks = []
+    sources_used = []
+
+    MAX_PAGES_TOTAL = 6  # hard cap across all PDFs to keep payload < 5MB
+    pages_added = 0
+
+    try:
+        from config import INVENTORY_IMAGE_DPI as _po_dpi
+    except ImportError:
+        _po_dpi = 150
+    try:
+        from config import INVENTORY_IMAGE_QUALITY as _po_quality
+    except ImportError:
+        _po_quality = 75
+    MAX_IMAGE_BYTES = 4 * 1024 * 1024
+
+    try:
+        from PIL import Image as _PILImage
+    except ImportError:
+        _PILImage = None
+    from io import BytesIO
+
+    for pdf_path, page_indices in page_picks.items():
+        if pages_added >= MAX_PAGES_TOTAL:
+            break
+        sources_used.append(os.path.basename(pdf_path))
+        if fitz is None:
+            continue
+        try:
+            doc = fitz.open(pdf_path)
+        except Exception:
+            continue
+        zoom = _po_dpi / 72
+        matrix = fitz.Matrix(zoom, zoom)
+        for pidx in page_indices:
+            if pages_added >= MAX_PAGES_TOTAL:
+                break
+            if pidx >= len(doc):
+                continue
+            page = doc[pidx]
+            text = page.get_text().strip()
+            if text:
+                pretext_parts.append(
+                    f"--- {os.path.basename(pdf_path)} page {pidx + 1} ---\n{text}"
+                )
+            try:
+                pix = page.get_pixmap(matrix=matrix)
+                if _PILImage:
+                    img = _PILImage.frombytes("RGB", [pix.width, pix.height], pix.samples)
+                    buf = BytesIO()
+                    img.save(buf, format="JPEG", quality=_po_quality)
+                    img_bytes = buf.getvalue()
+                    if len(img_bytes) > MAX_IMAGE_BYTES:
+                        buf = BytesIO()
+                        img.save(buf, format="JPEG", quality=40)
+                        img_bytes = buf.getvalue()
+                    media_type = "image/jpeg"
+                else:
+                    img_bytes = pix.tobytes("png")
+                    media_type = "image/png"
+                if len(img_bytes) > MAX_IMAGE_BYTES:
+                    continue
+                b64_data = base64.standard_b64encode(img_bytes).decode("utf-8")
+                image_blocks.append({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": media_type,
+                        "data": b64_data,
+                    }
+                })
+                pages_added += 1
+            except Exception as e:
+                print(f"   ⚠️  Could not render page {pidx + 1} of "
+                      f"{os.path.basename(pdf_path)}: {e}")
+        doc.close()
+
+    if not pretext_parts and not image_blocks:
+        print(f"   ⚠️  Could not gather any text or images from G-pages")
+        return None
+
+    print(f"   📄 Sending {pages_added} G-page image(s) + "
+          f"{len(pretext_parts)} text block(s) to Claude")
+
+    # 3. Build the focused overview prompt
+    overview_prompt = """You are reading the GENERAL NOTES / COVERSHEET / TITLE pages
+(G-series and T-series) of a construction project. These pages establish project
+scope and scale — the bulk of context that drives measurement decisions later.
+
+Your ONLY task on this pass is to extract the project's SCOPE AND SCALE — not
+room measurements. Look for:
+- Project name (cover sheet, title block)
+- Scope of work narrative (general notes, project description)
+- Total Gross Square Footage (GSF) — often labeled "TOTAL BUILDING AREA",
+  "PROJECT AREA", or in a code summary table
+- Number of buildings (if multi-building)
+- Number of stories / floors per building
+- Occupancy classification (e.g., "R-2", "B", "A-3", "I-2")
+- Unit count (for multifamily / senior living)
+- Construction type (Type I-A, Type V-B, etc.) — useful context, not required
+
+Use the PRE-EXTRACTED TEXT as the PRIMARY source — exact figures from text
+extraction are more reliable than what you read from the images.
+
+Return ONLY this JSON, no other commentary:
+{
+  "project_name": "...",
+  "scope_summary": "1-3 sentence summary of the painting-relevant scope",
+  "scope_of_work": "Direct quote or paraphrase of the scope-of-work general note",
+  "total_gsf": 0,
+  "building_count": 0,
+  "stories": 0,
+  "occupancy_type": "",
+  "unit_count": 0,
+  "construction_type": "",
+  "notes": "Anything notable — phasing, exclusions, owner-furnished items, etc."
+}
+
+If a field is not stated on these pages, use 0 for numbers and "" for strings."""
+
+    content_blocks = []
+    if pretext_parts:
+        content_blocks.append({
+            "type": "text",
+            "text": (
+                "PRE-EXTRACTED TEXT FROM G-SERIES / TITLE PAGES (use as PRIMARY "
+                "source — the images below may be lower resolution):\n\n"
+                + "\n\n".join(pretext_parts)
+            )
+        })
+    content_blocks.extend(image_blocks)
+    content_blocks.append({"type": "text", "text": overview_prompt})
+
+    try:
+        result_parts = []
+        with client.messages.stream(
+            model="claude-sonnet-4-20250514",
+            max_tokens=2000,
+            temperature=0,
+            timeout=180.0,
+            messages=[{"role": "user", "content": content_blocks}]
+        ) as stream:
+            for text in stream.text_stream:
+                result_parts.append(text)
+        result_text = "".join(result_parts)
+        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        if not json_match:
+            print(f"   ⚠️  Could not parse project overview JSON")
+            return None
+        overview = json.loads(json_match.group())
+        overview["source_pdfs"] = sources_used
+        overview["source_pages"] = {
+            os.path.basename(p): [i + 1 for i in idxs]
+            for p, idxs in page_picks.items()
+        }
+        # Print summary
+        print(f"   ✅ Project Overview extracted:")
+        if overview.get("project_name"):
+            print(f"      • Project: {overview['project_name']}")
+        if overview.get("scope_summary"):
+            print(f"      • Scope: {overview['scope_summary'][:120]}")
+        if overview.get("total_gsf"):
+            print(f"      • Total GSF: {overview['total_gsf']:,}")
+        if overview.get("building_count"):
+            print(f"      • Buildings: {overview['building_count']}")
+        if overview.get("stories"):
+            print(f"      • Stories: {overview['stories']}")
+        if overview.get("occupancy_type"):
+            print(f"      • Occupancy: {overview['occupancy_type']}")
+        if overview.get("unit_count"):
+            print(f"      • Units: {overview['unit_count']}")
+        return overview
+    except Exception as e:
+        print(f"   ❌ Project overview extraction failed: {e}")
+        return None
 
 
 def _estimate_from_room_finish_schedule(room_schedule_data, schedule_data=None):
@@ -5758,6 +6143,216 @@ def _deduplicate_rooms(rooms):
                 seen_identity[key] = (unit_key, room_type)
 
     return list(seen.values()), dedup_log
+
+
+# ---------------------------------------------------------------------------
+# Phase 4 — Provenance Audit (hallucination detection, count reconciliation)
+# ---------------------------------------------------------------------------
+
+# Regex to parse a sheet ID like "M-201" / "S101" / "ID-3.02" → discipline prefix
+_PROVENANCE_SHEET_RE = re.compile(r'^\s*([A-Z]{1,3})\s*[-.]?\s*\d', re.IGNORECASE)
+
+# Disciplines that should NEVER be the source of a painted room
+_EXCLUDED_DISCIPLINE_PREFIXES = {"S", "M", "E", "P", "C", "L", "FP", "FA"}
+
+# Synthetic / non-sheet provenance values that are valid (set by our own pipeline)
+_SYNTHETIC_PROVENANCE = {
+    "room finish schedule", "building info", "schedule", "estimated",
+    "secondary space template", "unit template", "footprint estimate",
+}
+
+
+def _audit_room_provenance(analysis, project_overview=None):
+    """
+    Phase 4 of the Rider workflow: re-check the merged, deduplicated room data
+    for likely hallucinations and cross-validate against the project overview.
+
+    Conservative — flags only; does not auto-remove rooms. The flags surface
+    on the analysis dict for inspection / manual review.
+
+    Three checks:
+      1. **Wrong-discipline source** — rooms whose source_sheet parses to an
+         excluded discipline (S/M/E/P/C/L/FP/FA). These can't be painted rooms.
+      2. **Outlier wall area** — rooms with absurd wall area (> 3000 sqft for
+         a single room or < 20 sqft for non-closet rooms) get flagged.
+      3. **Count reconciliation** — total room count vs project_overview's
+         unit_count × typical rooms-per-unit. Out-of-band ratios get flagged.
+
+    Args:
+        analysis: the merged analysis dict (after dedup + recalc).
+        project_overview: optional dict from _extract_project_overview().
+
+    Returns:
+        analysis (mutated in place) with new keys:
+            - "provenance_audit": {
+                "wrong_discipline": [...],
+                "outliers": [...],
+                "count_reconciliation": {...},
+                "hallucination_suspects": [...]   # union, for quick view
+              }
+    """
+    audit = {
+        "wrong_discipline": [],
+        "outliers": [],
+        "count_reconciliation": {},
+        "hallucination_suspects": [],
+    }
+    suspect_ids = set()
+
+    # ---- Check 1 + 2: walk every room ----
+    for floor in analysis.get("floors", []):
+        floor_name = floor.get("floor_name", "?")
+        for room in floor.get("rooms", []):
+            rid = room.get("room_id") or room.get("room_name", "?")
+            sheet = (room.get("source_sheet") or "").strip()
+            sheet_lower = sheet.lower()
+
+            # 1. Wrong-discipline check
+            is_synthetic = any(syn in sheet_lower for syn in _SYNTHETIC_PROVENANCE)
+            if sheet and not is_synthetic:
+                m = _PROVENANCE_SHEET_RE.match(sheet)
+                if m:
+                    prefix = m.group(1).upper()
+                    # Strip trailing letters one at a time to find the longest
+                    # prefix in the excluded set. ("FPA101" → FPA→FP→F)
+                    matched_excl = None
+                    for i in range(len(prefix), 0, -1):
+                        sub = prefix[:i]
+                        if sub in _EXCLUDED_DISCIPLINE_PREFIXES:
+                            matched_excl = sub
+                            break
+                    if matched_excl:
+                        audit["wrong_discipline"].append({
+                            "room_id": rid,
+                            "room_name": room.get("room_name", "?"),
+                            "floor": floor_name,
+                            "source_sheet": sheet,
+                            "discipline_prefix": matched_excl,
+                            "reason": (
+                                f"Sheet {sheet} parses to discipline '{matched_excl}' "
+                                f"which is excluded from painting scope"
+                            ),
+                        })
+                        suspect_ids.add(rid)
+                        room["_provenance_flag"] = "wrong_discipline"
+
+            # 2. Outlier wall area
+            wall_area = _num(room.get("wall_area_sqft", 0))
+            rname_l = (room.get("room_name") or "").lower()
+            is_closet_or_small = any(
+                kw in rname_l for kw in
+                ("closet", "wic", "pantry", "linen", "alcove")
+            )
+            if wall_area > 3000:
+                audit["outliers"].append({
+                    "room_id": rid,
+                    "room_name": room.get("room_name", "?"),
+                    "floor": floor_name,
+                    "wall_area_sqft": wall_area,
+                    "reason": f"Wall area {wall_area:.0f} sqft exceeds 3000 sqft "
+                              f"single-room threshold",
+                })
+                suspect_ids.add(rid)
+                room["_provenance_flag"] = room.get("_provenance_flag") or "outlier_high"
+            elif 0 < wall_area < 20 and not is_closet_or_small:
+                audit["outliers"].append({
+                    "room_id": rid,
+                    "room_name": room.get("room_name", "?"),
+                    "floor": floor_name,
+                    "wall_area_sqft": wall_area,
+                    "reason": f"Wall area {wall_area:.1f} sqft is implausibly small "
+                              f"for a non-closet room",
+                })
+                suspect_ids.add(rid)
+                room["_provenance_flag"] = room.get("_provenance_flag") or "outlier_low"
+
+    # ---- Check 3: count reconciliation against project overview ----
+    pi = analysis.get("project_info", {})
+    extracted_rooms = sum(
+        len(f.get("rooms", [])) for f in analysis.get("floors", [])
+    )
+
+    expected_rooms = None
+    expected_basis = ""
+
+    overview_units = 0
+    if project_overview:
+        overview_units = int(_num(project_overview.get("unit_count", 0)))
+    pi_units = int(_num(pi.get("total_units", 0)))
+    units = overview_units or pi_units
+
+    if units > 0:
+        # Rough heuristic: 7 rooms/unit average across studio→3BR mix
+        expected_rooms = units * 7
+        expected_basis = f"{units} units × 7 rooms/unit (project overview)"
+    elif project_overview and project_overview.get("total_gsf"):
+        # ~200 GSF per room as a very loose fallback
+        gsf = int(_num(project_overview.get("total_gsf", 0)))
+        if gsf > 0:
+            expected_rooms = max(5, gsf // 200)
+            expected_basis = f"{gsf:,} GSF ÷ 200 sqft/room"
+
+    if expected_rooms:
+        ratio = extracted_rooms / expected_rooms if expected_rooms else 1.0
+        status = "ok"
+        message = ""
+        if ratio > 1.8:
+            status = "likely_over_extraction"
+            message = (
+                f"Extracted {extracted_rooms} rooms is {ratio:.1f}× expected "
+                f"({expected_rooms} rooms from {expected_basis}) — "
+                f"check for duplicate buildings or hallucinated rooms"
+            )
+        elif ratio < 0.4:
+            status = "likely_under_extraction"
+            message = (
+                f"Extracted {extracted_rooms} rooms is only {ratio:.1f}× expected "
+                f"({expected_rooms} rooms from {expected_basis}) — "
+                f"floor plans may not have been fully read"
+            )
+        audit["count_reconciliation"] = {
+            "extracted_rooms": extracted_rooms,
+            "expected_rooms": expected_rooms,
+            "ratio": round(ratio, 2),
+            "basis": expected_basis,
+            "status": status,
+            "message": message,
+        }
+    else:
+        audit["count_reconciliation"] = {
+            "extracted_rooms": extracted_rooms,
+            "status": "no_baseline",
+            "message": "No unit count or GSF available to reconcile against",
+        }
+
+    audit["hallucination_suspects"] = sorted(suspect_ids)
+    analysis["provenance_audit"] = audit
+
+    # ---- Print summary + add to notes ----
+    n_wrong = len(audit["wrong_discipline"])
+    n_out = len(audit["outliers"])
+    print(f"\n🔎 Phase 4: Provenance Audit")
+    print(f"   • Rooms with wrong-discipline source sheet: {n_wrong}")
+    print(f"   • Wall-area outliers: {n_out}")
+    cr = audit["count_reconciliation"]
+    if cr.get("expected_rooms"):
+        print(f"   • Room count: extracted={cr['extracted_rooms']}, "
+              f"expected≈{cr['expected_rooms']} ({cr['status']})")
+    if cr.get("message"):
+        print(f"     {cr['message']}")
+    for item in audit["wrong_discipline"][:5]:
+        print(f"     ⚠️  {item['room_id']}: {item['reason']}")
+    for item in audit["outliers"][:5]:
+        print(f"     ⚠️  {item['room_id']}: {item['reason']}")
+
+    notes = analysis.setdefault("notes", [])
+    if n_wrong or n_out or cr.get("status", "ok") not in ("ok", "no_baseline"):
+        notes.append(
+            f"[Provenance Audit] {n_wrong} wrong-discipline source(s), "
+            f"{n_out} outlier(s), count status: {cr.get('status', 'ok')}"
+        )
+
+    return analysis
 
 
 def _normalize_scope_fields(analysis):
@@ -8453,10 +9048,116 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
 
     subtotal = sum(li["total"] for li in line_items)
 
+    exclusions = _build_standard_exclusions(
+        analysis=analysis,
+        aggregated_totals=aggregated_totals,
+        exterior=exterior,
+        building_type=bt,
+    )
+
     return {
         "line_items": line_items,
-        "subtotal": round(subtotal, 2)
+        "subtotal": round(subtotal, 2),
+        "exclusions": exclusions,
     }
+
+
+def _build_standard_exclusions(analysis=None, aggregated_totals=None,
+                                exterior=None, building_type=""):
+    """Standard Rider Painting exclusions surfaced on every estimate.
+
+    These are scope-protection defaults that the pipeline already enforces
+    silently in extraction (e.g., ACT not painted, factory-finished items not
+    re-finished). Surfacing them in the output so the GC sees the assumptions
+    rather than discovering them at the bid table.
+
+    Returns a list of dicts: {"item": str, "reason": str, "category": str}
+    """
+    aggregated_totals = aggregated_totals or {}
+    exterior = exterior or {}
+    bt = str(building_type).lower()
+
+    items = [
+        {
+            "category": "Ceilings",
+            "item": "ACT (acoustical ceiling tile) and suspended/drop ceilings",
+            "reason": "Not painted unless specifically called for in the finish schedule.",
+        },
+        {
+            "category": "Doors / Frames / Trim",
+            "item": "Factory-finished doors, frames, windows, millwork, and casework",
+            "reason": "Excluded unless drawings explicitly require field finishing.",
+        },
+        {
+            "category": "Coordination",
+            "item": "Cut-in / patching of work installed by other trades",
+            "reason": "By others. Rider Painting paints to a clean, prepared substrate.",
+        },
+        {
+            "category": "Coordination",
+            "item": "Repair of trade damage and rework caused by other trades",
+            "reason": "By others. Touch-up of Rider's own work is included.",
+        },
+        {
+            "category": "Building Envelope",
+            "item": "Window-return sealant functioning as enclosure / air barrier",
+            "reason": "By others where indicated as part of the air-barrier system.",
+        },
+        {
+            "category": "Substrates",
+            "item": "Painting of mechanical, electrical, plumbing, and fire-protection equipment",
+            "reason": "Not included unless specifically scheduled for paint.",
+        },
+        {
+            "category": "Substrates",
+            "item": "Galvanized metal, stainless steel, anodized aluminum, and pre-finished metal panels",
+            "reason": "Excluded unless drawings or specs explicitly require field paint.",
+        },
+        {
+            "category": "Site",
+            "item": "Striping, traffic markings, signage, and pavement coatings",
+            "reason": "By others unless specifically included.",
+        },
+        {
+            "category": "Hazardous Materials",
+            "item": "Lead paint, asbestos, mold abatement, and any hazmat removal",
+            "reason": "By others. Rider does not perform abatement.",
+        },
+        {
+            "category": "Conditions",
+            "item": "Heat, temporary power, water, and access provided by GC",
+            "reason": "By GC / others. Required for paint application per manufacturer specs.",
+        },
+    ]
+
+    # Conditional exclusions based on what was extracted
+    if _num(aggregated_totals.get("total_cmu_wall_sqft", 0)) == 0:
+        items.append({
+            "category": "Substrates",
+            "item": "Block filler / sealing of unpainted CMU",
+            "reason": "No painted CMU surfaces identified in this scope.",
+        })
+
+    if _num(exterior.get("exterior_paint_sqft", 0)) == 0 and \
+       _num(exterior.get("hardie_siding_sqft", 0)) == 0 and \
+       _num(exterior.get("cornice_lf", 0)) == 0:
+        items.append({
+            "category": "Exterior",
+            "item": "All exterior painting, staining, and clear sealer scope",
+            "reason": "No exterior painting scope identified — interior-only bid.",
+        })
+
+    if "commercial" in bt:
+        items.append({
+            "category": "Coordination",
+            "item": "Painting of access panels, fire dampers, and rated assemblies "
+                    "after rough-in inspections by others",
+            "reason": "Final paint coordinated with GC after MEP sign-off; "
+                      "additional mobilizations may be billed.",
+        })
+
+    return items
+
 
 def _validate_cost_estimate(analysis, cost_estimate):
     """Flag line items with concerning patterns for quality review."""
@@ -9547,6 +10248,23 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         print(f"   ⚠️  Building inventory pre-scan failed: {e}")
         building_inventory = None
 
+    # --- Phase 1: Project Overview from G-series / coversheets ---
+    # Reads General Notes pages FIRST (mirrors Rider's manual workflow) to
+    # establish project scope and scale before any measurement work.
+    project_overview = None
+    try:
+        enable_overview = True
+        try:
+            from config import ENABLE_PROJECT_OVERVIEW_SCAN
+            enable_overview = ENABLE_PROJECT_OVERVIEW_SCAN
+        except ImportError:
+            pass
+        if enable_overview:
+            project_overview = _extract_project_overview(client, pdf_paths)
+    except Exception as e:
+        print(f"   ⚠️  Phase 1 project overview scan failed: {e}")
+        project_overview = None
+
     # --- Analyse each PDF ---
     all_results = []
     files_analyzed = []
@@ -9963,6 +10681,25 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     # Run extraction validation checks
     analysis = _validate_extraction(analysis, file_room_counts=file_room_counts)
 
+    # --- Phase 4: Provenance audit (hallucination detection, count reconciliation) ---
+    # Conservative — flags only, does not auto-remove. Runs AFTER dedup + recalc
+    # so it sees the final merged room set, but BEFORE building-inventory scaling
+    # (that step multiplies rooms — auditing pre-multiplication is the right unit).
+    try:
+        enable_audit = True
+        try:
+            from config import ENABLE_PROVENANCE_AUDIT
+            enable_audit = ENABLE_PROVENANCE_AUDIT
+        except ImportError:
+            pass
+        if enable_audit:
+            analysis = _audit_room_provenance(
+                analysis, project_overview=project_overview)
+        if project_overview:
+            analysis["project_overview"] = project_overview
+    except Exception as e:
+        print(f"   ⚠️  Phase 4 provenance audit failed: {e}")
+
     # Run building inventory validation (auto-scale multipliers from index pages)
     if building_inventory:
         analysis = _validate_building_inventory(
@@ -10329,9 +11066,9 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         "pricing_model": pricing_model_used if pricing_model_used else PRICING_MODEL,
         "adjustments_applied": adjustments_log if adjustments_log else None,
         "rfi_items": rfi_items if rfi_items else None,
-        "will_synthesis": will_result.get("will_synthesis") if 'will_result' in dir() else None,
-        "will_adjustments_log": will_result.get("adjustments_log") if 'will_result' in dir() else None,
-        "will_rejected_log": will_result.get("rejected_log") if 'will_result' in dir() else None,
+        "will_synthesis": will_result.get("will_synthesis"),
+        "will_adjustments_log": will_result.get("adjustments_log"),
+        "will_rejected_log": will_result.get("rejected_log"),
     }
 
     with open(output_json, 'w') as f:
@@ -10363,12 +11100,14 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         "document": document_ref,
         "rfi_items": rfi_items,
         "adjustments_applied": adjustments_log if adjustments_log else None,
-        "will_synthesis": will_result.get("will_synthesis") if 'will_result' in dir() else None,
+        "will_synthesis": will_result.get("will_synthesis"),
     }
 
 
 def main():
     """Main CLI entry point — parses args and delegates to run_analysis()."""
+
+    _run_start = time.time()
 
     if len(sys.argv) < 4:
         print("Nightshift AI - Construction Document Analyzer")
@@ -10495,6 +11234,18 @@ def main():
                      schedule_estimation=schedule_estimation,
                      rate_overrides=rate_overrides,
                      interactive=interactive)
+
+        _elapsed = time.time() - _run_start
+        _mins, _secs = divmod(int(_elapsed), 60)
+        print(f"\n⏱️  Total runtime: {_mins}m {_secs}s ({_elapsed:.1f}s)")
+        try:
+            _log_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'logs')
+            os.makedirs(_log_dir, exist_ok=True)
+            _pdf_names = ",".join(os.path.basename(p) for p in pdf_files)
+            with open(os.path.join(_log_dir, 'runtime.log'), 'a') as _rt:
+                _rt.write(f"{datetime.now().isoformat()}\tduration_s={_elapsed:.1f}\tpdfs={_pdf_names}\n")
+        except OSError:
+            pass
 
     except anthropic.RateLimitError:
         print("\n❌ API rate limit exceeded after multiple retries")

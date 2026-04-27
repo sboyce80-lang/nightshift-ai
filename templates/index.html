@@ -7,6 +7,10 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
+    <div class="auth-bar" style="display:flex;justify-content:flex-end;align-items:center;gap:12px;padding:8px 16px;background:#0f172a;color:#e2e8f0;font-size:13px;">
+        <span id="auth-status">Loading…</span>
+        <a href="#" id="sign-out-link" style="display:none;color:#93c5fd;text-decoration:underline;">Sign out</a>
+    </div>
     <header class="hero">
         <div class="hero-content">
             <div class="hero-logo-wrap">
@@ -43,7 +47,7 @@
         </div>
     </section>
 
-    <main class="form-container">
+    <main class="form-container" id="form-container" style="display:none;">
         {% with messages = get_flashed_messages(with_categories=true) %}
         {% if messages %}
         <div class="flash-messages">
@@ -59,18 +63,7 @@
 
             <section class="form-section">
                 <h2>Contact Information</h2>
-                <div class="form-row">
-                    <div class="form-group">
-                        <label for="name">Name *</label>
-                        <input type="text" id="name" name="name" required
-                               placeholder="Your full name">
-                    </div>
-                    <div class="form-group">
-                        <label for="email">Email *</label>
-                        <input type="email" id="email" name="email" required
-                               placeholder="you@company.com">
-                    </div>
-                </div>
+                <p style="margin:0 0 12px 0;color:#475569;">Estimate will be sent to <strong id="user-email-inline">…</strong></p>
                 <div class="form-group">
                     <label for="business_name">Business Name</label>
                     <input type="text" id="business_name" name="business_name"
@@ -134,6 +127,50 @@
     <footer>
         <p>&copy; 2026 Knight Shift &mdash; Forged by Willpower</p>
     </footer>
+
+    {% if clerk_publishable_key and clerk_frontend_api_host %}
+    <script
+        async
+        crossorigin="anonymous"
+        data-clerk-publishable-key="{{ clerk_publishable_key }}"
+        src="https://{{ clerk_frontend_api_host }}/npm/@clerk/clerk-js@5/dist/clerk.browser.js"
+        type="text/javascript"
+        onload="window.__bootClerk()"></script>
+    <script>
+    window.__bootClerk = async function() {
+        const Clerk = window.Clerk;
+        await Clerk.load();
+        const status = document.getElementById('auth-status');
+        const signOutLink = document.getElementById('sign-out-link');
+        const formContainer = document.getElementById('form-container');
+        const emailInline = document.getElementById('user-email-inline');
+
+        if (!Clerk.user) {
+            // Not signed in — bounce to Clerk's hosted sign-in.
+            const returnTo = encodeURIComponent(window.location.origin + '/');
+            window.location = '{{ clerk_sign_in_url }}?redirect_url=' + returnTo;
+            return;
+        }
+
+        // Signed in — populate UI.
+        const email = Clerk.user.primaryEmailAddress
+            ? Clerk.user.primaryEmailAddress.emailAddress
+            : (Clerk.user.emailAddresses[0] || {}).emailAddress || '';
+        const name = [Clerk.user.firstName, Clerk.user.lastName].filter(Boolean).join(' ') || email;
+
+        if (status) status.innerHTML = 'Signed in as <strong>' + name + '</strong> &lt;' + email + '&gt;';
+        if (signOutLink) {
+            signOutLink.style.display = 'inline';
+            signOutLink.addEventListener('click', (e) => {
+                e.preventDefault();
+                Clerk.signOut().then(() => { window.location = '{{ clerk_sign_in_url }}'; });
+            });
+        }
+        if (emailInline) emailInline.textContent = email;
+        if (formContainer) formContainer.style.display = '';
+    };
+    </script>
+    {% endif %}
 
     <script>
     (function() {

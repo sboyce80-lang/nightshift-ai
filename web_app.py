@@ -5,27 +5,39 @@ Knight Shift — Web Form for RFP Submission
 Flask application that provides a branded web form for submitting
 construction document PDFs for automated painting estimates.
 
+Flow:
+    1. Browser POSTs form + PDFs to /submit.
+    2. Flask validates input, stages files in a temp dir.
+    3. Each PDF is streamed to Cloudflare R2 under
+       submissions/<id>/uploads/<filename>.
+    4. A row is created in the `submissions` table (and `files`).
+    5. An RQ job is enqueued; Redis hands it to a worker.
+    6. Worker downloads inputs from R2, runs the takeoff, uploads
+       results back to R2, updates the DB, and emails the contact.
+
+Source of truth: Postgres. R2 holds files only.
+
 Usage:
-    Development:  python web_app.py
-    Production:   gunicorn --bind 0.0.0.0:8080 --workers 2 --timeout 300 wsgi:app
+    Development:  python web_app.py        (terminal 1)
+                  python worker.py         (terminal 2)
+                  redis-server             (terminal 3 if not already running)
+    Production:   gunicorn --bind 0.0.0.0:8080 --workers 2 --timeout 120 wsgi:app
+                  rq worker nightshift     # one or more worker processes
 """
 
 import os
 import sys
 import uuid
-import json
-import shutil
 import logging
-import smtplib
-from datetime import datetime
-from threading import Thread
-from queue import Queue
+import tempfile
 
-from flask import Flask, request, render_template, redirect, url_for, flash
+from flask import Flask, request, render_template, redirect, url_for, flash, jsonify
 from werkzeug.utils import secure_filename
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.application import MIMEApplication
+
+from redis import Redis
+from rq import Queue
+from rq.job import Job
+from rq.exceptions import NoSuchJobError
 
 # ---------------------------------------------------------------------------
 # Ensure local imports work
@@ -33,13 +45,15 @@ from email.mime.application import MIMEApplication
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import (
-    EMAIL_ADDRESS, EMAIL_APP_PASSWORD,
-    EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT,
-    COMPANY_NAME, COMPANY_EMAIL, COMPANY_PHONE,
     MAX_PDF_SIZE_MB, MAX_PDFS_PER_EMAIL,
     WEB_PORT, FLASK_SECRET_KEY,
+    REDIS_URL, RQ_QUEUE_NAME, RQ_JOB_TIMEOUT, RQ_RESULT_TTL,
+    CLERK_PUBLISHABLE_KEY, CLERK_SIGN_IN_URL,
 )
-from Takeoff_DIRECT import run_analysis
+import storage
+from db import session_scope
+from models import User, Submission, File
+from auth import require_auth, current_user_id, clerk_frontend_api_host
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -63,231 +77,32 @@ logger = logging.getLogger("nightshift.web")
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET_KEY or os.urandom(24).hex()
 
-# Maximum total upload size (all files combined)
 app.config["MAX_CONTENT_LENGTH"] = MAX_PDF_SIZE_MB * MAX_PDFS_PER_EMAIL * 1024 * 1024
-
-SUBMISSIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "submissions")
-os.makedirs(SUBMISSIONS_DIR, exist_ok=True)
 
 ALLOWED_EXTENSIONS = {".pdf"}
 
 # ---------------------------------------------------------------------------
-# Background Worker
+# Job Queue
 # ---------------------------------------------------------------------------
-_submission_queue = Queue()
-
-
-def _worker():
-    """Background worker that processes submissions one at a time."""
-    while True:
-        job = _submission_queue.get()
-        if job is None:
-            break
-        try:
-            _process_submission(**job)
-        except Exception as exc:
-            logger.error("Worker error for %s: %s",
-                         job.get("submission_id", "?"), exc, exc_info=True)
-        finally:
-            _submission_queue.task_done()
-
-
-def _start_worker():
-    """Start the background worker thread (daemon so it exits with the app)."""
-    t = Thread(target=_worker, daemon=True, name="submission-worker")
-    t.start()
-    logger.info("Background worker started")
-    return t
+_redis = Redis.from_url(REDIS_URL)
+_queue = Queue(RQ_QUEUE_NAME, connection=_redis)
 
 
 # ---------------------------------------------------------------------------
-# Submission Processing
+# Template context — Clerk frontend keys available in every render
 # ---------------------------------------------------------------------------
 
-def _update_status(submission_dir, status, error=None):
-    """Update the status field in a submission's metadata.json."""
-    meta_path = os.path.join(submission_dir, "metadata.json")
+@app.context_processor
+def _inject_clerk_context():
     try:
-        with open(meta_path, "r") as f:
-            meta = json.load(f)
-        meta["status"] = status
-        if error:
-            meta["error"] = error
-        meta["updated_at"] = datetime.now().isoformat()
-        with open(meta_path, "w") as f:
-            json.dump(meta, f, indent=2)
-    except Exception as exc:
-        logger.warning("Could not update status for %s: %s", submission_dir, exc)
-
-
-def _process_submission(submission_id, submission_dir, pdf_paths, contact_info,
-                        scope_notes):
-    """Called by the background worker to run the analysis and email results."""
-    logger.info("Processing submission %s (%d PDFs)", submission_id, len(pdf_paths))
-    _update_status(submission_dir, "processing")
-
-    try:
-        result = run_analysis(
-            pdf_paths,
-            contact_name=contact_info["name"],
-            contact_email=contact_info["email"],
-            scope_notes=scope_notes,
-        )
-
-        # Copy output files to the submission's results directory
-        results_dir = os.path.join(submission_dir, "results")
-        os.makedirs(results_dir, exist_ok=True)
-
-        for key in ("output_json_path", "output_pdf_path"):
-            src = result.get(key)
-            if src and os.path.exists(src):
-                dst = os.path.join(results_dir, os.path.basename(src))
-                shutil.copy2(src, dst)
-
-        # Send email with results
-        _send_result_email(contact_info, result)
-
-        _update_status(submission_dir, "completed")
-        logger.info("Submission %s completed — $%,.2f estimate",
-                     submission_id,
-                     result.get("cost_estimate", {}).get("subtotal", 0))
-
-    except Exception as exc:
-        logger.error("Submission %s failed: %s", submission_id, exc, exc_info=True)
-        _update_status(submission_dir, "failed", error=str(exc))
-        _send_error_email(contact_info, str(exc))
-
-
-# ---------------------------------------------------------------------------
-# Email Notifications (mirrors email_processor.py patterns)
-# ---------------------------------------------------------------------------
-
-def _send_result_email(contact_info, result):
-    """Send analysis results to the submitter via SMTP."""
-    if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD:
-        logger.warning("SMTP not configured — skipping email notification")
-        return
-
-    costs = result.get("cost_estimate", {})
-    analysis = result.get("analysis", {})
-    totals = analysis.get("aggregated_totals", {})
-    project = analysis.get("project_info", {})
-
-    items_text = ""
-    for item in costs.get("line_items", []):
-        if item.get("qty", 0) > 0:
-            items_text += f"  - {item['item']}: ${item['total']:,.2f}\n"
-
-    body = f"""Hi {contact_info['name']},
-
-Thank you for submitting your construction documents through Knight Shift. Your painting estimate is ready.
-
-PROJECT SUMMARY
-  Floors analyzed: {project.get('total_floors_analyzed', 'N/A')}
-  Rooms found:     {project.get('total_rooms_found', 'N/A')}
-
-MEASUREMENTS EXTRACTED
-  Paintable walls:    {totals.get('total_paintable_wall_sqft', 0):,.0f} sq ft
-  Paintable ceilings: {totals.get('total_paintable_ceiling_sqft', 0):,.0f} sq ft
-  Base trim:          {totals.get('total_base_trim_lf', 0):,.0f} linear feet
-  Doors (full paint): {totals.get('total_doors_full_paint', 0):,.0f}
-  Doors (HM panel):   {totals.get('total_doors_hm_panel', 0):,.0f}
-  Windows (painted):  {totals.get('total_windows_painted_interior', 0):,.0f}
-  Stair sections:     {totals.get('total_stair_sections', 0):,.0f}
-
-COST ESTIMATE
-{items_text}
-  TOTAL: ${costs.get('subtotal', 0):,.2f}
-
-IMPORTANT: This is a preliminary estimate generated automatically from your
-drawings. A formal proposal will follow after review.
-
-The detailed analysis is attached as a PDF report.
-
-Best regards,
-{COMPANY_NAME}
-{COMPANY_PHONE}
-{COMPANY_EMAIL}
-"""
-
-    msg = MIMEMultipart()
-    msg["From"] = f"{COMPANY_NAME} <{EMAIL_ADDRESS}>"
-    msg["To"] = f"{contact_info['name']} <{contact_info['email']}>"
-    msg["Subject"] = "Knight Shift - Your Painting Estimate is Ready"
-    msg.attach(MIMEText(body, "plain"))
-
-    # Attach PDF report
-    pdf_path = result.get("output_pdf_path")
-    if pdf_path and os.path.exists(pdf_path):
-        with open(pdf_path, "rb") as f:
-            att = MIMEApplication(f.read(), _subtype="pdf")
-            att.add_header(
-                "Content-Disposition", "attachment",
-                filename=os.path.basename(pdf_path),
-            )
-            msg.attach(att)
-
-    # Attach JSON
-    json_path = result.get("output_json_path")
-    if json_path and os.path.exists(json_path):
-        with open(json_path, "rb") as f:
-            att = MIMEApplication(f.read(), _subtype="json")
-            att.add_header(
-                "Content-Disposition", "attachment",
-                filename=os.path.basename(json_path),
-            )
-            msg.attach(att)
-
-    try:
-        with smtplib.SMTP(EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT) as server:
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-            server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
-            server.send_message(msg)
-        logger.info("Result email sent to %s", contact_info["email"])
-    except Exception as exc:
-        logger.error("Failed to send result email: %s", exc)
-
-
-def _send_error_email(contact_info, error_msg):
-    """Send an error notification to the submitter."""
-    if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD:
-        logger.warning("SMTP not configured — skipping error email")
-        return
-
-    body = f"""Hi {contact_info['name']},
-
-Thank you for submitting your construction documents through Knight Shift.
-
-Unfortunately, our system encountered an issue processing your documents:
-  {error_msg}
-
-This may happen when drawings are in an unsupported format or contain
-elements our system can't yet interpret.
-
-Please reply to this email or call {COMPANY_PHONE} for assistance.
-
-Best regards,
-{COMPANY_NAME}
-"""
-
-    msg = MIMEMultipart()
-    msg["From"] = f"{COMPANY_NAME} <{EMAIL_ADDRESS}>"
-    msg["To"] = f"{contact_info['name']} <{contact_info['email']}>"
-    msg["Subject"] = "Knight Shift - Issue Processing Your Documents"
-    msg.attach(MIMEText(body, "plain"))
-
-    try:
-        with smtplib.SMTP(EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT) as server:
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-            server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
-            server.send_message(msg)
-        logger.info("Error email sent to %s", contact_info["email"])
-    except Exception as exc:
-        logger.error("Failed to send error email: %s", exc)
+        host = clerk_frontend_api_host() if CLERK_PUBLISHABLE_KEY else ""
+    except Exception:
+        host = ""
+    return {
+        "clerk_publishable_key": CLERK_PUBLISHABLE_KEY,
+        "clerk_sign_in_url": CLERK_SIGN_IN_URL,
+        "clerk_frontend_api_host": host,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -296,24 +111,25 @@ Best regards,
 
 @app.route("/")
 def index():
-    """Render the RFP submission form."""
+    """Public landing — Clerk.js handles auth client-side and bootstraps the
+    session cookie via the dev-mode handshake. The form is hidden by JS
+    until Clerk confirms a signed-in user. Server-side auth is enforced on
+    /submit and /jobs/<id>, which only fire after the cookie is in place.
+    """
     return render_template("index.html")
 
 
 @app.route("/submit", methods=["POST"])
+@require_auth
 def submit():
-    """Handle form submission: validate, save files, queue for processing."""
+    """Authenticated user uploads PDFs; we persist + enqueue."""
 
-    # 1. Validate required fields
-    name = request.form.get("name", "").strip()
-    email_addr = request.form.get("email", "").strip()
-
-    if not name:
-        flash("Name is required.", "error")
-        return redirect(url_for("index"))
-    if not email_addr or "@" not in email_addr:
-        flash("A valid email address is required.", "error")
-        return redirect(url_for("index"))
+    # 1. Identity from session — no form fields for name/email any more.
+    user_id = current_user_id()
+    with session_scope() as session:
+        user = session.get(User, user_id)
+        name = user.name or ""
+        email_addr = user.email
 
     # 2. Get uploaded files
     files = request.files.getlist("attachments")
@@ -327,89 +143,172 @@ def submit():
         flash(f"Maximum {MAX_PDFS_PER_EMAIL} files allowed.", "error")
         return redirect(url_for("index"))
 
-    # 3. Create submission directory
     submission_id = str(uuid.uuid4())
-    submission_dir = os.path.join(SUBMISSIONS_DIR, submission_id)
-    uploads_dir = os.path.join(submission_dir, "uploads")
-    os.makedirs(uploads_dir, exist_ok=True)
 
-    # 4. Save and validate each file
-    pdf_paths = []
-    try:
-        for f in valid_files:
-            filename = secure_filename(f.filename)
-            if not filename:
-                filename = f"upload_{len(pdf_paths) + 1}.pdf"
-            ext = os.path.splitext(filename)[1].lower()
+    # 3. Stage files locally, validate, push to R2.
+    uploaded_files = []   # list of (filename, r2_key, size_bytes)
 
-            if ext not in ALLOWED_EXTENSIONS:
-                flash(f"Only PDF files are accepted. Rejected: {f.filename}", "error")
-                shutil.rmtree(submission_dir, ignore_errors=True)
-                return redirect(url_for("index"))
+    with tempfile.TemporaryDirectory(prefix=f"ns-{submission_id}-") as staging:
+        try:
+            for idx, f in enumerate(valid_files):
+                filename = secure_filename(f.filename) or f"upload_{idx + 1}.pdf"
+                ext = os.path.splitext(filename)[1].lower()
+                if ext not in ALLOWED_EXTENSIONS:
+                    flash(f"Only PDF files are accepted. Rejected: {f.filename}", "error")
+                    return redirect(url_for("index"))
 
-            filepath = os.path.join(uploads_dir, filename)
-            f.save(filepath)
+                local_path = os.path.join(staging, filename)
+                f.save(local_path)
 
-            size_mb = os.path.getsize(filepath) / (1024 * 1024)
-            if size_mb > MAX_PDF_SIZE_MB:
-                flash(f"{filename} exceeds the {MAX_PDF_SIZE_MB} MB size limit.", "error")
-                shutil.rmtree(submission_dir, ignore_errors=True)
-                return redirect(url_for("index"))
+                size_bytes = os.path.getsize(local_path)
+                if size_bytes > MAX_PDF_SIZE_MB * 1024 * 1024:
+                    flash(f"{filename} exceeds the {MAX_PDF_SIZE_MB} MB size limit.", "error")
+                    return redirect(url_for("index"))
 
-            pdf_paths.append(filepath)
+                key = storage.upload_key(submission_id, filename)
+                storage.upload_file(local_path, key, content_type="application/pdf")
+                uploaded_files.append((filename, key, size_bytes))
 
-    except Exception as exc:
-        logger.error("File save error: %s", exc)
-        flash("An error occurred while uploading your files. Please try again.", "error")
-        shutil.rmtree(submission_dir, ignore_errors=True)
-        return redirect(url_for("index"))
+        except storage.StorageNotConfigured as exc:
+            logger.error("R2 not configured: %s", exc)
+            flash("Storage is not configured. Please contact support.", "error")
+            return redirect(url_for("index"))
+        except Exception as exc:
+            logger.error("Upload error for submission %s: %s", submission_id, exc, exc_info=True)
+            flash("An error occurred while uploading your files. Please try again.", "error")
+            try:
+                storage.delete_prefix(storage.submission_prefix(submission_id))
+            except Exception:
+                pass
+            return redirect(url_for("index"))
 
-    # 5. Collect metadata
+    # 4. Persist submission + files to the DB.
     phone = request.form.get("phone", "").strip()
     business_name = request.form.get("business_name", "").strip()
     scope_notes = request.form.get("scope_notes", "").strip()
     deadline = request.form.get("deadline", "").strip()
 
-    metadata = {
-        "submission_id": submission_id,
-        "name": name,
-        "email": email_addr,
-        "phone": phone,
-        "business_name": business_name,
-        "scope_notes": scope_notes,
-        "deadline": deadline,
-        "submitted_at": datetime.now().isoformat(),
-        "status": "queued",
-        "pdf_files": [os.path.basename(p) for p in pdf_paths],
-    }
+    try:
+        with session_scope() as session:
+            sub = Submission(
+                id=submission_id,
+                user_id=user_id,
+                phone=phone or None,
+                business_name=business_name or None,
+                scope_notes=scope_notes or None,
+                deadline=deadline or None,
+                status="queued",
+            )
+            session.add(sub)
+            for filename, r2_key, size_bytes in uploaded_files:
+                session.add(File(
+                    submission_id=submission_id,
+                    kind="upload",
+                    filename=filename,
+                    r2_key=r2_key,
+                    size_bytes=size_bytes,
+                    content_type="application/pdf",
+                ))
+    except Exception as exc:
+        logger.error("DB write failed for %s: %s", submission_id, exc, exc_info=True)
+        flash("An error occurred while saving your submission. Please try again.", "error")
+        try:
+            storage.delete_prefix(storage.submission_prefix(submission_id))
+        except Exception:
+            pass
+        return redirect(url_for("index"))
 
-    with open(os.path.join(submission_dir, "metadata.json"), "w") as f:
-        json.dump(metadata, f, indent=2)
+    # 5. Enqueue the job.
+    pdf_keys = [k for (_, k, _) in uploaded_files]
+    try:
+        job = _queue.enqueue(
+            "jobs.process_submission",
+            kwargs={
+                "submission_id": submission_id,
+                "pdf_keys": pdf_keys,
+                "contact_info": {
+                    "name": name,
+                    "email": email_addr,
+                    "phone": phone,
+                    "business_name": business_name,
+                },
+                "scope_notes": scope_notes,
+            },
+            job_id=submission_id,
+            job_timeout=RQ_JOB_TIMEOUT,
+            result_ttl=RQ_RESULT_TTL,
+            failure_ttl=RQ_RESULT_TTL,
+        )
+    except Exception as exc:
+        logger.error("Failed to enqueue submission %s: %s", submission_id, exc)
+        flash("Our queue is unavailable right now. Please try again in a few minutes.", "error")
+        # Mark the DB row failed; leave files in R2 for forensics.
+        try:
+            with session_scope() as session:
+                sub = session.get(Submission, submission_id)
+                if sub:
+                    sub.status = "failed"
+                    sub.error = f"enqueue failed: {exc}"
+        except Exception:
+            pass
+        return redirect(url_for("index"))
 
-    # 6. Queue the job for background processing
-    _submission_queue.put({
-        "submission_id": submission_id,
-        "submission_dir": submission_dir,
-        "pdf_paths": sorted(pdf_paths),
-        "contact_info": {
-            "name": name,
-            "email": email_addr,
-            "phone": phone,
-            "business_name": business_name,
-        },
-        "scope_notes": scope_notes,
-    })
+    logger.info("Submission %s enqueued — %d PDFs from %s <%s> (job %s)",
+                submission_id, len(pdf_keys), name, email_addr, job.id)
 
-    logger.info("Submission %s queued — %d PDFs from %s <%s>",
-                submission_id, len(pdf_paths), name, email_addr)
-
-    # 7. Show confirmation page
     return render_template(
         "thank_you.html",
         name=name,
         email=email_addr,
-        num_files=len(pdf_paths),
+        num_files=len(pdf_keys),
     )
+
+
+@app.route("/jobs/<submission_id>", methods=["GET"])
+@require_auth
+def job_status(submission_id):
+    """Return submission status + signed download URLs for any results.
+
+    Authorization: only the submission's owner may view it. Other users get
+    a 404 (not 403) so we don't leak existence of foreign IDs.
+    """
+    with session_scope() as session:
+        sub = session.get(Submission, submission_id)
+        if sub is None or sub.user_id != current_user_id():
+            return jsonify({"error": "not found"}), 404
+
+        result_files = [f for f in sub.files if f.kind == "result"]
+        results = [{
+            "filename": f.filename,
+            "size": f.size_bytes,
+            "url": storage.presigned_download_url(f.r2_key),
+        } for f in result_files]
+
+        payload = {
+            "submission_id": sub.id,
+            "status": sub.status,
+            "error": sub.error,
+            "submitted_at": sub.submitted_at.isoformat() if sub.submitted_at else None,
+            "updated_at": sub.updated_at.isoformat() if sub.updated_at else None,
+            "subtotal": float(sub.subtotal) if sub.subtotal is not None else None,
+            "results": results,
+        }
+
+    # RQ status is best-effort; the DB row is authoritative.
+    rq_status = None
+    rq_error = None
+    try:
+        job = Job.fetch(submission_id, connection=_redis)
+        rq_status = job.get_status(refresh=True)
+        if job.is_failed and job.exc_info:
+            rq_error = job.exc_info.splitlines()[-1]
+    except NoSuchJobError:
+        rq_status = "expired"
+
+    payload["rq_status"] = rq_status
+    if not payload["error"] and rq_error:
+        payload["error"] = rq_error
+    return jsonify(payload)
 
 
 # ---------------------------------------------------------------------------
@@ -434,9 +333,7 @@ def server_error(e):
 # Start
 # ---------------------------------------------------------------------------
 
-# Start the background worker when the module loads
-_start_worker()
-
 if __name__ == "__main__":
-    logger.info("Starting Knight Shift web form on port %d", WEB_PORT)
+    logger.info("Starting Knight Shift web form on port %d (queue=%s, redis=%s)",
+                WEB_PORT, RQ_QUEUE_NAME, REDIS_URL)
     app.run(host="0.0.0.0", port=WEB_PORT, debug=True)

@@ -380,9 +380,9 @@ def _success_body(name, result):
     if scope_notes_val:
         scope_text = f"""
 SCOPE APPLIED
-Scope notes: {scope_notes_val}
-Rooms in scope: {scope_summary.get('rooms_in_scope', 'all')}
-Rooms excluded: {scope_summary.get('rooms_excluded', 0)}
+  Scope notes:     {scope_notes_val}
+  Rooms in scope:  {scope_summary.get('rooms_in_scope', 'all')}
+  Rooms excluded:  {scope_summary.get('rooms_excluded', 0)}
 """
 
     # ── Will's executive recap goes at the top of the reply ──

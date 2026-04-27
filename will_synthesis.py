@@ -152,6 +152,13 @@ Return a single JSON object and nothing else. No preamble, no markdown fences, n
       "severity": "high" | "medium" | "low"
     }
   ],
+  "additional_exclusions": [
+    {
+      "category": string,
+      "item": string,
+      "reason": string
+    }
+  ],
   "gc_scope_of_work": string,
   "joist_shorthand_scope": string,
   "confidence": {
@@ -177,6 +184,10 @@ Return a single JSON object and nothing else. No preamble, no markdown fences, n
 **`rejected_adjustments`**: If you considered adjusting something by more than 25% but had to back off, log it here. The `pct_change` should be the percentage you would have applied (positive or negative). These get auto-converted to RFIs by the pipeline.
 
 **`additional_rfis`**: RFIs the Python pipeline didn't generate. Don't duplicate the existing RFI list — add new ones based on your review. Categorize them and rate severity.
+
+**`additional_exclusions`**: The pipeline already supplies a standard scope-protection exclusions list in the input under `exclusions` (ACT, factory-finished items, cut-in by others, trade damage, hazmat, MEP equipment, etc.). DO NOT duplicate those. Use `additional_exclusions` only to add **project-specific** exclusions you spot during review — for example: a specific room or area called "tenant fit-out, by tenant", a specialty coating named in the spec but not budgeted, an exterior element shown but flagged as future phase, equipment screens, decorative metals, etc. Each entry needs a category, the item, and a one-sentence reason. If you have nothing to add, return an empty array.
+
+**`prevailing_wage`**: The pipeline pre-extracts prevailing-wage indicators into the input as `project_info.prevailing_wage_signal`. Copy `applies` / `county` / `wage_schedule_basis` from that signal into your output unless you have stronger evidence to override. If the signal is `unknown`, you must either (a) raise a high-severity RFI requesting confirmation, or (b) infer from context (e.g., school district owner, NYCHA, public housing) and explain in `notes`. Never silently default to `false`.
 
 **`gc_scope_of_work`**: A 4–8 sentence narrative describing what Rider Painting is bidding to do, written in the voice of a senior estimator. This goes straight into the proposal. Sign it `— Will, Senior Estimator, Rider Painting, Inc.` at the end.
 
@@ -218,7 +229,7 @@ Walk it in this order — same as how you'd review any junior's takeoff:
 
 8. **Specialty finishes** — Wallcovering, stained wood, dryfall. These are price-sensitive ($6–9/sqft). Confirm they came from finish schedule, not LLM guess.
 
-9. **Prevailing wage** — Check project_info, scope notes, and any government/public/school references. If it's a NY public project, prevailing wage almost certainly applies.
+9. **Prevailing wage** — The pipeline already runs a document-level prevailing-wage scan and reports the result in `project_info.prevailing_wage_signal` (fields: `applies` ∈ {yes, no, unknown}, `county`, `wage_schedule_basis`, `indicators`, `source_pages`). Treat that signal as authoritative and copy it into your `prevailing_wage` output. Only override when scope_notes or pipeline_notes contain stronger contradicting evidence — and document the override in `notes`. If `applies == "unknown"`, write a high-severity RFI in `additional_rfis` requesting confirmation; do not silently assume non-PW. If `applies == "yes"` and the cost estimate appears to use standard (non-PW) labor rates, flag a high-severity "Pricing Concern" RFI noting the labor-cost gap.
 
 10. **Round numbers test** — Total feels right? A 2,500 sqft single-family home shouldn't price at $80,000. A 3-story 20-unit building shouldn't price at $35,000.
 
@@ -281,6 +292,14 @@ def _build_review_payload(analysis, cost_estimate, rfi_items, validation):
                 "total": item["total"],
             })
 
+    # Pre-extracted prevailing-wage signal from the LLM document scan.
+    # Will should treat this as the authoritative starting point and only
+    # override based on additional evidence in scope_notes / pipeline_notes.
+    pw_signal = pi.get("prevailing_wage") if isinstance(pi.get("prevailing_wage"), dict) else {
+        "applies": "unknown", "county": None, "wage_schedule_basis": None,
+        "indicators": [], "source_pages": []
+    }
+
     payload = {
         "project_info": {
             "building_type": pi.get("building_type", "unknown"),
@@ -291,11 +310,13 @@ def _build_review_payload(analysis, cost_estimate, rfi_items, validation):
             "total_rooms_found": pi.get("total_rooms_found", 0),
             "project_name": pi.get("project_name", ""),
             "location": pi.get("location", ""),
+            "prevailing_wage_signal": pw_signal,
         },
         "aggregated_totals": agg,
         "exterior": ext,
         "line_items": line_items_simplified,
         "subtotal": cost_estimate.get("subtotal", 0),
+        "exclusions": cost_estimate.get("exclusions", []),
         "existing_rfis": rfi_items or [],
         "validation_warnings": validation.get("warnings", []) if validation else [],
         "data_quality_score": validation.get("data_quality_score", 0) if validation else 0,
@@ -600,6 +621,21 @@ def run_will_synthesis(analysis, cost_estimate, rfi_items=None, validation=None,
         rfi.setdefault("source", "will_synthesis")
 
     new_rfis = additional_rfis + auto_rejected_rfis
+
+    # Merge Will's project-specific exclusions into the cost estimate's
+    # standard exclusions list. Tag source so the proposal can distinguish
+    # between standard scope-protection rules and Will's call-outs.
+    additional_exclusions = will_output.get("additional_exclusions", []) or []
+    if additional_exclusions:
+        existing_exclusions = cost_estimate.get("exclusions", []) or []
+        for excl in existing_exclusions:
+            excl.setdefault("source", "standard")
+        for excl in additional_exclusions:
+            if not isinstance(excl, dict):
+                continue
+            excl.setdefault("source", "will_synthesis")
+            existing_exclusions.append(excl)
+        cost_estimate["exclusions"] = existing_exclusions
 
     # Print summary
     if adjustments_log:

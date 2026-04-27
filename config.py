@@ -414,6 +414,45 @@ WEB_PORT = int(os.environ.get("WEB_PORT", "8080"))
 FLASK_SECRET_KEY = os.environ.get("FLASK_SECRET_KEY", "")
 MAX_SUBMISSIONS_PER_HOUR = int(os.environ.get("MAX_SUBMISSIONS_PER_HOUR", "5"))
 
+# Job Queue (Redis + RQ)
+REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+RQ_QUEUE_NAME = os.environ.get("RQ_QUEUE_NAME", "nightshift")
+RQ_JOB_TIMEOUT = int(os.environ.get("RQ_JOB_TIMEOUT", "7200"))   # 2 hours per job
+RQ_RESULT_TTL = int(os.environ.get("RQ_RESULT_TTL", "604800"))   # keep results 7 days
+
+# Object Storage (Cloudflare R2 — S3-compatible)
+R2_ACCOUNT_ID         = os.environ.get("R2_ACCOUNT_ID", "")
+R2_ACCESS_KEY_ID      = os.environ.get("R2_ACCESS_KEY_ID", "")
+R2_SECRET_ACCESS_KEY  = os.environ.get("R2_SECRET_ACCESS_KEY", "")
+R2_BUCKET             = os.environ.get("R2_BUCKET", "")
+R2_ENDPOINT_URL       = os.environ.get(
+    "R2_ENDPOINT_URL",
+    f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com" if R2_ACCOUNT_ID else "",
+)
+R2_SIGNED_URL_EXPIRY  = int(os.environ.get("R2_SIGNED_URL_EXPIRY", "604800"))  # 7d
+
+# Database (Postgres in prod, local dev expects a local Postgres too)
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL",
+    "postgresql+psycopg2://localhost/nightshift_dev",
+)
+# Render's DATABASE_URL is `postgres://...`; SQLAlchemy 2.x wants `postgresql://...`.
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql+psycopg2://", 1)
+
+# Auth (Clerk)
+CLERK_SECRET_KEY      = os.environ.get("CLERK_SECRET_KEY", "")
+CLERK_PUBLISHABLE_KEY = os.environ.get("CLERK_PUBLISHABLE_KEY", "")
+# Hosted sign-in URL — Clerk hosts this for free at accounts.<your-clerk-domain>.
+# In Clerk dashboard, you can copy the exact URL; we accept it via env var.
+CLERK_SIGN_IN_URL     = os.environ.get("CLERK_SIGN_IN_URL", "")
+# Allowed origins for Clerk's CSRF check (comma-separated). For dev:
+#   http://localhost:8080
+CLERK_AUTHORIZED_PARTIES = [
+    o.strip() for o in os.environ.get("CLERK_AUTHORIZED_PARTIES", "").split(",")
+    if o.strip()
+]
+
 def validate_config():
     if not CLAUDE_API_KEY:
         print("⚠️  CLAUDE_API_KEY is not set")

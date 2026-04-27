@@ -7,6 +7,10 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
+    <div class="auth-bar" style="display:flex;justify-content:flex-end;align-items:center;gap:12px;padding:8px 16px;background:#0f172a;color:#e2e8f0;font-size:13px;">
+        <span>Signed in as <strong>{{ email }}</strong></span>
+        <a href="#" id="sign-out-link" style="color:#93c5fd;text-decoration:underline;">Sign out</a>
+    </div>
     <header class="hero hero-compact">
         <div class="hero-content">
             <div class="hero-logo-wrap">
@@ -66,6 +70,26 @@
     <footer>
         <p>&copy; 2026 Knight Shift &mdash; Forged by Willpower</p>
     </footer>
+
+    {% if clerk_publishable_key and clerk_frontend_api_host %}
+    <script
+        async
+        crossorigin="anonymous"
+        data-clerk-publishable-key="{{ clerk_publishable_key }}"
+        src="https://{{ clerk_frontend_api_host }}/npm/@clerk/clerk-js@5/dist/clerk.browser.js"
+        type="text/javascript"
+        onload="window.Clerk.load().then(() => {
+            const link = document.getElementById('sign-out-link');
+            if (link) {
+                link.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    window.Clerk.signOut().then(() => {
+                        window.location = '{{ clerk_sign_in_url }}';
+                    });
+                });
+            }
+        })"></script>
+    {% endif %}
 
     <script>
     (function() {
