@@ -1,3 +1,175 @@
+#!/usr/bin/env python3
+"""
+Will Synthesis Module — Senior Estimator Review Layer for Nightshift AI
+========================================================================
+
+Takes the completed analysis + cost_estimate from run_analysis() and runs
+a final Claude API call as "Will," a Senior Estimator persona, to:
+
+  1. Review the estimate and propose bounded adjustments to line items
+  2. Generate a GC-level scope of work narrative
+  3. Generate a Joist-style shorthand scope
+  4. Produce a confidence percentage and bid recommendation
+  5. Identify top risks and items to confirm before bid
+  6. Assess prevailing wage applicability
+  7. Add Will-specific RFIs that the Python pipeline missed
+
+GUARDRAILS:
+  - Will can adjust any line item by at most ±25% from the calculated value.
+  - Adjustments outside the ±25% band become RFIs instead of silent overrides.
+  - Every adjustment is logged in adjustments_log with from/to/reason.
+  - Will cannot modify scope protection rules (ACT exclusions, factory-finished, etc.) —
+    those are hard-coded in the Python pipeline.
+"""
+
+import os
+import json
+import re
+import anthropic
+from datetime import datetime
+
+try:
+    from config import CLAUDE_API_KEY
+except ImportError:
+    CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
+
+
+# ---------------------------------------------------------------------------
+# Guardrail Constants
+# ---------------------------------------------------------------------------
+
+# Maximum percentage Will can adjust any single line item, up or down.
+# Adjustments beyond this become RFIs instead of overrides.
+MAX_ADJUSTMENT_PCT = 0.25
+
+# Line items Will is NEVER allowed to touch — these are scope protection rules
+# baked into the Python pipeline and Will should not override them.
+PROTECTED_CATEGORIES = {
+    # Future expansion — currently empty. Add category names here if you find
+    # Will trying to override hard-coded scope rules.
+}
+
+# Categories Will IS allowed to adjust (line item names from cost_estimate)
+ADJUSTABLE_CATEGORIES = {
+    "Gyp. Walls",
+    "Gyp. Ceilings",
+    "CMU Walls",
+    "Dryfall Ceiling",
+    "Base Trim",
+    "Doors (Full Paint)",
+    "Doors (HM Panel)",
+    "Doors (Frame Only)",
+    "Windows",
+    "Stairs",
+    "Gyp. Between Stairs",
+    "Level 5 Finish",
+    "Concrete Sealer",
+    "Painted Columns",
+    "Wallcovering",
+    "Stained Wood",
+    "Interior Soffits",
+    "Exterior Cornice",
+    "Exterior Window Trim",
+    "Exterior Painting",
+    "Hardie Siding",
+    "Azek Trim",
+    "Corner Boards",
+    "Steel Lintels",
+    "Lift Rental",
+    "Stain Siding",
+    "Stain Trim",
+    "Stain Railing",
+}
+
+
+# ---------------------------------------------------------------------------
+# Will's System Prompt
+# ---------------------------------------------------------------------------
+
+WILL_SYSTEM_PROMPT = """You are Will, Senior Estimator for Rider Painting, Inc. You are reviewing a completed takeoff and cost estimate that was produced by an automated pipeline. Your job is to do what a senior estimator does at the end of every bid: review the numbers, catch what the pipeline missed, write the scope language, and put your name on a confidence level and bid recommendation.
+
+You are operating inside the Nightshift automated proposal pipeline. There is no human in the loop on this turn — your output goes directly to the proposal document and email reply. Write accordingly: be decisive, structured, and never ask clarifying questions back.
+
+## Tone
+
+Professional GC-level. Practical. Construction-focused. Direct. The way a seasoned estimator talks to a project manager. No filler, no apologies, no AI hedging language ("I'd be happy to," "as an AI," "please let me know"). The objective is to **win profitable work for Rider Painting while avoiding hidden scope.**
+
+## Your authority — and its limits
+
+You have **bounded edit authority** over the cost estimate's line items. You can adjust any single line item by **at most ±25%** from the calculated value when you have a defensible reason. If you believe a number is wrong by more than 25%, **do not override it** — flag it as an RFI instead. The pipeline tracks every adjustment you make.
+
+You CANNOT:
+- Modify scope protection rules (ACT exclusions, factory-finished items, etc.) — those are non-negotiable and already enforced
+- Add line items that don't exist in the original estimate (you can only adjust existing ones)
+- Adjust totals directly — only line items, and the totals will be recomputed
+
+You CAN and SHOULD:
+- Trim or boost line items by up to ±25% with a clear written reason
+- Flag anything beyond ±25% as an RFI
+- Identify line items that look suspicious based on building type, project context, or proportions
+- Write the proposal-ready scope of work and Joist shorthand
+- Set confidence and bid recommendation
+
+## Required output format
+
+Return a single JSON object and nothing else. No preamble, no markdown fences, no commentary outside the JSON. The pipeline parses this directly. Use this exact schema:
+
+```
+{
+  "project_type": "residential" | "commercial" | "unknown",
+  "prevailing_wage": {
+    "applies": true | false | "unknown",
+    "county": string | null,
+    "wage_schedule_basis": string | null,
+    "notes": string
+  },
+  "adjustments": [
+    {
+      "category": string,
+      "from_value": number,
+      "to_value": number,
+      "from_total": number,
+      "to_total": number,
+      "reason": string,
+      "confidence": number
+    }
+  ],
+  "rejected_adjustments": [
+    {
+      "category": string,
+      "current_value": number,
+      "suggested_value": number,
+      "pct_change": number,
+      "reason_for_rejection": "exceeds_25_percent_band" | "protected_category",
+      "converted_to_rfi": true
+    }
+  ],
+  "additional_rfis": [
+    {
+      "category": "Missing Drawings" | "Incomplete Dimensions" | "Missing Schedules" | "Material Specifications" | "Clarification Needed" | "Scope Conflict" | "Pricing Concern",
+      "question": string,
+      "action_required": string,
+      "severity": "high" | "medium" | "low"
+    }
+  ],
+  "gc_scope_of_work": string,
+  "joist_shorthand_scope": string,
+  "confidence": {
+    "level_pct": number,
+    "reasoning": string,
+    "top_risks": [ string ],
+    "items_to_confirm_before_bid": [ string ],
+    "bid_recommendation": "aggressive" | "cautious" | "clarifications_only" | "do_not_bid"
+  },
+  "estimator_recap": string,
+  "pipeline_flags": {
+    "ready_to_send": true | false,
+    "route_to_human_review": true | false,
+    "missing_information": [ string ]
+  }
+}
+```
+
 ## Field-by-field guidance
 
 **`adjustments`**: Each adjustment must include `from_value` (current quantity, e.g. 2,150 sqft), `to_value` (your adjusted quantity), the resulting `from_total` and `to_total` dollar amounts, a clear `reason`, and your `confidence` (0.0–1.0). Only include adjustments you actually want applied. If you don't want to adjust something, leave it out.
@@ -128,7 +300,7 @@ def _build_review_payload(analysis, cost_estimate, rfi_items, validation):
         "validation_warnings": validation.get("warnings", []) if validation else [],
         "data_quality_score": validation.get("data_quality_score", 0) if validation else 0,
         "scope_notes": pi.get("_scope_notes", "") if isinstance(pi, dict) else "",
-        "pipeline_notes": analysis.get("notes", [])[:30],
+        "pipeline_notes": analysis.get("notes", [])[:30],  # cap to avoid overwhelming context
     }
     return payload
 
@@ -141,14 +313,19 @@ def _validate_adjustment(adjustment, line_items_by_category):
     """
     cat = adjustment.get("category", "").strip()
 
+    # Protected category check
     if cat in PROTECTED_CATEGORIES:
         return (False, "protected_category")
 
+    # Must be in the adjustable set OR exist in current line items
+    # (Will sometimes uses slightly different naming; we match against both)
     if cat not in ADJUSTABLE_CATEGORIES and cat not in line_items_by_category:
         return (False, "category_not_found")
 
+    # Find current value
     current = line_items_by_category.get(cat)
     if not current:
+        # Try fuzzy match
         for known_cat in line_items_by_category:
             if cat.lower() in known_cat.lower() or known_cat.lower() in cat.lower():
                 current = line_items_by_category[known_cat]
@@ -159,9 +336,11 @@ def _validate_adjustment(adjustment, line_items_by_category):
     current_qty = _num(current.get("qty", 0))
     proposed_qty = _num(adjustment.get("to_value", 0))
 
+    # Can't adjust what isn't there
     if current_qty == 0:
         return (False, "current_value_is_zero")
 
+    # ±25% guardrail
     pct_change = abs(proposed_qty - current_qty) / current_qty
     if pct_change > MAX_ADJUSTMENT_PCT:
         return (False, "exceeds_25_percent_band")
@@ -178,6 +357,7 @@ def _apply_adjustments_to_estimate(cost_estimate, valid_adjustments, line_items_
     log = []
     line_items = cost_estimate.get("line_items", [])
 
+    # Build label → index map for in-place modification
     by_label = {item["item"]: i for i, item in enumerate(line_items)}
     by_category = {_category_from_item_label(item["item"]): i for i, item in enumerate(line_items)}
 
@@ -185,6 +365,7 @@ def _apply_adjustments_to_estimate(cost_estimate, valid_adjustments, line_items_
         cat = adj.get("category", "").strip()
         idx = by_category.get(cat)
         if idx is None:
+            # Fuzzy match
             for known_cat, known_idx in by_category.items():
                 if cat.lower() in known_cat.lower() or known_cat.lower() in cat.lower():
                     idx = known_idx
@@ -199,6 +380,7 @@ def _apply_adjustments_to_estimate(cost_estimate, valid_adjustments, line_items_
         if old_qty == 0:
             continue
 
+        # Recompute proportionally — this preserves the unit rate and markup ratio
         old_cost = _num(item.get("cost", 0))
         old_markup = _num(item.get("markup", 0))
         old_total = _num(item.get("total", 0))
@@ -213,6 +395,9 @@ def _apply_adjustments_to_estimate(cost_estimate, valid_adjustments, line_items_
         item["markup"] = new_markup
         item["total"] = new_total
 
+        # Update label to reflect new qty
+        # Old: "Gyp. Walls - 12,400 sqft @ $1.25"
+        # New: "Gyp. Walls - 11,500 sqft @ $1.25 [Will: -7%]"
         if " @ " in item["item"]:
             prefix = item["item"].split(" - ")[0]
             rate_part = item["item"].split(" @ ")[1]
@@ -232,6 +417,7 @@ def _apply_adjustments_to_estimate(cost_estimate, valid_adjustments, line_items_
             "confidence": adj.get("confidence", 0),
         })
 
+    # Recalculate subtotal
     new_subtotal = round(sum(_num(item.get("total", 0)) for item in line_items), 2)
     cost_estimate["subtotal"] = new_subtotal
 
@@ -280,14 +466,17 @@ def run_will_synthesis(analysis, cost_estimate, rfi_items=None, validation=None,
     print("👷 WILL SYNTHESIS — Senior Estimator Review")
     print("=" * 80)
 
+    # Build the review payload
     payload = _build_review_payload(analysis, cost_estimate, rfi_items, validation)
 
+    # Build line items lookup for guardrail validation
     line_items_by_category = {}
     for item in cost_estimate.get("line_items", []):
         if _num(item.get("qty", 0)) > 0:
             cat = _category_from_item_label(item["item"])
             line_items_by_category[cat] = item
 
+    # Call Will
     user_message = (
         "Review this completed Rider Painting takeoff and cost estimate. "
         "Apply your senior-estimator judgment, propose any line item adjustments "
@@ -332,6 +521,7 @@ def run_will_synthesis(analysis, cost_estimate, rfi_items=None, validation=None,
             "error": f"Will synthesis failed: {e}",
         }
 
+    # Parse Will's JSON response
     json_match = re.search(r"\{.*\}", raw_response, re.DOTALL)
     if not json_match:
         print(f"   ❌ Will returned non-JSON response: {raw_response[:300]}")
@@ -357,6 +547,7 @@ def run_will_synthesis(analysis, cost_estimate, rfi_items=None, validation=None,
             "error": f"Will JSON parse error: {e}",
         }
 
+    # Apply guardrails to proposed adjustments
     proposed_adjustments = will_output.get("adjustments", [])
     valid_adjustments = []
     auto_rejected = []
@@ -380,10 +571,12 @@ def run_will_synthesis(analysis, cost_estimate, rfi_items=None, validation=None,
                 "converted_to_rfi": True,
             })
 
+    # Apply valid adjustments to the cost estimate
     cost_estimate, adjustments_log = _apply_adjustments_to_estimate(
         cost_estimate, valid_adjustments, line_items_by_category
     )
 
+    # Convert auto-rejected adjustments into RFIs
     auto_rejected_rfis = []
     for rej in auto_rejected:
         if rej["reason_for_rejection"] == "exceeds_25_percent_band":
@@ -401,12 +594,14 @@ def run_will_synthesis(analysis, cost_estimate, rfi_items=None, validation=None,
                 "source": "will_guardrail",
             })
 
+    # Will's additional RFIs
     additional_rfis = will_output.get("additional_rfis", [])
     for rfi in additional_rfis:
         rfi.setdefault("source", "will_synthesis")
 
     new_rfis = additional_rfis + auto_rejected_rfis
 
+    # Print summary
     if adjustments_log:
         print(f"\n   ✅ Will applied {len(adjustments_log)} adjustment(s):")
         for adj in adjustments_log:
@@ -458,6 +653,7 @@ def run_will_synthesis(analysis, cost_estimate, rfi_items=None, validation=None,
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
+    # Minimal smoke test — requires a real analysis JSON file path as arg
     import sys
     if len(sys.argv) < 2:
         print("Usage: python will_synthesis.py /path/to/construction_analysis_*.json")
