@@ -152,7 +152,6 @@
         const Clerk = window.Clerk;
         await Clerk.load();
         const status = document.getElementById('auth-status');
-        const signOutLink = document.getElementById('sign-out-link');
         const main = document.getElementById('main-content');
         const tabStrip = document.getElementById('tab-strip');
         const emailInline = document.getElementById('user-email-inline');
@@ -169,16 +168,8 @@
         const email = Clerk.user.primaryEmailAddress
             ? Clerk.user.primaryEmailAddress.emailAddress
             : (Clerk.user.emailAddresses[0] || {}).emailAddress || '';
-        const name = [Clerk.user.firstName, Clerk.user.lastName].filter(Boolean).join(' ') || email;
 
-        if (status) status.textContent = email;
-        if (signOutLink) {
-            signOutLink.style.display = '';
-            signOutLink.addEventListener('click', (e) => {
-                e.preventDefault();
-                Clerk.signOut().then(() => window.location.reload());
-            });
-        }
+        if (window.__initAccountMenu) window.__initAccountMenu(Clerk.user);
         if (emailInline) emailInline.textContent = email;
         if (main) main.style.display = '';
         if (tabStrip) tabStrip.style.display = '';

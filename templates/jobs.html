@@ -64,6 +64,16 @@
                             Show breakdown &amp; adjust pricing
                         </button>
                         {% endif %}
+                        {% if status_filter == 'active' and s.status == 'queued' %}
+                            {% if is_admin %}
+                            <button type="button" class="btn-secondary job-prioritize" data-submission-id="{{ s.id }}">
+                                &#9889; Priority
+                            </button>
+                            {% endif %}
+                            <button type="button" class="btn-secondary job-cancel" data-submission-id="{{ s.id }}">
+                                &#10005; Cancel
+                            </button>
+                        {% endif %}
                         {% for f in s.results %}
                         <a class="btn-link" href="{{ f.url }}" target="_blank">&#11015; {{ f.filename }}</a>
                         {% endfor %}
@@ -113,7 +123,6 @@
         const Clerk = window.Clerk;
         await Clerk.load();
         const status = document.getElementById('auth-status');
-        const signOutLink = document.getElementById('sign-out-link');
         const main = document.getElementById('main-content');
         const tabStrip = document.getElementById('tab-strip');
         if (!Clerk.user) {
@@ -121,17 +130,7 @@
             Clerk.openSignIn({ afterSignInUrl: window.location.href });
             return;
         }
-        const email = Clerk.user.primaryEmailAddress
-            ? Clerk.user.primaryEmailAddress.emailAddress
-            : (Clerk.user.emailAddresses[0] || {}).emailAddress || '';
-        if (status) status.textContent = email;
-        if (signOutLink) {
-            signOutLink.style.display = '';
-            signOutLink.addEventListener('click', (e) => {
-                e.preventDefault();
-                Clerk.signOut().then(() => window.location.reload());
-            });
-        }
+        if (window.__initAccountMenu) window.__initAccountMenu(Clerk.user);
         if (main) main.style.display = '';
         if (tabStrip) tabStrip.style.display = '';
     };
@@ -239,6 +238,55 @@
                     renderRows(wrap, data.line_items || [], data.subtotal || 0);
                 } catch (e) {
                     loading.textContent = "Failed to load: " + e.message;
+                }
+            });
+        });
+
+        async function postJobAction(subId, path) {
+            const res = await fetch(`/api/jobs/${subId}/${path}`, {
+                method: "POST",
+                credentials: "same-origin",
+                headers: { "Accept": "application/json" },
+            });
+            if (!res.ok) {
+                let msg = `HTTP ${res.status}`;
+                try { msg = (await res.json()).error || msg; } catch (_) {}
+                throw new Error(msg);
+            }
+            return res.json();
+        }
+
+        document.querySelectorAll(".job-prioritize").forEach(btn => {
+            btn.addEventListener("click", async () => {
+                const subId = btn.dataset.submissionId;
+                btn.disabled = true;
+                const orig = btn.innerHTML;
+                btn.textContent = "Prioritizing…";
+                try {
+                    await postJobAction(subId, "prioritize");
+                    btn.textContent = "✓ Prioritized";
+                } catch (e) {
+                    alert("Could not prioritize: " + e.message);
+                    btn.innerHTML = orig;
+                    btn.disabled = false;
+                }
+            });
+        });
+
+        document.querySelectorAll(".job-cancel").forEach(btn => {
+            btn.addEventListener("click", async () => {
+                const subId = btn.dataset.submissionId;
+                if (!confirm("Cancel this queued job? This cannot be undone.")) return;
+                btn.disabled = true;
+                btn.textContent = "Cancelling…";
+                try {
+                    await postJobAction(subId, "cancel");
+                    const card = document.querySelector(`.job-card[data-submission-id="${subId}"]`);
+                    if (card) card.remove();
+                } catch (e) {
+                    alert("Could not cancel: " + e.message);
+                    btn.disabled = false;
+                    btn.textContent = "✕ Cancel";
                 }
             });
         });

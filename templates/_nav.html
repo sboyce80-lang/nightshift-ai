@@ -1,6 +1,6 @@
 {# Shared header: brand bar with auth status + tab strip. Included in all
    authenticated pages. Caller passes `active_tab` as one of:
-       new | active | completed | pricing | detail
+       new | active | completed | pricing | members | detail
 #}
 <div class="brand-bar">
     <div class="brand-bar-inner">
@@ -12,8 +12,44 @@
             </div>
         </a>
         <div class="brand-spacer"></div>
-        <span id="auth-status" class="brand-auth">Loading…</span>
-        <a href="#" id="sign-out-link" class="brand-signout" style="display:none;">Sign out</a>
+
+        {# Account menu — populated client-side by Clerk bootstrap. The
+           legacy #auth-status and #sign-out-link IDs are preserved so the
+           per-page bootstrap JS keeps working without per-page changes. #}
+        <div class="account-menu" id="account-menu" style="display:none;">
+            <button type="button" class="account-trigger" id="account-trigger" aria-haspopup="true" aria-expanded="false">
+                <span class="account-avatar" id="account-avatar" aria-hidden="true">?</span>
+                <span class="account-trigger-label" id="auth-status">Loading…</span>
+                <span class="account-caret" aria-hidden="true">&#9662;</span>
+            </button>
+            <div class="account-dropdown" id="account-dropdown" role="menu">
+                <div class="account-dropdown-header">
+                    <div class="account-dropdown-name" id="account-menu-name">&nbsp;</div>
+                    <div class="account-dropdown-email" id="account-menu-email">&nbsp;</div>
+                    <div class="account-dropdown-org">
+                        <span id="account-menu-org">&nbsp;</span>
+                        <span class="account-role-badge" id="account-menu-role" style="display:none;"></span>
+                    </div>
+                </div>
+                <div class="account-dropdown-divider"></div>
+                <a href="#" class="account-dropdown-item" id="account-menu-profile" role="menuitem">
+                    <span class="account-item-icon">&#128100;</span> Manage account
+                </a>
+                <a href="{{ url_for('organization') }}" class="account-dropdown-item" role="menuitem">
+                    <span class="account-item-icon">&#127970;</span> Manage organization
+                </a>
+                <a href="{{ url_for('members') }}" class="account-dropdown-item" role="menuitem">
+                    <span class="account-item-icon">&#128101;</span> Members
+                </a>
+                <a href="{{ url_for('pricing_settings') }}" class="account-dropdown-item" role="menuitem">
+                    <span class="account-item-icon">&#128176;</span> Pricing defaults
+                </a>
+                <div class="account-dropdown-divider"></div>
+                <a href="#" class="account-dropdown-item account-dropdown-signout" id="sign-out-link" role="menuitem">
+                    <span class="account-item-icon">&#128682;</span> Sign out
+                </a>
+            </div>
+        </div>
     </div>
     <nav class="tab-strip" id="tab-strip" style="display:none;">
         <a href="{{ url_for('index') }}" class="tab {% if active_tab == 'new' %}tab-active{% endif %}">
@@ -30,3 +66,88 @@
         </a>
     </nav>
 </div>
+
+<script>
+// Account menu open/close + Clerk wiring. Idempotent — safe to include
+// once per page; per-page bootstrap also calls __initAccountMenu after
+// Clerk.load() to fill in name/email/org and the sign-out handler.
+(function() {
+    const menu = document.getElementById('account-menu');
+    if (!menu) return;
+    const trigger = document.getElementById('account-trigger');
+    const dropdown = document.getElementById('account-dropdown');
+
+    function close() {
+        menu.classList.remove('open');
+        trigger.setAttribute('aria-expanded', 'false');
+    }
+    function toggle() {
+        const open = menu.classList.toggle('open');
+        trigger.setAttribute('aria-expanded', open ? 'true' : 'false');
+    }
+    trigger.addEventListener('click', (e) => { e.stopPropagation(); toggle(); });
+    document.addEventListener('click', (e) => {
+        if (!menu.contains(e.target)) close();
+    });
+    document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape') close();
+    });
+
+    // Hook used by per-page Clerk bootstrap — keeps page templates simple.
+    window.__initAccountMenu = function(clerkUser) {
+        const email = clerkUser.primaryEmailAddress
+            ? clerkUser.primaryEmailAddress.emailAddress
+            : (clerkUser.emailAddresses[0] || {}).emailAddress || '';
+        const name = [clerkUser.firstName, clerkUser.lastName].filter(Boolean).join(' ') || email;
+        const initial = (name || email || '?').trim().charAt(0).toUpperCase() || '?';
+
+        const avatar = document.getElementById('account-avatar');
+        const label = document.getElementById('auth-status');
+        const menuName = document.getElementById('account-menu-name');
+        const menuEmail = document.getElementById('account-menu-email');
+        if (avatar) avatar.textContent = initial;
+        if (label) label.textContent = email;
+        if (menuName) menuName.textContent = name;
+        if (menuEmail) menuEmail.textContent = email;
+
+        // Org info comes from a small server-side endpoint so members
+        // see the same org name/role they'd see on the Members page.
+        fetch('/api/account/me', { credentials: 'same-origin' })
+            .then(r => r.ok ? r.json() : null)
+            .then(data => {
+                if (!data) return;
+                const orgEl = document.getElementById('account-menu-org');
+                const roleEl = document.getElementById('account-menu-role');
+                if (orgEl && data.org_name) orgEl.textContent = data.org_name;
+                if (roleEl && data.role) {
+                    roleEl.textContent = data.role;
+                    roleEl.style.display = '';
+                }
+            })
+            .catch(() => { /* non-fatal */ });
+
+        const profile = document.getElementById('account-menu-profile');
+        if (profile) {
+            profile.addEventListener('click', (e) => {
+                e.preventDefault();
+                close();
+                if (window.Clerk && window.Clerk.openUserProfile) {
+                    window.Clerk.openUserProfile();
+                }
+            });
+        }
+
+        const signOut = document.getElementById('sign-out-link');
+        if (signOut) {
+            signOut.addEventListener('click', (e) => {
+                e.preventDefault();
+                if (window.Clerk) {
+                    window.Clerk.signOut().then(() => window.location.reload());
+                }
+            });
+        }
+
+        menu.style.display = '';
+    };
+})();
+</script>

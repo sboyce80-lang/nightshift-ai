@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Members &mdash; Knight Shift</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body class="dark-theme">
+    {% set active_tab = 'members' %}
+    {% include "_nav.html" %}
+
+    <div class="page-shell">
+        <main id="main-content" style="display:none;margin-top:28px;">
+            {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}<div class="flash-messages">
+                {% for cat, m in messages %}<div class="flash flash-{{cat}}">{{m}}</div>{% endfor %}
+            </div>{% endif %}
+            {% endwith %}
+
+            <section class="panel">
+                <div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;">
+                    <h2 style="margin-bottom:0;">Members</h2>
+                    <span class="panel-subtle" style="margin:0;">
+                        {{ org.name }}{% if org.email_domain %} &middot; @{{ org.email_domain }}{% endif %}
+                    </span>
+                </div>
+
+                {% if org.is_personal %}
+                <p class="panel-subtle" style="margin-top:14px;">
+                    This is a personal account. To collaborate with teammates, sign in with a corporate email
+                    address &mdash; you'll be auto-grouped into your organization.
+                </p>
+                {% elif my_role != 'owner' %}
+                <p class="panel-subtle" style="margin-top:14px;">
+                    You're a member of this org. Only owners can invite or remove members.
+                </p>
+                {% endif %}
+
+                {% if can_invite %}
+                <form method="POST" action="{{ url_for('members_invite') }}"
+                      style="margin-top:18px;display:flex;gap:10px;flex-wrap:wrap;align-items:flex-end;">
+                    <div class="form-group" style="flex:1;min-width:240px;margin-bottom:0;">
+                        <label for="invite_email">Invite a teammate</label>
+                        <input type="email" id="invite_email" name="email" required
+                               placeholder="name@{{ org.email_domain or 'yourcompany.com' }}">
+                    </div>
+                    <div class="form-group" style="margin-bottom:0;">
+                        <label for="invite_role">Role</label>
+                        <select id="invite_role" name="role" class="rate-input" style="min-width:120px;">
+                            <option value="member" selected>Member</option>
+                            <option value="owner">Owner</option>
+                        </select>
+                    </div>
+                    <button type="submit" class="submit-btn dark-submit-btn"
+                            style="max-width:160px;margin-bottom:0;">
+                        Send invite
+                    </button>
+                </form>
+                <p class="panel-subtle" style="margin-top:8px;font-size:0.8rem;">
+                    Invitees must use a @{{ org.email_domain or '...' }} email. They'll join the org automatically the first time they sign in.
+                </p>
+                {% endif %}
+
+                <table class="pricing-table" style="margin-top:24px;">
+                    <thead>
+                        <tr>
+                            <th>Email</th>
+                            <th>Name</th>
+                            <th>Role</th>
+                            <th>Status</th>
+                            <th></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for m in members %}
+                        <tr>
+                            <td>{{ m.email }}{% if m.is_self %} <span class="account-role-badge" style="margin-left:6px;background:rgba(96,165,250,0.18);color:#93c5fd;">you</span>{% endif %}</td>
+                            <td style="color:#cbd5e1;">{{ m.name or '—' }}</td>
+                            <td>
+                                {% if my_role == 'owner' and not m.is_self %}
+                                <form method="POST" action="{{ url_for('members_role', membership_id=m.membership_id) }}"
+                                      style="display:inline;">
+                                    <select name="role" class="rate-input" style="min-width:110px;"
+                                            onchange="this.form.submit()">
+                                        <option value="member" {% if m.role == 'member' %}selected{% endif %}>Member</option>
+                                        <option value="owner" {% if m.role == 'owner' %}selected{% endif %}>Owner</option>
+                                    </select>
+                                </form>
+                                {% else %}
+                                <span class="account-role-badge">{{ m.role }}</span>
+                                {% endif %}
+                            </td>
+                            <td style="color:{% if m.active %}#6ee7b7{% else %}#fcd34d{% endif %};font-size:0.85rem;">
+                                {% if m.active %}Active{% else %}Pending sign-in{% endif %}
+                            </td>
+                            <td style="text-align:right;">
+                                {% if my_role == 'owner' and not m.is_self %}
+                                <form method="POST" action="{{ url_for('members_remove', membership_id=m.membership_id) }}"
+                                      style="display:inline;"
+                                      onsubmit="return confirm('Remove {{ m.email }} from this org?');">
+                                    <button type="submit"
+                                            style="background:none;border:1px solid rgba(252,165,165,0.4);color:#fca5a5;padding:5px 12px;border-radius:6px;cursor:pointer;font-size:0.82rem;">
+                                        Remove
+                                    </button>
+                                </form>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+            </section>
+        </main>
+    </div>
+
+    <footer style="text-align:center;padding:20px;color:rgba(203,213,225,0.5);font-size:0.85rem;">
+        &copy; 2026 Knight Shift &mdash; Forged by Willpower
+    </footer>
+
+    {% if clerk_publishable_key and clerk_frontend_api_host %}
+    <script>
+    window.__bootClerk = async function() {
+        const Clerk = window.Clerk;
+        await Clerk.load();
+        const status = document.getElementById('auth-status');
+        const main = document.getElementById('main-content');
+        const tabStrip = document.getElementById('tab-strip');
+        if (!Clerk.user) {
+            if (status) status.textContent = 'Sign in to continue';
+            Clerk.openSignIn({ afterSignInUrl: window.location.href });
+            return;
+        }
+        if (window.__initAccountMenu) window.__initAccountMenu(Clerk.user);
+        if (main) main.style.display = '';
+        if (tabStrip) tabStrip.style.display = '';
+    };
+    </script>
+    <script async crossorigin="anonymous"
+        data-clerk-publishable-key="{{ clerk_publishable_key }}"
+        src="https://{{ clerk_frontend_api_host }}/npm/@clerk/clerk-js@5/dist/clerk.browser.js"
+        onload="window.__bootClerk()"></script>
+    {% endif %}
+</body>
+</html>

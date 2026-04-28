@@ -1,0 +1,158 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Organization &mdash; Knight Shift</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body class="dark-theme">
+    {% set active_tab = 'organization' %}
+    {% include "_nav.html" %}
+
+    <div class="page-shell">
+        <main id="main-content" style="display:none;margin-top:28px;">
+            {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}<div class="flash-messages">
+                {% for cat, m in messages %}<div class="flash flash-{{cat}}">{{m}}</div>{% endfor %}
+            </div>{% endif %}
+            {% endwith %}
+
+            <section class="panel">
+                <div style="display:flex;align-items:baseline;gap:14px;flex-wrap:wrap;">
+                    <h2 style="margin-bottom:0;">Manage Organization</h2>
+                    <span class="account-role-badge">{{ my_role }}</span>
+                </div>
+                <p class="panel-subtle" style="margin-top:6px;">
+                    Settings for the org you're currently signed into.
+                    {% if not is_owner %}You're a member &mdash; only owners can edit.{% endif %}
+                </p>
+
+                <form method="POST" action="{{ url_for('organization') }}" style="margin-top:18px;">
+                    <div class="form-group">
+                        <label for="org_name">Organization name</label>
+                        <input type="text" id="org_name" name="name" required maxlength="255"
+                               value="{{ org.name }}"
+                               {% if not is_owner %}disabled{% endif %}>
+                    </div>
+
+                    {% if is_owner %}
+                    <button type="submit" class="submit-btn dark-submit-btn"
+                            style="max-width:200px;">
+                        Save changes
+                    </button>
+                    {% endif %}
+                </form>
+
+                <div class="account-dropdown-divider" style="margin:24px 0;"></div>
+
+                <h3 style="margin-bottom:10px;">Details</h3>
+                <table class="pricing-table">
+                    <tbody>
+                        <tr>
+                            <td style="color:#cbd5e1;width:40%;">Type</td>
+                            <td>
+                                {% if org.is_personal %}
+                                    Personal account
+                                {% else %}
+                                    Corporate org
+                                {% endif %}
+                            </td>
+                        </tr>
+                        <tr>
+                            <td style="color:#cbd5e1;">Email domain</td>
+                            <td>
+                                {% if org.email_domain %}
+                                    @{{ org.email_domain }}
+                                {% else %}
+                                    <span class="panel-subtle">&mdash; (free-email signup)</span>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        <tr>
+                            <td style="color:#cbd5e1;">Domain verification</td>
+                            <td>
+                                {% if org.is_personal %}
+                                    <span class="panel-subtle">N/A &mdash; personal account</span>
+                                {% elif org.verified_at %}
+                                    <span style="color:#6ee7b7;">&#10003; Verified</span>
+                                    <span class="panel-subtle" style="margin-left:8px;">
+                                        {{ org.verified_at.strftime('%b %d, %Y') }}
+                                    </span>
+                                {% else %}
+                                    <span style="color:#fcd34d;">Pending</span>
+                                    <span class="panel-subtle" style="margin-left:8px;">
+                                        verification email goes to webmaster@{{ org.email_domain }}
+                                    </span>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        <tr>
+                            <td style="color:#cbd5e1;">Beta access</td>
+                            <td>
+                                {% if org.is_beta_approved %}
+                                    <span style="color:#6ee7b7;">&#10003; Approved</span>
+                                {% else %}
+                                    <span style="color:#fcd34d;">Waitlisted</span>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        <tr>
+                            <td style="color:#cbd5e1;">Daily submission cap</td>
+                            <td>
+                                {{ daily_cap_effective }} per 24 hours
+                                {% if not org.daily_submission_cap %}
+                                <span class="panel-subtle" style="margin-left:8px;">
+                                    (default &mdash; contact support to raise)
+                                </span>
+                                {% endif %}
+                            </td>
+                        </tr>
+                        <tr>
+                            <td style="color:#cbd5e1;">Members</td>
+                            <td>
+                                {{ member_count }}
+                                ({{ owner_count }} owner{% if owner_count != 1 %}s{% endif %})
+                                <a href="{{ url_for('members') }}"
+                                   style="color:#93c5fd;margin-left:10px;">Manage &rarr;</a>
+                            </td>
+                        </tr>
+                        <tr>
+                            <td style="color:#cbd5e1;">Created</td>
+                            <td>{{ org.created_at.strftime('%b %d, %Y') }}</td>
+                        </tr>
+                    </tbody>
+                </table>
+            </section>
+        </main>
+    </div>
+
+    <footer style="text-align:center;padding:20px;color:rgba(203,213,225,0.5);font-size:0.85rem;">
+        &copy; 2026 Knight Shift &mdash; Forged by Willpower
+    </footer>
+
+    {% if clerk_publishable_key and clerk_frontend_api_host %}
+    <script>
+    window.__bootClerk = async function() {
+        const Clerk = window.Clerk;
+        await Clerk.load();
+        const status = document.getElementById('auth-status');
+        const main = document.getElementById('main-content');
+        const tabStrip = document.getElementById('tab-strip');
+        if (!Clerk.user) {
+            if (status) status.textContent = 'Sign in to continue';
+            Clerk.openSignIn({ afterSignInUrl: window.location.href });
+            return;
+        }
+        if (window.__initAccountMenu) window.__initAccountMenu(Clerk.user);
+        if (main) main.style.display = '';
+        if (tabStrip) tabStrip.style.display = '';
+    };
+    </script>
+    <script async crossorigin="anonymous"
+        data-clerk-publishable-key="{{ clerk_publishable_key }}"
+        src="https://{{ clerk_frontend_api_host }}/npm/@clerk/clerk-js@5/dist/clerk.browser.js"
+        onload="window.__bootClerk()"></script>
+    {% endif %}
+</body>
+</html>

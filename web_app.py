@@ -60,8 +60,9 @@ import storage
 from datetime import datetime, timezone, timedelta
 
 from db import session_scope
-from models import User, Submission, File, Organization
-from auth import require_auth, current_user_id, clerk_frontend_api_host
+from models import User, Submission, File, Organization, OrganizationMembership
+from auth import require_auth, current_user_id, clerk_frontend_api_host, is_admin
+from orgs import FREE_EMAIL_DOMAINS, _domain_of
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -546,13 +547,15 @@ def jobs_list():
     uid = current_user_id()
     status_filter = (request.args.get("status") or "active").lower()
     if status_filter == "completed":
-        wanted = ("completed", "failed")
+        wanted = ("completed", "failed", "cancelled")
     else:
         wanted = ("queued", "processing")
         status_filter = "active"
 
     rows = []
     with session_scope() as session:
+        user = session.get(User, uid)
+        admin = is_admin(user)
         subs = (session.query(Submission)
                 .filter(Submission.user_id == uid)
                 .filter(Submission.status.in_(wanted))
@@ -579,7 +582,8 @@ def jobs_list():
                 "upload_count": sum(1 for f in s.files if f.kind == "upload"),
                 "results": results,
             })
-    return render_template("jobs.html", submissions=rows, status_filter=status_filter)
+    return render_template("jobs.html", submissions=rows,
+                           status_filter=status_filter, is_admin=admin)
 
 
 @app.route("/jobs/<submission_id>", methods=["GET"])
@@ -677,6 +681,71 @@ def job_result_api(submission_id):
     })
 
 
+@app.route("/api/jobs/<submission_id>/prioritize", methods=["POST"])
+@require_auth
+def job_prioritize_api(submission_id):
+    """Admin-only: bump a queued job to the front of its RQ queue.
+
+    Implemented by removing the job from its current queue position and
+    re-enqueuing with at_front=True. The DB row and job_id are unchanged.
+    """
+    uid = current_user_id()
+    with session_scope() as session:
+        user = session.get(User, uid)
+        if not is_admin(user):
+            return jsonify({"error": "forbidden"}), 403
+        sub = session.get(Submission, submission_id)
+        if sub is None:
+            return jsonify({"error": "not found"}), 404
+        if sub.status != "queued":
+            return jsonify({"error": f"cannot prioritize a {sub.status} job"}), 409
+
+    try:
+        job = Job.fetch(submission_id, connection=_redis)
+    except NoSuchJobError:
+        return jsonify({"error": "job not found in queue"}), 404
+
+    origin = job.origin  # the queue name this job was enqueued on
+    queue = Queue(origin, connection=_redis)
+    try:
+        queue.remove(job)
+        queue.enqueue_job(job, at_front=True)
+    except Exception as exc:
+        logger.error("Failed to prioritize %s: %s", submission_id, exc)
+        return jsonify({"error": "failed to prioritize"}), 500
+
+    logger.info("Submission %s prioritized on queue %s by user %d",
+                submission_id, origin, uid)
+    return jsonify({"ok": True, "queue": origin})
+
+
+@app.route("/api/jobs/<submission_id>/cancel", methods=["POST"])
+@require_auth
+def job_cancel_api(submission_id):
+    """Cancel a queued job. Owner-only. Refuses jobs that are already processing."""
+    uid = current_user_id()
+    with session_scope() as session:
+        sub = session.get(Submission, submission_id)
+        if sub is None or sub.user_id != uid:
+            return jsonify({"error": "not found"}), 404
+        if sub.status != "queued":
+            return jsonify({"error": f"cannot cancel a {sub.status} job"}), 409
+        sub.status = "cancelled"
+
+    try:
+        job = Job.fetch(submission_id, connection=_redis)
+        job.cancel()
+        job.delete()
+    except NoSuchJobError:
+        # DB row already updated; treat as success.
+        pass
+    except Exception as exc:
+        logger.warning("Cancel: RQ cleanup failed for %s: %s", submission_id, exc)
+
+    logger.info("Submission %s cancelled by user %d", submission_id, uid)
+    return jsonify({"ok": True})
+
+
 @app.route("/pricing", methods=["GET", "POST"])
 @require_auth
 def pricing_settings():
@@ -748,6 +817,286 @@ def pricing_settings():
         },
         rate_fields=RATE_FIELDS,
     )
+
+
+# ---------------------------------------------------------------------------
+# Account / Members
+# ---------------------------------------------------------------------------
+
+def _membership_for(session, user_id, org_id):
+    """Return the (single) membership row linking user_id to org_id, or None."""
+    return (session.query(OrganizationMembership)
+                   .filter(OrganizationMembership.user_id == user_id,
+                           OrganizationMembership.organization_id == org_id)
+                   .one_or_none())
+
+
+def _is_owner(session, user_id, org_id):
+    m = _membership_for(session, user_id, org_id)
+    return bool(m and m.role == "owner")
+
+
+@app.route("/api/account/me", methods=["GET"])
+@require_auth
+def account_me_api():
+    """Lightweight payload for the top-right dropdown header."""
+    uid = current_user_id()
+    with session_scope() as session:
+        user = session.get(User, uid)
+        org = user.current_organization if user else None
+        m = _membership_for(session, uid, org.id) if (user and org) else None
+        return jsonify({
+            "email": user.email if user else None,
+            "name": user.name if user else None,
+            "org_name": org.name if org else None,
+            "org_id": org.id if org else None,
+            "role": m.role if m else None,
+            "is_personal_org": bool(org and org.is_personal),
+        })
+
+
+@app.route("/account/organization", methods=["GET", "POST"])
+@require_auth
+def organization():
+    """View / edit the user's current org. Owner can rename; everyone else
+    sees the page read-only. Domain / personal / verified / beta-approval
+    are not editable here — they're either auto-derived (domain, personal)
+    or admin-managed (verified, beta_approved, daily_cap).
+    """
+    uid = current_user_id()
+    with session_scope() as session:
+        user = session.get(User, uid)
+        org = user.current_organization if user else None
+        if org is None:
+            flash("Your account is not yet fully set up. Please contact support.", "error")
+            return redirect(url_for("index"))
+
+        my_role = (_membership_for(session, uid, org.id) or
+                   OrganizationMembership(role="member")).role
+        is_owner = (my_role == "owner")
+
+        if request.method == "POST":
+            if not is_owner:
+                flash("Only org owners can edit the organization.", "error")
+                return redirect(url_for("organization"))
+            new_name = (request.form.get("name") or "").strip()
+            if not new_name:
+                flash("Organization name is required.", "error")
+                return redirect(url_for("organization"))
+            if len(new_name) > 255:
+                flash("Organization name is too long (max 255 characters).", "error")
+                return redirect(url_for("organization"))
+            org.name = new_name
+            flash("Organization updated.", "success")
+            return redirect(url_for("organization"))
+
+        member_count = (session.query(OrganizationMembership)
+                               .filter(OrganizationMembership.organization_id == org.id)
+                               .count())
+        owner_count = (session.query(OrganizationMembership)
+                              .filter(OrganizationMembership.organization_id == org.id,
+                                      OrganizationMembership.role == "owner")
+                              .count())
+        return render_template(
+            "organization.html",
+            org=org,
+            my_role=my_role,
+            is_owner=is_owner,
+            member_count=member_count,
+            owner_count=owner_count,
+            daily_cap_effective=org.daily_submission_cap or BETA_DAILY_SUBMISSION_CAP_DEFAULT,
+        )
+
+
+@app.route("/account/members", methods=["GET"])
+@require_auth
+def members():
+    """Render the members management page for the user's current org."""
+    uid = current_user_id()
+    with session_scope() as session:
+        user = session.get(User, uid)
+        org = user.current_organization if user else None
+        if org is None:
+            flash("Your account is not yet fully set up. Please contact support.", "error")
+            return redirect(url_for("index"))
+
+        my_role = (_membership_for(session, uid, org.id) or
+                   OrganizationMembership(role="member")).role
+
+        rows = (session.query(OrganizationMembership, User)
+                       .join(User, User.id == OrganizationMembership.user_id)
+                       .filter(OrganizationMembership.organization_id == org.id)
+                       .order_by(OrganizationMembership.created_at.asc())
+                       .all())
+        members_list = [{
+            "membership_id": m.id,
+            "user_id": u.id,
+            "email": u.email,
+            "name": u.name or "",
+            "role": m.role,
+            "is_self": (u.id == uid),
+            "joined_at": m.created_at,
+            "active": bool(u.clerk_user_id),
+        } for (m, u) in rows]
+
+        return render_template(
+            "members.html",
+            org=org,
+            members=members_list,
+            my_role=my_role,
+            can_invite=(my_role == "owner") and not org.is_personal,
+        )
+
+
+@app.route("/account/members/invite", methods=["POST"])
+@require_auth
+def members_invite():
+    """Owner pre-creates a User + Membership for an email on the org's domain.
+
+    No outbound email yet — invitee just signs in with that email and the
+    existing _sync_user path links their Clerk account to the pre-created row.
+    Personal orgs cannot invite (they're single-user by design).
+    """
+    uid = current_user_id()
+    raw_email = (request.form.get("email") or "").strip().lower()
+    role = (request.form.get("role") or "member").strip().lower()
+    if role not in ("owner", "member"):
+        role = "member"
+
+    if not raw_email or "@" not in raw_email:
+        flash("Enter a valid email address.", "error")
+        return redirect(url_for("members"))
+
+    with session_scope() as session:
+        user = session.get(User, uid)
+        org = user.current_organization if user else None
+        if org is None or not _is_owner(session, uid, org.id):
+            flash("Only org owners can invite members.", "error")
+            return redirect(url_for("members"))
+        if org.is_personal:
+            flash("Personal accounts cannot have additional members.", "error")
+            return redirect(url_for("members"))
+
+        # Domain restriction: corporate orgs only accept emails on their own
+        # domain. Mirrors the auto-provisioning rule in orgs.provision_org_for_user.
+        invitee_domain = _domain_of(raw_email)
+        if org.email_domain and invitee_domain != org.email_domain:
+            flash(
+                f"Invitees must use a @{org.email_domain} email address.",
+                "error",
+            )
+            return redirect(url_for("members"))
+        if invitee_domain in FREE_EMAIL_DOMAINS:
+            flash("Free-email addresses cannot be added to a corporate org.", "error")
+            return redirect(url_for("members"))
+
+        existing = session.query(User).filter(User.email == raw_email).one_or_none()
+        if existing is None:
+            existing = User(email=raw_email, name=None)
+            session.add(existing)
+            session.flush()  # need id for the membership row
+
+        # Idempotent: if they're already in the org, just bump their role.
+        existing_m = _membership_for(session, existing.id, org.id)
+        if existing_m is not None:
+            if existing_m.role != role:
+                existing_m.role = role
+                flash(f"Updated {raw_email} to {role}.", "success")
+            else:
+                flash(f"{raw_email} is already a member.", "success")
+            return redirect(url_for("members"))
+
+        session.add(OrganizationMembership(
+            organization_id=org.id,
+            user_id=existing.id,
+            role=role,
+        ))
+        # If this is the invitee's first org, seed their current_organization
+        # so they land in it on first sign-in.
+        if existing.current_organization_id is None:
+            existing.current_organization_id = org.id
+
+    flash(f"Invited {raw_email}. They'll join automatically when they sign in.",
+          "success")
+    return redirect(url_for("members"))
+
+
+@app.route("/account/members/<int:membership_id>/remove", methods=["POST"])
+@require_auth
+def members_remove(membership_id):
+    """Owner-only removal. Refuses to remove the last remaining owner."""
+    uid = current_user_id()
+    with session_scope() as session:
+        user = session.get(User, uid)
+        org = user.current_organization if user else None
+        if org is None or not _is_owner(session, uid, org.id):
+            flash("Only org owners can remove members.", "error")
+            return redirect(url_for("members"))
+
+        target = session.get(OrganizationMembership, membership_id)
+        if target is None or target.organization_id != org.id:
+            flash("Member not found.", "error")
+            return redirect(url_for("members"))
+
+        if target.role == "owner":
+            owner_count = (session.query(OrganizationMembership)
+                                  .filter(OrganizationMembership.organization_id == org.id,
+                                          OrganizationMembership.role == "owner")
+                                  .count())
+            if owner_count <= 1:
+                flash("Can't remove the last owner — promote someone else first.",
+                      "error")
+                return redirect(url_for("members"))
+
+        # If the removed user's current_organization points here, clear it so
+        # their next sign-in re-provisions them into a personal org.
+        target_user = session.get(User, target.user_id)
+        if target_user and target_user.current_organization_id == org.id:
+            target_user.current_organization_id = None
+
+        target_email = target_user.email if target_user else "user"
+        session.delete(target)
+
+    flash(f"Removed {target_email} from the org.", "success")
+    return redirect(url_for("members"))
+
+
+@app.route("/account/members/<int:membership_id>/role", methods=["POST"])
+@require_auth
+def members_role(membership_id):
+    """Owner-only role change. Refuses to demote the last owner."""
+    uid = current_user_id()
+    new_role = (request.form.get("role") or "").strip().lower()
+    if new_role not in ("owner", "member"):
+        flash("Invalid role.", "error")
+        return redirect(url_for("members"))
+
+    with session_scope() as session:
+        user = session.get(User, uid)
+        org = user.current_organization if user else None
+        if org is None or not _is_owner(session, uid, org.id):
+            flash("Only org owners can change roles.", "error")
+            return redirect(url_for("members"))
+
+        target = session.get(OrganizationMembership, membership_id)
+        if target is None or target.organization_id != org.id:
+            flash("Member not found.", "error")
+            return redirect(url_for("members"))
+
+        if target.role == "owner" and new_role == "member":
+            owner_count = (session.query(OrganizationMembership)
+                                  .filter(OrganizationMembership.organization_id == org.id,
+                                          OrganizationMembership.role == "owner")
+                                  .count())
+            if owner_count <= 1:
+                flash("Can't demote the last owner — promote someone else first.",
+                      "error")
+                return redirect(url_for("members"))
+
+        target.role = new_role
+
+    flash("Role updated.", "success")
+    return redirect(url_for("members"))
 
 
 # ---------------------------------------------------------------------------
