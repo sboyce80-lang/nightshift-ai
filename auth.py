@@ -166,10 +166,23 @@ def _fetch_clerk_user_email_and_name(clerk_user_id: str) -> tuple[str, Optional[
 
 
 def _sync_user(clerk_user_id: str) -> int:
-    """Return our local users.id for this Clerk user, creating/linking as needed."""
+    """Return our local users.id for this Clerk user, creating/linking as needed.
+
+    Also ensures the user has a current_organization_id — provisions an
+    org based on email domain if one isn't already set. Existing users
+    migrated by Alembic 0003 already have this set; new users get it
+    here on first sign-in.
+    """
+    from orgs import provision_org_for_user  # local import — avoid cycle
+
     with session_scope() as session:
         user = session.query(User).filter(User.clerk_user_id == clerk_user_id).one_or_none()
         if user is not None:
+            # Defensive re-provision for any user whose org assignment
+            # somehow got cleared (e.g. ON DELETE SET NULL on an org row).
+            if user.current_organization_id is None:
+                provision_org_for_user(session, user)
+                session.flush()
             return user.id
 
         # Not yet linked — fetch email from Clerk and try to match an existing
@@ -183,7 +196,12 @@ def _sync_user(clerk_user_id: str) -> int:
             user.clerk_user_id = clerk_user_id
             if name and not user.name:
                 user.name = name
-        session.flush()
+        session.flush()  # need user.id before provisioning the org
+
+        if user.current_organization_id is None:
+            provision_org_for_user(session, user)
+            session.flush()
+
         return user.id
 
 

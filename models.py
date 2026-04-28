@@ -2,16 +2,28 @@
 """
 Knight Shift — SQLAlchemy Models
 ================================
-Three tables:
+Five tables:
 
-    users         — one row per submitter, identified by email. Linked to
-                    a Clerk user_id once auth is wired up in step 4.
-    submissions   — one row per /submit request. The submission_id (UUID)
-                    is the same value used as the RQ job_id and the R2
-                    key prefix.
-    files         — one row per object in R2 attached to a submission
-                    (uploads + results). Lets us list a user's history
-                    cheaply without scanning R2.
+    users                      — one row per submitter, identified by email.
+                                 Linked to a Clerk user_id once auth is wired
+                                 up. Each user has a current_organization_id
+                                 pointing at the org context they're acting in.
+    organizations              — one row per tenant. Corporate orgs are keyed
+                                 by email_domain; personal orgs (free-email
+                                 signups) have email_domain=NULL and
+                                 is_personal=TRUE. Pricing overrides live here
+                                 (moved from users in migration 0003).
+    organization_memberships   — many-to-many between users and organizations
+                                 with a role. Supports the multi-org context
+                                 switcher.
+    submissions                — one row per /submit request. Owned by a user
+                                 AND scoped to an organization (the user's
+                                 current org at submission time). The
+                                 submission_id (UUID) is the same value used
+                                 as the RQ job_id and the R2 key prefix.
+    files                      — one row per object in R2 attached to a
+                                 submission (uploads + results). Lets us list
+                                 a user's history cheaply without scanning R2.
 """
 
 import uuid
@@ -20,7 +32,7 @@ from typing import List, Optional
 
 from sqlalchemy import (
     String, Integer, BigInteger, Numeric, DateTime, ForeignKey, Index,
-    UniqueConstraint, JSON,
+    UniqueConstraint, JSON, Boolean,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -33,6 +45,92 @@ def _utcnow() -> datetime:
 
 # ---------------------------------------------------------------------------
 
+class Organization(Base):
+    __tablename__ = "organizations"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+
+    # Lowercase email domain ("riderpaintingny.com") for corporate orgs;
+    # NULL for personal orgs created from free-email signups.
+    email_domain: Mapped[Optional[str]] = mapped_column(
+        String(255), nullable=True, index=True,
+    )
+
+    # True when this org was auto-provisioned for a single user with a
+    # free-email address (gmail/yahoo/etc.). Distinguishes from a corporate
+    # org that happens to have only one member at the moment.
+    is_personal: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false",
+    )
+
+    # Domain ownership verified via webmaster@<domain> email. NULL until the
+    # first admin completes verification. Orgs created by the 0003 migration
+    # are grandfathered with verified_at = migration time.
+    verified_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+
+    # Pricing overrides JSON, formerly on users.pricing_overrides.
+    # Shape: {"rates": {<key>: <float>, ...}, "markup": <float>}
+    pricing_overrides: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False,
+    )
+
+    memberships: Mapped[List["OrganizationMembership"]] = relationship(
+        back_populates="organization", cascade="all, delete-orphan",
+    )
+    submissions: Mapped[List["Submission"]] = relationship(back_populates="organization")
+
+    def __repr__(self) -> str:
+        return f"<Organization id={self.id} name={self.name!r} domain={self.email_domain!r}>"
+
+
+# ---------------------------------------------------------------------------
+
+# Two roles for v1. Owner can edit org pricing and invite members. Member
+# can run jobs and per-job overrides but not change org-level pricing.
+# Add 'admin' as a middle tier later if owners need to delegate.
+ORGANIZATION_ROLES = ("owner", "member")
+
+
+class OrganizationMembership(Base):
+    __tablename__ = "organization_memberships"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    organization_id: Mapped[int] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    user_id: Mapped[int] = mapped_column(
+        ForeignKey("users.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    role: Mapped[str] = mapped_column(String(32), nullable=False, default="member")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False,
+    )
+
+    organization: Mapped["Organization"] = relationship(back_populates="memberships")
+    user: Mapped["User"] = relationship(back_populates="memberships")
+
+    __table_args__ = (
+        UniqueConstraint(
+            "organization_id", "user_id", name="uq_membership_org_user",
+        ),
+    )
+
+    def __repr__(self) -> str:
+        return f"<OrgMembership org={self.organization_id} user={self.user_id} role={self.role}>"
+
+
+# ---------------------------------------------------------------------------
+
 class User(Base):
     __tablename__ = "users"
 
@@ -40,7 +138,16 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(320), nullable=False, unique=True, index=True)
     name: Mapped[Optional[str]] = mapped_column(String(255))
     clerk_user_id: Mapped[Optional[str]] = mapped_column(String(64), unique=True, index=True)
-    pricing_overrides: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+
+    # Which org the user is currently acting as. Set on first sign-in to
+    # their auto-provisioned org; the multi-org context switcher updates
+    # this when the user picks a different org from the dropdown.
+    # Nullable because a user may briefly exist between row creation and
+    # org assignment; treat None as "no org context, deny pricing reads".
+    current_organization_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("organizations.id", ondelete="SET NULL"), nullable=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False,
     )
@@ -50,6 +157,12 @@ class User(Base):
 
     submissions: Mapped[List["Submission"]] = relationship(
         back_populates="user", cascade="all, delete-orphan",
+    )
+    memberships: Mapped[List["OrganizationMembership"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan",
+    )
+    current_organization: Mapped[Optional["Organization"]] = relationship(
+        foreign_keys=[current_organization_id],
     )
 
     def __repr__(self) -> str:
@@ -72,6 +185,10 @@ class Submission(Base):
     user_id: Mapped[int] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True,
     )
+    org_id: Mapped[int] = mapped_column(
+        ForeignKey("organizations.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
 
     # Per-submission contact details (a user may submit for different orgs).
     phone: Mapped[Optional[str]] = mapped_column(String(64))
@@ -91,6 +208,7 @@ class Submission(Base):
     )
 
     user: Mapped["User"] = relationship(back_populates="submissions")
+    organization: Mapped["Organization"] = relationship(back_populates="submissions")
     files: Mapped[List["File"]] = relationship(
         back_populates="submission", cascade="all, delete-orphan",
     )

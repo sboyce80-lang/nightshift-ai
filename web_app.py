@@ -162,7 +162,8 @@ def _effective_user_overrides(user):
         "concrete_rate": "concrete_sealer",
         "column_rate":   "painted_columns",
     }
-    saved = (user.pricing_overrides or {}) if user else {}
+    org = user.current_organization if user else None
+    saved = (org.pricing_overrides or {}) if org else {}
     saved_rates = saved.get("rates") or {}
     saved_markup = saved.get("markup")
 
@@ -265,6 +266,16 @@ def submit():
         user = session.get(User, user_id)
         name = user.name or ""
         email_addr = user.email
+        org_id = user.current_organization_id
+
+    if org_id is None:
+        # Post-migration every Clerk-synced user is provisioned an org in
+        # auth._sync_user. Reaching here means provisioning failed silently;
+        # refuse the submission rather than write a row that will fail the
+        # NOT-NULL constraint on submissions.org_id.
+        logger.error("submit blocked: user %s has no current_organization_id", user_id)
+        flash("Your account is not yet fully set up. Please contact support.", "error")
+        return redirect(url_for("index"))
 
     # 2. Get uploaded files
     files = request.files.getlist("attachments")
@@ -328,6 +339,7 @@ def submit():
             sub = Submission(
                 id=submission_id,
                 user_id=user_id,
+                org_id=org_id,
                 phone=phone or None,
                 business_name=business_name or None,
                 scope_notes=scope_notes or None,
@@ -354,11 +366,15 @@ def submit():
         return redirect(url_for("index"))
 
     # 5. Build pricing overrides for this submission.
-    #    Start from the user's saved profile, then merge any per-job
+    #    Start from the org's saved pricing profile, then merge any per-job
     #    overrides posted from the inline pricing table (rate__<key>).
     with session_scope() as session:
         user = session.get(User, user_id)
-        rate_overrides = _flatten_overrides(user.pricing_overrides) if user else None
+        org_overrides = (
+            user.current_organization.pricing_overrides
+            if user and user.current_organization else None
+        )
+        rate_overrides = _flatten_overrides(org_overrides)
 
     per_job = {}
     for key, _label, _unit, _default in RATE_FIELDS:
@@ -598,14 +614,24 @@ def job_result_api(submission_id):
 @app.route("/pricing", methods=["GET", "POST"])
 @require_auth
 def pricing_settings():
-    """View / edit per-account pricing overrides (rates + markup)."""
+    """View / edit per-org pricing overrides (rates + markup).
+
+    Pricing is org-scoped: any member of the same org sees the same saved
+    rates. Owners edit; member-vs-owner role enforcement ships with the
+    invite/role UI.
+    """
     uid = current_user_id()
     with session_scope() as session:
         user = session.get(User, uid)
+        org = user.current_organization if user else None
+        if org is None:
+            flash("Your account is not yet fully set up. Please contact support.",
+                  "error")
+            return redirect(url_for("index"))
 
         if request.method == "POST":
             if request.form.get("reset"):
-                user.pricing_overrides = None
+                org.pricing_overrides = None
                 flash("Pricing reset to Rider defaults.", "success")
                 return redirect(url_for("pricing_settings"))
 
@@ -642,11 +668,11 @@ def pricing_settings():
                 overrides["rates"] = rates
             if markup is not None:
                 overrides["markup"] = markup
-            user.pricing_overrides = overrides or None
+            org.pricing_overrides = overrides or None
             flash("Pricing saved.", "success")
             return redirect(url_for("pricing_settings"))
 
-        overrides = user.pricing_overrides or {}
+        overrides = org.pricing_overrides or {}
 
     return render_template(
         "pricing.html",

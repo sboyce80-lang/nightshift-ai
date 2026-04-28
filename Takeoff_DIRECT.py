@@ -1942,28 +1942,34 @@ WINDOW SCHEDULE
 Go through the window schedule table ROW BY ROW.  For EACH window mark:
 1. Read the window mark / type (e.g., W1, W2, A, B)
 2. Read the QTY column if present (some schedules list quantity per type)
-3. Read the FRAME material, TYPE, FINISH, and NOTES columns carefully
-4. Determine if the interior frame is painted:
-   • PAINTED INTERIOR (count as windows_painted_interior):
-     - Schedule explicitly says "painted", "paint", "black", or "color" for interior finish
-     - Frame material is WOOD (WD) — wood frames require painting
-     - Notes or finish column mentions "field painted" or "prime and paint"
-   • NOT PAINTED INTERIOR (do not count):
-     - Factory-finished aluminum, vinyl, fiberglass, or clad windows
-     - Double-hung / single-hung with no paint specification (factory finish is default)
-     - Storefronts (SF-prefix) — NEVER painted interior
-     - Fire-rated windows (FYRE-TEC or similar) — factory finish unless noted otherwise
-     - "Pre-treated", "shop finish", "shop finished", "shop painted" — window was
-       finished/painted off-site at the manufacturer, no field painting needed
-     - "Pre-finished", "factory painted", "factory finish" — same as above
-     - Any reference to off-site finishing means the window is NOT painted in the field
-   • BE CONSERVATIVE: If there is NO explicit paint specification for interior,
-     the window is NOT painted interior.  Most modern windows come factory-finished.
-5. Calculate total: type_qty × number_of_marks, or count each row individually
+3. Read the FRAME material, TYPE, FINISH, JAMB DETAIL, HEAD DETAIL, SILL DETAIL,
+   and NOTES columns carefully — also cross-reference any window TYPE detail
+   drawings (often on the schedule sheet) showing casing, return, sill, apron,
+   and drywall return construction.
+4. Identify which window-trim COMPONENTS are present and paintable per window type:
+   • CASING — wood/MDF trim around the window opening (head + jambs ± sill)
+   • APRON — horizontal trim board below the sill
+   • STOOL / SILL — interior sill board (separate from exterior sill)
+   • RETURN — wood return (jamb extension wrapping back to wall) requiring paint
+   • DRYWALL RETURN — gypsum return at jamb (paintable like a wall, no casing)
+     (drywall returns are typically NOT counted as window trim — they're already
+     part of the wall paint scope; flag presence only)
+   • SASH — operable sash (factory-finished on virtually all modern windows)
+5. Determine sash paint status:
+   • COMMERCIAL JOBS: ASSUME sashes are NOT painted (factory-finished). Do not
+     count sashes as painted unless the schedule EXPLICITLY says "field paint sash"
+     or "paint operable sash".
+   • Storefronts (SF-prefix), aluminum, vinyl, fiberglass, clad, fire-rated,
+     pre-finished/factory-painted/shop-painted = sash NOT painted.
+6. Determine per-component paint status (casing/apron/sill/return) from the
+   schedule, type detail, and any explicit paint callouts. Components are paintable
+   when they exist as wood/MDF trim — they do NOT need to be called out as "PT-x"
+   to be painted; wood trim is painted by default unless marked stained/clear.
 
-IMPORTANT: Do NOT assume residential windows are painted unless the schedule says so.
-Most modern residential windows are factory-finished vinyl or aluminum-clad.
-Only count windows as painted if you see explicit evidence in the schedule.
+IMPORTANT: Do NOT assume residential windows have painted sashes. Modern windows
+are factory-finished. Casings/aprons/stools, when present as wood trim, ARE
+painted. If the schedule does not show jamb/head/sill details that confirm
+component construction, leave components UNKNOWN rather than guessing.
 
 ═══════════════════════════════════════════════════════════
 STAIR INFO (if visible on these pages)
@@ -1992,9 +1998,21 @@ OUTPUT FORMAT — Return ONLY this JSON, no other text:
     "total_windows": <int>,
     "windows_painted_interior": <int>,
     "window_types": [
-      {"mark": "W1", "qty": 10, "frame": "wood", "painted_interior": true},
-      {"mark": "W2", "qty": 5, "frame": "aluminum", "painted_interior": false}
+      {"mark": "W1", "qty": 10, "frame": "wood", "painted_interior": true,
+       "has_casing": true, "has_apron": true, "has_stool_sill": true,
+       "has_wood_return": false, "has_drywall_return": false,
+       "sash_painted": false},
+      {"mark": "W2", "qty": 5, "frame": "aluminum", "painted_interior": false,
+       "has_casing": false, "has_apron": false, "has_stool_sill": false,
+       "has_wood_return": false, "has_drywall_return": true,
+       "sash_painted": false}
     ],
+    "windows_with_casing": <int>,
+    "windows_with_apron": <int>,
+    "windows_with_stool_sill": <int>,
+    "windows_with_wood_return": <int>,
+    "windows_with_drywall_return": <int>,
+    "windows_with_painted_sash": <int>,
     "window_paint_spec": "description of interior paint spec if found",
     "notes": ""
   },
@@ -2560,7 +2578,17 @@ def _build_extraction_prompt(scope_notes="", schedule_hints=None,
         w_painted = ws.get("windows_painted_interior", 0) or 0
         if w_total:
             hint_parts.append(f"- Total windows: {w_total}")
-            hint_parts.append(f"- Windows with painted interior: {w_painted}")
+            hint_parts.append(f"- Windows with painted SASHES: {w_painted}")
+            for ck, lbl in (
+                ("windows_with_casing", "with casing"),
+                ("windows_with_apron", "with apron"),
+                ("windows_with_stool_sill", "with stool/sill"),
+                ("windows_with_wood_return", "with wood return"),
+                ("windows_with_drywall_return", "with drywall return"),
+            ):
+                v = ws.get(ck, 0) or 0
+                if v:
+                    hint_parts.append(f"- Windows {lbl}: {v}")
         s_total = si.get("total_stair_sections", 0) or 0
         if s_total:
             hint_parts.append(f"- Total stair flight sections: {s_total}")
@@ -2943,22 +2971,37 @@ schedule totals for that floor. If the schedule shows 45 doors on floor 2 and yo
 10 units × 4 doors = 40 from templates, the remaining 5 doors are in corridors/common areas.
 Do NOT double-count doors that appear both in template rooms AND in corridor/common rooms.
 
-STEP 5: WINDOWS — CRITICAL DISTINCTION
+STEP 5: WINDOWS — REQUIRES WINDOW SCHEDULE
 - Count ALL windows visible as "windows_total"
-- Count ONLY windows requiring INTERIOR painting as "windows_painted_interior"
-- Factory-finished aluminum/vinyl storefront frames do NOT get painted → do NOT count
-- Wood-framed windows or windows with "painted", "black", or colored interior finishes DO count
-- If the PDF includes a WINDOW SCHEDULE, read it to determine frame materials and finishes
-  (look for "painted interior", "wood frame", "black finish", "WD" material codes)
-- If no window schedule exists AND frame material is completely unclear → set windows_painted_interior = 0
-  and add a note
-- Residential unit windows are more likely to be painted interior than commercial storefront windows
-CRITICAL WINDOW SCHEDULE RULE: If a WINDOW SCHEDULE exists, the total window count across
-the ENTIRE building comes from that schedule — do NOT estimate or guess window counts per room.
-Count the total painted-interior windows from the schedule, then distribute them across rooms.
-Example: If the window schedule lists 26 windows total with wood frames requiring paint,
-and you have 20 apartments across 2 floors, that's roughly 1-2 windows per apartment —
-NOT 2-3 per room. Use the schedule total as your ceiling.
+- "windows_painted_interior" = window SASHES requiring field paint (NOT casings/aprons)
+- COMMERCIAL JOBS: ASSUME no window sashes are painted. windows_painted_interior = 0
+  unless the WINDOW SCHEDULE explicitly says "field paint sash" or "paint operable sash".
+- Factory-finished aluminum/vinyl/clad/storefront sashes are NEVER field-painted.
+- WINDOW SCHEDULE IS REQUIRED to determine paint scope. The window TYPE detail
+  shows whether each window has a casing, apron, stool/sill, wood return, or
+  drywall return — these are the actual paintable trim components.
+- IF NO WINDOW SCHEDULE EXISTS:
+  * DO NOT assume any window paint scope (no casings, no aprons, no sashes)
+  * Set windows_painted_interior = 0 for ALL rooms
+  * Add a note: "No window schedule — window paint scope cannot be determined; RFI required"
+  * Window TYPE is needed to know what trim components exist; without it, do not guess.
+
+APRON DETECTION (call out if seen):
+- Aprons can be called out on the FINISH SCHEDULE (a separate "Apron" or trim
+  column), in WALL SECTIONS, or in INTERIOR ELEVATIONS showing apron trim below
+  window sills.
+- If an apron is shown in any of these sources, those windows have painted aprons.
+- Apron COUNT comes from the WINDOW SCHEDULE (one apron per window of that type).
+  Do NOT count aprons per room — record the global presence in notes:
+  "Aprons called out in [finish schedule|wall sections|interior elevations] —
+  count from window schedule"
+- If aprons are shown in wall sections / interior elevations but no window
+  schedule exists, still flag them in notes — they require RFI for accurate count.
+
+CRITICAL WINDOW SCHEDULE RULE: If a WINDOW SCHEDULE exists, the total window
+count across the ENTIRE building comes from that schedule — do NOT estimate or
+guess window counts per room. Count totals from the schedule, then distribute
+across rooms.
 
 STEP 6: STAIRS — COUNT ACROSS ENTIRE BUILDING
 - Count TOTAL stair flight sections in the entire building (1 section = one run between landings)
@@ -3099,6 +3142,8 @@ IMPORTANT RULES:
     "total_doors_frame_only": 0,
     "total_windows_painted_interior": 0,
     "total_windows_all": 0,
+    "aprons_called_out": false,
+    "aprons_callout_source": "",
     "total_stair_sections": 0,
     "total_gyp_between_stairs_sqft": 0,
     "total_level_5_finish_sqft": 0,
@@ -3139,7 +3184,10 @@ CRITICAL RULES:
   Record wall material as "CMU" (distinct from "GYP") so pricing can apply CMU-specific rates.
 - Exposed/open ceilings: classify as "DRYFALL" when specs indicate dryfall or spray-applied coating.
 - Ceilings only count if ceiling_painted = true
-- Windows: check window schedule for painted specs; default to 0 only if NO schedule exists
+- Windows: REQUIRES window schedule to determine TYPE and paintable components
+  (casing/apron/stool/return/drywall return). Without a window schedule, set
+  windows_painted_interior=0 in all rooms and flag for RFI — do NOT assume.
+- Commercial jobs: assume window sashes are NOT painted (factory-finished)
 - Door schedules override floor plan counts
 - Include ALL hallways, corridors, lobbies, and common areas
 - Base trim in EVERY room with gyp walls, even if not explicitly called out
@@ -3531,18 +3579,29 @@ Look for these specific items and extract counts:
    - If the schedule has columns for "Material" or "Type", use those to classify
    - For commercial buildings, most painted doors are HM (Hollow Metal) type
 
-2. WINDOW SCHEDULE — BE CONSERVATIVE on painted interior counts:
+2. WINDOW SCHEDULE — extract per-type paintable components:
    - Count total windows in the schedule
-   - Count ONLY windows requiring INTERIOR PAINTING — row by row:
-     * DO NOT assume all windows are painted just because the spec says "painted finish"
-     * Only count windows where the INTERIOR FRAME is WOOD and explicitly marked for paint
-     * Storefront windows = NOT painted interior (aluminum frame, factory finish)
-     * Aluminum-framed windows = NOT painted interior (even if exterior is painted)
-     * Vinyl windows = NOT painted interior
-     * Commercial ground-floor windows are almost NEVER painted interior
-     * Only RESIDENTIAL windows with wood frames typically get interior paint
-     * If the schedule doesn't clearly distinguish painted vs non-painted interiors,
-       set windows_painted_interior to 0 and note "unable to determine from schedule"
+   - For EACH window type/mark, read the TYPE/FRAME/FINISH columns AND any
+     window TYPE detail drawings to determine which trim components are present:
+     * CASING — wood/MDF trim around the opening (head + jambs)
+     * APRON — horizontal trim below the interior sill
+     * STOOL / SILL — interior sill board
+     * WOOD RETURN — wood jamb extension wrapping back to wall
+     * DRYWALL RETURN — gypsum return at jamb (no casing — wall paint scope)
+     * SASH — operable sash (almost always factory-finished)
+   - SASH PAINT (windows_painted_interior = painted sashes only):
+     * COMMERCIAL JOBS: ASSUME sashes are NOT painted. Set windows_painted_interior=0
+       unless schedule EXPLICITLY says "field paint sash" or "paint operable sash".
+     * Storefront/aluminum/vinyl/fiberglass/clad/fire-rated/pre-finished = NOT painted.
+     * Only count sashes as painted with explicit field-paint callout.
+   - PER-COMPONENT COUNTS — sum quantity-per-type across the schedule:
+     * windows_with_casing — windows whose type detail shows wood/MDF casing
+     * windows_with_apron — windows whose type detail shows an apron
+     * windows_with_stool_sill — windows whose type detail shows a wood stool/sill
+     * windows_with_wood_return — windows with wood jamb returns
+     * windows_with_drywall_return — windows with gypsum returns (informational)
+   - If the schedule doesn't clearly show component construction, set those
+     counts to 0 and note "unable to determine components from schedule"
    - Note the paint specification if found (e.g., "Black painted interior")
 
 3. STAIR INFORMATION (from sections, details, or notes):
@@ -3566,6 +3625,11 @@ Return ONLY this JSON:
   "window_schedule": {
     "total_windows": 0,
     "windows_painted_interior": 0,
+    "windows_with_casing": 0,
+    "windows_with_apron": 0,
+    "windows_with_stool_sill": 0,
+    "windows_with_wood_return": 0,
+    "windows_with_drywall_return": 0,
     "window_paint_spec": "",
     "notes": ""
   },
@@ -5117,46 +5181,33 @@ def _apply_schedule_overrides(combined):
             print(f"   🔧 Window schedule override: zeroed {room_win_painted:.0f} phantom "
                   f"painted windows (schedule says 0 total)")
 
-    # --- Residential window casing heuristic ---
-    # In residential buildings, even factory-finished windows have interior wood casings
-    # that require painting. If schedule says 0 painted but building is residential,
-    # estimate painted casings based on building type.
-    # NOTE: Only apply when the schedule lists a positive window count — if the schedule
-    # reports 0 total windows (aluminum/factory-finished), there are no casings to paint
-    # either, so skip this heuristic entirely.
-    building_type = str(combined.get("project_info", {}).get("building_type", "")).lower()
-    is_multi_family = any(kw in building_type
-                         for kw in ("mixed", "multi", "apartment"))
-    is_single_family = any(kw in building_type for kw in ("single", "detached"))
-    is_residential = is_multi_family or is_single_family or "residential" in building_type
-    total_units = _num(combined.get("project_info", {}).get("total_units", 0))
+    # --- Window component overrides (apron/casing/stool/return) ---
+    # Pull per-component counts directly from the schedule. These represent
+    # paintable trim components that exist regardless of whether the sash is
+    # field-painted. Components called out in the schedule are authoritative —
+    # do NOT estimate or apply heuristics when missing; flag for RFI instead.
+    apron_ct = _num(ws.get("windows_with_apron", 0)) * schedule_scale
+    casing_ct = _num(ws.get("windows_with_casing", 0)) * schedule_scale
+    stool_ct = _num(ws.get("windows_with_stool_sill", 0)) * schedule_scale
+    wood_return_ct = _num(ws.get("windows_with_wood_return", 0)) * schedule_scale
+    drywall_return_ct = _num(ws.get("windows_with_drywall_return", 0)) * schedule_scale
 
-    # Determine total windows from best available source (schedule > room extraction)
-    total_win_available = sched_win_total if sched_win_total > 0 else _num(agg.get("total_windows", 0))
-
-    if is_single_family and total_win_available > 0 and sched_win_painted == 0:
-        # Single-family: ALL windows get interior trim painting
-        # Rider Ruel data: 23 windows painted out of ~20 total
-        est_painted = int(total_win_available)
-        agg["total_windows_painted_interior"] = est_painted
-        overrides_applied.append(
-            f"Windows: single-family heuristic — all {est_painted} windows estimated to have "
-            f"painted interior wood trim. Schedule showed 0 painted but single-family homes "
-            f"typically have painted wood casings/trim on all windows."
-        )
-    elif is_multi_family and sched_win_total > 0 and sched_win_painted == 0 and total_units > 0:
-        # Multi-family: estimate ~1.3 painted casings per unit
-        # Rider data: 26 painted windows / 20 units = 1.3 per unit
-        est_painted = round(total_units * 1.3)
-        est_painted = min(est_painted, int(sched_win_total))
-        agg["total_windows_painted_interior"] = est_painted
-        overrides_applied.append(
-            f"Windows: multi-family casing heuristic — {est_painted} windows estimated to have "
-            f"painted interior casings ({total_units:.0f} units x 1.3/unit). "
-            f"Schedule showed 0 painted but residential units typically have wood casings."
-        )
+    if sched_win_total > 0:
+        agg["total_window_aprons_painted"] = apron_ct
+        agg["total_window_casings_painted"] = casing_ct
+        agg["total_window_stools_painted"] = stool_ct
+        agg["total_window_wood_returns_painted"] = wood_return_ct
+        agg["total_window_drywall_returns"] = drywall_return_ct
+        if (apron_ct + casing_ct + stool_ct + wood_return_ct) > 0:
+            overrides_applied.append(
+                f"Window components from schedule: aprons={apron_ct:.0f}, "
+                f"casings={casing_ct:.0f}, stools={stool_ct:.0f}, "
+                f"wood returns={wood_return_ct:.0f}, drywall returns={drywall_return_ct:.0f}"
+            )
 
     # --- Door count sanity check for multi-unit residential ---
+    building_type = str(combined.get("project_info", {}).get("building_type", "")).lower()
+    total_units = _num(combined.get("project_info", {}).get("total_units", 0))
     if sched_doors_total > 0 and total_units > 0:
         expected_min_doors = total_units * 7  # Minimum ~7 doors per unit
         if sched_doors_total < expected_min_doors * 0.85:
@@ -7524,9 +7575,10 @@ def _recalculate_totals(analysis):
         exterior_obj["interior_lift_required"] = True
 
     # --- Guard rail: if NO window schedule was found ---
-    # For commercial buildings, zero painted windows (storefront/aluminum frames).
-    # For residential/mixed-use buildings, KEEP painted window counts because
-    # residential windows commonly have painted wood frames or interior finishes.
+    # No window schedule means we cannot determine window TYPE — without TYPE we
+    # don't know whether casings, aprons, stools, returns, or drywall returns are
+    # present. Do NOT assume any window paint scope. Zero painted windows
+    # (regardless of residential vs commercial) and flag for RFI.
     has_win_sched = analysis.get("has_window_schedule")
     notes_text = " ".join(str(n) for n in analysis.get("notes", []))
     no_schedule_in_notes = (
@@ -7535,32 +7587,18 @@ def _recalculate_totals(analysis):
         or "window schedule not" in notes_text.lower()
     )
     if has_win_sched is False or (has_win_sched is None and no_schedule_in_notes):
-        building_type = str(analysis.get("project_info", {}).get("building_type", "")).lower()
-        # "commercial/mixed-use" contains "mixed" but is commercial — commercial takes precedence
-        # unless the type also explicitly mentions "residential"/"apartment"/"condo"
-        _has_commercial = "commercial" in building_type
-        _has_residential_kw = any(kw in building_type
-                                  for kw in ("residential", "apartment", "condo"))
-        is_residential = (not _has_commercial or _has_residential_kw) and any(
-            kw in building_type for kw in ("residential", "mixed", "multi", "apartment", "condo"))
-
         if total_windows_painted > 0:
-            if is_residential:
-                # Residential/mixed-use: keep painted windows, flag for RFI confirmation
-                print(f"   ⚠️  No window schedule found — keeping {total_windows_painted} "
-                      f"painted windows for residential building (will generate RFI)")
-                analysis.setdefault("notes", []).append(
-                    f"[Window Guard Rail] No window schedule found but {total_windows_painted} "
-                    f"windows kept as painted for residential building — RFI recommended to confirm"
-                )
-            else:
-                # Commercial: zero painted windows (storefront/aluminum frames not painted)
-                print(f"   ⚠️  No window schedule found — zeroing {total_windows_painted} "
-                      f"assumed painted windows for commercial building (will generate RFI)")
-                total_windows_painted = 0
-                for floor in analysis.get("floors", []):
-                    for room in floor.get("rooms", []):
-                        room.get("elements", {})["windows_painted_interior"] = 0
+            print(f"   ⚠️  No window schedule found — zeroing {total_windows_painted} "
+                  f"assumed painted windows (RFI will be generated; no assumptions without schedule)")
+            analysis.setdefault("notes", []).append(
+                f"[Window Guard Rail] No window schedule found — zeroed {total_windows_painted} "
+                f"assumed painted windows. Window TYPE is required to determine casing, apron, "
+                f"sill, return, drywall return, or paintable area. RFI generated."
+            )
+            total_windows_painted = 0
+            for floor in analysis.get("floors", []):
+                for room in floor.get("rooms", []):
+                    room.get("elements", {})["windows_painted_interior"] = 0
         # Make sure the flag is set for RFI generation
         analysis["has_window_schedule"] = False
 
@@ -7736,8 +7774,12 @@ def _apply_whitebox_exclusion(analysis):
 
 def _apply_commercial_window_exclusion(analysis):
     """
-    For commercial (non-residential) buildings, zero out all painted windows.
-    Commercial windows (storefront, aluminum-frame) are not field-painted.
+    For commercial (non-residential) buildings, zero out painted window SASHES.
+    Commercial sashes (storefront, aluminum-frame, factory-finished) are not
+    field-painted. Aprons, casings, stools, and wood returns called out in the
+    window schedule, finish schedule, wall sections, or interior elevations are
+    PRESERVED — they may still require paint.
+
     Adds RFI flag for estimator to confirm or override.
     """
     pi = analysis.get("project_info", {})
@@ -7762,18 +7804,30 @@ def _apply_commercial_window_exclusion(analysis):
     if not is_commercial_for_windows:
         return analysis
 
+    # Preserve painted-component counts (apron/casing/stool/wood return) — these
+    # may be explicitly called out and still require field paint on commercial.
+    apron_ct = _num(agg.get("total_window_aprons_painted", 0))
+    casing_ct = _num(agg.get("total_window_casings_painted", 0))
+    stool_ct = _num(agg.get("total_window_stools_painted", 0))
+    return_ct = _num(agg.get("total_window_wood_returns_painted", 0))
+    has_painted_components = (apron_ct + casing_ct + stool_ct + return_ct) > 0
+
     current_windows = _num(agg.get("total_windows_painted_interior", 0))
     if current_windows > 0:
-        print(f"   ⚠️  Commercial building — zeroing {current_windows:.0f} painted windows "
-              f"(commercial windows assumed not painted)")
+        print(f"   ⚠️  Commercial building — zeroing {current_windows:.0f} painted window sashes "
+              f"(commercial sashes assumed factory-finished, not field-painted)")
+        if has_painted_components:
+            print(f"      Preserving painted components: aprons={apron_ct:.0f}, "
+                  f"casings={casing_ct:.0f}, stools={stool_ct:.0f}, wood returns={return_ct:.0f}")
         analysis.setdefault("notes", []).append(
-            f"[Commercial Window Exclusion] Zeroed {current_windows:.0f} painted windows — "
-            f"commercial building windows assumed storefront/aluminum (not painted). "
-            f"RFI: If windows require painting, provide window schedule with finish specs."
+            f"[Commercial Window Exclusion] Zeroed {current_windows:.0f} painted window sashes — "
+            f"commercial sashes assumed factory-finished (storefront/aluminum/vinyl). "
+            f"Painted aprons/casings/stools/returns preserved if explicitly called out. "
+            f"RFI: If sashes require field paint, provide window schedule with finish specs."
         )
         agg["total_windows_painted_interior"] = 0
         analysis["aggregated_totals"] = agg
-        # Also zero at room level for consistency
+        # Also zero at room level for consistency (sashes only)
         for floor in analysis.get("floors", []):
             for room in floor.get("rooms", []):
                 room.get("elements", {})["windows_painted_interior"] = 0
@@ -7893,11 +7947,19 @@ def generate_rfi_items(analysis):
         items.append({
             "category": "Missing Schedules",
             "question": (
-                "No window schedule was found in the provided documents. We need to "
-                "determine which windows have painted interior frames versus factory-finished "
-                "aluminum. Can you provide the window schedule?"
+                "No window schedule was found in the provided documents. The window "
+                "TYPE is required to determine paint scope — specifically whether each "
+                "window has a casing, apron, stool/sill, wood return, drywall return, "
+                "or any paintable interior trim. Without the window schedule and TYPE "
+                "details we cannot estimate window paint scope and have set window "
+                "paint quantities to zero. Can you provide the window schedule and "
+                "associated window TYPE detail drawings?"
             ),
-            "action_required": "Provide window schedule showing frame materials and finish specifications."
+            "action_required": (
+                "Provide window schedule with TYPE details showing frame material, "
+                "casing, apron, stool/sill, wood return, drywall return, and "
+                "field-paint specifications."
+            )
         })
 
     # --- 4. Rooms with zero dimensions (grouped by floor) ---
@@ -8013,6 +8075,33 @@ def generate_rfi_items(analysis):
             "action_required": "Confirm window count and interior painting requirements."
         })
 
+    # --- 9b. Aprons called out without a window schedule ---
+    # Aprons can show up in the finish schedule, wall sections, or interior
+    # elevations. Without a window schedule we cannot compute an accurate apron
+    # count (one apron per window), so flag for RFI.
+    aprons_called_out = analysis.get("aprons_called_out", False)
+    apron_source = analysis.get("aprons_callout_source", "")
+    no_win_sched = analysis.get("has_window_schedule") is False
+    sched_apron_ct = _num(agg.get("total_window_aprons_painted", 0))
+    if aprons_called_out and no_win_sched and sched_apron_ct == 0:
+        src_phrase = (
+            f" in the {apron_source}" if apron_source else
+            " in the finish schedule, wall sections, or interior elevations"
+        )
+        items.append({
+            "category": "Clarification Needed",
+            "question": (
+                f"Apron trim is called out{src_phrase}, but no window schedule "
+                f"was provided. We need accurate window counts from the window "
+                f"schedule to compute the apron quantity (one apron per window). "
+                f"Can you provide the window schedule?"
+            ),
+            "action_required": (
+                "Provide window schedule so apron quantities can be computed "
+                "from the per-type window counts."
+            )
+        })
+
     # --- 10. Exterior all zeros on multi-floor building ---
     ext = analysis.get("exterior", {})
     floors_count = len(analysis.get("floors", []))
@@ -8038,15 +8127,18 @@ def generate_rfi_items(analysis):
         items.append({
             "category": "Clarification Needed",
             "question": (
-                "Our estimate excludes interior window painting for this commercial building. "
-                "Commercial windows are typically storefront or aluminum-frame and do not require "
-                "field painting. If any windows DO require painting (e.g., wood-frame or "
-                "painted interior trim), please provide the window schedule with finish "
-                "specifications so we can add them to the estimate."
+                "Our estimate assumes no window SASHES require field paint on this "
+                "commercial project (sashes are factory-finished — storefront, aluminum, "
+                "vinyl, or clad). Painted aprons, casings, stools, and wood returns "
+                "called out in the window schedule, finish schedule, wall sections, or "
+                "interior elevations are still included. If any sashes DO require field "
+                "paint, please provide the window schedule with explicit field-paint "
+                "specifications."
             ),
             "action_required": (
-                "Confirm windows are excluded, or provide window schedule showing "
-                "which windows require interior painting."
+                "Confirm window sashes are factory-finished (no field paint), or "
+                "provide window schedule with field-paint specs for any sashes that "
+                "require painting."
             )
         })
 
