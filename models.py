@@ -86,6 +86,14 @@ class Organization(Base):
         Integer, nullable=True,
     )
 
+    # When the user completed the /onboarding form (the sign-up gate that
+    # captures the explicit company name and triggers the admin notification).
+    # NULL = user authenticated but never submitted the access request →
+    # they get pushed to /onboarding. NOT NULL = pending review or approved.
+    approval_requested_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False,
     )

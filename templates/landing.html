@@ -1,0 +1,173 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Knight Shift &mdash; Forged by Willpower</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <style>
+        .landing-shell {
+            min-height: 80vh;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            justify-content: center;
+            padding: 2rem;
+            text-align: center;
+        }
+        .landing-hero {
+            display: flex;
+            align-items: center;
+            gap: 1.5rem;
+            margin-bottom: 1.5rem;
+        }
+        .landing-hero img { width: 84px; height: auto; }
+        .landing-title {
+            font-size: 2.4rem;
+            margin: 0;
+            color: #fff;
+        }
+        .landing-tagline {
+            color: rgba(203,213,225,0.75);
+            margin-top: 0.25rem;
+            font-size: 1rem;
+            letter-spacing: 0.04em;
+        }
+        .landing-blurb {
+            max-width: 560px;
+            color: rgba(203,213,225,0.85);
+            font-size: 1.05rem;
+            line-height: 1.5;
+            margin: 1rem 0 2rem;
+        }
+        .landing-actions {
+            display: flex;
+            gap: 1rem;
+            flex-wrap: wrap;
+            justify-content: center;
+        }
+        .landing-btn {
+            min-width: 200px;
+            padding: 14px 26px;
+            font-size: 1rem;
+            font-weight: 600;
+            border-radius: 8px;
+            border: 0;
+            cursor: pointer;
+            transition: transform 0.05s ease, box-shadow 0.15s ease;
+        }
+        .landing-btn:active { transform: translateY(1px); }
+        .landing-btn-primary {
+            background: linear-gradient(180deg,#2563eb,#1d4ed8);
+            color: #fff;
+            box-shadow: 0 6px 18px rgba(37,99,235,0.35);
+        }
+        .landing-btn-secondary {
+            background: rgba(255,255,255,0.06);
+            color: #f1f5f9;
+            border: 1px solid rgba(255,255,255,0.18);
+        }
+        .landing-foot {
+            margin-top: 2.5rem;
+            color: rgba(203,213,225,0.5);
+            font-size: 0.85rem;
+        }
+        .landing-foot a { color: #93c5fd; text-decoration: none; }
+    </style>
+</head>
+<body class="dark-theme">
+    <main class="landing-shell">
+        <div class="landing-hero">
+            <img src="{{ url_for('static', filename='logo_helm.png') }}" alt="Knight Shift helm">
+            <div>
+                <h1 class="landing-title">
+                    <span class="brand-name-light">Knight</span>
+                    <span class="brand-name-white">Shift</span>
+                </h1>
+                <div class="landing-tagline">Forged by Willpower</div>
+            </div>
+        </div>
+
+        <p class="landing-blurb">
+            Automated painting estimates from your construction documents.
+            Sign in to your account or request access if you're new.
+        </p>
+
+        <div class="landing-actions">
+            <button type="button" class="landing-btn landing-btn-primary"
+                    id="btn-login" disabled>
+                Log in
+            </button>
+            <button type="button" class="landing-btn landing-btn-secondary"
+                    id="btn-signup" disabled>
+                Request access
+            </button>
+        </div>
+
+        <p class="landing-foot" id="landing-foot" style="display:none;">
+            Already signed in? <a href="#" id="continue-link">Continue to your account &rarr;</a>
+        </p>
+    </main>
+
+    {% if clerk_publishable_key and clerk_frontend_api_host %}
+    <script>
+    (function() {
+        // If we just got bounced here from a failed reload-after-signin,
+        // skip the auto-redirect to avoid a loop. The user can still click
+        // a CTA manually.
+        const params = new URLSearchParams(window.location.search);
+        const skipAutoRedirect = params.get('reauth') === '1';
+
+        window.__bootClerk = async function() {
+            const Clerk = window.Clerk;
+            await Clerk.load();
+
+            // Already signed in (Clerk has a session client-side, but the
+            // server-side cookie may not have been set on the previous
+            // request). Reload so the server can route us to the right page.
+            if (Clerk.user && !skipAutoRedirect) {
+                window.location.replace('/?reauth=1');
+                return;
+            }
+
+            // Reauth bounce: just show a "continue" link and disable the
+            // auto-redirect. User can click through manually.
+            if (Clerk.user && skipAutoRedirect) {
+                const foot = document.getElementById('landing-foot');
+                const link = document.getElementById('continue-link');
+                if (foot) foot.style.display = '';
+                if (link) link.addEventListener('click', (e) => {
+                    e.preventDefault();
+                    window.location.replace('/');
+                });
+            }
+
+            const login = document.getElementById('btn-login');
+            const signup = document.getElementById('btn-signup');
+            login.disabled = false;
+            signup.disabled = false;
+
+            login.addEventListener('click', () => {
+                Clerk.openSignIn({
+                    afterSignInUrl: '/',
+                    afterSignUpUrl: '/onboarding',
+                });
+            });
+            signup.addEventListener('click', () => {
+                Clerk.openSignUp({
+                    afterSignUpUrl: '/onboarding',
+                    afterSignInUrl: '/',
+                });
+            });
+        };
+    })();
+    </script>
+    <script async crossorigin="anonymous"
+        data-clerk-publishable-key="{{ clerk_publishable_key }}"
+        src="https://{{ clerk_frontend_api_host }}/npm/@clerk/clerk-js@5/dist/clerk.browser.js"
+        onload="window.__bootClerk()"></script>
+    {% else %}
+    <noscript><p style="color:#fff;text-align:center;">JavaScript is required.</p></noscript>
+    {% endif %}
+</body>
+</html>

@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Admin &mdash; Pending Access &mdash; Knight Shift</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <style>
+        .admin-shell { padding: 2rem; max-width: 1100px; margin: 0 auto; }
+        .admin-shell h1 { color: #fff; margin-bottom: 0.25rem; }
+        .admin-shell p.lede {
+            color: rgba(203,213,225,0.7);
+            margin: 0 0 1.5rem;
+        }
+        .admin-shell h2 {
+            color: #f1f5f9;
+            font-size: 1.15rem;
+            margin: 2rem 0 0.75rem;
+            border-bottom: 1px solid rgba(255,255,255,0.08);
+            padding-bottom: 0.5rem;
+        }
+        .admin-table {
+            width: 100%;
+            border-collapse: collapse;
+            background: rgba(15,23,42,0.45);
+            border-radius: 8px;
+            overflow: hidden;
+        }
+        .admin-table th, .admin-table td {
+            padding: 12px 14px;
+            text-align: left;
+            border-bottom: 1px solid rgba(255,255,255,0.06);
+            color: #cbd5e1;
+            font-size: 0.9rem;
+            vertical-align: top;
+        }
+        .admin-table th {
+            color: rgba(203,213,225,0.7);
+            font-weight: 600;
+            font-size: 0.8rem;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+            background: rgba(255,255,255,0.03);
+        }
+        .admin-table tr:last-child td { border-bottom: 0; }
+        .admin-table .org-name { color: #fff; font-weight: 600; }
+        .admin-table .muted { color: rgba(203,213,225,0.55); font-size: 0.8rem; }
+        .admin-table .owner-list { color: #93c5fd; }
+        .badge {
+            display: inline-block;
+            padding: 2px 8px;
+            border-radius: 99px;
+            font-size: 0.72rem;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.04em;
+        }
+        .badge-personal { background: rgba(99,102,241,0.18); color: #a5b4fc; }
+        .badge-corp     { background: rgba(34,197,94,0.18);  color: #86efac; }
+        .approve-btn {
+            background: linear-gradient(180deg,#16a34a,#15803d);
+            color: #fff;
+            border: 0;
+            padding: 8px 16px;
+            border-radius: 6px;
+            font-weight: 600;
+            font-size: 0.85rem;
+            cursor: pointer;
+        }
+        .empty-row {
+            padding: 1.5rem;
+            text-align: center;
+            color: rgba(203,213,225,0.55);
+            font-style: italic;
+        }
+        .flash-messages { margin-bottom: 1rem; }
+        .top-link {
+            display: inline-block;
+            color: #93c5fd;
+            text-decoration: none;
+            margin-bottom: 1rem;
+            font-size: 0.9rem;
+        }
+    </style>
+</head>
+<body class="dark-theme">
+    <main class="admin-shell">
+        <a href="{{ url_for('index') }}" class="top-link">&larr; Back to app</a>
+        <h1>Access Requests</h1>
+        <p class="lede">Approve new accounts that have completed sign-up.</p>
+
+        {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}<div class="flash-messages">
+            {% for cat, m in messages %}<div class="flash flash-{{cat}}">{{m}}</div>{% endfor %}
+        </div>{% endif %}
+        {% endwith %}
+
+        <h2>Pending ({{ pending|length }})</h2>
+        {% if pending %}
+        <table class="admin-table">
+            <thead>
+                <tr>
+                    <th>Company</th>
+                    <th>Type</th>
+                    <th>Owner(s)</th>
+                    <th>Requested</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+            {% for o in pending %}
+                <tr>
+                    <td>
+                        <div class="org-name">{{ o.name }}</div>
+                        {% if o.email_domain %}<div class="muted">@{{ o.email_domain }}</div>{% endif %}
+                    </td>
+                    <td>
+                        {% if o.is_personal %}
+                            <span class="badge badge-personal">Personal</span>
+                        {% else %}
+                            <span class="badge badge-corp">Corporate</span>
+                        {% endif %}
+                    </td>
+                    <td class="owner-list">
+                        {% for e in o.owner_emails %}{{ e }}{% if not loop.last %}<br>{% endif %}{% endfor %}
+                    </td>
+                    <td>
+                        {% if o.requested_at %}{{ o.requested_at.strftime('%b %d, %Y %H:%M') }}{% else %}&mdash;{% endif %}
+                    </td>
+                    <td>
+                        <form method="POST" action="{{ url_for('admin_orgs_approve', org_id=o.id) }}"
+                              style="margin:0;">
+                            <button type="submit" class="approve-btn">Approve</button>
+                        </form>
+                    </td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="empty-row">No pending access requests.</div>
+        {% endif %}
+
+        <h2>Recently Approved</h2>
+        {% if approved %}
+        <table class="admin-table">
+            <thead>
+                <tr>
+                    <th>Company</th>
+                    <th>Type</th>
+                    <th>Owner(s)</th>
+                    <th>Created</th>
+                </tr>
+            </thead>
+            <tbody>
+            {% for o in approved %}
+                <tr>
+                    <td>
+                        <div class="org-name">{{ o.name }}</div>
+                        {% if o.email_domain %}<div class="muted">@{{ o.email_domain }}</div>{% endif %}
+                    </td>
+                    <td>
+                        {% if o.is_personal %}
+                            <span class="badge badge-personal">Personal</span>
+                        {% else %}
+                            <span class="badge badge-corp">Corporate</span>
+                        {% endif %}
+                    </td>
+                    <td class="owner-list">
+                        {% for e in o.owner_emails %}{{ e }}{% if not loop.last %}<br>{% endif %}{% endfor %}
+                    </td>
+                    <td>{{ o.created_at.strftime('%b %d, %Y') }}</td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% else %}
+        <div class="empty-row">No approved orgs yet.</div>
+        {% endif %}
+    </main>
+</body>
+</html>

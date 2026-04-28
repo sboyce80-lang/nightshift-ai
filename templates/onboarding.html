@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Request Access &mdash; Knight Shift</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <style>
+        .onboard-shell {
+            min-height: 80vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 2rem;
+        }
+        .onboard-card {
+            width: 100%;
+            max-width: 480px;
+            background: rgba(15,23,42,0.55);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 12px;
+            padding: 2rem 2rem 1.75rem;
+            box-shadow: 0 12px 32px rgba(0,0,0,0.35);
+        }
+        .onboard-card h1 {
+            color: #fff;
+            margin: 0 0 0.5rem;
+            font-size: 1.4rem;
+        }
+        .onboard-card p.lede {
+            color: rgba(203,213,225,0.75);
+            margin: 0 0 1.5rem;
+            line-height: 1.5;
+        }
+        .onboard-card label {
+            display: block;
+            color: #cbd5e1;
+            font-size: 0.85rem;
+            margin: 0.85rem 0 0.35rem;
+            font-weight: 600;
+        }
+        .onboard-card input[type=text],
+        .onboard-card input[type=email] {
+            width: 100%;
+            padding: 10px 12px;
+            border-radius: 6px;
+            border: 1px solid rgba(255,255,255,0.12);
+            background: rgba(255,255,255,0.03);
+            color: #f1f5f9;
+            font-size: 0.95rem;
+            box-sizing: border-box;
+        }
+        .onboard-card input[readonly] {
+            color: rgba(203,213,225,0.6);
+            cursor: not-allowed;
+        }
+        .onboard-card .submit-row {
+            margin-top: 1.5rem;
+        }
+        .onboard-card .field-help {
+            color: rgba(203,213,225,0.55);
+            font-size: 0.8rem;
+            margin-top: 0.3rem;
+        }
+        .flash-messages { margin-bottom: 1rem; }
+    </style>
+</head>
+<body class="dark-theme">
+    <main class="onboard-shell">
+        <div class="onboard-card">
+            <h1>Request Access</h1>
+            <p class="lede">
+                Almost done. Tell us a bit about you and your company &mdash;
+                we'll review and email you when your account is approved.
+            </p>
+
+            {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}<div class="flash-messages">
+                {% for cat, m in messages %}<div class="flash flash-{{cat}}">{{m}}</div>{% endfor %}
+            </div>{% endif %}
+            {% endwith %}
+
+            <form method="POST" action="{{ url_for('onboarding') }}">
+                <label for="name">Your name</label>
+                <input type="text" id="name" name="name" required maxlength="200"
+                       value="{{ user_name }}" placeholder="Jane Smith">
+
+                <label for="email">Email</label>
+                <input type="email" id="email" value="{{ user_email }}" readonly>
+                <div class="field-help">Locked to your sign-in email.</div>
+
+                <label for="company_name">Company name</label>
+                <input type="text" id="company_name" name="company_name" required maxlength="200"
+                       value="{{ company_name }}" placeholder="Acme Painting LLC">
+
+                <div class="submit-row">
+                    <button type="submit" class="submit-btn dark-submit-btn">
+                        Submit access request
+                    </button>
+                </div>
+            </form>
+        </div>
+    </main>
+</body>
+</html>

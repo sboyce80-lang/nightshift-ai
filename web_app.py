@@ -63,6 +63,7 @@ from db import session_scope
 from models import User, Submission, File, Organization, OrganizationMembership
 from auth import require_auth, current_user_id, clerk_frontend_api_host, is_admin
 from orgs import FREE_EMAIL_DOMAINS, _domain_of
+from notifications import notify_admin_of_new_signup, notify_user_of_approval
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -221,43 +222,96 @@ def _is_mobile_ua():
     return bool(_MOBILE_UA_RE.search(ua))
 
 
+def _try_signed_in_user_snapshot():
+    """Return (user_id, org_state_dict) if the request has a verifiable Clerk
+    session and a synced local User row, else (None, None). Used by `/` to
+    decide whether to render the landing page, the waitlist, the onboarding
+    redirect, or the estimate form — all without requiring @require_auth on
+    the public landing.
+
+    Returns a snapshot dict (not the live ORM objects) so the caller can use
+    it after the session_scope has closed.
+    """
+    try:
+        from auth import _read_session_token, verify_session, AuthError
+        token = _read_session_token()
+        if not token:
+            return None, None
+        try:
+            claims = verify_session(token)
+        except AuthError:
+            return None, None
+        clerk_uid = claims.get("sub")
+        if not clerk_uid:
+            return None, None
+        with session_scope() as session:
+            user = (session.query(User)
+                          .filter(User.clerk_user_id == clerk_uid)
+                          .one_or_none())
+            if user is None:
+                return None, None
+            org = user.current_organization
+            snapshot = {
+                "user_id": user.id,
+                "org_id": org.id if org else None,
+                "org_name": org.name if org else None,
+                "is_beta_approved": bool(org and org.is_beta_approved),
+                "approval_requested_at": (org.approval_requested_at if org else None),
+            }
+            # Pre-fetch effective rates while the session is still open.
+            rates, markup = _effective_user_overrides(user) if org else (
+                _effective_user_overrides(None)
+            )
+            snapshot["rates"] = rates
+            snapshot["markup"] = markup
+            return user.id, snapshot
+    except Exception as exc:
+        logger.debug("Optional auth detection failed: %s", exc)
+        return None, None
+
+
 @app.route("/")
 def index():
-    """Public landing — Clerk.js handles auth client-side and bootstraps the
-    session cookie via the dev-mode handshake. The form is hidden by JS
-    until Clerk confirms a signed-in user. Server-side auth is enforced on
-    /submit and /api/jobs/<id>, which only fire after the cookie is in place.
+    """Public entry point.
 
-    Pricing context is fetched server-side too — but unauthenticated callers
-    get the global defaults (Clerk-protected pages will refuse data fetch).
+    Routing (server-side, with a JS fallback for the cold-cookie case):
+      - Unauthenticated → landing.html (Login + Request Access CTAs).
+      - Authenticated, but org missing → /onboarding (defensive).
+      - Authenticated, org not beta-approved + no approval request yet
+        → /onboarding (push them to fill out the company form).
+      - Authenticated, org not beta-approved + request submitted
+        → waitlist.html.
+      - Authenticated, approved → existing estimate form (index.html).
 
     Phones are redirected to /mobile unless ?desktop=1 is passed.
     """
     if _is_mobile_ua() and request.args.get("desktop") != "1":
         return redirect(url_for("mobile"))
 
-    rates, markup = _effective_user_overrides(None)
-    try:
-        from auth import _read_session_token, verify_session, AuthError
-        token = _read_session_token()
-        try:
-            claims = verify_session(token)
-            clerk_uid = claims.get("sub")
-            if clerk_uid:
-                with session_scope() as session:
-                    user = session.query(User).filter(User.clerk_user_id == clerk_uid).one_or_none()
-                    if user is not None:
-                        rates, markup = _effective_user_overrides(user)
-        except AuthError:
-            pass
-    except Exception:
-        pass
+    _uid, snap = _try_signed_in_user_snapshot()
+    if snap is None:
+        # Cold-cookie path: render landing. Its JS detects an existing Clerk
+        # session and reloads (now with the cookie set) — that lands here
+        # again with `snap` populated.
+        return render_template("landing.html")
+
+    if snap["org_id"] is None:
+        return redirect(url_for("onboarding"))
+
+    if not snap["is_beta_approved"]:
+        if snap["approval_requested_at"] is None:
+            return redirect(url_for("onboarding"))
+        return render_template(
+            "waitlist.html",
+            org_name=snap["org_name"],
+            requested_at=snap["approval_requested_at"],
+        )
 
     return render_template(
         "index.html",
         rate_fields=RATE_FIELDS,
-        effective_rates=rates,
-        effective_markup=markup,
+        effective_rates=snap["rates"],
+        effective_markup=snap["markup"],
     )
 
 
@@ -1097,6 +1151,189 @@ def members_role(membership_id):
 
     flash("Role updated.", "success")
     return redirect(url_for("members"))
+
+
+# ---------------------------------------------------------------------------
+# Onboarding (sign-up access request) + Admin Approval
+# ---------------------------------------------------------------------------
+
+@app.route("/onboarding", methods=["GET", "POST"])
+@require_auth
+def onboarding():
+    """Capture explicit Name + Company on first sign-in and notify admins.
+
+    Skipped when the user's org is already beta-approved (returning users
+    who land here via a stale link bounce home).
+    """
+    uid = current_user_id()
+
+    if request.method == "GET":
+        with session_scope() as session:
+            user = session.get(User, uid)
+            org = user.current_organization if user else None
+            if org is not None and org.is_beta_approved:
+                return redirect(url_for("index"))
+            return render_template(
+                "onboarding.html",
+                user_name=user.name or "" if user else "",
+                user_email=user.email if user else "",
+                company_name=(org.name if org else ""),
+            )
+
+    # POST
+    submitted_name = (request.form.get("name") or "").strip()
+    submitted_company = (request.form.get("company_name") or "").strip()
+
+    if not submitted_name:
+        flash("Please enter your name.", "error")
+        return redirect(url_for("onboarding"))
+    if not submitted_company:
+        flash("Please enter your company name.", "error")
+        return redirect(url_for("onboarding"))
+    if len(submitted_company) > 200 or len(submitted_name) > 200:
+        flash("Name and company must each be under 200 characters.", "error")
+        return redirect(url_for("onboarding"))
+
+    notify_payload = None
+    with session_scope() as session:
+        user = session.get(User, uid)
+        if user is None:
+            flash("Account not found. Please sign in again.", "error")
+            return redirect(url_for("index"))
+
+        org = user.current_organization
+        if org is None:
+            flash("Your organization is not set up. Please contact support.",
+                  "error")
+            return redirect(url_for("index"))
+
+        if org.is_beta_approved:
+            return redirect(url_for("index"))
+
+        user.name = submitted_name
+        org.name = submitted_company
+
+        first_request = org.approval_requested_at is None
+        org.approval_requested_at = datetime.now(timezone.utc)
+
+        # Capture a snapshot for the email send (which we do AFTER commit so a
+        # send failure doesn't roll back the application).
+        if first_request:
+            notify_payload = {
+                "user_email": user.email,
+                "user_name": user.name,
+                "org_name": org.name,
+                "org_email_domain": org.email_domain,
+            }
+
+    if notify_payload:
+        admin_url = url_for("admin_orgs", _external=True)
+
+        # Lightweight stand-in objects with the attribute shape the helper
+        # expects. Avoids passing detached ORM rows out of the session_scope.
+        class _U: pass
+        class _O: pass
+        u, o = _U(), _O()
+        u.name = notify_payload["user_name"]
+        u.email = notify_payload["user_email"]
+        o.name = notify_payload["org_name"]
+        o.email_domain = notify_payload["org_email_domain"]
+        try:
+            notify_admin_of_new_signup(u, o, admin_url)
+        except Exception as exc:
+            logger.error("Admin signup notification failed: %s", exc)
+
+    flash("Thanks — your access request has been received.", "success")
+    return redirect(url_for("index"))
+
+
+@app.route("/admin/orgs", methods=["GET"])
+@require_auth
+def admin_orgs():
+    """List orgs awaiting beta approval. Admin-only."""
+    uid = current_user_id()
+    with session_scope() as session:
+        user = session.get(User, uid)
+        if not is_admin(user):
+            return ("Forbidden", 403)
+
+        # Pending = applied (approval_requested_at NOT NULL) but not yet approved.
+        pending_q = (session.query(Organization)
+                            .filter(Organization.is_beta_approved.is_(False))
+                            .filter(Organization.approval_requested_at.isnot(None))
+                            .order_by(Organization.approval_requested_at.desc()))
+
+        approved_q = (session.query(Organization)
+                             .filter(Organization.is_beta_approved.is_(True))
+                             .order_by(Organization.created_at.desc())
+                             .limit(50))
+
+        def _row(org):
+            owner_emails = []
+            for m in org.memberships:
+                if m.role == "owner" and m.user and m.user.email:
+                    owner_emails.append(m.user.email)
+            return {
+                "id": org.id,
+                "name": org.name,
+                "email_domain": org.email_domain,
+                "is_personal": org.is_personal,
+                "owner_emails": owner_emails,
+                "requested_at": org.approval_requested_at,
+                "created_at": org.created_at,
+            }
+
+        pending = [_row(o) for o in pending_q.all()]
+        approved = [_row(o) for o in approved_q.all()]
+
+    return render_template(
+        "admin_orgs.html",
+        pending=pending,
+        approved=approved,
+    )
+
+
+@app.route("/admin/orgs/<int:org_id>/approve", methods=["POST"])
+@require_auth
+def admin_orgs_approve(org_id):
+    """Flip is_beta_approved=True and email the org's owners."""
+    uid = current_user_id()
+    notify = []
+    with session_scope() as session:
+        user = session.get(User, uid)
+        if not is_admin(user):
+            return ("Forbidden", 403)
+
+        org = session.get(Organization, org_id)
+        if org is None:
+            flash("Organization not found.", "error")
+            return redirect(url_for("admin_orgs"))
+
+        if org.is_beta_approved:
+            flash(f"{org.name} is already approved.", "success")
+            return redirect(url_for("admin_orgs"))
+
+        org.is_beta_approved = True
+        # If approval is granted before the user ever submitted /onboarding
+        # (rare path — admin pre-approves a known org), backfill the request
+        # timestamp so the org doesn't reappear on the pending list.
+        if org.approval_requested_at is None:
+            org.approval_requested_at = datetime.now(timezone.utc)
+
+        org_name = org.name
+        for m in org.memberships:
+            if m.role == "owner" and m.user and m.user.email:
+                notify.append((m.user.email, m.user.name or ""))
+
+    app_url = url_for("index", _external=True)
+    for email, name in notify:
+        try:
+            notify_user_of_approval(email, name, org_name, app_url)
+        except Exception as exc:
+            logger.error("Approval notification to %s failed: %s", email, exc)
+
+    flash(f"Approved {org_name}.", "success")
+    return redirect(url_for("admin_orgs"))
 
 
 # ---------------------------------------------------------------------------

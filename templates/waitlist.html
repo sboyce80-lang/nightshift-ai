@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pending Approval &mdash; Knight Shift</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <style>
+        .waitlist-shell {
+            min-height: 80vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 2rem;
+        }
+        .waitlist-card {
+            width: 100%;
+            max-width: 520px;
+            background: rgba(15,23,42,0.55);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 12px;
+            padding: 2rem;
+            text-align: center;
+            box-shadow: 0 12px 32px rgba(0,0,0,0.35);
+        }
+        .waitlist-card h1 {
+            color: #fff;
+            margin: 0 0 0.75rem;
+        }
+        .waitlist-card p {
+            color: rgba(203,213,225,0.85);
+            line-height: 1.55;
+        }
+        .waitlist-meta {
+            margin: 1.5rem 0;
+            padding: 1rem;
+            background: rgba(255,255,255,0.04);
+            border-radius: 8px;
+            color: #cbd5e1;
+            font-size: 0.9rem;
+        }
+        .waitlist-meta strong { color: #fff; }
+        .waitlist-actions {
+            margin-top: 1.5rem;
+            display: flex;
+            gap: 0.75rem;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+        .waitlist-btn {
+            padding: 10px 18px;
+            border-radius: 6px;
+            border: 1px solid rgba(255,255,255,0.18);
+            background: rgba(255,255,255,0.06);
+            color: #f1f5f9;
+            font-size: 0.9rem;
+            text-decoration: none;
+            cursor: pointer;
+        }
+    </style>
+</head>
+<body class="dark-theme">
+    <main class="waitlist-shell">
+        <div class="waitlist-card">
+            <h1>Thanks &mdash; you're on the list</h1>
+            <p>
+                Your access request has been received. We'll review it
+                shortly and email you as soon as your account is approved.
+            </p>
+
+            <div class="waitlist-meta">
+                Company: <strong>{{ org_name }}</strong>{% if requested_at %}<br>
+                Submitted: <strong>{{ requested_at.strftime('%b %d, %Y') }}</strong>{% endif %}
+            </div>
+
+            <div class="waitlist-actions">
+                <a href="{{ url_for('onboarding') }}" class="waitlist-btn">Update company info</a>
+                <a href="#" id="signout-link" class="waitlist-btn">Sign out</a>
+            </div>
+        </div>
+    </main>
+
+    {% if clerk_publishable_key and clerk_frontend_api_host %}
+    <script>
+    window.__bootClerk = async function() {
+        const Clerk = window.Clerk;
+        await Clerk.load();
+        const link = document.getElementById('signout-link');
+        if (link) link.addEventListener('click', (e) => {
+            e.preventDefault();
+            Clerk.signOut().then(() => window.location.replace('/'));
+        });
+    };
+    </script>
+    <script async crossorigin="anonymous"
+        data-clerk-publishable-key="{{ clerk_publishable_key }}"
+        src="https://{{ clerk_frontend_api_host }}/npm/@clerk/clerk-js@5/dist/clerk.browser.js"
+        onload="window.__bootClerk()"></script>
+    {% endif %}
+</body>
+</html>

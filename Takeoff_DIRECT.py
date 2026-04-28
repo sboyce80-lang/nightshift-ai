@@ -33,6 +33,35 @@ from datetime import datetime
 import os
 
 
+# Silence MuPDF's xref/format warnings on the console and drain them to
+# logs/mupdf.log instead. PyMuPDF emits these to stdout via C, so a Python-level
+# stderr redirect won't help — disable display and drain the internal buffer.
+try:
+    import fitz as _fitz_log_setup
+    import atexit as _atexit
+    _fitz_log_setup.TOOLS.mupdf_display_errors(False)
+    _MUPDF_LOG_PATH = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), 'logs', 'mupdf.log'
+    )
+    os.makedirs(os.path.dirname(_MUPDF_LOG_PATH), exist_ok=True)
+
+    def _drain_mupdf_warnings():
+        try:
+            msgs = _fitz_log_setup.TOOLS.mupdf_warnings(reset=True)
+            if msgs:
+                with open(_MUPDF_LOG_PATH, 'a') as _f:
+                    _f.write(f"\n=== {datetime.now().isoformat()} pid={os.getpid()} ===\n")
+                    _f.write(msgs)
+                    if not msgs.endswith('\n'):
+                        _f.write('\n')
+        except Exception:
+            pass
+
+    _atexit.register(_drain_mupdf_warnings)
+except Exception:
+    pass
+
+
 # ---------------------------------------------------------------------------
 # Job progress tracking (for Streamlit UI)
 # ---------------------------------------------------------------------------
@@ -2257,6 +2286,58 @@ def _normalize_floor_key(name):
     return n
 
 
+_INCOMPLETE_PLAN_FLAGS = (
+    "no_floor_plans_found",
+    "no_detailed_floor_plans_found",
+    "no_complete_floor_plans_found",
+)
+
+
+def _model_flagged_no_plans(analysis):
+    """True if the model self-reported missing floor plans under any known
+    flag name. The extraction prompt has used three different names over
+    time, so downstream rescue triggers normalize through this helper."""
+    if not isinstance(analysis, dict):
+        return False
+    return any(bool(analysis.get(k)) for k in _INCOMPLETE_PLAN_FLAGS)
+
+
+def _extraction_likely_incomplete(analysis):
+    """True when extraction returned synthetic templates instead of real
+    physical floor data. Common DD-scale failure: model summarizes repeated
+    unit floors as "Typical Units (Floors 2-3)" rather than extracting each
+    physical floor.
+
+    Fires when the model flagged no plans, OR when total_stories exceeds the
+    number of physical (non-template) floors extracted with at least one
+    template floor present."""
+    if not isinstance(analysis, dict):
+        return False
+    if _model_flagged_no_plans(analysis):
+        return True
+    floors = analysis.get("floors") or []
+    if not floors:
+        return False
+    physical_count = 0
+    template_count = 0
+    for f in floors:
+        if _normalize_floor_key(f.get("floor_name", "")).startswith("T_"):
+            template_count += 1
+        else:
+            physical_count += 1
+    pi = analysis.get("project_info") or {}
+    raw = pi.get("total_stories") or 0
+    try:
+        total_stories = int(raw) if str(raw).strip().isdigit() else 0
+    except (ValueError, TypeError):
+        total_stories = 0
+    return (
+        template_count > 0
+        and total_stories > 0
+        and physical_count < total_stories
+    )
+
+
 def _floor_room_count(floor):
     """Total effective rooms on a floor accounting for unit_multiplier."""
     total = 0
@@ -3557,8 +3638,13 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
                     "chunk_page_ranges": list(_chunk_plan_ranges),
                 }
                 result_text = json.dumps(merged_data)
-            except (json.JSONDecodeError, AttributeError):
-                pass  # if we can't parse, don't break the flow
+            except (json.JSONDecodeError, AttributeError) as _parse_err:
+                # Don't break the flow, but make the loss visible — without this
+                # warning, chunk_tracking silently drops to None in the output and
+                # debugging which chunks succeeded/failed becomes guesswork.
+                print(f"   ⚠️  Could not inject chunk_tracking into merged response "
+                      f"({type(_parse_err).__name__}: {str(_parse_err)[:120]}); "
+                      f"chunks_succeeded={chunks_succeeded}, chunks_failed={chunks_failed}")
 
         if result_text is None:
             raise RuntimeError("PDF analysis produced no results")
@@ -7998,6 +8084,201 @@ def _check_wall_ceiling_ratio(analysis):
     return analysis
 
 
+def _classify_rfi_topic(text):
+    """Map an RFI question/action text to a normalized topic key.
+
+    More-specific patterns are checked first so e.g. "missing ceiling
+    heights" classifies as ceiling_heights, not building_sections.
+    """
+    t = (text or "").lower()
+    if "ceiling height" in t:
+        return "ceiling_heights"
+    if "building section" in t:
+        return "building_sections"
+    if "door schedule" in t or "door classification" in t or "door type" in t:
+        return "door_schedule"
+    if "window schedule" in t or "window paint scope" in t or "window sash" in t:
+        return "window_schedule"
+    if "finish schedule" in t:
+        return "finish_schedule"
+    if "wall area" in t or "wall perimeter" in t or "wall dimension" in t:
+        return "wall_dimensions"
+    if "wallcovering" in t or "wallpaper" in t:
+        return "wallcoverings"
+    if "wall material" in t or "wall type" in t:
+        return "material_specs"
+    if "floor plan" in t:
+        return "floor_plans"
+    if "exterior" in t and ("elevation" in t or "scope" in t or "cornice" in t or "soffit" in t):
+        return "exterior_scope"
+    if "prevailing wage" in t:
+        return "prevailing_wage"
+    if "drawing set" in t and ("incomplete" in t or "missing" in t or "partial" in t):
+        return "partial_drawing_set"
+    return "other"
+
+
+def _detect_answered_topics(analysis):
+    """
+    Inspect the aggregated analysis and decide which RFI topics have been
+    resolved downstream — so we can suppress stale per-sheet RFIs.
+
+    Returns (answered, fallback):
+      answered: topics filled from a high-confidence source (Building Level
+                Schedule, RCP dimension text, plan keynote, building section).
+                Per-sheet RFIs on these topics are dropped.
+      fallback: topics filled only by a typical-value fallback (e.g. 9'
+                typical residential). Per-sheet RFIs on these are kept but
+                rewritten as "Assumption Used" rather than "Critical".
+    """
+    answered = set()
+    fallback = set()
+
+    rooms = []
+    for floor in analysis.get("floors", []):
+        rooms.extend(floor.get("rooms", []))
+
+    notes_text = " ".join(str(n).lower() for n in analysis.get("notes", []))
+    for r in rooms:
+        notes_text += " " + str(r.get("notes", "")).lower()
+        notes_text += " " + str(r.get("dimensions", {}).get("notes", "")).lower()
+
+    # ---- ceiling_heights / building_sections ----
+    if rooms:
+        with_ceil = [r for r in rooms
+                     if _num(r.get("dimensions", {}).get("ceiling_height_feet", 0)) > 0]
+        coverage = len(with_ceil) / len(rooms)
+        real_source_phrases = (
+            "building level schedule",
+            "pre-extracted dimension",
+            "plan notation",
+            "per plan",
+            "from building section",
+            "section level differences",
+            "level schedule differences",
+        )
+        fallback_phrases = (
+            "typical residential",
+            "typical commercial",
+            "9' typical",
+            "9'-0\" typical",
+        )
+        has_real = any(p in notes_text for p in real_source_phrases)
+        has_fallback = any(p in notes_text for p in fallback_phrases)
+        if coverage >= 0.80 and has_real:
+            answered.add("ceiling_heights")
+            answered.add("building_sections")
+        elif coverage >= 0.80 and has_fallback:
+            fallback.add("ceiling_heights")
+            fallback.add("building_sections")
+
+    # ---- wall_dimensions ----
+    agg = analysis.get("aggregated_totals", {})
+    if _num(agg.get("total_paintable_wall_sqft", 0)) > 0:
+        answered.add("wall_dimensions")
+
+    # ---- floor_plans ----
+    if rooms:
+        measurable = [r for r in rooms
+                      if _num(r.get("dimensions", {}).get("wall_area_sqft", 0)) > 0
+                      or _num(r.get("dimensions", {}).get("perimeter_lf", 0)) > 0]
+        if len(measurable) / len(rooms) >= 0.80:
+            answered.add("floor_plans")
+
+    # ---- material_specs / finish_schedule ----
+    if rooms:
+        with_mat = [r for r in rooms
+                    if str(r.get("materials", {}).get("walls", "")).strip().lower()
+                    not in ("", "unknown")]
+        if len(with_mat) / len(rooms) >= 0.80:
+            answered.add("material_specs")
+            answered.add("finish_schedule")
+
+    return answered, fallback
+
+
+def _reconcile_rfi_items(items, analysis):
+    """
+    Post-process the RFI list:
+      1. Suppress per-sheet "Our review noted" / "Our analysis noted" RFIs
+         whose topic has been answered by aggregation.
+      2. Downgrade the tone of per-sheet RFIs whose topic was only filled by
+         a typical fallback (kept visible as "Assumption Used", not Critical).
+      3. Dedupe surviving per-sheet RFIs by topic — if multiple sheets flagged
+         the same topic, keep the first and append the additional sheet refs.
+
+    Dedicated RFIs (door schedule, window schedule, exterior scope, pricing,
+    etc.) are never suppressed — those were already gated on aggregation
+    checks at the call site.
+    """
+    answered, fallback = _detect_answered_topics(analysis)
+    PER_SHEET_PREFIXES = ("Our review noted", "Our analysis noted")
+
+    surviving = []
+    suppressed = 0
+    deduped = 0
+    downgraded = 0
+    seen_by_topic = {}
+
+    for it in items:
+        question = it.get("question") or ""
+        is_per_sheet = question.startswith(PER_SHEET_PREFIXES)
+        if not is_per_sheet:
+            surviving.append(it)
+            continue
+
+        text = question + " " + (it.get("action_required") or "")
+        topic = _classify_rfi_topic(text)
+
+        if topic in answered:
+            suppressed += 1
+            continue
+
+        if topic in fallback:
+            it = dict(it)
+            sheet_match = re.search(r'\[([^\]]+\.pdf)\]', question)
+            sheet_ref = f" (per {sheet_match.group(1)})" if sheet_match else ""
+            it["category"] = "Assumption Used"
+            if topic in ("ceiling_heights", "building_sections"):
+                it["question"] = (
+                    f"Ceiling heights for some rooms were not shown on building "
+                    f"sections; we assumed 9'-0\" typical residential{sheet_ref}. "
+                    f"Please confirm or provide building sections for verification."
+                )
+                it["action_required"] = (
+                    "Confirm typical 9'-0\" residential ceiling height, or "
+                    "provide building sections / RCP dimension callouts."
+                )
+            downgraded += 1
+
+        # Aliases: topics that ask the same question to the user collapse together.
+        dedupe_key = {"building_sections": "ceiling_heights"}.get(topic, topic)
+
+        if topic != "other" and dedupe_key in seen_by_topic:
+            prior = seen_by_topic[dedupe_key]
+            sheet_match = re.search(r'\[([^\]]+\.pdf)\]', question)
+            if sheet_match:
+                sheet_name = sheet_match.group(1)
+                prior_q = prior.get("question") or ""
+                if sheet_name not in prior_q:
+                    if "(also referenced on:" in prior_q:
+                        prior["question"] = prior_q.rstrip().rstrip(")") + f", {sheet_name})"
+                    else:
+                        prior["question"] = prior_q.rstrip() + f" (also referenced on: {sheet_name})"
+            deduped += 1
+            continue
+
+        if topic != "other":
+            seen_by_topic[dedupe_key] = it
+        surviving.append(it)
+
+    if suppressed or deduped or downgraded:
+        print(f"   📋 RFI reconciliation: suppressed {suppressed} answered, "
+              f"deduped {deduped} duplicates, downgraded {downgraded} to assumption")
+
+    return surviving
+
+
 def generate_rfi_items(analysis):
     """
     Scan the analysis dict for missing/incomplete data and return
@@ -8008,7 +8289,7 @@ def generate_rfi_items(analysis):
 
     Categories:
         "Missing Drawings", "Incomplete Dimensions", "Missing Schedules",
-        "Material Specifications", "Clarification Needed"
+        "Material Specifications", "Clarification Needed", "Assumption Used"
 
     Returns [] if no issues found.
     """
@@ -8252,6 +8533,12 @@ def generate_rfi_items(analysis):
             ),
             "action_required": "Confirm drawing set is complete and all floor plans are included."
         })
+
+    # Reconcile against aggregated analysis: drop per-sheet RFIs whose data
+    # was answered downstream (Building Level Schedule, RCP dimension text,
+    # plan keynotes, material aggregation) and collapse duplicate per-topic
+    # reports across sheets.
+    items = _reconcile_rfi_items(items, analysis)
 
     # Assign sequential numbers
     for i, item in enumerate(items, 1):
@@ -9052,7 +9339,7 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     # 3. Very few rooms for institutional building type
     _extraction_quality = "normal"
     if analysis:
-        _no_plans = analysis.get("no_floor_plans_found", False)
+        _no_plans = _model_flagged_no_plans(analysis)
         _all_floors = analysis.get("floors", [])
         _all_rooms_list = [r for f in _all_floors for r in f.get("rooms", [])]
         _source_sheets = set(r.get("source_sheet", "") for r in _all_rooms_list)
@@ -9061,7 +9348,7 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
 
         if _no_plans:
             _extraction_quality = "poor"
-            print(f"   ⚠️  Extraction quality: POOR — no_floor_plans_found flag set")
+            print(f"   ⚠️  Extraction quality: POOR — no-floor-plans flag set by model")
         elif _all_from_demo and _room_count > 0:
             _extraction_quality = "poor"
             print(f"   ⚠️  Extraction quality: POOR — all {_room_count} rooms from demolition sheets {_source_sheets}")
@@ -10552,6 +10839,7 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         # Claude could identify room names but couldn't read dimension text (the core
         # DD-scale resolution problem).
         used_enhanced = False
+        attempted_enhanced = False  # True once the enhanced-extraction block ran
         rooms_have_zero_dims = False
         if best_result and best_rooms > 0:
             _, _check_analysis = best_result
@@ -10566,7 +10854,15 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                     print(f"   ⚠️  All {len(_all_rooms)} rooms have 0 wall area — "
                           f"dimension text likely unreadable")
 
-        if best_rooms == 0 or rooms_have_zero_dims:
+        # Detect "templates instead of physical floors" — common DD-scale
+        # failure where the model returns "Typical Units (Floors 2-3)" rather
+        # than per-floor data. Treat that as a partial extraction so the
+        # large-format rescue path (text-layer + tiling) gets a shot.
+        likely_incomplete = bool(
+            best_result and _extraction_likely_incomplete(best_result[1])
+        )
+
+        if best_rooms == 0 or rooms_have_zero_dims or likely_incomplete:
             try:
                 from config import ENABLE_ENHANCED_EXTRACTION, LARGE_FORMAT_THRESHOLD_PT
             except ImportError:
@@ -10603,8 +10899,15 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                     pass
 
                 if has_large_pages:
+                    attempted_enhanced = True
                     n_pages = len(painting_page_indices) if painting_page_indices else "all"
-                    print(f"\n   🔬 Native PDF returned 0 rooms — "
+                    if best_rooms == 0:
+                        _why = "Native PDF returned 0 rooms"
+                    elif rooms_have_zero_dims:
+                        _why = "Native rooms had unreadable dimensions"
+                    else:
+                        _why = "Native returned templates instead of physical floors"
+                    print(f"\n   🔬 {_why} — "
                           f"large-format pages detected, trying enhanced extraction "
                           f"({n_pages} painting-relevant pages)...")
                     time.sleep(15)  # brief cooldown
@@ -10619,20 +10922,32 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                         _, enh_analysis = enhanced_result
                         enh_rooms = enh_analysis.get('project_info', {}).get(
                             'total_rooms_found', 0)
-                        if enh_rooms > 0:
+                        # When native returned templates (likely_incomplete) but enhanced
+                        # returned fewer rooms, keep the original — fewer real rooms can
+                        # still be a worse estimate than multiplied templates.
+                        if enh_rooms > 0 and (best_rooms == 0
+                                              or rooms_have_zero_dims
+                                              or enh_rooms >= best_rooms):
                             print(f"   🔬 Enhanced extraction recovered {enh_rooms} rooms!")
                             result = enhanced_result
                             best_result = enhanced_result
                             best_rooms = enh_rooms
                             used_enhanced = True
+                        elif enh_rooms > 0:
+                            print(f"   🔬 Enhanced extraction returned {enh_rooms} rooms "
+                                  f"— keeping native ({best_rooms}) which had more")
                         else:
                             print(f"   🔬 Enhanced extraction also returned 0 rooms")
                     else:
                         print(f"   🔬 Enhanced extraction failed")
 
         # ── Image fallback for floor plan files that returned 0 rooms ──
+        # Also fires for combined-volume PDFs (filename doesn't match floor-plan
+        # patterns) when enhanced extraction was attempted but didn't recover any
+        # rooms — the file has large-format architectural pages, so image
+        # rendering is worth a final attempt.
         used_image_fb = False
-        if image_fallback and is_fp and best_rooms == 0:
+        if image_fallback and best_rooms == 0 and (is_fp or attempted_enhanced):
             try:
                 from config import ENABLE_IMAGE_FALLBACK
                 do_fallback = ENABLE_IMAGE_FALLBACK
@@ -10704,7 +11019,7 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             all_results.append(result)
             files_analyzed.append(filename)
             path, analysis_result = result
-            if analysis_result.get('no_floor_plans_found') or analysis_result.get('no_detailed_floor_plans_found'):
+            if _model_flagged_no_plans(analysis_result):
                 print(f"   ⚠️  No detailed floor plans in this file")
                 print(f"   Pages: {analysis_result.get('pages_reviewed', 'N/A')}")
                 # Step 1: Existing door/window/stair schedule extraction
@@ -10726,7 +11041,8 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                         )
                         if synthetic_floors:
                             analysis_result["floors"] = synthetic_floors
-                            analysis_result["no_floor_plans_found"] = False
+                            for _flag in _INCOMPLETE_PLAN_FLAGS:
+                                analysis_result[_flag] = False
                             analysis_result["schedule_estimated"] = True
                             analysis_result["building_info"] = room_schedule.get("building_info", {})
                             schedule_estimated_files.append(filename)
@@ -10812,7 +11128,7 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         analysis = merge_analyses(all_results, file_building_counts=file_building_counts)
     else:
         _, analysis = all_results[0]
-        if analysis.get('no_floor_plans_found') or analysis.get('no_detailed_floor_plans_found'):
+        if _model_flagged_no_plans(analysis):
             print(f"\n⚠️  NO FLOOR PLANS FOUND")
             print(f"Pages reviewed: {analysis.get('pages_reviewed', 'Unknown')}")
         analysis = _normalize_scope_fields(analysis)
