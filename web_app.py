@@ -261,6 +261,7 @@ def submit():
         name=name,
         email=email_addr,
         num_files=len(pdf_keys),
+        submission_id=submission_id,
     )
 
 

@@ -93,31 +93,74 @@
 
     <script>
     (function() {
-        // Simulated progress animation (real polling can be added later
-        // when the backend exposes a status endpoint)
-        const bar = document.getElementById('progress-bar');
-        const status = document.getElementById('progress-status');
-        const steps = [
-            { pct: 15, step: 'step-scan', text: 'Scanning document structure...' },
-            { pct: 35, step: 'step-extract', text: 'Measuring rooms and surfaces...' },
-            { pct: 65, step: 'step-extract', text: 'Extracting doors, windows, finishes...' },
-            { pct: 85, step: 'step-price', text: 'Calculating pricing...' },
-            { pct: 100, step: 'step-done', text: 'Estimate complete! Check your email.' },
-        ];
+        const submissionId = {{ submission_id|tojson }};
+        if (!submissionId) return;
 
-        let i = 0;
-        function advance() {
-            if (i >= steps.length) return;
-            const s = steps[i];
-            bar.style.width = s.pct + '%';
-            status.textContent = s.text;
-            document.getElementById(s.step).classList.add('active');
-            i++;
-            if (i < steps.length) {
-                setTimeout(advance, 3000 + Math.random() * 4000);
+        const bar = document.getElementById('progress-bar');
+        const statusEl = document.getElementById('progress-status');
+        const stepIds = ['step-upload', 'step-scan', 'step-extract', 'step-price', 'step-done'];
+
+        function setStage(idx, pct, text) {
+            for (let j = 0; j <= idx; j++) {
+                document.getElementById(stepIds[j]).classList.add('active');
             }
+            bar.style.width = pct + '%';
+            statusEl.textContent = text;
         }
-        setTimeout(advance, 2000);
+
+        async function getToken() {
+            try {
+                if (window.Clerk && window.Clerk.session) {
+                    return await window.Clerk.session.getToken();
+                }
+            } catch (e) {}
+            return null;
+        }
+
+        async function poll() {
+            const token = await getToken();
+            const headers = token ? { 'Authorization': 'Bearer ' + token } : {};
+            let res;
+            try {
+                res = await fetch('/jobs/' + submissionId, { headers, credentials: 'same-origin' });
+            } catch (err) {
+                statusEl.textContent = 'Connection lost. Retrying...';
+                return setTimeout(poll, 5000);
+            }
+            if (!res.ok) {
+                statusEl.textContent = 'Status check failed (' + res.status + '). Retrying...';
+                return setTimeout(poll, 5000);
+            }
+            const data = await res.json();
+            const dbStatus = (data.status || '').toLowerCase();
+
+            if (dbStatus === 'completed' || dbStatus === 'complete') {
+                setStage(4, 100, 'Estimate complete! Check your email.');
+                if (data.results && data.results.length > 0) {
+                    const dl = document.createElement('div');
+                    dl.style.marginTop = '16px';
+                    dl.innerHTML = data.results.map(r =>
+                        '<a href="' + r.url + '" download>' + r.filename + '</a>'
+                    ).join(' &middot; ');
+                    statusEl.appendChild(dl);
+                }
+                return;
+            }
+            if (dbStatus === 'failed') {
+                statusEl.style.color = '#b91c1c';
+                statusEl.textContent = 'Processing failed: ' + (data.error || 'unknown error');
+                return;
+            }
+            if (dbStatus === 'processing') {
+                setStage(2, 55, 'AI is reading your drawings...');
+            } else {
+                // queued, or unknown
+                setStage(1, 20, 'Queued — waiting for a worker...');
+            }
+            setTimeout(poll, 3000);
+        }
+
+        setTimeout(poll, 1000);
     })();
     </script>
 </body>
