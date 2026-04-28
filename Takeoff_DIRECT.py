@@ -202,6 +202,25 @@ def _compute_chunk_plan(pdf_path):
     file_mb = os.path.getsize(pdf_path) / (1024 * 1024)
     avg_mb = file_mb / max(1, total_pages)
 
+    # Sample page dimensions to detect large-format (DD-scale) sheets. Even a
+    # vector-light DD-scale sheet (≈0.9 MB) packs an entire floor of a multi-unit
+    # building; bundling 5–8 of them into one API call routinely truncates
+    # Claude's room extraction on the middle pages (silent under-extraction).
+    LARGE_FORMAT_PT = 2000  # ≈28" — matches LARGE_FORMAT_THRESHOLD_PT used elsewhere
+    sample_indices = sorted({0, total_pages // 4, total_pages // 2,
+                              (3 * total_pages) // 4, total_pages - 1})
+    has_large_format = False
+    for si in sample_indices:
+        if si >= total_pages:
+            continue
+        try:
+            mb = reader.pages[si].mediabox
+            if max(float(mb.width), float(mb.height)) >= LARGE_FORMAT_PT:
+                has_large_format = True
+                break
+        except Exception:
+            continue
+
     # Heuristic: target ≤5 MB per chunk (base64 expands ~33%, so ~6.5 MB encoded).
     # Large-format architectural PDFs (DD-scale, 42"×30") with complex vectors
     # frequently cause API 500 errors at higher sizes. Keep chunks small.
@@ -212,6 +231,12 @@ def _compute_chunk_plan(pdf_path):
         ppc = max(2, int(TARGET_MB / avg_mb))
     else:
         ppc = 8
+
+    # Cap chunk size on DD-scale sheets regardless of MB-per-page. A floor plan
+    # of a multi-unit building is dense enough that Claude only reliably
+    # extracts rooms when each plan page gets its own attention budget.
+    if has_large_format and ppc > 2:
+        ppc = 2
 
     chunks = []
     for start in range(0, total_pages, ppc):
@@ -226,6 +251,7 @@ def _compute_chunk_plan(pdf_path):
         "pages_per_chunk": ppc,
         "total_pages": total_pages,
         "file_size_mb": round(file_mb, 2),
+        "has_large_format": has_large_format,
         "chunks": chunks,
     }
 
@@ -515,6 +541,16 @@ def _load_pdf_for_api(pdf_path, _client_for_validation=None):
     _pending_chunks = chunk_info[1:]  # list of (path, start_page_1based)
     _chunk_page_offsets = [first_offset] + [off for _, off in chunk_info[1:]]
 
+    # Stash the full chunk plan ranges (1-based, inclusive) so downstream
+    # validation can detect per-page under-extraction within a chunk.
+    global _chunk_plan_ranges
+    _chunk_plan_ranges = [
+        {"chunk_idx": i + 1,
+         "page_start": c["start"] + 1,
+         "page_end": c["end"]}  # end is exclusive 0-based, so equals last page 1-based
+        for i, c in enumerate(chunk_plan["chunks"])
+    ]
+
     print(f"   ✅ Split into {len(chunk_info)} chunks")
     print(f"   📄 Processing chunk 1/{len(chunk_info)} ({len(first_b64)/1024:.0f} KB)")
     return first_b64
@@ -533,6 +569,9 @@ def _cleanup_filtered_tmp(path):
 _pending_chunks = []
 # Module-level list of page offsets for each chunk (1-based start page)
 _chunk_page_offsets = []
+# Module-level list of {chunk_idx, page_start, page_end} (1-based inclusive)
+# for the FULL chunk plan, used by validation to spot per-page under-extraction.
+_chunk_plan_ranges = []
 # Module-level page index map: {filtered_page_0based: original_page_0based} or None
 _page_index_map = None
 
@@ -2797,8 +2836,12 @@ For each room:
 - Level 5 finish: Check the FINISH SCHEDULE, wall type legends, and room notes for "Level 5",
   "Level 5 skim coat", "L5", "smooth finish", or "skim coat" specifications on any wall or ceiling.
   Common locations: entryways, foyers, hallways, great rooms, formal dining rooms (especially in
-  high-end single-family homes). If found, set "level_5_finish_sqft" to 1 (it's priced per
-  occurrence, not per sqft). Set to 0 if not specified anywhere in the documents.
+  high-end single-family homes). If L5 applies to ALL room walls and ceiling, set
+  "level_5_finish_sqft" = wall_area_sqft + ceiling_area_sqft. If L5 applies to walls only, set
+  it to wall_area_sqft. If L5 applies to ceiling only, set it to ceiling_area_sqft. If L5 is
+  specified but you cannot tell the surface scope, set it to wall_area_sqft + ceiling_area_sqft
+  (assume both). Set to 0 if not specified anywhere in the documents. Do NOT use a placeholder
+  of 1 — Level 5 is priced per square foot ($0.55/sf), so a value of 1 yields nearly nothing.
 - Concrete floor sealer: ONLY record concrete_floor_sqft when the specs EXPLICITLY call out
   sealcoating, concrete sealer, epoxy coating, or floor coating. A bare concrete floor alone
   does NOT qualify — the project must specifically require a sealer/coating application.
@@ -3501,13 +3544,17 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
             else:
                 raise RuntimeError("All PDF chunks failed — no data could be extracted")
 
-            # Inject chunk tracking metadata into the merged result
+            # Inject chunk tracking metadata into the merged result.
+            # chunk_page_ranges (set in _load_pdf_for_api) lets downstream
+            # validation flag pages that returned 0 rooms inside a chunk
+            # whose siblings yielded data — i.e., silent truncation.
             try:
                 merged_data = json.loads(re.search(r'\{.*\}', result_text, re.DOTALL).group())
                 merged_data["_chunk_tracking"] = {
                     "total_chunks": total_chunks,
                     "chunks_succeeded": chunks_succeeded,
                     "chunks_failed": chunks_failed,
+                    "chunk_page_ranges": list(_chunk_plan_ranges),
                 }
                 result_text = json.dumps(merged_data)
             except (json.JSONDecodeError, AttributeError):
@@ -6780,6 +6827,46 @@ def _validate_extraction(analysis, file_room_counts=None):
                 f"Rooms from those files are missing."
             )
 
+    # --- Check 8: Per-page under-extraction within a chunk ---
+    # Catches the silent-truncation pattern where Claude returns rooms for
+    # some pages of a multi-page chunk but skips others. Diagnoses cases like
+    # King.pdf where 1st/2nd-floor plans yielded 0 rooms while their
+    # chunk-mates (lower level, 3rd floor) yielded 26 and 14 rooms.
+    chunk_ranges = chunk_tracking.get("chunk_page_ranges") or []
+    if chunk_ranges:
+        rooms_by_page = {}
+        for f in floors:
+            for r in f.get("rooms", []):
+                sp = r.get("source_page")
+                if isinstance(sp, (int, float)) and sp > 0:
+                    rooms_by_page[int(sp)] = rooms_by_page.get(int(sp), 0) + 1
+
+        suspect_pages = []
+        for cr in chunk_ranges:
+            ps = cr.get("page_start")
+            pe = cr.get("page_end")
+            if not isinstance(ps, int):
+                continue
+            if pe is None:
+                pe = ps  # single-page or last chunk with unknown end
+            chunk_page_list = list(range(ps, pe + 1))
+            if len(chunk_page_list) < 2:
+                continue
+            yields = [(p, rooms_by_page.get(p, 0)) for p in chunk_page_list]
+            with_rooms = [p for p, n in yields if n >= 3]
+            zero_rooms = [p for p, n in yields if n == 0]
+            if with_rooms and zero_rooms:
+                suspect_pages.extend(zero_rooms)
+
+        if suspect_pages:
+            warnings.append(
+                f"[HIGH] {len(suspect_pages)} page(s) returned 0 rooms while "
+                f"their chunk-mates yielded data — likely Claude truncated room "
+                f"extraction mid-chunk: pages {sorted(suspect_pages)[:10]}"
+                f"{'...' if len(suspect_pages) > 10 else ''}. "
+                f"Re-run with --image-fallback or smaller chunks for these pages."
+            )
+
     # Print all warnings
     if warnings:
         print(f"\n{'='*60}")
@@ -7127,7 +7214,17 @@ def _recalculate_totals(analysis):
             total_gyp_stairs += _num(elems.get("gyp_between_stairs_sqft", 0)) * multiplier
 
             # Level 5 finish
-            total_level_5 += _num(elems.get("level_5_finish_sqft", 0)) * multiplier
+            # Fallback: expand legacy placeholder values (1-10) to the room's actual paint
+            # surface, since L5 is priced per SF ($0.55/sf). A value of 1 yields nearly $0;
+            # a flagged room should price the wall + ceiling area it actually covers.
+            _l5_raw = _num(elems.get("level_5_finish_sqft", 0))
+            if 0 < _l5_raw <= 10:
+                _l5_walls = _num(dims.get("wall_area_sqft", 0))
+                _l5_ceil = _num(dims.get("ceiling_area_sqft", 0))
+                _l5_expanded = _l5_walls + _l5_ceil
+                if _l5_expanded > 0:
+                    _l5_raw = _l5_expanded
+            total_level_5 += _l5_raw * multiplier
 
             # Concrete floor sealer — only when specs explicitly call out sealcoating.
             # A bare concrete floor does NOT qualify; must have sealer/epoxy/coating spec.
@@ -8751,7 +8848,10 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
         lift_needed = 0
 
     # If any exterior scope exists, require exterior lift (unless single-family ≤3 stories)
-    has_any_ext = ext_paint_sqft > 0 or hardie_sqft > 0 or azek_lf > 0
+    # Cornice work on 2+ story buildings requires a lift — ladders only suffice at residential scale.
+    has_any_ext = (
+        ext_paint_sqft > 0 or hardie_sqft > 0 or azek_lf > 0 or cornice_lf > 0
+    )
     if has_any_ext and lift_needed == 0:
         # Single-family homes ≤3 stories use ladders, not lifts
         _sf_stories_ext = _num(project_info.get('total_stories', 0))
@@ -10403,7 +10503,11 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                                           building_inventory=building_inventory)
             if result:
                 _, analysis_check = result
-                rooms_found = analysis_check.get('project_info', {}).get('total_rooms_found', 0)
+                rooms_found_raw = analysis_check.get('project_info', {}).get('total_rooms_found', 0)
+                try:
+                    rooms_found = int(rooms_found_raw) if rooms_found_raw is not None else 0
+                except (ValueError, TypeError):
+                    rooms_found = 0
                 has_incomplete = analysis_check.get('incomplete_analysis_reason')
 
                 # Track the best result (most rooms extracted)
