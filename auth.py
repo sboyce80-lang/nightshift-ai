@@ -117,10 +117,15 @@ def verify_session(token: str) -> dict:
         raise AuthError(f"invalid session token: {exc}") from exc
 
     # azp must be one of our authorized origins (CSRF defense per Clerk docs).
+    # When this rejects, log both sides of the mismatch so the fix
+    # (update CLERK_AUTHORIZED_PARTIES) is one grep away in Render logs.
     if CLERK_AUTHORIZED_PARTIES:
         azp = claims.get("azp")
         if azp and azp not in CLERK_AUTHORIZED_PARTIES:
-            raise AuthError(f"unauthorized azp: {azp}")
+            raise AuthError(
+                f"unauthorized azp: {azp!r} not in "
+                f"CLERK_AUTHORIZED_PARTIES={CLERK_AUTHORIZED_PARTIES!r}"
+            )
 
     return claims
 
