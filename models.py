@@ -75,6 +75,17 @@ class Organization(Base):
     # Shape: {"rates": {<key>: <float>, ...}, "markup": <float>}
     pricing_overrides: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
+    # Beta gate. New orgs land with is_beta_approved=False and must be
+    # approved (manual SQL flip for now). Migration 0004 grandfathers
+    # all pre-existing orgs to True so current users aren't locked out.
+    is_beta_approved: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false",
+    )
+    # Per-org rolling-24h submission cap. NULL means use the env default.
+    daily_submission_cap: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False,
     )

@@ -50,12 +50,17 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from config import (
     MAX_PDF_SIZE_MB, MAX_PDFS_PER_EMAIL,
     WEB_PORT, FLASK_SECRET_KEY,
-    REDIS_URL, RQ_QUEUE_NAME, RQ_JOB_TIMEOUT, RQ_RESULT_TTL,
+    REDIS_URL, RQ_QUEUE_FAST, RQ_QUEUE_HEAVY,
+    HEAVY_QUEUE_PAGE_THRESHOLD, HEAVY_QUEUE_FILE_MB,
+    RQ_JOB_TIMEOUT, RQ_RESULT_TTL,
+    BETA_DAILY_SUBMISSION_CAP_DEFAULT,
     CLERK_PUBLISHABLE_KEY,
 )
 import storage
+from datetime import datetime, timezone, timedelta
+
 from db import session_scope
-from models import User, Submission, File
+from models import User, Submission, File, Organization
 from auth import require_auth, current_user_id, clerk_frontend_api_host
 
 # ---------------------------------------------------------------------------
@@ -120,7 +125,29 @@ def _flatten_overrides(po):
 # Job Queue
 # ---------------------------------------------------------------------------
 _redis = Redis.from_url(REDIS_URL)
-_queue = Queue(RQ_QUEUE_NAME, connection=_redis)
+# Two queues, two dedicated workers (see render.yaml). The fast queue keeps
+# small jobs from getting stuck behind a 30-min DD-scale takeoff.
+_queue_fast = Queue(RQ_QUEUE_FAST, connection=_redis)
+_queue_heavy = Queue(RQ_QUEUE_HEAVY, connection=_redis)
+
+
+def _count_pdf_pages(path):
+    """Best-effort page count. Returns 0 on failure so routing falls back
+    to size-based heuristic — never blocks a submission on a broken PDF."""
+    try:
+        from PyPDF2 import PdfReader
+        reader = PdfReader(path, strict=False)
+        return len(reader.pages)
+    except Exception as exc:
+        logger.warning("page count failed for %s: %s", path, exc)
+        return 0
+
+
+def _pick_queue(total_pages, max_size_bytes):
+    max_mb = max_size_bytes / (1024 * 1024)
+    if total_pages >= HEAVY_QUEUE_PAGE_THRESHOLD or max_mb >= HEAVY_QUEUE_FILE_MB:
+        return _queue_heavy, RQ_QUEUE_HEAVY
+    return _queue_fast, RQ_QUEUE_FAST
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +304,36 @@ def submit():
         flash("Your account is not yet fully set up. Please contact support.", "error")
         return redirect(url_for("index"))
 
+    # 1b. Beta gate. Reject before touching R2 so we don't waste an upload.
+    with session_scope() as session:
+        org = session.get(Organization, org_id)
+        if org is None or not org.is_beta_approved:
+            logger.info("submit blocked: org %s not beta-approved (user %s)", org_id, user_id)
+            flash(
+                "Your organization is on the Nightshift AI beta waitlist. "
+                "We'll email you as soon as your access is approved.",
+                "error",
+            )
+            return redirect(url_for("index"))
+
+        cap = org.daily_submission_cap or BETA_DAILY_SUBMISSION_CAP_DEFAULT
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        recent_count = (
+            session.query(Submission)
+            .filter(Submission.org_id == org_id, Submission.submitted_at >= cutoff)
+            .count()
+        )
+        if recent_count >= cap:
+            logger.info("submit blocked: org %s hit daily cap %d (user %s)",
+                        org_id, cap, user_id)
+            flash(
+                f"Your organization has reached its daily submission limit "
+                f"({cap} per 24 hours). Please try again later or contact support "
+                f"to request a higher limit.",
+                "error",
+            )
+            return redirect(url_for("index"))
+
     # 2. Get uploaded files
     files = request.files.getlist("attachments")
     valid_files = [f for f in files if f.filename and f.filename.strip()]
@@ -293,6 +350,8 @@ def submit():
 
     # 3. Stage files locally, validate, push to R2.
     uploaded_files = []   # list of (filename, r2_key, size_bytes)
+    total_pages = 0
+    max_size_bytes = 0
 
     with tempfile.TemporaryDirectory(prefix=f"ns-{submission_id}-") as staging:
         try:
@@ -310,6 +369,10 @@ def submit():
                 if size_bytes > MAX_PDF_SIZE_MB * 1024 * 1024:
                     flash(f"{filename} exceeds the {MAX_PDF_SIZE_MB} MB size limit.", "error")
                     return redirect(url_for("index"))
+
+                total_pages += _count_pdf_pages(local_path)
+                if size_bytes > max_size_bytes:
+                    max_size_bytes = size_bytes
 
                 key = storage.upload_key(submission_id, filename)
                 storage.upload_file(local_path, key, content_type="application/pdf")
@@ -401,10 +464,11 @@ def submit():
         rate_overrides = dict(rate_overrides or {})
         rate_overrides.update(per_job)
 
-    # 6. Enqueue the job.
+    # 6. Enqueue the job — route to fast or heavy queue based on size/pages.
     pdf_keys = [k for (_, k, _) in uploaded_files]
+    queue, queue_name = _pick_queue(total_pages, max_size_bytes)
     try:
-        job = _queue.enqueue(
+        job = queue.enqueue(
             "jobs.process_submission",
             kwargs={
                 "submission_id": submission_id,
@@ -437,8 +501,9 @@ def submit():
             pass
         return redirect(url_for("index"))
 
-    logger.info("Submission %s enqueued — %d PDFs from %s <%s> (job %s)",
-                submission_id, len(pdf_keys), name, email_addr, job.id)
+    logger.info("Submission %s enqueued on %s — %d PDFs, %d pages, %.1f MB max from %s <%s> (job %s)",
+                submission_id, queue_name, len(pdf_keys), total_pages,
+                max_size_bytes / (1024 * 1024), name, email_addr, job.id)
 
     # Post/Redirect/Get: land the user on a GET-able URL so that refresh,
     # back-button, or a shared link doesn't reload as `GET /submit` (405).
@@ -707,6 +772,6 @@ def server_error(e):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    logger.info("Starting Knight Shift web form on port %d (queue=%s, redis=%s)",
-                WEB_PORT, RQ_QUEUE_NAME, REDIS_URL)
+    logger.info("Starting Knight Shift web form on port %d (queues=%s/%s, redis=%s)",
+                WEB_PORT, RQ_QUEUE_FAST, RQ_QUEUE_HEAVY, REDIS_URL)
     app.run(host="0.0.0.0", port=WEB_PORT, debug=True)

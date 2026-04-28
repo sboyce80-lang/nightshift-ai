@@ -416,9 +416,23 @@ MAX_SUBMISSIONS_PER_HOUR = int(os.environ.get("MAX_SUBMISSIONS_PER_HOUR", "5"))
 
 # Job Queue (Redis + RQ)
 REDIS_URL = os.environ.get("REDIS_URL", "redis://localhost:6379/0")
+# Legacy single queue name — kept for backward compat with any external scripts
+# that import RQ_QUEUE_NAME. Live traffic now routes to fast/heavy below.
 RQ_QUEUE_NAME = os.environ.get("RQ_QUEUE_NAME", "nightshift")
+RQ_QUEUE_FAST = os.environ.get("RQ_QUEUE_FAST", "nightshift-fast")
+RQ_QUEUE_HEAVY = os.environ.get("RQ_QUEUE_HEAVY", "nightshift-heavy")
+# Routing heuristic: a submission goes to the heavy queue if EITHER threshold
+# is exceeded. Pages alone misses 100MB DD-scale decks with few pages; size
+# alone misses moderate-size decks with many pages.
+HEAVY_QUEUE_PAGE_THRESHOLD = int(os.environ.get("HEAVY_QUEUE_PAGE_THRESHOLD", "10"))
+HEAVY_QUEUE_FILE_MB = int(os.environ.get("HEAVY_QUEUE_FILE_MB", "30"))
 RQ_JOB_TIMEOUT = int(os.environ.get("RQ_JOB_TIMEOUT", "7200"))   # 2 hours per job
 RQ_RESULT_TTL = int(os.environ.get("RQ_RESULT_TTL", "604800"))   # keep results 7 days
+
+# Beta gate
+BETA_DAILY_SUBMISSION_CAP_DEFAULT = int(
+    os.environ.get("BETA_DAILY_SUBMISSION_CAP_DEFAULT", "5")
+)
 
 # Object Storage (Cloudflare R2 — S3-compatible)
 R2_ACCOUNT_ID         = os.environ.get("R2_ACCOUNT_ID", "")

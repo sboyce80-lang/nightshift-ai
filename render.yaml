@@ -47,15 +47,36 @@ services:
           name: nightshift-db
           property: connectionString
 
+  # Two dedicated workers — fast queue serves small jobs (<10 pages and
+  # all files <30MB) so they aren't stuck behind a 30-min DD-scale takeoff
+  # on the heavy queue. Each runs as its own service for memory isolation.
   - type: worker
-    name: nightshift-worker
+    name: nightshift-worker-fast
     runtime: python
-    plan: starter
+    plan: standard
     region: oregon
     buildCommand: pip install -r requirements.txt
     startCommand: python worker.py
     envVars:
       - fromGroup: nightshift-shared
+      - key: RQ_QUEUE_NAME
+        value: nightshift-fast
+      - key: DATABASE_URL
+        fromDatabase:
+          name: nightshift-db
+          property: connectionString
+
+  - type: worker
+    name: nightshift-worker-heavy
+    runtime: python
+    plan: standard
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: python worker.py
+    envVars:
+      - fromGroup: nightshift-shared
+      - key: RQ_QUEUE_NAME
+        value: nightshift-heavy
       - key: DATABASE_URL
         fromDatabase:
           name: nightshift-db
