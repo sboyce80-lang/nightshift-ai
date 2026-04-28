@@ -4880,6 +4880,7 @@ def _apply_schedule_overrides(combined):
         return combined
 
     agg = combined.get("aggregated_totals", {})
+    pi = combined.get("project_info", {})
     overrides_applied = []
 
     # --- Building multiplier for schedule overrides ---
