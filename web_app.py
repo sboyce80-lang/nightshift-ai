@@ -33,6 +33,7 @@ import tempfile
 
 from flask import Flask, request, render_template, redirect, url_for, flash, jsonify
 from werkzeug.utils import secure_filename
+from werkzeug.middleware.proxy_fix import ProxyFix
 
 from redis import Redis
 from rq import Queue
@@ -76,6 +77,11 @@ logger = logging.getLogger("nightshift.web")
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
 app.secret_key = FLASK_SECRET_KEY or os.urandom(24).hex()
+
+# Trust Render's proxy headers so request.url reflects the public hostname
+# (knightshiftai.com) instead of the internal localhost:$PORT. Without this,
+# server-side redirects (e.g. Clerk sign-in return URL) point users at localhost.
+app.wsgi_app = ProxyFix(app.wsgi_app, x_for=1, x_proto=1, x_host=1, x_prefix=1)
 
 app.config["MAX_CONTENT_LENGTH"] = MAX_PDF_SIZE_MB * MAX_PDFS_PER_EMAIL * 1024 * 1024
 
