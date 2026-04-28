@@ -50,7 +50,7 @@ from config import (
     MAX_PDF_SIZE_MB, MAX_PDFS_PER_EMAIL,
     WEB_PORT, FLASK_SECRET_KEY,
     REDIS_URL, RQ_QUEUE_NAME, RQ_JOB_TIMEOUT, RQ_RESULT_TTL,
-    CLERK_PUBLISHABLE_KEY, CLERK_SIGN_IN_URL,
+    CLERK_PUBLISHABLE_KEY,
 )
 import storage
 from db import session_scope
@@ -134,7 +134,6 @@ def _inject_clerk_context():
         host = ""
     return {
         "clerk_publishable_key": CLERK_PUBLISHABLE_KEY,
-        "clerk_sign_in_url": CLERK_SIGN_IN_URL,
         "clerk_frontend_api_host": host,
     }
 
@@ -211,6 +210,21 @@ def index():
         effective_rates=rates,
         effective_markup=markup,
     )
+
+
+@app.route("/sign-in", methods=["GET"])
+def sign_in():
+    """GET-able sign-in landing. Opens the Clerk modal client-side and then
+    navigates to ?next=<path> on success. Used as the redirect target from
+    @require_auth so that:
+      - relative-URL redirects don't leak the internal localhost host, and
+      - a POST that hit @require_auth bounces back via GET (no 405).
+    """
+    next_path = request.args.get("next") or "/"
+    # Same-origin only — block protocol/host injection via the next param.
+    if not next_path.startswith("/") or next_path.startswith("//"):
+        next_path = "/"
+    return render_template("sign_in.html", next_path=next_path)
 
 
 @app.route("/submit", methods=["POST"])

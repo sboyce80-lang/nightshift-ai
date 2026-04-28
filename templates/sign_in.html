@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Sign in &mdash; Knight Shift</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body class="dark-theme">
+    <main class="page-shell" style="display:flex;align-items:center;justify-content:center;min-height:80vh;">
+        <div id="signin-status" style="color:rgba(203,213,225,0.7);text-align:center;">
+            Loading sign in&hellip;
+        </div>
+    </main>
+
+    {% if clerk_publishable_key and clerk_frontend_api_host %}
+    <script>
+    const NEXT_PATH = {{ next_path|tojson }};
+    window.__bootClerk = async function() {
+        const Clerk = window.Clerk;
+        await Clerk.load();
+        if (Clerk.user) {
+            window.location.replace(NEXT_PATH);
+            return;
+        }
+        const status = document.getElementById('signin-status');
+        if (status) status.textContent = 'Sign in to continue';
+        Clerk.openSignIn({
+            afterSignInUrl: NEXT_PATH,
+            afterSignUpUrl: NEXT_PATH,
+        });
+    };
+    </script>
+    <script async crossorigin="anonymous"
+        data-clerk-publishable-key="{{ clerk_publishable_key }}"
+        src="https://{{ clerk_frontend_api_host }}/npm/@clerk/clerk-js@5/dist/clerk.browser.js"
+        onload="window.__bootClerk()"></script>
+    {% else %}
+    <noscript><p style="color:#fff;text-align:center;">JavaScript is required to sign in.</p></noscript>
+    {% endif %}
+</body>
+</html>

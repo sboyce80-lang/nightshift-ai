@@ -31,7 +31,7 @@ from flask import request, redirect, g, jsonify, abort
 
 from config import (
     CLERK_SECRET_KEY, CLERK_PUBLISHABLE_KEY,
-    CLERK_SIGN_IN_URL, CLERK_AUTHORIZED_PARTIES,
+    CLERK_AUTHORIZED_PARTIES,
 )
 from db import session_scope
 from models import User
@@ -187,19 +187,30 @@ def _sync_user(clerk_user_id: str) -> int:
 # ---------------------------------------------------------------------------
 
 def _redirect_to_sign_in():
-    """Send the user to Clerk's hosted sign-in page, with return URL."""
-    if not CLERK_SIGN_IN_URL:
-        return jsonify({"error": "auth not configured"}), 500
-    return_to = quote(request.url, safe="")
-    sep = "&" if "?" in CLERK_SIGN_IN_URL else "?"
-    return redirect(f"{CLERK_SIGN_IN_URL}{sep}redirect_url={return_to}")
+    """Redirect to the local /sign-in page with a relative `next` path.
+
+    Two reasons we don't use Clerk's hosted page or request.url here:
+      1. request.url can leak the internal localhost:$PORT host when the
+         proxy chain has more hops than ProxyFix is configured to trust.
+         A relative path is resolved by the browser against whatever public
+         origin it's already on, so the public hostname is never in doubt.
+      2. 303 forces the browser to GET /sign-in even if the original
+         request was POST (e.g. /submit). Without this, Clerk's hosted
+         sign-in flow bounces the user back via GET to a POST-only endpoint
+         and they hit a 405.
+    """
+    next_path = request.path
+    qs = request.query_string.decode("ascii", errors="replace")
+    if qs:
+        next_path = f"{next_path}?{qs}"
+    return redirect(f"/sign-in?next={quote(next_path, safe='')}", code=303)
 
 
 def require_auth(view_func):
     """Verify the request, populate flask.g.user_id, or redirect to sign-in.
 
-    For HTML routes (Accept: text/html), unauthenticated users are 302'd to
-    Clerk's hosted sign-in page. For JSON / API requests, returns 401 JSON.
+    For HTML routes (Accept: text/html), unauthenticated users are 303'd to
+    the local /sign-in page. For JSON / API requests, returns 401 JSON.
     """
     @wraps(view_func)
     def wrapper(*args, **kwargs):

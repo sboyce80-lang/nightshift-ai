@@ -84,7 +84,7 @@
                 link.addEventListener('click', (e) => {
                     e.preventDefault();
                     window.Clerk.signOut().then(() => {
-                        window.location = '{{ clerk_sign_in_url }}';
+                        window.location = '/';
                     });
                 });
             }
