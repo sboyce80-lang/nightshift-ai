@@ -7,9 +7,15 @@
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
 <body>
-    <div class="auth-bar" style="display:flex;justify-content:flex-end;align-items:center;gap:12px;padding:8px 16px;background:#0f172a;color:#e2e8f0;font-size:13px;">
-        <span id="auth-status">Loading…</span>
-        <a href="#" id="sign-out-link" style="display:none;color:#93c5fd;text-decoration:underline;">Sign out</a>
+    <div class="auth-bar" style="display:flex;justify-content:space-between;align-items:center;gap:12px;padding:8px 16px;background:#0f172a;color:#e2e8f0;font-size:13px;">
+        <div id="nav-links" style="display:none;">
+            <a href="{{ url_for('jobs_list') }}" style="color:#93c5fd;text-decoration:none;margin-right:12px;">My Jobs</a>
+            <a href="{{ url_for('pricing_settings') }}" style="color:#93c5fd;text-decoration:none;">Pricing</a>
+        </div>
+        <div style="display:flex;align-items:center;gap:12px;margin-left:auto;">
+            <span id="auth-status">Loading…</span>
+            <a href="#" id="sign-out-link" style="display:none;color:#93c5fd;text-decoration:underline;">Sign out</a>
+        </div>
     </div>
     <header class="hero">
         <div class="hero-content">
@@ -80,7 +86,7 @@
                                accept=".pdf,application/pdf" multiple required>
                         <div class="upload-icon">&#128203;</div>
                         <p>Drag &amp; drop PDF files here, or click to browse</p>
-                        <p class="file-hint">PDF files only &bull; Up to 25 MB each &bull; Maximum 10 files</p>
+                        <p class="file-hint">PDF files only &bull; Up to 200 MB each &bull; Maximum 10 files</p>
                     </div>
                     <div id="file-list"></div>
                 </div>
@@ -162,6 +168,8 @@
         }
         if (emailInline) emailInline.textContent = email;
         if (formContainer) formContainer.style.display = '';
+        const navLinks = document.getElementById('nav-links');
+        if (navLinks) navLinks.style.display = '';
     };
     </script>
     <script

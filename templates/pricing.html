@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Pricing &mdash; Knight Shift</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="auth-bar" style="display:flex;justify-content:space-between;align-items:center;gap:12px;padding:8px 16px;background:#0f172a;color:#e2e8f0;font-size:13px;">
+        <div>
+            <a href="{{ url_for('index') }}" style="color:#93c5fd;text-decoration:none;margin-right:12px;">New Estimate</a>
+            <a href="{{ url_for('jobs_list') }}" style="color:#93c5fd;text-decoration:none;margin-right:12px;">My Jobs</a>
+            <a href="{{ url_for('pricing_settings') }}" style="color:#fff;text-decoration:none;font-weight:600;">Pricing</a>
+        </div>
+        <span id="auth-status">Loading…</span>
+    </div>
+    <header class="hero hero-compact">
+        <div class="hero-content">
+            <h1>Pricing Rates &amp; Markup</h1>
+            <p class="subtitle">Override the default Rider Painting rates with your own. Saved per account &mdash; applies to all future submissions.</p>
+        </div>
+    </header>
+    <main class="form-container">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}<div class="flash-messages">
+            {% for cat, m in messages %}<div class="flash flash-{{cat}}">{{m}}</div>{% endfor %}
+        </div>{% endif %}
+        {% endwith %}
+
+        <form method="POST" action="{{ url_for('pricing_settings') }}">
+            <section class="form-section">
+                <h2>Global Markup</h2>
+                <div class="form-group">
+                    <label for="markup">Markup applied to every line item (e.g. 0.06 = 6%)</label>
+                    <input type="number" step="0.01" min="0" max="1" id="markup" name="markup"
+                           value="{{ overrides.markup if overrides.markup is not none else '' }}"
+                           placeholder="0.06 (default)">
+                    <p class="field-hint">Leave blank to use per-item defaults (most items default to 6%).</p>
+                </div>
+            </section>
+
+            <section class="form-section">
+                <h2>Rate Overrides</h2>
+                <p class="field-hint" style="margin-bottom:16px;">Leave blank to use Rider's tiered defaults. A value here flattens all volume tiers to that single rate for your account.</p>
+                {% for key, label, unit, default in rate_fields %}
+                <div class="form-group">
+                    <label for="{{ key }}">
+                        {{ label }}
+                        <span style="color:#64748b;font-weight:400;">($ per {{ unit }} &middot; default ~${{ default }})</span>
+                    </label>
+                    <input type="number" step="0.01" min="0" id="{{ key }}" name="{{ key }}"
+                           value="{{ overrides.rates.get(key, '') if overrides.rates else '' }}">
+                </div>
+                {% endfor %}
+            </section>
+
+            <button type="submit" class="submit-btn">Save Pricing</button>
+            <button type="submit" name="reset" value="1" class="submit-btn"
+                    style="background:#64748b;margin-top:10px;"
+                    onclick="return confirm('Reset all pricing to Rider defaults?');">
+                Reset to defaults
+            </button>
+        </form>
+    </main>
+
+    <footer><p>&copy; 2026 Knight Shift &mdash; Forged by Willpower</p></footer>
+
+    {% if clerk_publishable_key and clerk_frontend_api_host %}
+    <script>
+    window.__bootClerk = async function() {
+        const Clerk = window.Clerk;
+        await Clerk.load();
+        const status = document.getElementById('auth-status');
+        if (!Clerk.user) {
+            Clerk.openSignIn({ afterSignInUrl: window.location.href });
+            return;
+        }
+        const email = Clerk.user.primaryEmailAddress
+            ? Clerk.user.primaryEmailAddress.emailAddress
+            : (Clerk.user.emailAddresses[0] || {}).emailAddress || '';
+        if (status) status.textContent = email;
+    };
+    </script>
+    <script async crossorigin="anonymous"
+        data-clerk-publishable-key="{{ clerk_publishable_key }}"
+        src="https://{{ clerk_frontend_api_host }}/npm/@clerk/clerk-js@5/dist/clerk.browser.js"
+        onload="window.__bootClerk()"></script>
+    {% endif %}
+</body>
+</html>

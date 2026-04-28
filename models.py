@@ -20,7 +20,7 @@ from typing import List, Optional
 
 from sqlalchemy import (
     String, Integer, BigInteger, Numeric, DateTime, ForeignKey, Index,
-    UniqueConstraint,
+    UniqueConstraint, JSON,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -40,6 +40,7 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(320), nullable=False, unique=True, index=True)
     name: Mapped[Optional[str]] = mapped_column(String(255))
     clerk_user_id: Mapped[Optional[str]] = mapped_column(String(64), unique=True, index=True)
+    pricing_overrides: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False,
     )

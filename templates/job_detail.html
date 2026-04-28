@@ -1,0 +1,134 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Job {{ submission_id[:8] }} &mdash; Knight Shift</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="auth-bar" style="display:flex;justify-content:space-between;align-items:center;gap:12px;padding:8px 16px;background:#0f172a;color:#e2e8f0;font-size:13px;">
+        <div>
+            <a href="{{ url_for('jobs_list') }}" style="color:#93c5fd;text-decoration:none;">&larr; My Jobs</a>
+        </div>
+        <span id="auth-status">Loading…</span>
+    </div>
+    <header class="hero hero-compact">
+        <div class="hero-content">
+            <h1>Estimate Status</h1>
+            <p class="subtitle">Submission <code style="background:rgba(255,255,255,0.12);padding:2px 8px;border-radius:4px;font-size:0.85em;">{{ submission_id }}</code></p>
+        </div>
+    </header>
+    <main class="form-container">
+        <section class="form-section">
+            <h2>Status: <span id="status-pill" class="status-pill">loading…</span></h2>
+            <p id="status-msg" style="color:#475569;">Checking…</p>
+            <div style="height:8px;background:#e2e8f0;border-radius:4px;overflow:hidden;margin-top:12px;">
+                <div id="progress-fill" style="height:100%;width:0;background:linear-gradient(90deg,#1a6fb5,#2ecc71);transition:width .4s;"></div>
+            </div>
+        </section>
+        <section class="form-section" id="results-section" style="display:none;">
+            <h2>Results</h2>
+            <p>Subtotal: <strong id="subtotal-display" style="color:#0a2540;font-size:1.4rem;">—</strong></p>
+            <ul id="result-files" style="list-style:none;padding:0;"></ul>
+        </section>
+        <section class="form-section" id="error-section" style="display:none;">
+            <h2 style="color:#dc2626;">Error</h2>
+            <pre id="error-text" style="white-space:pre-wrap;color:#dc2626;background:#fef2f2;padding:12px;border-radius:6px;"></pre>
+        </section>
+    </main>
+
+    <footer><p>&copy; 2026 Knight Shift &mdash; Forged by Willpower</p></footer>
+
+    {% if clerk_publishable_key and clerk_frontend_api_host %}
+    <script>
+    window.__bootClerk = async function() {
+        const Clerk = window.Clerk;
+        await Clerk.load();
+        const status = document.getElementById('auth-status');
+        if (!Clerk.user) {
+            Clerk.openSignIn({ afterSignInUrl: window.location.href });
+            return;
+        }
+        const email = Clerk.user.primaryEmailAddress
+            ? Clerk.user.primaryEmailAddress.emailAddress
+            : (Clerk.user.emailAddresses[0] || {}).emailAddress || '';
+        if (status) status.textContent = email;
+        startPolling();
+    };
+    </script>
+    <script async crossorigin="anonymous"
+        data-clerk-publishable-key="{{ clerk_publishable_key }}"
+        src="https://{{ clerk_frontend_api_host }}/npm/@clerk/clerk-js@5/dist/clerk.browser.js"
+        onload="window.__bootClerk()"></script>
+    {% else %}
+    <script>document.addEventListener('DOMContentLoaded', startPolling);</script>
+    {% endif %}
+
+    <script>
+    const SUB_ID = {{ submission_id|tojson }};
+    const TERMINAL = new Set(["completed", "failed"]);
+    const PROGRESS = { queued: 10, processing: 55, completed: 100, failed: 100 };
+    const MSGS = {
+        queued: "Waiting in queue…",
+        processing: "Extracting rooms, walls, doors, windows…",
+        completed: "Done — your estimate is ready below.",
+        failed: "Something went wrong. See error below.",
+    };
+    let pollTimer = null;
+
+    function render(d) {
+        const pill = document.getElementById("status-pill");
+        pill.textContent = d.status;
+        pill.className = "status-pill status-" + d.status;
+        document.getElementById("progress-fill").style.width = (PROGRESS[d.status] || 0) + "%";
+        document.getElementById("status-msg").textContent = MSGS[d.status] || "";
+
+        if (d.status === "completed") {
+            document.getElementById("results-section").style.display = "";
+            document.getElementById("subtotal-display").textContent =
+                d.subtotal != null
+                    ? "$" + d.subtotal.toLocaleString(undefined, {maximumFractionDigits: 0})
+                    : "—";
+            const ul = document.getElementById("result-files");
+            ul.innerHTML = "";
+            (d.results || []).forEach(f => {
+                const li = document.createElement("li");
+                li.style.padding = "8px 0";
+                const a = document.createElement("a");
+                a.href = f.url;
+                a.textContent = f.filename;
+                a.target = "_blank";
+                a.style.color = "#1a6fb5";
+                a.style.fontWeight = "500";
+                li.appendChild(a);
+                ul.appendChild(li);
+            });
+        }
+        if (d.status === "failed" && d.error) {
+            document.getElementById("error-section").style.display = "";
+            document.getElementById("error-text").textContent = d.error;
+        }
+    }
+
+    async function poll() {
+        try {
+            const res = await fetch(`/api/jobs/${SUB_ID}`, { credentials: "same-origin" });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            const data = await res.json();
+            render(data);
+            if (TERMINAL.has(data.status)) {
+                clearInterval(pollTimer);
+            }
+        } catch (e) {
+            document.getElementById("status-msg").textContent = "Lost connection — retrying…";
+        }
+    }
+
+    function startPolling() {
+        poll();
+        pollTimer = setInterval(poll, 3000);
+    }
+    </script>
+</body>
+</html>

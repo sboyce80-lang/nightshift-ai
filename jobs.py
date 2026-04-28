@@ -105,7 +105,8 @@ def _record_result_file(submission_id, filename, r2_key, size_bytes, content_typ
 # Main worker entry point — RQ calls this
 # ---------------------------------------------------------------------------
 
-def process_submission(submission_id, pdf_keys, contact_info, scope_notes):
+def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
+                        rate_overrides=None):
     """Run the full takeoff pipeline for a submission.
 
     Args:
@@ -113,6 +114,8 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes):
         pdf_keys: list of R2 object keys (e.g. submissions/<id>/uploads/X.pdf).
         contact_info: dict with name, email, phone, business_name.
         scope_notes: free-form scope text.
+        rate_overrides: optional dict of pricing overrides applied to
+                        PRICING_MODEL via Takeoff_DIRECT._apply_rate_overrides.
 
     Workflow:
         1. Mark submission `processing` in the DB.
@@ -142,6 +145,7 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes):
                 contact_name=contact_info["name"],
                 contact_email=contact_info["email"],
                 scope_notes=scope_notes,
+                rate_overrides=rate_overrides,
             )
 
             for key_name, content_type in (

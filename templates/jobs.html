@@ -1,0 +1,83 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>My Jobs &mdash; Knight Shift</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+    <div class="auth-bar" style="display:flex;justify-content:space-between;align-items:center;gap:12px;padding:8px 16px;background:#0f172a;color:#e2e8f0;font-size:13px;">
+        <div>
+            <a href="{{ url_for('index') }}" style="color:#93c5fd;text-decoration:none;margin-right:12px;">New Estimate</a>
+            <a href="{{ url_for('jobs_list') }}" style="color:#fff;text-decoration:none;margin-right:12px;font-weight:600;">My Jobs</a>
+            <a href="{{ url_for('pricing_settings') }}" style="color:#93c5fd;text-decoration:none;">Pricing</a>
+        </div>
+        <span id="auth-status">Loading…</span>
+    </div>
+    <header class="hero hero-compact">
+        <div class="hero-content">
+            <h1>My Jobs</h1>
+            <p class="subtitle">Recent submissions and their status.</p>
+        </div>
+    </header>
+    <main class="form-container">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+        {% if messages %}<div class="flash-messages">
+            {% for cat, m in messages %}<div class="flash flash-{{cat}}">{{m}}</div>{% endfor %}
+        </div>{% endif %}
+        {% endwith %}
+
+        {% if not submissions %}
+            <p style="text-align:center;color:#475569;">No submissions yet. <a href="{{ url_for('index') }}">Submit your first PDF &rarr;</a></p>
+        {% else %}
+        <table class="jobs-table">
+            <thead>
+                <tr>
+                    <th>Submitted</th>
+                    <th>Files</th>
+                    <th>Status</th>
+                    <th>Subtotal</th>
+                    <th></th>
+                </tr>
+            </thead>
+            <tbody>
+            {% for s in submissions %}
+                <tr>
+                    <td>{{ s.submitted_at.strftime('%Y-%m-%d %H:%M') if s.submitted_at else '—' }}</td>
+                    <td>{{ s.upload_count }}</td>
+                    <td><span class="status-pill status-{{ s.status }}">{{ s.status }}</span></td>
+                    <td>{% if s.subtotal is not none %}${{ "{:,.0f}".format(s.subtotal) }}{% else %}—{% endif %}</td>
+                    <td><a href="{{ url_for('job_detail', submission_id=s.id) }}">View &rarr;</a></td>
+                </tr>
+            {% endfor %}
+            </tbody>
+        </table>
+        {% endif %}
+    </main>
+
+    <footer><p>&copy; 2026 Knight Shift &mdash; Forged by Willpower</p></footer>
+
+    {% if clerk_publishable_key and clerk_frontend_api_host %}
+    <script>
+    window.__bootClerk = async function() {
+        const Clerk = window.Clerk;
+        await Clerk.load();
+        const status = document.getElementById('auth-status');
+        if (!Clerk.user) {
+            Clerk.openSignIn({ afterSignInUrl: window.location.href });
+            return;
+        }
+        const email = Clerk.user.primaryEmailAddress
+            ? Clerk.user.primaryEmailAddress.emailAddress
+            : (Clerk.user.emailAddresses[0] || {}).emailAddress || '';
+        if (status) status.textContent = email;
+    };
+    </script>
+    <script async crossorigin="anonymous"
+        data-clerk-publishable-key="{{ clerk_publishable_key }}"
+        src="https://{{ clerk_frontend_api_host }}/npm/@clerk/clerk-js@5/dist/clerk.browser.js"
+        onload="window.__bootClerk()"></script>
+    {% endif %}
+</body>
+</html>

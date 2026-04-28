@@ -542,6 +542,45 @@ footer {
     margin: 0;
 }
 
+/* ── Status Pills (jobs list + detail) ── */
+.status-pill {
+    display: inline-block;
+    padding: 3px 12px;
+    border-radius: 12px;
+    font-size: 0.78rem;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+.status-queued     { background: #fef3c7; color: #92400e; }
+.status-processing { background: #dbeafe; color: #1e40af; }
+.status-completed  { background: #dcfce7; color: #166534; }
+.status-failed     { background: #fee2e2; color: #991b1b; }
+
+/* ── Jobs Table ── */
+.jobs-table {
+    width: 100%;
+    border-collapse: collapse;
+    font-size: 0.95rem;
+}
+.jobs-table th {
+    text-align: left;
+    padding: 10px 8px;
+    border-bottom: 2px solid var(--border-gray);
+    color: var(--text-muted);
+    font-size: 0.82rem;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+}
+.jobs-table td {
+    padding: 12px 8px;
+    border-bottom: 1px solid #e5e7eb;
+    color: var(--text-dark);
+}
+.jobs-table tr:last-child td { border-bottom: none; }
+.jobs-table a { color: var(--medium-blue); text-decoration: none; font-weight: 500; }
+.jobs-table a:hover { text-decoration: underline; }
+
 /* ── Responsive ── */
 @media (max-width: 640px) {
     .hero {

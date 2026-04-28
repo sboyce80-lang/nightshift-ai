@@ -82,6 +82,33 @@ app.config["MAX_CONTENT_LENGTH"] = MAX_PDF_SIZE_MB * MAX_PDFS_PER_EMAIL * 1024 *
 ALLOWED_EXTENSIONS = {".pdf"}
 
 # ---------------------------------------------------------------------------
+# Pricing — fields surfaced in the /pricing settings UI. Keys match the
+# shorthand accepted by Takeoff_DIRECT._apply_rate_overrides().
+# ---------------------------------------------------------------------------
+RATE_FIELDS = [
+    ("wall_rate",     "Interior walls (gyp)",     "sqft", "1.25"),
+    ("ceiling_rate",  "Ceilings (gyp)",           "sqft", "1.25"),
+    ("door_rate",     "Doors (full paint)",       "ea",   "225.00"),
+    ("window_rate",   "Windows",                  "ea",   "120.00"),
+    ("trim_rate",     "Base trim",                "lf",   "3.25"),
+    ("stair_rate",    "Stairs",                   "ea",   "1500.00"),
+    ("cmu_rate",      "CMU walls (full)",         "sqft", "1.10"),
+    ("dryfall_rate",  "Dryfall ceilings",         "sqft", "0.90"),
+    ("concrete_rate", "Concrete sealer",          "sqft", "2.20"),
+    ("column_rate",   "Painted columns",          "ea",   "200.00"),
+]
+
+
+def _flatten_overrides(po):
+    """Convert {"rates": {...}, "markup": x} -> flat dict for run_analysis."""
+    if not po:
+        return None
+    flat = dict(po.get("rates") or {})
+    if po.get("markup") is not None:
+        flat["markup"] = po["markup"]
+    return flat or None
+
+# ---------------------------------------------------------------------------
 # Job Queue
 # ---------------------------------------------------------------------------
 _redis = Redis.from_url(REDIS_URL)
@@ -218,7 +245,12 @@ def submit():
             pass
         return redirect(url_for("index"))
 
-    # 5. Enqueue the job.
+    # 5. Load any saved pricing overrides for this user.
+    with session_scope() as session:
+        user = session.get(User, user_id)
+        rate_overrides = _flatten_overrides(user.pricing_overrides) if user else None
+
+    # 6. Enqueue the job.
     pdf_keys = [k for (_, k, _) in uploaded_files]
     try:
         job = _queue.enqueue(
@@ -233,6 +265,7 @@ def submit():
                     "business_name": business_name,
                 },
                 "scope_notes": scope_notes,
+                "rate_overrides": rate_overrides,
             },
             job_id=submission_id,
             job_timeout=RQ_JOB_TIMEOUT,
@@ -265,9 +298,42 @@ def submit():
     )
 
 
+@app.route("/jobs", methods=["GET"])
+@require_auth
+def jobs_list():
+    """Render the user's submission history (HTML)."""
+    uid = current_user_id()
+    rows = []
+    with session_scope() as session:
+        subs = (session.query(Submission)
+                .filter(Submission.user_id == uid)
+                .order_by(Submission.submitted_at.desc())
+                .limit(100).all())
+        for s in subs:
+            rows.append({
+                "id": s.id,
+                "submitted_at": s.submitted_at,
+                "status": s.status,
+                "subtotal": float(s.subtotal) if s.subtotal is not None else None,
+                "upload_count": sum(1 for f in s.files if f.kind == "upload"),
+            })
+    return render_template("jobs.html", submissions=rows)
+
+
 @app.route("/jobs/<submission_id>", methods=["GET"])
 @require_auth
-def job_status(submission_id):
+def job_detail(submission_id):
+    """HTML status page for one submission. Polls /api/jobs/<id> for live updates."""
+    with session_scope() as session:
+        sub = session.get(Submission, submission_id)
+        if sub is None or sub.user_id != current_user_id():
+            return ("Not found", 404)
+    return render_template("job_detail.html", submission_id=submission_id)
+
+
+@app.route("/api/jobs/<submission_id>", methods=["GET"])
+@require_auth
+def job_status_api(submission_id):
     """Return submission status + signed download URLs for any results.
 
     Authorization: only the submission's owner may view it. Other users get
@@ -310,6 +376,69 @@ def job_status(submission_id):
     if not payload["error"] and rq_error:
         payload["error"] = rq_error
     return jsonify(payload)
+
+
+@app.route("/pricing", methods=["GET", "POST"])
+@require_auth
+def pricing_settings():
+    """View / edit per-account pricing overrides (rates + markup)."""
+    uid = current_user_id()
+    with session_scope() as session:
+        user = session.get(User, uid)
+
+        if request.method == "POST":
+            if request.form.get("reset"):
+                user.pricing_overrides = None
+                flash("Pricing reset to Rider defaults.", "success")
+                return redirect(url_for("pricing_settings"))
+
+            rates, errors = {}, []
+            for key, _label, _unit, _default in RATE_FIELDS:
+                raw = (request.form.get(key) or "").strip()
+                if not raw:
+                    continue
+                try:
+                    v = float(raw)
+                    if v < 0 or v > 100000:
+                        raise ValueError("out of range")
+                    rates[key] = v
+                except ValueError:
+                    errors.append(f"{key}: must be a number between 0 and 100000")
+
+            markup = None
+            raw_m = (request.form.get("markup") or "").strip()
+            if raw_m:
+                try:
+                    markup = float(raw_m)
+                    if markup < 0 or markup > 1:
+                        raise ValueError()
+                except ValueError:
+                    errors.append("markup: must be between 0.0 and 1.0")
+
+            if errors:
+                for e in errors:
+                    flash(e, "error")
+                return redirect(url_for("pricing_settings"))
+
+            overrides = {}
+            if rates:
+                overrides["rates"] = rates
+            if markup is not None:
+                overrides["markup"] = markup
+            user.pricing_overrides = overrides or None
+            flash("Pricing saved.", "success")
+            return redirect(url_for("pricing_settings"))
+
+        overrides = user.pricing_overrides or {}
+
+    return render_template(
+        "pricing.html",
+        overrides={
+            "markup": overrides.get("markup"),
+            "rates": overrides.get("rates", {}),
+        },
+        rate_fields=RATE_FIELDS,
+    )
 
 
 # ---------------------------------------------------------------------------
