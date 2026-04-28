@@ -26,6 +26,7 @@ Usage:
 """
 
 import os
+import re
 import sys
 import json
 import uuid
@@ -178,6 +179,19 @@ def _effective_user_overrides(user):
     return rates, markup
 
 
+_MOBILE_UA_RE = re.compile(
+    r"(iPhone|iPod|Android.*Mobile|BlackBerry|IEMobile|Opera Mini|Windows Phone)",
+    re.IGNORECASE,
+)
+
+
+def _is_mobile_ua():
+    """True if the User-Agent looks like a phone. iPad and Android tablets
+    are intentionally excluded — they get the desktop layout."""
+    ua = (request.user_agent.string or "")
+    return bool(_MOBILE_UA_RE.search(ua))
+
+
 @app.route("/")
 def index():
     """Public landing — Clerk.js handles auth client-side and bootstraps the
@@ -187,7 +201,12 @@ def index():
 
     Pricing context is fetched server-side too — but unauthenticated callers
     get the global defaults (Clerk-protected pages will refuse data fetch).
+
+    Phones are redirected to /mobile unless ?desktop=1 is passed.
     """
+    if _is_mobile_ua() and request.args.get("desktop") != "1":
+        return redirect(url_for("mobile"))
+
     user = None
     try:
         from auth import _read_session_token, verify_session, AuthError
@@ -225,6 +244,14 @@ def sign_in():
     if not next_path.startswith("/") or next_path.startswith("//"):
         next_path = "/"
     return render_template("sign_in.html", next_path=next_path)
+
+
+@app.route("/mobile")
+def mobile():
+    """Streamlined phone-first submission form. Same /submit endpoint, but
+    no inline pricing override UI — the backend falls back to the user's
+    saved pricing defaults when no rate__ fields are POSTed."""
+    return render_template("mobile.html")
 
 
 @app.route("/submit", methods=["POST"])
@@ -397,11 +424,30 @@ def submit():
     logger.info("Submission %s enqueued — %d PDFs from %s <%s> (job %s)",
                 submission_id, len(pdf_keys), name, email_addr, job.id)
 
+    # Post/Redirect/Get: land the user on a GET-able URL so that refresh,
+    # back-button, or a shared link doesn't reload as `GET /submit` (405).
+    return redirect(url_for("thank_you", submission_id=submission_id))
+
+
+@app.route("/thank-you/<submission_id>", methods=["GET"])
+@require_auth
+def thank_you(submission_id):
+    """GET-safe confirmation page for a submission the caller owns."""
+    uid = current_user_id()
+    with session_scope() as session:
+        sub = session.get(Submission, submission_id)
+        if sub is None or sub.user_id != uid:
+            return ("Not found", 404)
+        user = session.get(User, uid)
+        name = (user.name if user else "") or ""
+        email_addr = user.email if user else ""
+        num_files = sum(1 for f in sub.files if f.kind == "upload")
+
     return render_template(
         "thank_you.html",
         name=name,
         email=email_addr,
-        num_files=len(pdf_keys),
+        num_files=num_files,
         submission_id=submission_id,
     )
 

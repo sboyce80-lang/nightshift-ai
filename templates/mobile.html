@@ -1,0 +1,415 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <meta name="theme-color" content="#0a2540">
+    <title>Knight Shift &mdash; Mobile</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <style>
+        /* ---------- Mobile-first streamlined form ---------- */
+        body.mobile-shell {
+            background: #0a2540;
+            color: #e2e8f0;
+            min-height: 100vh;
+            min-height: 100dvh;
+            display: flex;
+            flex-direction: column;
+        }
+        .m-header {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            gap: 12px;
+            padding: 14px 16px;
+            background: linear-gradient(135deg, #0a2540 0%, #061a2e 100%);
+            border-bottom: 1px solid rgba(255,255,255,0.08);
+        }
+        .m-header .m-brand {
+            display: flex;
+            align-items: center;
+            gap: 10px;
+            color: #fff;
+            text-decoration: none;
+        }
+        .m-header .m-brand img { height: 32px; width: auto; }
+        .m-header .m-brand strong { font-size: 1rem; letter-spacing: 0.2px; }
+        .m-header .m-tagline { font-size: 0.7rem; color: #2ecc71; }
+        .m-header .m-auth {
+            font-size: 0.75rem;
+            color: rgba(226,232,240,0.75);
+            text-align: right;
+            line-height: 1.25;
+        }
+        .m-header .m-auth a {
+            color: #93c5fd;
+            text-decoration: none;
+            font-size: 0.7rem;
+        }
+        .m-main {
+            flex: 1;
+            padding: 18px 16px 32px;
+            max-width: 560px;
+            margin: 0 auto;
+            width: 100%;
+        }
+        .m-card {
+            background: rgba(255,255,255,0.04);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 14px;
+            padding: 18px 16px;
+        }
+        .m-card h2 {
+            font-size: 1.1rem;
+            font-weight: 700;
+            color: #fff;
+            margin-bottom: 4px;
+        }
+        .m-sent-to {
+            font-size: 0.82rem;
+            color: rgba(226,232,240,0.7);
+            margin-bottom: 14px;
+        }
+        .m-sent-to strong { color: #fff; }
+        .m-group { margin-bottom: 14px; }
+        .m-group label {
+            display: block;
+            font-size: 0.78rem;
+            font-weight: 600;
+            color: rgba(226,232,240,0.85);
+            margin-bottom: 6px;
+            letter-spacing: 0.02em;
+            text-transform: uppercase;
+        }
+        .m-group input[type="text"],
+        .m-group textarea {
+            width: 100%;
+            padding: 12px 12px;
+            font-size: 16px; /* prevents iOS zoom on focus */
+            background: rgba(255,255,255,0.06);
+            border: 1px solid rgba(255,255,255,0.12);
+            border-radius: 10px;
+            color: #fff;
+            font-family: inherit;
+        }
+        .m-group input[type="text"]:focus,
+        .m-group textarea:focus {
+            outline: none;
+            border-color: #2ecc71;
+            background: rgba(255,255,255,0.09);
+        }
+        .m-group textarea { resize: vertical; min-height: 70px; }
+        .m-drop {
+            position: relative;
+            border: 2px dashed rgba(46,204,113,0.5);
+            border-radius: 12px;
+            padding: 24px 14px;
+            text-align: center;
+            background: rgba(46,204,113,0.04);
+            transition: border-color 0.15s, background 0.15s;
+        }
+        .m-drop.drag-over {
+            border-color: #2ecc71;
+            background: rgba(46,204,113,0.10);
+        }
+        .m-drop input[type="file"] {
+            position: absolute;
+            inset: 0;
+            opacity: 0;
+            width: 100%;
+            height: 100%;
+            cursor: pointer;
+        }
+        .m-drop .m-icon { font-size: 1.8rem; margin-bottom: 6px; }
+        .m-drop p { margin: 0; color: rgba(226,232,240,0.85); font-size: 0.92rem; }
+        .m-drop .m-hint {
+            margin-top: 6px;
+            font-size: 0.72rem;
+            color: rgba(226,232,240,0.55);
+        }
+        .m-files {
+            margin-top: 10px;
+            display: flex;
+            flex-direction: column;
+            gap: 6px;
+        }
+        .m-file {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            gap: 10px;
+            padding: 8px 10px;
+            background: rgba(255,255,255,0.05);
+            border-radius: 8px;
+            font-size: 0.85rem;
+        }
+        .m-file .m-name {
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            color: #fff;
+        }
+        .m-file .m-size {
+            font-size: 0.75rem;
+            color: rgba(226,232,240,0.6);
+            flex-shrink: 0;
+        }
+        .m-toggle-row {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 8px;
+        }
+        .m-toggle {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 10px 12px;
+            background: rgba(255,255,255,0.05);
+            border: 1px solid rgba(255,255,255,0.10);
+            border-radius: 10px;
+            font-size: 0.9rem;
+            color: #fff;
+            cursor: pointer;
+        }
+        .m-toggle input { accent-color: #2ecc71; }
+        .m-submit {
+            width: 100%;
+            padding: 16px;
+            font-size: 1.02rem;
+            font-weight: 700;
+            color: #0a2540;
+            background: linear-gradient(135deg, #2ecc71 0%, #27ae60 100%);
+            border: none;
+            border-radius: 12px;
+            cursor: pointer;
+            margin-top: 4px;
+            letter-spacing: 0.02em;
+        }
+        .m-submit:disabled {
+            opacity: 0.7;
+            cursor: not-allowed;
+        }
+        .m-submit .spinner {
+            display: inline-block;
+            width: 14px; height: 14px;
+            border: 2px solid rgba(10,37,64,0.3);
+            border-top-color: #0a2540;
+            border-radius: 50%;
+            animation: m-spin 0.8s linear infinite;
+            vertical-align: -2px;
+            margin-right: 6px;
+        }
+        @keyframes m-spin { to { transform: rotate(360deg); } }
+        .m-flash {
+            padding: 10px 12px;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            margin-bottom: 12px;
+        }
+        .m-flash.error {
+            background: rgba(220,38,38,0.15);
+            border: 1px solid rgba(220,38,38,0.4);
+            color: #fecaca;
+        }
+        .m-flash.success {
+            background: rgba(46,204,113,0.15);
+            border: 1px solid rgba(46,204,113,0.4);
+            color: #bbf7d0;
+        }
+        .m-foot-link {
+            display: block;
+            text-align: center;
+            margin-top: 18px;
+            font-size: 0.78rem;
+            color: rgba(226,232,240,0.55);
+            text-decoration: none;
+        }
+        .m-foot-link:hover { color: #93c5fd; }
+        #m-app { display: none; }
+        .m-loading {
+            text-align: center;
+            padding: 60px 20px;
+            color: rgba(226,232,240,0.7);
+            font-size: 0.95rem;
+        }
+    </style>
+</head>
+<body class="mobile-shell">
+    <header class="m-header">
+        <a href="{{ url_for('mobile') }}" class="m-brand">
+            <img src="{{ url_for('static', filename='logo_helm_sm.png') }}" alt="Knight Shift">
+            <div>
+                <strong>Knight Shift</strong>
+                <div class="m-tagline">Forged by Willpower</div>
+            </div>
+        </a>
+        <div class="m-auth">
+            <span id="auth-status">Loading…</span><br>
+            <a href="#" id="sign-out-link" style="display:none;">Sign out</a>
+        </div>
+    </header>
+
+    <main class="m-main">
+        <div id="m-loading" class="m-loading">Signing you in…</div>
+
+        <div id="m-app">
+            {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for cat, m in messages %}
+                <div class="m-flash {{ cat }}">{{ m }}</div>
+                {% endfor %}
+            {% endif %}
+            {% endwith %}
+
+            <section class="m-card">
+                <h2>New Estimate</h2>
+                <p class="m-sent-to">Results sent to <strong id="user-email-inline">…</strong></p>
+
+                <form action="{{ url_for('submit') }}" method="POST"
+                      enctype="multipart/form-data" id="m-form">
+
+                    <div class="m-group">
+                        <label for="business_name">Business Name</label>
+                        <input type="text" id="business_name" name="business_name"
+                               placeholder="Optional" autocomplete="organization">
+                    </div>
+
+                    <div class="m-group">
+                        <label>Drawings</label>
+                        <div class="m-drop" id="m-drop">
+                            <input type="file" id="m-files-input" name="attachments"
+                                   accept=".pdf,application/pdf" multiple required>
+                            <div class="m-icon">&#128203;</div>
+                            <p>Tap to choose PDFs</p>
+                            <p class="m-hint">PDF only &bull; up to 25 MB each</p>
+                        </div>
+                        <div class="m-files" id="m-file-list"></div>
+                    </div>
+
+                    <div class="m-group">
+                        <label>Scope</label>
+                        <div class="m-toggle-row">
+                            <label class="m-toggle">
+                                <input type="checkbox" name="scope_interior" value="1" checked>
+                                Interior
+                            </label>
+                            <label class="m-toggle">
+                                <input type="checkbox" name="scope_exterior" value="1">
+                                Exterior
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="m-group">
+                        <label>Project Type</label>
+                        <div class="m-toggle-row">
+                            <label class="m-toggle">
+                                <input type="radio" name="project_type" value="new_construction" checked>
+                                New
+                            </label>
+                            <label class="m-toggle">
+                                <input type="radio" name="project_type" value="repaint">
+                                Repaint
+                            </label>
+                        </div>
+                    </div>
+
+                    <div class="m-group">
+                        <label for="scope_notes">Notes</label>
+                        <textarea id="scope_notes" name="scope_notes" rows="2"
+                                  placeholder="e.g., Skip basement"></textarea>
+                    </div>
+
+                    <button type="submit" class="m-submit" id="m-submit-btn">
+                        Submit for Estimate
+                    </button>
+                </form>
+            </section>
+
+            <a href="{{ url_for('index', desktop=1) }}" class="m-foot-link">Switch to desktop view &rarr;</a>
+        </div>
+    </main>
+
+    {% if clerk_publishable_key and clerk_frontend_api_host %}
+    <script>
+    window.__bootClerk = async function() {
+        const Clerk = window.Clerk;
+        await Clerk.load();
+        const status = document.getElementById('auth-status');
+        const signOutLink = document.getElementById('sign-out-link');
+        const app = document.getElementById('m-app');
+        const loading = document.getElementById('m-loading');
+        const emailInline = document.getElementById('user-email-inline');
+
+        if (!Clerk.user) {
+            if (status) status.textContent = 'Sign in';
+            Clerk.openSignIn({
+                afterSignInUrl: window.location.origin + '/mobile',
+                afterSignUpUrl: window.location.origin + '/mobile',
+            });
+            return;
+        }
+
+        const email = Clerk.user.primaryEmailAddress
+            ? Clerk.user.primaryEmailAddress.emailAddress
+            : (Clerk.user.emailAddresses[0] || {}).emailAddress || '';
+
+        if (status) status.textContent = email;
+        if (signOutLink) {
+            signOutLink.style.display = '';
+            signOutLink.addEventListener('click', (e) => {
+                e.preventDefault();
+                Clerk.signOut().then(() => window.location.reload());
+            });
+        }
+        if (emailInline) emailInline.textContent = email;
+        if (loading) loading.style.display = 'none';
+        if (app) app.style.display = '';
+    };
+    </script>
+    <script async crossorigin="anonymous"
+        data-clerk-publishable-key="{{ clerk_publishable_key }}"
+        src="https://{{ clerk_frontend_api_host }}/npm/@clerk/clerk-js@5/dist/clerk.browser.js"
+        onload="window.__bootClerk()"></script>
+    {% endif %}
+
+    <script>
+    (function() {
+        const drop = document.getElementById('m-drop');
+        const input = document.getElementById('m-files-input');
+        const list = document.getElementById('m-file-list');
+        const form = document.getElementById('m-form');
+        const btn = document.getElementById('m-submit-btn');
+
+        ['dragenter','dragover'].forEach(evt =>
+            drop.addEventListener(evt, e => { e.preventDefault(); drop.classList.add('drag-over'); }));
+        ['dragleave','drop'].forEach(evt =>
+            drop.addEventListener(evt, e => { e.preventDefault(); drop.classList.remove('drag-over'); }));
+        drop.addEventListener('drop', e => {
+            if (e.dataTransfer.files.length > 0) { input.files = e.dataTransfer.files; render(); }
+        });
+        input.addEventListener('change', render);
+
+        function render() {
+            list.innerHTML = '';
+            for (const f of input.files) {
+                const sizeMB = (f.size / 1048576).toFixed(1);
+                const isPDF = f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf');
+                const row = document.createElement('div');
+                row.className = 'm-file';
+                row.innerHTML = '<span class="m-name">' + (isPDF ? '' : '&#9888; ') + f.name + '</span>' +
+                                '<span class="m-size">' + sizeMB + ' MB</span>';
+                if (!isPDF) row.style.borderLeft = '3px solid #dc2626';
+                list.appendChild(row);
+            }
+        }
+
+        form.addEventListener('submit', () => {
+            if (btn.disabled) return false;
+            btn.disabled = true;
+            btn.innerHTML = '<span class="spinner"></span>Uploading…';
+        });
+    })();
+    </script>
+</body>
+</html>
