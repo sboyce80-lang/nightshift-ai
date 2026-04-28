@@ -200,6 +200,10 @@
             margin-right: 6px;
         }
         @keyframes m-spin { to { transform: rotate(360deg); } }
+        /* NOTE: #m-app is hidden via inline style on the element itself
+           (not a CSS rule) so that JS can show it by clearing the inline
+           value — `el.style.display = ''` only clears inline overrides,
+           it does NOT override a CSS rule. Bit me on the first deploy. */
         .m-flash {
             padding: 10px 12px;
             border-radius: 8px;
@@ -225,7 +229,6 @@
             text-decoration: none;
         }
         .m-foot-link:hover { color: #93c5fd; }
-        #m-app { display: none; }
         .m-loading {
             text-align: center;
             padding: 60px 20px;
@@ -252,7 +255,7 @@
     <main class="m-main">
         <div id="m-loading" class="m-loading">Signing you in…</div>
 
-        <div id="m-app">
+        <div id="m-app" style="display:none;">
             {% with messages = get_flashed_messages(with_categories=true) %}
             {% if messages %}
                 {% for cat, m in messages %}
