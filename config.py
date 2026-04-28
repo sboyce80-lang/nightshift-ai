@@ -434,6 +434,14 @@ BETA_DAILY_SUBMISSION_CAP_DEFAULT = int(
     os.environ.get("BETA_DAILY_SUBMISSION_CAP_DEFAULT", "5")
 )
 
+# Admins — comma-separated lowercase emails. Admins can prioritize jobs
+# (jump to front of queue) on the /jobs page.
+ADMIN_EMAILS = frozenset(
+    e.strip().lower()
+    for e in os.environ.get("ADMIN_EMAILS", "").split(",")
+    if e.strip()
+)
+
 # Object Storage (Cloudflare R2 — S3-compatible)
 R2_ACCOUNT_ID         = os.environ.get("R2_ACCOUNT_ID", "")
 R2_ACCESS_KEY_ID      = os.environ.get("R2_ACCESS_KEY_ID", "")

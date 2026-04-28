@@ -31,7 +31,7 @@ from flask import request, redirect, g, jsonify, abort
 
 from config import (
     CLERK_SECRET_KEY, CLERK_PUBLISHABLE_KEY,
-    CLERK_AUTHORIZED_PARTIES,
+    CLERK_AUTHORIZED_PARTIES, ADMIN_EMAILS,
 )
 from db import session_scope
 from models import User
@@ -269,3 +269,10 @@ def current_user_id() -> int:
     if uid is None:
         raise RuntimeError("current_user_id() called outside @require_auth")
     return uid
+
+
+def is_admin(user) -> bool:
+    """True if `user.email` is in ADMIN_EMAILS (case-insensitive). user may be None."""
+    if not user or not user.email:
+        return False
+    return user.email.lower() in ADMIN_EMAILS
