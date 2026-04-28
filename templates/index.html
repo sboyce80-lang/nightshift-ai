@@ -167,6 +167,8 @@
         async
         crossorigin="anonymous"
         data-clerk-publishable-key="{{ clerk_publishable_key }}"
+        data-clerk-is-satellite="true"
+        data-clerk-domain="{{ request.host }}"
         src="https://{{ clerk_frontend_api_host }}/npm/@clerk/clerk-js@5/dist/clerk.browser.js"
         type="text/javascript"
         onload="window.__bootClerk()"></script>
