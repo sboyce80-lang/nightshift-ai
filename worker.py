@@ -13,6 +13,7 @@ For production on Render, point the Background Worker service at this script.
 
 import os
 import sys
+import uuid
 import logging
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -42,9 +43,24 @@ logger = logging.getLogger("nightshift.worker")
 def main():
     conn = Redis.from_url(REDIS_URL)
     queue = Queue(RQ_QUEUE_NAME, connection=conn)
-    worker = Worker([queue], connection=conn, name=f"nightshift-{os.getpid()}")
-    logger.info("Worker started (queue=%s, redis=%s, pid=%d)",
-                RQ_QUEUE_NAME, REDIS_URL, os.getpid())
+
+    # Sweep stale registrations from prior containers whose death wasn't
+    # recorded (Render redeploys can collide on PID-based names). RQ marks
+    # workers dead if they haven't heartbeated within their TTL.
+    try:
+        for stale in Worker.all(connection=conn):
+            if not stale.is_alive():
+                stale.register_death()
+                logger.info("Cleaned stale worker: %s", stale.name)
+    except Exception as exc:
+        logger.warning("Stale-worker sweep failed (non-fatal): %s", exc)
+
+    # Unique name per startup so a stale registration from a prior container
+    # can never block a new one.
+    worker_name = f"nightshift-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    worker = Worker([queue], connection=conn, name=worker_name)
+    logger.info("Worker started (name=%s, queue=%s, redis=%s)",
+                worker_name, RQ_QUEUE_NAME, REDIS_URL)
     worker.work(with_scheduler=False)
 
 
