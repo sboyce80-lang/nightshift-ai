@@ -375,7 +375,7 @@ EMAIL_SMTP_PORT     = int(os.environ.get("EMAIL_SMTP_PORT", "587"))
 EMAIL_WATCH_FOLDER  = os.environ.get("EMAIL_WATCH_FOLDER", "INBOX")
 EMAIL_POLL_INTERVAL = int(os.environ.get("EMAIL_POLL_INTERVAL", "60"))
 EMAIL_SUBJECT_FILTER = os.environ.get("EMAIL_SUBJECT_FILTER", "")
-MAX_PDF_SIZE_MB     = 25
+MAX_PDF_SIZE_MB     = 200
 MAX_PDFS_PER_EMAIL  = 10
 
 # Image-Based Schedule Extraction
