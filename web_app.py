@@ -27,6 +27,7 @@ Usage:
 
 import os
 import sys
+import json
 import uuid
 import logging
 import tempfile
@@ -142,14 +143,74 @@ def _inject_clerk_context():
 # Routes
 # ---------------------------------------------------------------------------
 
+def _effective_user_overrides(user):
+    """Build {rate_key: float, markup: float} reflecting the user's saved
+    overrides over the global PRICING_MODEL defaults. Used to pre-fill the
+    inline pricing table on the New Estimate page."""
+    from config import PRICING_MODEL  # local import — avoid module-level cost
+
+    # Map RATE_FIELDS shorthand -> PRICING_MODEL key (mirrors Takeoff_DIRECT).
+    _rate_map = {
+        "wall_rate":     "gyp_walls",
+        "ceiling_rate":  "gyp_ceilings",
+        "door_rate":     "doors_full_paint",
+        "window_rate":   "windows",
+        "trim_rate":     "base_trim",
+        "stair_rate":    "stairs",
+        "cmu_rate":      "cmu_walls_full",
+        "dryfall_rate":  "dryfall_ceiling",
+        "concrete_rate": "concrete_sealer",
+        "column_rate":   "painted_columns",
+    }
+    saved = (user.pricing_overrides or {}) if user else {}
+    saved_rates = saved.get("rates") or {}
+    saved_markup = saved.get("markup")
+
+    rates = {}
+    for shorthand, _label, _unit, _default in RATE_FIELDS:
+        if shorthand in saved_rates:
+            rates[shorthand] = float(saved_rates[shorthand])
+        else:
+            pm_key = _rate_map.get(shorthand)
+            tiers = (PRICING_MODEL.get(pm_key) or {}).get("tiers") or []
+            rates[shorthand] = float(tiers[0]["rate"]) if tiers else 0.0
+
+    markup = float(saved_markup) if saved_markup is not None else 0.06
+    return rates, markup
+
+
 @app.route("/")
 def index():
     """Public landing — Clerk.js handles auth client-side and bootstraps the
     session cookie via the dev-mode handshake. The form is hidden by JS
     until Clerk confirms a signed-in user. Server-side auth is enforced on
-    /submit and /jobs/<id>, which only fire after the cookie is in place.
+    /submit and /api/jobs/<id>, which only fire after the cookie is in place.
+
+    Pricing context is fetched server-side too — but unauthenticated callers
+    get the global defaults (Clerk-protected pages will refuse data fetch).
     """
-    return render_template("index.html")
+    user = None
+    try:
+        from auth import _read_session_token, verify_session, AuthError
+        token = _read_session_token()
+        try:
+            claims = verify_session(token)
+            clerk_uid = claims.get("sub")
+            if clerk_uid:
+                with session_scope() as session:
+                    user = session.query(User).filter(User.clerk_user_id == clerk_uid).one_or_none()
+        except AuthError:
+            pass
+    except Exception:
+        pass
+
+    rates, markup = _effective_user_overrides(user)
+    return render_template(
+        "index.html",
+        rate_fields=RATE_FIELDS,
+        effective_rates=rates,
+        effective_markup=markup,
+    )
 
 
 @app.route("/submit", methods=["POST"])
@@ -251,10 +312,37 @@ def submit():
             pass
         return redirect(url_for("index"))
 
-    # 5. Load any saved pricing overrides for this user.
+    # 5. Build pricing overrides for this submission.
+    #    Start from the user's saved profile, then merge any per-job
+    #    overrides posted from the inline pricing table (rate__<key>).
     with session_scope() as session:
         user = session.get(User, user_id)
         rate_overrides = _flatten_overrides(user.pricing_overrides) if user else None
+
+    per_job = {}
+    for key, _label, _unit, _default in RATE_FIELDS:
+        raw = (request.form.get(f"rate__{key}") or "").strip()
+        if not raw:
+            continue
+        try:
+            v = float(raw)
+            if 0 <= v <= 100000:
+                per_job[key] = v
+        except ValueError:
+            pass
+
+    raw_markup = (request.form.get("rate__markup") or "").strip()
+    if raw_markup:
+        try:
+            mv = float(raw_markup)
+            if 0 <= mv <= 1:
+                per_job["markup"] = mv
+        except ValueError:
+            pass
+
+    if per_job:
+        rate_overrides = dict(rate_overrides or {})
+        rate_overrides.update(per_job)
 
     # 6. Enqueue the job.
     pdf_keys = [k for (_, k, _) in uploaded_files]
@@ -307,23 +395,49 @@ def submit():
 @app.route("/jobs", methods=["GET"])
 @require_auth
 def jobs_list():
-    """Render the user's submission history (HTML)."""
+    """Render the user's submission history (HTML).
+
+    Filtered by query string `status`:
+        active     -> queued + processing (default)
+        completed  -> completed + failed
+    """
     uid = current_user_id()
+    status_filter = (request.args.get("status") or "active").lower()
+    if status_filter == "completed":
+        wanted = ("completed", "failed")
+    else:
+        wanted = ("queued", "processing")
+        status_filter = "active"
+
     rows = []
     with session_scope() as session:
         subs = (session.query(Submission)
                 .filter(Submission.user_id == uid)
+                .filter(Submission.status.in_(wanted))
                 .order_by(Submission.submitted_at.desc())
                 .limit(100).all())
         for s in subs:
+            results = []
+            if s.status == "completed":
+                for f in s.files:
+                    if f.kind == "result":
+                        try:
+                            results.append({
+                                "filename": f.filename,
+                                "url": storage.presigned_download_url(f.r2_key),
+                            })
+                        except Exception as exc:
+                            logger.warning("Could not sign URL for %s: %s", f.r2_key, exc)
             rows.append({
                 "id": s.id,
+                "business_name": s.business_name,
                 "submitted_at": s.submitted_at,
                 "status": s.status,
                 "subtotal": float(s.subtotal) if s.subtotal is not None else None,
                 "upload_count": sum(1 for f in s.files if f.kind == "upload"),
+                "results": results,
             })
-    return render_template("jobs.html", submissions=rows)
+    return render_template("jobs.html", submissions=rows, status_filter=status_filter)
 
 
 @app.route("/jobs/<submission_id>", methods=["GET"])
@@ -382,6 +496,43 @@ def job_status_api(submission_id):
     if not payload["error"] and rq_error:
         payload["error"] = rq_error
     return jsonify(payload)
+
+
+@app.route("/api/jobs/<submission_id>/result", methods=["GET"])
+@require_auth
+def job_result_api(submission_id):
+    """Return the parsed cost_estimate (line_items + subtotal) from the
+    submission's result JSON in R2. Used by the Completed tab to render
+    an editable line-item breakdown without exposing the full result blob.
+    """
+    with session_scope() as session:
+        sub = session.get(Submission, submission_id)
+        if sub is None or sub.user_id != current_user_id():
+            return jsonify({"error": "not found"}), 404
+        if sub.status != "completed":
+            return jsonify({"error": "not completed"}), 409
+
+        json_files = [f for f in sub.files
+                      if f.kind == "result" and f.filename.lower().endswith(".json")]
+        if not json_files:
+            return jsonify({"error": "result JSON not found"}), 404
+        # Most recent result JSON wins if there are multiples.
+        json_file = sorted(json_files, key=lambda f: f.id, reverse=True)[0]
+        r2_key = json_file.r2_key
+
+    try:
+        raw = storage.get_bytes(r2_key)
+        data = json.loads(raw)
+    except Exception as exc:
+        logger.error("Failed to load result JSON %s: %s", r2_key, exc)
+        return jsonify({"error": "failed to load result"}), 500
+
+    ce = data.get("cost_estimate") or {}
+    return jsonify({
+        "line_items": ce.get("line_items") or [],
+        "subtotal": ce.get("subtotal"),
+        "exclusions": ce.get("exclusions") or [],
+    })
 
 
 @app.route("/pricing", methods=["GET", "POST"])

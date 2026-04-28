@@ -6,39 +6,44 @@
     <title>Job {{ submission_id[:8] }} &mdash; Knight Shift</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
-<body>
-    <div class="auth-bar" style="display:flex;justify-content:space-between;align-items:center;gap:12px;padding:8px 16px;background:#0f172a;color:#e2e8f0;font-size:13px;">
-        <div>
-            <a href="{{ url_for('jobs_list') }}" style="color:#93c5fd;text-decoration:none;">&larr; My Jobs</a>
-        </div>
-        <span id="auth-status">Loading…</span>
-    </div>
-    <header class="hero hero-compact">
-        <div class="hero-content">
-            <h1>Estimate Status</h1>
-            <p class="subtitle">Submission <code style="background:rgba(255,255,255,0.12);padding:2px 8px;border-radius:4px;font-size:0.85em;">{{ submission_id }}</code></p>
-        </div>
-    </header>
-    <main class="form-container">
-        <section class="form-section">
-            <h2>Status: <span id="status-pill" class="status-pill">loading…</span></h2>
-            <p id="status-msg" style="color:#475569;">Checking…</p>
-            <div style="height:8px;background:#e2e8f0;border-radius:4px;overflow:hidden;margin-top:12px;">
-                <div id="progress-fill" style="height:100%;width:0;background:linear-gradient(90deg,#1a6fb5,#2ecc71);transition:width .4s;"></div>
-            </div>
-        </section>
-        <section class="form-section" id="results-section" style="display:none;">
-            <h2>Results</h2>
-            <p>Subtotal: <strong id="subtotal-display" style="color:#0a2540;font-size:1.4rem;">—</strong></p>
-            <ul id="result-files" style="list-style:none;padding:0;"></ul>
-        </section>
-        <section class="form-section" id="error-section" style="display:none;">
-            <h2 style="color:#dc2626;">Error</h2>
-            <pre id="error-text" style="white-space:pre-wrap;color:#dc2626;background:#fef2f2;padding:12px;border-radius:6px;"></pre>
-        </section>
-    </main>
+<body class="dark-theme">
+    {% set active_tab = 'detail' %}
+    {% include "_nav.html" %}
 
-    <footer><p>&copy; 2026 Knight Shift &mdash; Forged by Willpower</p></footer>
+    <div class="page-shell">
+        <main id="main-content" style="display:none;margin-top:28px;">
+            <section class="panel">
+                <h2>Estimate Status</h2>
+                <p class="panel-subtle">
+                    Submission <code style="background:rgba(255,255,255,0.07);padding:2px 8px;border-radius:4px;font-size:0.85em;color:#cbd5e1;">{{ submission_id }}</code>
+                </p>
+
+                <div style="display:flex;align-items:center;gap:16px;margin-top:18px;">
+                    <span style="color:#cbd5e1;">Status:</span>
+                    <span id="status-pill" class="status-pill">loading…</span>
+                </div>
+                <p id="status-msg" style="color:rgba(203,213,225,0.85);margin-top:12px;">Checking…</p>
+                <div style="height:8px;background:rgba(8,18,32,0.7);border-radius:4px;overflow:hidden;margin-top:14px;">
+                    <div id="progress-fill" style="height:100%;width:0;background:linear-gradient(90deg,#1a6fb5,#2ecc71);transition:width .4s;"></div>
+                </div>
+            </section>
+
+            <section class="panel" id="results-section" style="display:none;margin-top:20px;">
+                <h2>Results</h2>
+                <p style="color:#cbd5e1;font-size:1.1rem;">Subtotal: <strong id="subtotal-display" style="color:var(--accent-green);font-size:1.6rem;">—</strong></p>
+                <ul id="result-files" style="list-style:none;padding:0;margin-top:12px;"></ul>
+            </section>
+
+            <section class="panel" id="error-section" style="display:none;margin-top:20px;border-color:rgba(220,38,38,0.4);">
+                <h2 style="color:#f87171;">Error</h2>
+                <pre id="error-text" style="white-space:pre-wrap;color:#fecaca;background:rgba(127,29,29,0.25);padding:14px;border-radius:6px;"></pre>
+            </section>
+        </main>
+    </div>
+
+    <footer style="text-align:center;padding:20px;color:rgba(203,213,225,0.5);font-size:0.85rem;">
+        &copy; 2026 Knight Shift &mdash; Forged by Willpower
+    </footer>
 
     {% if clerk_publishable_key and clerk_frontend_api_host %}
     <script>
@@ -46,7 +51,11 @@
         const Clerk = window.Clerk;
         await Clerk.load();
         const status = document.getElementById('auth-status');
+        const signOutLink = document.getElementById('sign-out-link');
+        const main = document.getElementById('main-content');
+        const tabStrip = document.getElementById('tab-strip');
         if (!Clerk.user) {
+            if (status) status.textContent = 'Sign in to continue';
             Clerk.openSignIn({ afterSignInUrl: window.location.href });
             return;
         }
@@ -54,6 +63,15 @@
             ? Clerk.user.primaryEmailAddress.emailAddress
             : (Clerk.user.emailAddresses[0] || {}).emailAddress || '';
         if (status) status.textContent = email;
+        if (signOutLink) {
+            signOutLink.style.display = '';
+            signOutLink.addEventListener('click', (e) => {
+                e.preventDefault();
+                Clerk.signOut().then(() => window.location.reload());
+            });
+        }
+        if (main) main.style.display = '';
+        if (tabStrip) tabStrip.style.display = '';
         startPolling();
     };
     </script>
@@ -62,7 +80,10 @@
         src="https://{{ clerk_frontend_api_host }}/npm/@clerk/clerk-js@5/dist/clerk.browser.js"
         onload="window.__bootClerk()"></script>
     {% else %}
-    <script>document.addEventListener('DOMContentLoaded', startPolling);</script>
+    <script>document.addEventListener('DOMContentLoaded', () => {
+        document.getElementById('main-content').style.display = '';
+        startPolling();
+    });</script>
     {% endif %}
 
     <script>
@@ -87,9 +108,7 @@
         if (d.status === "completed") {
             document.getElementById("results-section").style.display = "";
             document.getElementById("subtotal-display").textContent =
-                d.subtotal != null
-                    ? "$" + d.subtotal.toLocaleString(undefined, {maximumFractionDigits: 0})
-                    : "—";
+                d.subtotal != null ? "$" + d.subtotal.toLocaleString(undefined, {maximumFractionDigits: 0}) : "—";
             const ul = document.getElementById("result-files");
             ul.innerHTML = "";
             (d.results || []).forEach(f => {
@@ -97,9 +116,9 @@
                 li.style.padding = "8px 0";
                 const a = document.createElement("a");
                 a.href = f.url;
-                a.textContent = f.filename;
+                a.textContent = "⬇ " + f.filename;
                 a.target = "_blank";
-                a.style.color = "#1a6fb5";
+                a.style.color = "#93c5fd";
                 a.style.fontWeight = "500";
                 li.appendChild(a);
                 ul.appendChild(li);
@@ -117,9 +136,7 @@
             if (!res.ok) throw new Error(`HTTP ${res.status}`);
             const data = await res.json();
             render(data);
-            if (TERMINAL.has(data.status)) {
-                clearInterval(pollTimer);
-            }
+            if (TERMINAL.has(data.status)) clearInterval(pollTimer);
         } catch (e) {
             document.getElementById("status-msg").textContent = "Lost connection — retrying…";
         }

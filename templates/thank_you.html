@@ -122,7 +122,7 @@
             const headers = token ? { 'Authorization': 'Bearer ' + token } : {};
             let res;
             try {
-                res = await fetch('/jobs/' + submissionId, { headers, credentials: 'same-origin' });
+                res = await fetch('/api/jobs/' + submissionId, { headers, credentials: 'same-origin' });
             } catch (err) {
                 statusEl.textContent = 'Connection lost. Retrying...';
                 return setTimeout(poll, 5000);

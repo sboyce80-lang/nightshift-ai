@@ -1,0 +1,32 @@
+{# Shared header: brand bar with auth status + tab strip. Included in all
+   authenticated pages. Caller passes `active_tab` as one of:
+       new | active | completed | pricing | detail
+#}
+<div class="brand-bar">
+    <div class="brand-bar-inner">
+        <a href="{{ url_for('index') }}" class="brand-mark">
+            <img src="{{ url_for('static', filename='logo_helm_sm.png') }}" alt="Knight Shift" class="brand-logo">
+            <div class="brand-text">
+                <strong>Knight&nbsp;Shift</strong>
+                <span class="brand-tagline">Forged by Willpower</span>
+            </div>
+        </a>
+        <div class="brand-spacer"></div>
+        <span id="auth-status" class="brand-auth">Loading…</span>
+        <a href="#" id="sign-out-link" class="brand-signout" style="display:none;">Sign out</a>
+    </div>
+    <nav class="tab-strip" id="tab-strip" style="display:none;">
+        <a href="{{ url_for('index') }}" class="tab {% if active_tab == 'new' %}tab-active{% endif %}">
+            <span class="tab-icon">&#9999;&#65039;</span> New Estimate
+        </a>
+        <a href="{{ url_for('jobs_list', status='active') }}" class="tab {% if active_tab == 'active' %}tab-active{% endif %}">
+            <span class="tab-icon">&#128202;</span> Active &amp; Queued
+        </a>
+        <a href="{{ url_for('jobs_list', status='completed') }}" class="tab {% if active_tab == 'completed' %}tab-active{% endif %}">
+            <span class="tab-icon">&#128193;</span> Completed
+        </a>
+        <a href="{{ url_for('pricing_settings') }}" class="tab {% if active_tab == 'pricing' %}tab-active{% endif %}">
+            <span class="tab-icon">&#128176;</span> Pricing Defaults
+        </a>
+    </nav>
+</div>

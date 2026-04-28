@@ -6,132 +6,144 @@
     <title>Knight Shift &mdash; Forged by Willpower</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
-<body>
-    <div class="auth-bar" style="display:flex;justify-content:space-between;align-items:center;gap:12px;padding:8px 16px;background:#0f172a;color:#e2e8f0;font-size:13px;">
-        <div id="nav-links" style="display:none;">
-            <a href="{{ url_for('jobs_list') }}" style="color:#93c5fd;text-decoration:none;margin-right:12px;">My Jobs</a>
-            <a href="{{ url_for('pricing_settings') }}" style="color:#93c5fd;text-decoration:none;">Pricing</a>
-        </div>
-        <div style="display:flex;align-items:center;gap:12px;margin-left:auto;">
-            <span id="auth-status">Loading…</span>
-            <a href="#" id="sign-out-link" style="display:none;color:#93c5fd;text-decoration:underline;">Sign out</a>
-        </div>
+<body class="dark-theme">
+    {% set active_tab = 'new' %}
+    {% include "_nav.html" %}
+
+    <div class="page-shell">
+        <section class="hero-banner">
+            <img src="{{ url_for('static', filename='logo_helm.png') }}" alt="Knight Shift helm" class="banner-logo">
+            <div>
+                <h1><span class="brand-name-light">Knight</span> <span class="brand-name-white">Shift</span></h1>
+                <p class="banner-tagline">Forged by Willpower</p>
+            </div>
+        </section>
+
+        <main id="main-content" style="display:none;">
+            {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}<div class="flash-messages">
+                {% for cat, m in messages %}<div class="flash flash-{{cat}}">{{m}}</div>{% endfor %}
+            </div>{% endif %}
+            {% endwith %}
+
+            <div class="two-col">
+                <!-- LEFT: New Estimate form -->
+                <section class="panel">
+                    <h2>New Estimate</h2>
+                    <form action="{{ url_for('submit') }}" method="POST"
+                          enctype="multipart/form-data" id="rfp-form">
+
+                        <div class="form-group">
+                            <label for="business_name">Business Name</label>
+                            <input type="text" id="business_name" name="business_name"
+                                   placeholder="Company name (optional)">
+                        </div>
+
+                        <p style="margin:0 0 14px 0;color:rgba(203,213,225,0.7);font-size:0.85rem;">
+                            Estimate will be sent to <strong id="user-email-inline" style="color:#fff;">…</strong>
+                        </p>
+
+                        <div class="form-group">
+                            <label for="attachments">Upload Method</label>
+                            <div class="file-upload-area" id="drop-zone">
+                                <input type="file" id="attachments" name="attachments"
+                                       accept=".pdf,application/pdf" multiple required>
+                                <div class="upload-icon">&#128203;</div>
+                                <p>Drag &amp; drop PDF files here, or click to browse</p>
+                                <p class="file-hint">PDF only &bull; Up to 25 MB each &bull; Max 10 files</p>
+                            </div>
+                            <div id="file-list"></div>
+                        </div>
+
+                        <div class="form-group">
+                            <label>Scope</label>
+                            <div class="checkbox-row">
+                                <label class="check-label">
+                                    <input type="checkbox" name="scope_interior" value="1" checked> Interior
+                                </label>
+                                <label class="check-label">
+                                    <input type="checkbox" name="scope_exterior" value="1"> Exterior
+                                </label>
+                            </div>
+                        </div>
+
+                        <div class="form-group">
+                            <label>Project Type</label>
+                            <div class="checkbox-row">
+                                <label class="check-label">
+                                    <input type="radio" name="project_type" value="new_construction" checked> New Construction
+                                </label>
+                                <label class="check-label">
+                                    <input type="radio" name="project_type" value="repaint"> Repaint
+                                </label>
+                            </div>
+                        </div>
+
+                        <div class="form-group">
+                            <label for="scope_notes">Additional Notes</label>
+                            <textarea id="scope_notes" name="scope_notes" rows="2"
+                                      placeholder="e.g., Skip basement, residential floors only..."></textarea>
+                        </div>
+
+                        <!-- Per-job pricing overrides (hidden inputs auto-populated from the right panel) -->
+                        {% for key, _label, _unit, _default in rate_fields %}
+                        <input type="hidden" name="rate__{{ key }}" id="hidden_{{ key }}" value="">
+                        {% endfor %}
+                        <input type="hidden" name="rate__markup" id="hidden_markup" value="">
+
+                        <button type="submit" class="submit-btn dark-submit-btn" id="submit-btn">
+                            Submit for Estimate
+                        </button>
+                    </form>
+                </section>
+
+                <!-- RIGHT: Pricing — Rates & Markups (per-job override) -->
+                <section class="panel" id="pricing-panel">
+                    <h2>Pricing &mdash; Rates &amp; Markups</h2>
+                    <p class="panel-subtle">
+                        These are the rates Rider Painting uses for estimates. Adjust any values below &mdash; changes apply to this job only.
+                        <a href="{{ url_for('pricing_settings') }}" style="color:#93c5fd;">Edit account defaults &rarr;</a>
+                    </p>
+
+                    <table class="pricing-table">
+                        <thead>
+                            <tr>
+                                <th>Item</th>
+                                <th>Unit</th>
+                                <th class="num-col">Rate ($)</th>
+                                <th class="num-col">Markup (%)</th>
+                            </tr>
+                        </thead>
+                        <tbody>
+                            {% for key, label, unit, default in rate_fields %}
+                            <tr>
+                                <td>{{ label }}</td>
+                                <td class="unit-cell">/{{ unit }}</td>
+                                <td class="num-cell">
+                                    <input type="number" step="0.01" min="0"
+                                           class="rate-input"
+                                           data-key="{{ key }}"
+                                           data-default="{{ effective_rates.get(key, default) }}"
+                                           value="{{ effective_rates.get(key, default) }}">
+                                </td>
+                                <td class="num-cell">
+                                    <input type="number" step="0.1" min="0" max="100"
+                                           class="markup-input"
+                                           data-key="{{ key }}"
+                                           data-default="{{ (effective_markup * 100)|round(1) }}"
+                                           value="{{ (effective_markup * 100)|round(1) }}">
+                                </td>
+                            </tr>
+                            {% endfor %}
+                        </tbody>
+                    </table>
+                </section>
+            </div>
+        </main>
     </div>
-    <header class="hero">
-        <div class="hero-content">
-            <div class="hero-logo-wrap">
-                <img src="{{ url_for('static', filename='logo_helm.png') }}" alt="Knight Shift helm" class="hero-logo">
-                <div class="hero-text-overlay">
-                    <h1>Knight&nbsp;Shift</h1>
-                    <p class="tagline">Forged by Willpower</p>
-                </div>
-            </div>
-            <p class="subtitle">AI-powered painting estimates from architectural drawings &mdash; delivered in minutes, not days.</p>
-            <p class="trust-line">Powered by Rider Painting &mdash; 30+ years of commercial &amp; residential painting experience</p>
-        </div>
-    </header>
 
-    <section class="how-it-works">
-        <div class="steps-row">
-            <div class="step">
-                <div class="step-icon">&#128203;</div>
-                <h3>1. Upload PDFs</h3>
-                <p>Drop your architectural drawings &mdash; floor plans, schedules, elevations</p>
-            </div>
-            <div class="step-arrow">&#8594;</div>
-            <div class="step">
-                <div class="step-icon">&#128736;</div>
-                <h3>2. AI Measures</h3>
-                <p>Every room, wall, door, and window is extracted and measured automatically</p>
-            </div>
-            <div class="step-arrow">&#8594;</div>
-            <div class="step">
-                <div class="step-icon">&#128233;</div>
-                <h3>3. Estimate Delivered</h3>
-                <p>Line-item pricing with labor hours lands in your inbox in minutes</p>
-            </div>
-        </div>
-    </section>
-
-    <main class="form-container" id="form-container" style="display:none;">
-        {% with messages = get_flashed_messages(with_categories=true) %}
-        {% if messages %}
-        <div class="flash-messages">
-            {% for category, message in messages %}
-            <div class="flash flash-{{ category }}">{{ message }}</div>
-            {% endfor %}
-        </div>
-        {% endif %}
-        {% endwith %}
-
-        <form action="{{ url_for('submit') }}" method="POST"
-              enctype="multipart/form-data" id="rfp-form">
-
-            <section class="form-section">
-                <h2>Contact Information</h2>
-                <p style="margin:0 0 12px 0;color:#475569;">Estimate will be sent to <strong id="user-email-inline">…</strong></p>
-                <div class="form-group">
-                    <label for="business_name">Business Name</label>
-                    <input type="text" id="business_name" name="business_name"
-                           placeholder="Company name (optional)">
-                </div>
-            </section>
-
-            <section class="form-section">
-                <h2>Project Documents</h2>
-                <div class="form-group">
-                    <label for="attachments">Upload RFP PDFs *</label>
-                    <div class="file-upload-area" id="drop-zone">
-                        <input type="file" id="attachments" name="attachments"
-                               accept=".pdf,application/pdf" multiple required>
-                        <div class="upload-icon">&#128203;</div>
-                        <p>Drag &amp; drop PDF files here, or click to browse</p>
-                        <p class="file-hint">PDF files only &bull; Up to 200 MB each &bull; Maximum 10 files</p>
-                    </div>
-                    <div id="file-list"></div>
-                </div>
-            </section>
-
-            <section class="form-section">
-                <h2>Project Details</h2>
-                <div class="form-group">
-                    <label>Scope *</label>
-                    <div class="checkbox-row">
-                        <label class="check-label">
-                            <input type="checkbox" name="scope_interior" value="1" checked> Interior
-                        </label>
-                        <label class="check-label">
-                            <input type="checkbox" name="scope_exterior" value="1"> Exterior
-                        </label>
-                    </div>
-                </div>
-                <div class="form-group">
-                    <label>Project Type</label>
-                    <div class="checkbox-row">
-                        <label class="check-label">
-                            <input type="radio" name="project_type" value="new_construction" checked> New Construction
-                        </label>
-                        <label class="check-label">
-                            <input type="radio" name="project_type" value="repaint"> Repaint
-                        </label>
-                    </div>
-                </div>
-                <div class="form-group">
-                    <label for="scope_notes">Additional Notes</label>
-                    <textarea id="scope_notes" name="scope_notes" rows="2"
-                              placeholder="e.g., Skip basement and mechanical rooms, residential floors only..."></textarea>
-                    <p class="field-hint">Optional &mdash; anything else to help focus the estimate.</p>
-                </div>
-            </section>
-
-            <button type="submit" class="submit-btn" id="submit-btn">
-                Submit for Estimate
-            </button>
-        </form>
-    </main>
-
-    <footer>
-        <p>&copy; 2026 Knight Shift &mdash; Forged by Willpower</p>
+    <footer style="text-align:center;padding:20px;color:rgba(203,213,225,0.5);font-size:0.85rem;">
+        &copy; 2026 Knight Shift &mdash; Forged by Willpower
     </footer>
 
     {% if clerk_publishable_key and clerk_frontend_api_host %}
@@ -141,7 +153,8 @@
         await Clerk.load();
         const status = document.getElementById('auth-status');
         const signOutLink = document.getElementById('sign-out-link');
-        const formContainer = document.getElementById('form-container');
+        const main = document.getElementById('main-content');
+        const tabStrip = document.getElementById('tab-strip');
         const emailInline = document.getElementById('user-email-inline');
 
         if (!Clerk.user) {
@@ -158,30 +171,27 @@
             : (Clerk.user.emailAddresses[0] || {}).emailAddress || '';
         const name = [Clerk.user.firstName, Clerk.user.lastName].filter(Boolean).join(' ') || email;
 
-        if (status) status.innerHTML = 'Signed in as <strong>' + name + '</strong> &lt;' + email + '&gt;';
+        if (status) status.textContent = email;
         if (signOutLink) {
-            signOutLink.style.display = 'inline';
+            signOutLink.style.display = '';
             signOutLink.addEventListener('click', (e) => {
                 e.preventDefault();
                 Clerk.signOut().then(() => window.location.reload());
             });
         }
         if (emailInline) emailInline.textContent = email;
-        if (formContainer) formContainer.style.display = '';
-        const navLinks = document.getElementById('nav-links');
-        if (navLinks) navLinks.style.display = '';
+        if (main) main.style.display = '';
+        if (tabStrip) tabStrip.style.display = '';
     };
     </script>
-    <script
-        async
-        crossorigin="anonymous"
+    <script async crossorigin="anonymous"
         data-clerk-publishable-key="{{ clerk_publishable_key }}"
         src="https://{{ clerk_frontend_api_host }}/npm/@clerk/clerk-js@5/dist/clerk.browser.js"
-        type="text/javascript"
         onload="window.__bootClerk()"></script>
     {% endif %}
 
     <script>
+    // Drag-drop, file list, and pricing-table change tracking
     (function() {
         const dropZone = document.getElementById('drop-zone');
         const fileInput = document.getElementById('attachments');
@@ -189,66 +199,66 @@
         const submitBtn = document.getElementById('submit-btn');
         const form = document.getElementById('rfp-form');
 
-        // Drag & drop highlighting
-        ['dragenter', 'dragover'].forEach(evt => {
-            dropZone.addEventListener(evt, function(e) {
-                e.preventDefault();
-                e.stopPropagation();
-                dropZone.classList.add('drag-over');
-            });
+        ['dragenter','dragover'].forEach(evt =>
+            dropZone.addEventListener(evt, e => { e.preventDefault(); dropZone.classList.add('drag-over'); }));
+        ['dragleave','drop'].forEach(evt =>
+            dropZone.addEventListener(evt, e => { e.preventDefault(); dropZone.classList.remove('drag-over'); }));
+        dropZone.addEventListener('drop', e => {
+            if (e.dataTransfer.files.length > 0) { fileInput.files = e.dataTransfer.files; updateFileList(); }
         });
-
-        ['dragleave', 'drop'].forEach(evt => {
-            dropZone.addEventListener(evt, function(e) {
-                e.preventDefault();
-                e.stopPropagation();
-                dropZone.classList.remove('drag-over');
-            });
-        });
-
-        dropZone.addEventListener('drop', function(e) {
-            const dt = e.dataTransfer;
-            if (dt.files.length > 0) {
-                fileInput.files = dt.files;
-                updateFileList();
-            }
-        });
-
-        // Display file list on selection
         fileInput.addEventListener('change', updateFileList);
 
         function updateFileList() {
             fileList.innerHTML = '';
-            const files = fileInput.files;
-            if (!files || files.length === 0) return;
-
-            for (let i = 0; i < files.length; i++) {
-                const file = files[i];
-                const sizeMB = (file.size / (1024 * 1024)).toFixed(1);
-                const isPDF = file.type === 'application/pdf' ||
-                              file.name.toLowerCase().endsWith('.pdf');
-
+            for (const f of fileInput.files) {
+                const sizeMB = (f.size / 1048576).toFixed(1);
+                const isPDF = f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf');
                 const item = document.createElement('div');
                 item.className = 'file-item';
-                item.innerHTML =
-                    '<span class="file-name">' +
-                    (isPDF ? '' : '&#9888; ') +
-                    file.name + '</span>' +
-                    '<span class="file-size">' + sizeMB + ' MB</span>';
-
-                if (!isPDF) {
-                    item.style.borderLeft = '3px solid #dc2626';
-                }
+                item.innerHTML = '<span class="file-name">' + (isPDF ? '' : '&#9888; ') + f.name + '</span>' +
+                                 '<span class="file-size">' + sizeMB + ' MB</span>';
+                if (!isPDF) item.style.borderLeft = '3px solid #dc2626';
                 fileList.appendChild(item);
             }
         }
 
-        // Prevent double submit + show spinner
-        form.addEventListener('submit', function() {
+        // Pricing override sync — only post values that differ from default.
+        function syncOverrides() {
+            document.querySelectorAll('.rate-input').forEach(inp => {
+                const def = parseFloat(inp.dataset.default);
+                const cur = parseFloat(inp.value);
+                const hidden = document.getElementById('hidden_' + inp.dataset.key);
+                if (!isNaN(cur) && Math.abs(cur - def) > 0.001) {
+                    hidden.value = cur;
+                    inp.classList.add('pricing-edited');
+                } else {
+                    hidden.value = '';
+                    inp.classList.remove('pricing-edited');
+                }
+            });
+            // Markup is a single global override — use the first changed value.
+            let markupOverride = '';
+            document.querySelectorAll('.markup-input').forEach(inp => {
+                const def = parseFloat(inp.dataset.default);
+                const cur = parseFloat(inp.value);
+                if (!isNaN(cur) && Math.abs(cur - def) > 0.01) {
+                    markupOverride = (cur / 100).toFixed(4);
+                    inp.classList.add('pricing-edited');
+                } else {
+                    inp.classList.remove('pricing-edited');
+                }
+            });
+            document.getElementById('hidden_markup').value = markupOverride;
+        }
+        document.querySelectorAll('.rate-input, .markup-input').forEach(inp => {
+            inp.addEventListener('input', syncOverrides);
+        });
+
+        form.addEventListener('submit', () => {
+            syncOverrides();
             if (submitBtn.disabled) return false;
             submitBtn.disabled = true;
-            submitBtn.innerHTML =
-                '<span class="spinner"></span> Uploading...';
+            submitBtn.innerHTML = '<span class="spinner"></span> Uploading...';
         });
     })();
     </script>

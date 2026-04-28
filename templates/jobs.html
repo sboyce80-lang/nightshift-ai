@@ -3,60 +3,109 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>My Jobs &mdash; Knight Shift</title>
+    <title>{% if status_filter == 'completed' %}Completed{% else %}Active &amp; Queued{% endif %} &mdash; Knight Shift</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
 </head>
-<body>
-    <div class="auth-bar" style="display:flex;justify-content:space-between;align-items:center;gap:12px;padding:8px 16px;background:#0f172a;color:#e2e8f0;font-size:13px;">
-        <div>
-            <a href="{{ url_for('index') }}" style="color:#93c5fd;text-decoration:none;margin-right:12px;">New Estimate</a>
-            <a href="{{ url_for('jobs_list') }}" style="color:#fff;text-decoration:none;margin-right:12px;font-weight:600;">My Jobs</a>
-            <a href="{{ url_for('pricing_settings') }}" style="color:#93c5fd;text-decoration:none;">Pricing</a>
-        </div>
-        <span id="auth-status">Loading…</span>
+<body class="dark-theme">
+    {% set active_tab = 'completed' if status_filter == 'completed' else 'active' %}
+    {% include "_nav.html" %}
+
+    <div class="page-shell">
+        <main id="main-content" style="display:none;">
+            {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}<div class="flash-messages" style="margin-top:24px;">
+                {% for cat, m in messages %}<div class="flash flash-{{cat}}">{{m}}</div>{% endfor %}
+            </div>{% endif %}
+            {% endwith %}
+
+            <section class="panel" style="margin-top:28px;">
+                <h2>
+                    {% if status_filter == 'completed' %}Completed Jobs{% else %}Active &amp; Queued{% endif %}
+                    <span style="color:rgba(203,213,225,0.6);font-weight:400;font-size:0.95rem;">
+                        ({{ submissions|length }})
+                    </span>
+                </h2>
+
+                {% if not submissions %}
+                <div class="empty-state">
+                    <div class="empty-icon">{% if status_filter == 'completed' %}&#128193;{% else %}&#9203;{% endif %}</div>
+                    <p>
+                        {% if status_filter == 'completed' %}
+                            No completed jobs yet.
+                        {% else %}
+                            No jobs in flight. <a href="{{ url_for('index') }}" style="color:#93c5fd;">Submit a new estimate &rarr;</a>
+                        {% endif %}
+                    </p>
+                </div>
+                {% else %}
+                {% for s in submissions %}
+                <div class="job-card" data-submission-id="{{ s.id }}">
+                    <div class="job-card-head">
+                        <div>
+                            <strong style="color:#fff;font-size:1.02rem;">
+                                {{ s.business_name or 'Submission' }}
+                            </strong>
+                            <span class="job-card-id" style="margin-left:8px;">{{ s.id[:8] }}</span>
+                        </div>
+                        <span class="status-pill status-{{ s.status }}">{{ s.status }}</span>
+                    </div>
+                    <div class="job-card-meta">
+                        <span>&#128197; <strong>{{ s.submitted_at.strftime('%b %d, %Y %H:%M') if s.submitted_at else '—' }}</strong></span>
+                        <span>&#128196; {{ s.upload_count }} file{{ '' if s.upload_count == 1 else 's' }}</span>
+                        {% if s.subtotal is not none %}
+                        <span>&#128176; <strong>${{ "{:,.0f}".format(s.subtotal) }}</strong></span>
+                        {% endif %}
+                    </div>
+
+                    <div class="job-card-actions">
+                        <a class="btn-link" href="{{ url_for('job_detail', submission_id=s.id) }}">View status &rarr;</a>
+                        {% if status_filter == 'completed' and s.status == 'completed' %}
+                        <button type="button" class="btn-secondary toggle-breakdown" data-submission-id="{{ s.id }}">
+                            Show breakdown &amp; adjust pricing
+                        </button>
+                        {% endif %}
+                        {% for f in s.results %}
+                        <a class="btn-link" href="{{ f.url }}" target="_blank">&#11015; {{ f.filename }}</a>
+                        {% endfor %}
+                    </div>
+
+                    {% if status_filter == 'completed' and s.status == 'completed' %}
+                    <div class="breakdown-wrap" id="breakdown-{{ s.id }}">
+                        <p class="panel-subtle" style="margin-bottom:10px;">
+                            Edit any rate or markup to recalculate this estimate. Changes are previewed instantly.
+                        </p>
+                        <div class="breakdown-loading">Loading line items…</div>
+                        <table class="breakdown-table" style="display:none;">
+                            <thead>
+                                <tr>
+                                    <th>Item</th>
+                                    <th class="num">Qty</th>
+                                    <th class="num">Rate ($)</th>
+                                    <th class="num">Markup (%)</th>
+                                    <th class="num">Total</th>
+                                </tr>
+                            </thead>
+                            <tbody></tbody>
+                        </table>
+                        <div class="breakdown-totals" style="display:none;">
+                            <span class="label">Adjusted subtotal</span>
+                            <span>
+                                <span class="original"></span>
+                                <span class="adjusted">$0</span>
+                            </span>
+                        </div>
+                    </div>
+                    {% endif %}
+                </div>
+                {% endfor %}
+                {% endif %}
+            </section>
+        </main>
     </div>
-    <header class="hero hero-compact">
-        <div class="hero-content">
-            <h1>My Jobs</h1>
-            <p class="subtitle">Recent submissions and their status.</p>
-        </div>
-    </header>
-    <main class="form-container">
-        {% with messages = get_flashed_messages(with_categories=true) %}
-        {% if messages %}<div class="flash-messages">
-            {% for cat, m in messages %}<div class="flash flash-{{cat}}">{{m}}</div>{% endfor %}
-        </div>{% endif %}
-        {% endwith %}
 
-        {% if not submissions %}
-            <p style="text-align:center;color:#475569;">No submissions yet. <a href="{{ url_for('index') }}">Submit your first PDF &rarr;</a></p>
-        {% else %}
-        <table class="jobs-table">
-            <thead>
-                <tr>
-                    <th>Submitted</th>
-                    <th>Files</th>
-                    <th>Status</th>
-                    <th>Subtotal</th>
-                    <th></th>
-                </tr>
-            </thead>
-            <tbody>
-            {% for s in submissions %}
-                <tr>
-                    <td>{{ s.submitted_at.strftime('%Y-%m-%d %H:%M') if s.submitted_at else '—' }}</td>
-                    <td>{{ s.upload_count }}</td>
-                    <td><span class="status-pill status-{{ s.status }}">{{ s.status }}</span></td>
-                    <td>{% if s.subtotal is not none %}${{ "{:,.0f}".format(s.subtotal) }}{% else %}—{% endif %}</td>
-                    <td><a href="{{ url_for('job_detail', submission_id=s.id) }}">View &rarr;</a></td>
-                </tr>
-            {% endfor %}
-            </tbody>
-        </table>
-        {% endif %}
-    </main>
-
-    <footer><p>&copy; 2026 Knight Shift &mdash; Forged by Willpower</p></footer>
+    <footer style="text-align:center;padding:20px;color:rgba(203,213,225,0.5);font-size:0.85rem;">
+        &copy; 2026 Knight Shift &mdash; Forged by Willpower
+    </footer>
 
     {% if clerk_publishable_key and clerk_frontend_api_host %}
     <script>
@@ -64,7 +113,11 @@
         const Clerk = window.Clerk;
         await Clerk.load();
         const status = document.getElementById('auth-status');
+        const signOutLink = document.getElementById('sign-out-link');
+        const main = document.getElementById('main-content');
+        const tabStrip = document.getElementById('tab-strip');
         if (!Clerk.user) {
+            if (status) status.textContent = 'Sign in to continue';
             Clerk.openSignIn({ afterSignInUrl: window.location.href });
             return;
         }
@@ -72,6 +125,15 @@
             ? Clerk.user.primaryEmailAddress.emailAddress
             : (Clerk.user.emailAddresses[0] || {}).emailAddress || '';
         if (status) status.textContent = email;
+        if (signOutLink) {
+            signOutLink.style.display = '';
+            signOutLink.addEventListener('click', (e) => {
+                e.preventDefault();
+                Clerk.signOut().then(() => window.location.reload());
+            });
+        }
+        if (main) main.style.display = '';
+        if (tabStrip) tabStrip.style.display = '';
     };
     </script>
     <script async crossorigin="anonymous"
@@ -79,5 +141,108 @@
         src="https://{{ clerk_frontend_api_host }}/npm/@clerk/clerk-js@5/dist/clerk.browser.js"
         onload="window.__bootClerk()"></script>
     {% endif %}
+
+    <script>
+    // Breakdown expand + live recalc
+    (function() {
+        const cache = {};
+
+        function fmtMoney(n) {
+            return "$" + Number(n).toLocaleString(undefined, {maximumFractionDigits: 0});
+        }
+
+        async function loadBreakdown(subId, wrap) {
+            if (cache[subId]) return cache[subId];
+            const res = await fetch(`/api/jobs/${subId}/result`, { credentials: "same-origin" });
+            if (!res.ok) throw new Error("HTTP " + res.status);
+            const data = await res.json();
+            cache[subId] = data;
+            return data;
+        }
+
+        function renderRows(wrap, items, originalSubtotal) {
+            const tbody = wrap.querySelector("tbody");
+            tbody.innerHTML = "";
+            items.forEach((li, idx) => {
+                // Derive rate and markup_pct from the saved cost/qty/markup.
+                // qty=0 items are skipped (zero contribution).
+                const qty = Number(li.qty) || 0;
+                const cost = Number(li.cost) || 0;
+                const markup = Number(li.markup) || 0;
+                const rate = qty > 0 ? cost / qty : 0;
+                const markupPct = cost > 0 ? (markup / cost) * 100 : 6.0;
+                const total = Number(li.total) || 0;
+
+                if (qty === 0) return; // skip zero rows for clarity
+
+                const tr = document.createElement("tr");
+                tr.dataset.qty = qty;
+                tr.dataset.origRate = rate;
+                tr.dataset.origMarkupPct = markupPct;
+                tr.dataset.origTotal = total;
+                // Strip the "@ $X" annotation from the item label for cleaner display.
+                const cleanLabel = (li.item || "").split(" - ")[0];
+                tr.innerHTML = `
+                    <td>${cleanLabel}</td>
+                    <td class="num">${qty.toLocaleString()}</td>
+                    <td class="num"><input type="number" step="0.01" min="0" class="rate" value="${rate.toFixed(2)}"></td>
+                    <td class="num"><input type="number" step="0.1" min="0" max="100" class="markup" value="${markupPct.toFixed(1)}"></td>
+                    <td class="num total">${fmtMoney(total)}</td>
+                `;
+                tbody.appendChild(tr);
+            });
+
+            const totalsBar = wrap.querySelector(".breakdown-totals");
+            const adjustedEl = totalsBar.querySelector(".adjusted");
+            const originalEl = totalsBar.querySelector(".original");
+            originalEl.textContent = fmtMoney(originalSubtotal);
+            adjustedEl.textContent = fmtMoney(originalSubtotal);
+
+            function recalc() {
+                let sum = 0;
+                let anyEdited = false;
+                tbody.querySelectorAll("tr").forEach(tr => {
+                    const qty = Number(tr.dataset.qty);
+                    const rate = Number(tr.querySelector(".rate").value) || 0;
+                    const markupPct = Number(tr.querySelector(".markup").value) || 0;
+                    const newTotal = qty * rate * (1 + markupPct / 100);
+                    tr.querySelector(".total").textContent = fmtMoney(newTotal);
+                    sum += newTotal;
+
+                    const edited =
+                        Math.abs(rate - Number(tr.dataset.origRate)) > 0.001 ||
+                        Math.abs(markupPct - Number(tr.dataset.origMarkupPct)) > 0.05;
+                    tr.classList.toggle("row-edited", edited);
+                    if (edited) anyEdited = true;
+                });
+                adjustedEl.textContent = fmtMoney(sum);
+                originalEl.style.display = anyEdited ? "" : "none";
+            }
+            tbody.querySelectorAll("input").forEach(inp => inp.addEventListener("input", recalc));
+            wrap.querySelector(".breakdown-table").style.display = "";
+            totalsBar.style.display = "";
+            recalc();
+        }
+
+        document.querySelectorAll(".toggle-breakdown").forEach(btn => {
+            btn.addEventListener("click", async () => {
+                const subId = btn.dataset.submissionId;
+                const wrap = document.getElementById(`breakdown-${subId}`);
+                const expanded = wrap.classList.toggle("expanded");
+                btn.textContent = expanded ? "Hide breakdown" : "Show breakdown & adjust pricing";
+                if (!expanded) return;
+
+                const loading = wrap.querySelector(".breakdown-loading");
+                try {
+                    const data = await loadBreakdown(subId, wrap);
+                    loading.style.display = "none";
+                    renderRows(wrap, data.line_items || [], data.subtotal || 0);
+                } catch (e) {
+                    loading.textContent = "Failed to load: " + e.message;
+                }
+            });
+        });
+    })();
+    </script>
 </body>
 </html>
