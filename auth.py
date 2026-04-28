@@ -217,31 +217,13 @@ def require_auth(view_func):
         if not clerk_user_id:
             abort(401)
 
-        import sys, os
-        env_secret = os.environ.get("CLERK_SECRET_KEY", "")
-        from config import CLERK_SECRET_KEY as cfg_secret
-        debug_msg = (
-            f"!!! REQ DEBUG sub={clerk_user_id!r} "
-            f"env_secret_len={len(env_secret)} env_secret_pfx={env_secret[:12]!r} "
-            f"cfg_secret_len={len(cfg_secret)} cfg_secret_pfx={cfg_secret[:12]!r} "
-            f"pid={os.getpid()}"
-        )
-        print(debug_msg, file=sys.stdout, flush=True)
-        sys.stdout.flush()
-        # Also log via Flask's logger which gunicorn captures
-        from flask import current_app
-        current_app.logger.warning(debug_msg)
         try:
             g.clerk_user_id = clerk_user_id
             g.clerk_claims = claims
             g.user_id = _sync_user(clerk_user_id)
         except Exception as exc:
-            import traceback
-            print(f"!!! USER SYNC FAILED for {clerk_user_id!r}: {exc!r}", file=sys.stderr, flush=True)
-            traceback.print_exc(file=sys.stderr)
-            sys.stderr.flush()
             logger.error("User sync failed for %s: %s", clerk_user_id, exc, exc_info=True)
-            return jsonify({"error": str(exc) or "user provisioning failed"}), 500
+            return jsonify({"error": "user provisioning failed"}), 500
 
         return view_func(*args, **kwargs)
     return wrapper
