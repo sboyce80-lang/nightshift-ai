@@ -235,7 +235,7 @@ def index():
     if _is_mobile_ua() and request.args.get("desktop") != "1":
         return redirect(url_for("mobile"))
 
-    user = None
+    rates, markup = _effective_user_overrides(None)
     try:
         from auth import _read_session_token, verify_session, AuthError
         token = _read_session_token()
@@ -245,12 +245,13 @@ def index():
             if clerk_uid:
                 with session_scope() as session:
                     user = session.query(User).filter(User.clerk_user_id == clerk_uid).one_or_none()
+                    if user is not None:
+                        rates, markup = _effective_user_overrides(user)
         except AuthError:
             pass
     except Exception:
         pass
 
-    rates, markup = _effective_user_overrides(user)
     return render_template(
         "index.html",
         rate_fields=RATE_FIELDS,
@@ -760,11 +761,23 @@ def too_large(e):
     return redirect(url_for("index"))
 
 
+_ERROR_500_HTML = """<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8">
+<title>Something went wrong &mdash; Knight Shift</title>
+<link rel="stylesheet" href="/static/style.css"></head>
+<body class="dark-theme">
+<main class="page-shell" style="display:flex;align-items:center;justify-content:center;min-height:80vh;">
+<div style="text-align:center;color:#cbd5e1;max-width:480px;padding:2rem;">
+<h1 style="color:#fff;margin-bottom:0.5rem;">Something went wrong</h1>
+<p>The server hit an unexpected error. Try again, or contact support if it keeps happening.</p>
+<p style="margin-top:1.5rem;"><a href="/" style="color:#60a5fa;">Return home</a></p>
+</div></main></body></html>"""
+
+
 @app.errorhandler(500)
 def server_error(e):
-    logger.error("500 error: %s", e)
-    flash("Something went wrong. Please try again.", "error")
-    return redirect(url_for("index"))
+    logger.error("500 error: %s", e, exc_info=True)
+    return _ERROR_500_HTML, 500
 
 
 # ---------------------------------------------------------------------------
