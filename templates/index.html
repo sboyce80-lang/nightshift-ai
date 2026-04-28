@@ -139,13 +139,14 @@
         const emailInline = document.getElementById('user-email-inline');
 
         if (!Clerk.user) {
-            // Not signed in — bounce to Clerk's hosted sign-in.
-            const returnTo = encodeURIComponent(window.location.origin + '/');
-            window.location = '{{ clerk_sign_in_url }}?redirect_url=' + returnTo;
+            if (status) status.textContent = 'Sign in to continue';
+            Clerk.openSignIn({
+                afterSignInUrl: window.location.origin + '/',
+                afterSignUpUrl: window.location.origin + '/',
+            });
             return;
         }
 
-        // Signed in — populate UI.
         const email = Clerk.user.primaryEmailAddress
             ? Clerk.user.primaryEmailAddress.emailAddress
             : (Clerk.user.emailAddresses[0] || {}).emailAddress || '';
@@ -156,7 +157,7 @@
             signOutLink.style.display = 'inline';
             signOutLink.addEventListener('click', (e) => {
                 e.preventDefault();
-                Clerk.signOut().then(() => { window.location = '{{ clerk_sign_in_url }}'; });
+                Clerk.signOut().then(() => window.location.reload());
             });
         }
         if (emailInline) emailInline.textContent = email;
@@ -167,8 +168,6 @@
         async
         crossorigin="anonymous"
         data-clerk-publishable-key="{{ clerk_publishable_key }}"
-        data-clerk-is-satellite="true"
-        data-clerk-domain="{{ request.host }}"
         src="https://{{ clerk_frontend_api_host }}/npm/@clerk/clerk-js@5/dist/clerk.browser.js"
         type="text/javascript"
         onload="window.__bootClerk()"></script>
