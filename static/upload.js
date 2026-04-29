@@ -21,7 +21,10 @@
     'use strict';
 
     const MAX_PARALLEL_PARTS = 3;       // concurrent PUTs per file
-    const PART_RETRY_LIMIT = 3;          // retry a failed part this many times before giving up
+    const PART_RETRY_LIMIT = 6;          // retry a failed part this many times before giving up
+    // Backoff between retries, in ms. Capped at 30s so a flaky link gets time
+    // to recover without the user staring at a frozen progress bar forever.
+    const RETRY_BACKOFF_MS = [1000, 2000, 4000, 8000, 16000, 30000];
 
     function putPart(url, blob, onProgress) {
         return new Promise((resolve, reject) => {
@@ -36,29 +39,63 @@
                     // The ETag is a quoted hex string; we forward it as-is.
                     const etag = xhr.getResponseHeader('ETag');
                     if (!etag) {
-                        reject(new Error('R2 did not return an ETag header — check bucket CORS (must expose ETag).'));
+                        const err = new Error('R2 did not return an ETag header — check bucket CORS (must expose ETag).');
+                        err.kind = 'cors';
+                        reject(err);
                         return;
                     }
                     resolve(etag);
                 } else {
-                    reject(new Error(`Part upload failed (HTTP ${xhr.status}). ${xhr.responseText || ''}`.trim()));
+                    const body = (xhr.responseText || '').slice(0, 200);
+                    // R2 returns 403 with "Request has expired" when a presigned
+                    // URL has aged out — recoverable by re-minting the URL.
+                    const expired = xhr.status === 403 && /expired/i.test(body);
+                    const err = new Error(`HTTP ${xhr.status}${body ? ': ' + body : ''}`);
+                    err.kind = expired ? 'expired' : 'http';
+                    err.status = xhr.status;
+                    reject(err);
                 }
             };
-            xhr.onerror = () => reject(new Error('Network error during part upload.'));
-            xhr.onabort = () => reject(new Error('Part upload aborted.'));
+            xhr.onerror = () => {
+                const err = new Error('connection dropped');
+                err.kind = 'network';
+                reject(err);
+            };
+            xhr.onabort = () => {
+                const err = new Error('aborted');
+                err.kind = 'aborted';
+                reject(err);
+            };
             xhr.send(blob);
         });
     }
 
-    async function putPartWithRetry(url, blob, onProgress) {
+    /**
+     * Try a part with retries. `refreshUrl` is an async fn returning a fresh
+     * presigned URL — called before each retry so we recover from URL expiry
+     * automatically. Network/connection errors also trigger a refresh, since
+     * a long sleep between retries can itself push the URL past expiry.
+     */
+    async function putPartWithRetry(url, blob, onProgress, refreshUrl) {
         let lastErr;
+        let currentUrl = url;
         for (let attempt = 1; attempt <= PART_RETRY_LIMIT; attempt++) {
             try {
-                return await putPart(url, blob, onProgress);
+                return await putPart(currentUrl, blob, onProgress);
             } catch (err) {
                 lastErr = err;
-                // Backoff: 1s, 2s, 4s.
-                await new Promise(r => setTimeout(r, 1000 * Math.pow(2, attempt - 1)));
+                err.attempt = attempt;
+                // CORS misconfig and user-aborted uploads are not worth retrying.
+                if (err.kind === 'cors' || err.kind === 'aborted') throw err;
+                if (attempt >= PART_RETRY_LIMIT) break;
+
+                // Re-mint the URL before the next attempt. Best-effort — if the
+                // refresh itself fails, fall back to the URL we already have.
+                if (refreshUrl) {
+                    try { currentUrl = await refreshUrl(); } catch (_) { /* keep old URL */ }
+                }
+                const delay = RETRY_BACKOFF_MS[Math.min(attempt - 1, RETRY_BACKOFF_MS.length - 1)];
+                await new Promise(r => setTimeout(r, delay));
             }
         }
         throw lastErr;
@@ -97,11 +134,20 @@
                     const end = Math.min(file.size, start + partSize);
                     const blob = file.slice(start, end);
                     const expectedBytes = end - start;
+                    const totalParts = desc.parts.length;
+                    const refreshUrl = async () => {
+                        const r = await postJSON('/api/uploads/presign-part', {
+                            key: desc.key,
+                            upload_id: desc.upload_id,
+                            part_number: partInfo.part_number,
+                        });
+                        return r.url;
+                    };
                     partsInFlight++;
                     putPartWithRetry(partInfo.url, blob, (loaded) => {
                         partProgress[idx] = Math.min(loaded, expectedBytes);
                         reportProgress();
-                    }).then((etag) => {
+                    }, refreshUrl).then((etag) => {
                         partProgress[idx] = expectedBytes;
                         reportProgress();
                         completedParts.push({ part_number: partInfo.part_number, etag });
@@ -112,11 +158,35 @@
                         } else {
                             launchNext();
                         }
-                    }).catch(fail);
+                    }).catch((err) => {
+                        // Annotate so the top-level handler can produce a useful message.
+                        err.filename = file.name;
+                        err.partNumber = partInfo.part_number;
+                        err.totalParts = totalParts;
+                        fail(err);
+                    });
                 }
             };
             launchNext();
         });
+    }
+
+    function describeUploadError(err) {
+        const where = (err.filename && err.partNumber)
+            ? ` for ${err.filename} (part ${err.partNumber}/${err.totalParts})`
+            : '';
+        const tries = err.attempt ? ` after ${err.attempt} attempt${err.attempt === 1 ? '' : 's'}` : '';
+        const reason = (() => {
+            switch (err.kind) {
+                case 'network':  return 'connection dropped — please check your network and try again.';
+                case 'expired':  return 'upload link expired. Please refresh the page and re-upload.';
+                case 'cors':     return err.message;
+                case 'http':     return `server rejected the upload (${err.message}).`;
+                case 'aborted':  return 'upload was cancelled.';
+                default:         return err.message || String(err);
+            }
+        })();
+        return `Upload failed${where}${tries}: ${reason}`;
     }
 
     async function postJSON(path, body) {
@@ -240,8 +310,9 @@
                 inFlight = false;
                 if (wasRequired) fileInput.setAttribute('required', '');
                 fileInput.disabled = false;
-                if (opts.onError) opts.onError(err.message || String(err));
-                else alert('Upload failed: ' + (err.message || err));
+                const msg = describeUploadError(err);
+                if (opts.onError) opts.onError(msg);
+                else alert(msg);
             }
         });
     }

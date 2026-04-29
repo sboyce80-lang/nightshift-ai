@@ -29,7 +29,7 @@ from config import (
 # Presigned upload-part URLs are short-lived — they only need to live long
 # enough for the browser to finish uploading one part. Cap at 1 hour to keep
 # leaked URLs useless quickly while still allowing for very slow connections.
-PRESIGN_UPLOAD_PART_EXPIRY = 3600
+PRESIGN_UPLOAD_PART_EXPIRY = 21600  # 6h — long enough that slow connections don't expire mid-upload
 
 logger = logging.getLogger("nightshift.storage")
 

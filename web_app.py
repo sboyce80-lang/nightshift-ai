@@ -561,6 +561,37 @@ def api_uploads_abort():
     return jsonify({"ok": True})
 
 
+@app.route("/api/uploads/presign-part", methods=["POST"])
+@require_auth
+def api_uploads_presign_part():
+    """Re-mint a presigned URL for a single part so the browser can recover
+    from URL expiry mid-upload without restarting the whole file."""
+    payload = request.get_json(silent=True) or {}
+    key = (payload.get("key") or "").strip()
+    upload_id = (payload.get("upload_id") or "").strip()
+    try:
+        part_number = int(payload.get("part_number") or 0)
+    except (TypeError, ValueError):
+        return jsonify({"error": "Invalid part_number."}), 400
+
+    if not key or not upload_id or part_number < 1:
+        return jsonify({"error": "Missing key, upload_id, or part_number."}), 400
+    if not _validate_submission_key(key):
+        return jsonify({"error": "Invalid key."}), 400
+
+    try:
+        url = storage.presign_upload_part(key, upload_id, part_number)
+    except storage.StorageNotConfigured as exc:
+        logger.error("R2 not configured: %s", exc)
+        return jsonify({"error": "Storage is not configured."}), 500
+    except Exception as exc:
+        logger.error("uploads/presign-part failed (key %s, part %d): %s",
+                     key, part_number, exc, exc_info=True)
+        return jsonify({"error": "Could not refresh URL."}), 500
+
+    return jsonify({"url": url})
+
+
 @app.route("/submit", methods=["POST"])
 @require_auth
 def submit():
@@ -925,6 +956,7 @@ def jobs_list():
                 "id": s.id,
                 "business_name": s.business_name,
                 "submitted_at": s.submitted_at,
+                "deadline": s.deadline,
                 "status": s.status,
                 "subtotal": float(s.subtotal) if s.subtotal is not None else None,
                 "upload_count": sum(1 for f in s.files if f.kind == "upload"),
