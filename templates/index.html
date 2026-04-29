@@ -50,9 +50,11 @@
                                        accept=".pdf,application/pdf" multiple required>
                                 <div class="upload-icon">&#128203;</div>
                                 <p>Drag &amp; drop PDF files here, or click to browse</p>
-                                <p class="file-hint">PDF only &bull; Up to 25 MB each &bull; Max 10 files</p>
+                                <p class="file-hint">PDF only &bull; Up to 600 MB each &bull; Max 10 files</p>
                             </div>
                             <div id="file-list"></div>
+                            <div id="upload-progress" style="display:none;margin-top:10px;font-size:0.85rem;color:rgba(203,213,225,0.85);"></div>
+                            <input type="hidden" name="uploaded_manifest" id="uploaded_manifest" value="">
                         </div>
 
                         <div class="form-group">
@@ -169,6 +171,7 @@
         onload="window.__bootClerk()"></script>
     {% endif %}
 
+    <script src="{{ url_for('static', filename='upload.js') }}"></script>
     <script>
     // Drag-drop, file list, and pricing-table change tracking
     (function() {
@@ -233,12 +236,46 @@
             inp.addEventListener('input', syncOverrides);
         });
 
+        // Sync pricing overrides BEFORE the upload driver intercepts submit,
+        // so the hidden rate__* fields are populated by the time the form
+        // actually POSTs.
         form.addEventListener('submit', () => {
             syncOverrides();
-            if (submitBtn.disabled) return false;
+            if (submitBtn.disabled) return;
             submitBtn.disabled = true;
             submitBtn.innerHTML = '<span class="spinner"></span> Uploading...';
-        });
+        }, { capture: true });
+
+        // Wire browser-direct R2 multipart upload. The driver intercepts
+        // submit, uploads to R2, populates #uploaded_manifest, then re-submits
+        // the form normally. If JS is disabled or the driver fails to load,
+        // the form falls back to the legacy multipart path on the server.
+        const progressEl = document.getElementById('upload-progress');
+        const fileSizes = [];
+        function refreshProgress(idx, bytes, total) {
+            fileSizes[idx] = { bytes, total, name: fileInput.files[idx] && fileInput.files[idx].name };
+            const lines = fileSizes.map(f => f
+                ? `${f.name}: ${(f.bytes / 1048576).toFixed(1)} / ${(f.total / 1048576).toFixed(1)} MB`
+                : null).filter(Boolean);
+            progressEl.style.display = '';
+            progressEl.textContent = lines.join('  •  ');
+        }
+        if (window.NSUpload) {
+            window.NSUpload.driveAndSubmit(form, fileInput, {
+                onProgress: refreshProgress,
+                onPhase: (text) => {
+                    progressEl.style.display = '';
+                    progressEl.textContent = text;
+                },
+                onError: (msg) => {
+                    progressEl.style.display = '';
+                    progressEl.style.color = '#fca5a5';
+                    progressEl.textContent = 'Upload failed: ' + msg;
+                    submitBtn.disabled = false;
+                    submitBtn.innerHTML = 'Submit for Estimate';
+                },
+            });
+        }
     })();
     </script>
 </body>

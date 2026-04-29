@@ -382,8 +382,13 @@ EMAIL_SUBJECT_FILTER = os.environ.get("EMAIL_SUBJECT_FILTER", "")
 RESEND_API_KEY    = os.environ.get("RESEND_API_KEY", "")
 RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "")
 RESEND_FROM_NAME  = os.environ.get("RESEND_FROM_NAME", "Knight Shift")
-MAX_PDF_SIZE_MB     = 200
+MAX_PDF_SIZE_MB     = 600
 MAX_PDFS_PER_EMAIL  = 10
+# Browser-direct R2 multipart upload — split each file into parts of this size
+# so a flaky network only retries the failed slice, not the whole upload.
+# 16 MiB is a sweet spot: 600 MB → ~38 parts (well under the 10,000 part cap),
+# and each part is small enough that a single retry is cheap.
+UPLOAD_PART_SIZE_BYTES = 16 * 1024 * 1024
 
 # Image-Based Schedule Extraction
 ENABLE_IMAGE_SCHEDULE_EXTRACTION = True   # Pre-scan PDFs for schedule pages & render as images

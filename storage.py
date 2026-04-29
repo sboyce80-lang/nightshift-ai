@@ -26,6 +26,11 @@ from config import (
     R2_BUCKET, R2_ENDPOINT_URL, R2_SIGNED_URL_EXPIRY,
 )
 
+# Presigned upload-part URLs are short-lived — they only need to live long
+# enough for the browser to finish uploading one part. Cap at 1 hour to keep
+# leaked URLs useless quickly while still allowing for very slow connections.
+PRESIGN_UPLOAD_PART_EXPIRY = 3600
+
 logger = logging.getLogger("nightshift.storage")
 
 
@@ -147,6 +152,100 @@ def list_prefix(prefix: str) -> Iterable[dict]:
     for page in paginator.paginate(Bucket=R2_BUCKET, Prefix=prefix):
         for obj in page.get("Contents", []) or []:
             yield obj
+
+
+def head_object(key: str) -> dict:
+    """Return HeadObject response (ContentLength, ETag, etc.) or raise."""
+    return get_client().head_object(Bucket=R2_BUCKET, Key=key)
+
+
+# ---------------------------------------------------------------------------
+# Browser-direct multipart upload
+# ---------------------------------------------------------------------------
+#
+# Flow:
+#   1. Server calls create_multipart_upload(key) → upload_id.
+#   2. Server presigns one URL per part via presign_upload_part(...).
+#   3. Browser PUTs each part directly to R2, collecting ETags from response
+#      headers. (The bucket must have CORS configured to expose the ETag
+#      header — see configure_cors() below.)
+#   4. Server calls complete_multipart_upload(key, upload_id, parts) once the
+#      browser reports all parts done.
+#
+# If the browser drops out, server should call abort_multipart_upload(...) —
+# otherwise R2 keeps the partial parts billable. A bucket lifecycle rule that
+# aborts incomplete uploads after 24h is a good belt-and-suspenders.
+
+def create_multipart_upload(key: str, content_type: str = "application/pdf") -> str:
+    """Initiate a multipart upload. Returns the upload_id."""
+    resp = get_client().create_multipart_upload(
+        Bucket=R2_BUCKET, Key=key, ContentType=content_type,
+    )
+    return resp["UploadId"]
+
+
+def presign_upload_part(key: str, upload_id: str, part_number: int) -> str:
+    """Presign a single upload_part PUT URL. Browser PUTs the slice here."""
+    return get_client().generate_presigned_url(
+        "upload_part",
+        Params={
+            "Bucket": R2_BUCKET,
+            "Key": key,
+            "UploadId": upload_id,
+            "PartNumber": part_number,
+        },
+        ExpiresIn=PRESIGN_UPLOAD_PART_EXPIRY,
+    )
+
+
+def complete_multipart_upload(key: str, upload_id: str, parts: list) -> dict:
+    """Finalize a multipart upload.
+
+    `parts` is a list of {"PartNumber": int, "ETag": str} dicts, in order.
+    Returns the CompleteMultipartUpload response.
+    """
+    return get_client().complete_multipart_upload(
+        Bucket=R2_BUCKET,
+        Key=key,
+        UploadId=upload_id,
+        MultipartUpload={"Parts": parts},
+    )
+
+
+def abort_multipart_upload(key: str, upload_id: str) -> None:
+    """Best-effort abort. Swallows errors so callers can use this in cleanup."""
+    try:
+        get_client().abort_multipart_upload(
+            Bucket=R2_BUCKET, Key=key, UploadId=upload_id,
+        )
+    except ClientError as exc:
+        logger.warning("abort_multipart_upload(%s, %s) failed: %s", key, upload_id, exc)
+
+
+def configure_cors(allowed_origins: Iterable[str]) -> None:
+    """One-shot helper: set the bucket CORS policy needed for browser-direct
+    multipart uploads. Run this once after deploying or whenever the allowed
+    origins list changes — e.g.:
+
+        python -c "from storage import configure_cors; \
+            configure_cors(['https://knightshiftai.com', 'http://localhost:8080'])"
+
+    The ETag exposure is the part most people forget — without it, the browser
+    can't read the per-part ETags it needs to send back to complete the upload.
+    """
+    rules = [{
+        "AllowedMethods": ["GET", "PUT", "HEAD"],
+        "AllowedOrigins": list(allowed_origins),
+        "AllowedHeaders": ["*"],
+        "ExposeHeaders": ["ETag"],
+        "MaxAgeSeconds": 3600,
+    }]
+    get_client().put_bucket_cors(
+        Bucket=R2_BUCKET,
+        CORSConfiguration={"CORSRules": rules},
+    )
+    logger.info("CORS configured on bucket %s for origins: %s",
+                R2_BUCKET, list(allowed_origins))
 
 
 def delete_prefix(prefix: str) -> int:

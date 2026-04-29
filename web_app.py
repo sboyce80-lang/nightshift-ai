@@ -49,7 +49,7 @@ from rq.exceptions import NoSuchJobError, InvalidJobOperation
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from config import (
-    MAX_PDF_SIZE_MB, MAX_PDFS_PER_EMAIL,
+    MAX_PDF_SIZE_MB, MAX_PDFS_PER_EMAIL, UPLOAD_PART_SIZE_BYTES,
     WEB_PORT, FLASK_SECRET_KEY,
     REDIS_URL, RQ_QUEUE_FAST, RQ_QUEUE_HEAVY,
     HEAVY_QUEUE_PAGE_THRESHOLD, HEAVY_QUEUE_FILE_MB,
@@ -352,6 +352,205 @@ def mobile():
     return render_template("mobile.html")
 
 
+def _check_submission_gates(user_id):
+    """Run beta-approval + daily-cap gates for the current user. Returns
+    (org_id, error_message). Caller redirects on error_message."""
+    with session_scope() as session:
+        user = session.get(User, user_id)
+        org_id = user.current_organization_id if user else None
+
+    if org_id is None:
+        return None, "Your account is not yet fully set up. Please contact support."
+
+    with session_scope() as session:
+        org = session.get(Organization, org_id)
+        if org is None or not org.is_beta_approved:
+            return org_id, (
+                "Your organization is on the Nightshift AI beta waitlist. "
+                "We'll email you as soon as your access is approved."
+            )
+
+        cap = org.daily_submission_cap or BETA_DAILY_SUBMISSION_CAP_DEFAULT
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        recent_count = (
+            session.query(Submission)
+            .filter(Submission.org_id == org_id, Submission.submitted_at >= cutoff)
+            .count()
+        )
+        if recent_count >= cap:
+            return org_id, (
+                f"Your organization has reached its daily submission limit "
+                f"({cap} per 24 hours). Please try again later or contact support "
+                f"to request a higher limit."
+            )
+
+    return org_id, None
+
+
+@app.route("/api/uploads/init", methods=["POST"])
+@require_auth
+def api_uploads_init():
+    """Issue presigned R2 multipart-upload URLs for browser-direct upload.
+
+    Body: {"files": [{"filename": str, "size": int}, ...]}
+    Returns:
+      {"submission_id": str, "part_size": int,
+       "uploads": [{"filename", "key", "upload_id",
+                    "parts": [{"part_number": int, "url": str}, ...]}, ...]}
+
+    The submission_id is allocated here and used as the R2 prefix so the
+    final /submit call can locate the keys. No DB row is created — keys
+    that are abandoned mid-upload are cleaned up by the bucket lifecycle
+    rule (24h abort on incomplete multipart).
+    """
+    user_id = current_user_id()
+    org_id, err = _check_submission_gates(user_id)
+    if err:
+        # 403 for gate failures, 429 for rate limit. The browser surfaces the
+        # `error` field directly to the user.
+        status = 429 if "limit" in err.lower() else 403
+        return jsonify({"error": err}), status
+
+    payload = request.get_json(silent=True) or {}
+    files_in = payload.get("files") or []
+    if not isinstance(files_in, list) or not files_in:
+        return jsonify({"error": "Missing files."}), 400
+    if len(files_in) > MAX_PDFS_PER_EMAIL:
+        return jsonify({"error": f"Maximum {MAX_PDFS_PER_EMAIL} files allowed."}), 400
+
+    submission_id = str(uuid.uuid4())
+    seen_filenames = set()
+    uploads_resp = []
+
+    try:
+        for idx, entry in enumerate(files_in):
+            raw_name = (entry.get("filename") or "").strip()
+            try:
+                size = int(entry.get("size") or 0)
+            except (TypeError, ValueError):
+                return jsonify({"error": "Invalid file size."}), 400
+
+            if not raw_name:
+                return jsonify({"error": "Missing filename."}), 400
+            if os.path.splitext(raw_name)[1].lower() not in ALLOWED_EXTENSIONS:
+                return jsonify({"error": f"Only PDF files are accepted. Rejected: {raw_name}"}), 400
+            if size <= 0:
+                return jsonify({"error": f"{raw_name}: invalid size."}), 400
+            if size > MAX_PDF_SIZE_MB * 1024 * 1024:
+                return jsonify({"error": f"{raw_name} exceeds the {MAX_PDF_SIZE_MB} MB size limit."}), 400
+
+            filename = secure_filename(raw_name) or f"upload_{idx + 1}.pdf"
+            # Prevent collisions if the user picks two files with the same name.
+            base, ext = os.path.splitext(filename)
+            n = 1
+            while filename in seen_filenames:
+                n += 1
+                filename = f"{base}_{n}{ext}"
+            seen_filenames.add(filename)
+
+            key = storage.upload_key(submission_id, filename)
+            upload_id = storage.create_multipart_upload(key, content_type="application/pdf")
+
+            num_parts = max(1, (size + UPLOAD_PART_SIZE_BYTES - 1) // UPLOAD_PART_SIZE_BYTES)
+            parts = [
+                {"part_number": pn, "url": storage.presign_upload_part(key, upload_id, pn)}
+                for pn in range(1, num_parts + 1)
+            ]
+
+            uploads_resp.append({
+                "filename": filename,
+                "original_filename": raw_name,
+                "key": key,
+                "upload_id": upload_id,
+                "size": size,
+                "parts": parts,
+            })
+    except storage.StorageNotConfigured as exc:
+        logger.error("R2 not configured: %s", exc)
+        return jsonify({"error": "Storage is not configured. Please contact support."}), 500
+    except Exception as exc:
+        logger.error("uploads/init failed for submission %s: %s", submission_id, exc, exc_info=True)
+        # Best-effort: abort any multiparts we already created in this request.
+        for u in uploads_resp:
+            storage.abort_multipart_upload(u["key"], u["upload_id"])
+        return jsonify({"error": "Could not start upload. Please try again."}), 500
+
+    logger.info("uploads/init: user %s org %s submission %s — %d files",
+                user_id, org_id, submission_id, len(uploads_resp))
+    return jsonify({
+        "submission_id": submission_id,
+        "part_size": UPLOAD_PART_SIZE_BYTES,
+        "uploads": uploads_resp,
+    })
+
+
+def _validate_submission_key(key: str) -> bool:
+    """Keys we issue look like submissions/<uuid>/uploads/<filename>. Refuse
+    anything else so a forged /complete or /abort can't touch other prefixes."""
+    return key.startswith("submissions/") and "/uploads/" in key and ".." not in key
+
+
+@app.route("/api/uploads/complete", methods=["POST"])
+@require_auth
+def api_uploads_complete():
+    """Finalize a multipart upload after the browser has PUT every part."""
+    user_id = current_user_id()
+    payload = request.get_json(silent=True) or {}
+    key = (payload.get("key") or "").strip()
+    upload_id = (payload.get("upload_id") or "").strip()
+    parts_in = payload.get("parts") or []
+
+    if not key or not upload_id or not parts_in:
+        return jsonify({"error": "Missing key, upload_id, or parts."}), 400
+    if not _validate_submission_key(key):
+        return jsonify({"error": "Invalid key."}), 400
+
+    try:
+        parts = sorted(
+            [{"PartNumber": int(p["part_number"]), "ETag": str(p["etag"])} for p in parts_in],
+            key=lambda p: p["PartNumber"],
+        )
+    except (KeyError, TypeError, ValueError):
+        return jsonify({"error": "Malformed parts list."}), 400
+
+    try:
+        storage.complete_multipart_upload(key, upload_id, parts)
+        head = storage.head_object(key)
+        size = int(head.get("ContentLength") or 0)
+    except storage.StorageNotConfigured as exc:
+        logger.error("R2 not configured: %s", exc)
+        return jsonify({"error": "Storage is not configured."}), 500
+    except Exception as exc:
+        logger.error("uploads/complete failed (user %s, key %s): %s", user_id, key, exc, exc_info=True)
+        return jsonify({"error": "Could not finalize upload."}), 500
+
+    if size > MAX_PDF_SIZE_MB * 1024 * 1024:
+        # Browser declared a smaller size at init time but uploaded more bytes.
+        # Delete the object and reject — don't let it through to /submit.
+        try:
+            storage.get_client().delete_object(Bucket=storage.R2_BUCKET, Key=key)
+        except Exception:
+            pass
+        return jsonify({
+            "error": f"Uploaded file exceeds the {MAX_PDF_SIZE_MB} MB size limit."
+        }), 400
+
+    return jsonify({"ok": True, "key": key, "size": size})
+
+
+@app.route("/api/uploads/abort", methods=["POST"])
+@require_auth
+def api_uploads_abort():
+    """Best-effort cleanup if the browser cancels mid-upload."""
+    payload = request.get_json(silent=True) or {}
+    key = (payload.get("key") or "").strip()
+    upload_id = (payload.get("upload_id") or "").strip()
+    if not key or not upload_id or not _validate_submission_key(key):
+        return jsonify({"error": "Invalid key or upload_id."}), 400
+    storage.abort_multipart_upload(key, upload_id)
+    return jsonify({"ok": True})
+
+
 @app.route("/submit", methods=["POST"])
 @require_auth
 def submit():
@@ -404,62 +603,133 @@ def submit():
             )
             return redirect(url_for("index"))
 
-    # 2. Get uploaded files
-    files = request.files.getlist("attachments")
-    valid_files = [f for f in files if f.filename and f.filename.strip()]
-
-    if not valid_files:
-        flash("Please upload at least one PDF file.", "error")
-        return redirect(url_for("index"))
-
-    if len(valid_files) > MAX_PDFS_PER_EMAIL:
-        flash(f"Maximum {MAX_PDFS_PER_EMAIL} files allowed.", "error")
-        return redirect(url_for("index"))
-
-    submission_id = str(uuid.uuid4())
-
-    # 3. Stage files locally, validate, push to R2.
+    # 2. Get uploaded files. Two paths:
+    #    (a) New: browser uploaded directly to R2 via /api/uploads/* and posts
+    #        a JSON manifest in the `uploaded_manifest` form field. Files are
+    #        already in R2; we just need to verify and record them.
+    #    (b) Legacy fallback: traditional multipart form with file blobs in
+    #        `attachments`. Used by JS-disabled clients and as a safety net.
     uploaded_files = []   # list of (filename, r2_key, size_bytes)
     total_pages = 0
     max_size_bytes = 0
+    manifest_raw = (request.form.get("uploaded_manifest") or "").strip()
 
-    with tempfile.TemporaryDirectory(prefix=f"ns-{submission_id}-") as staging:
+    if manifest_raw:
+        # ---- (a) Browser-direct upload path ----
         try:
-            for idx, f in enumerate(valid_files):
-                filename = secure_filename(f.filename) or f"upload_{idx + 1}.pdf"
-                ext = os.path.splitext(filename)[1].lower()
-                if ext not in ALLOWED_EXTENSIONS:
-                    flash(f"Only PDF files are accepted. Rejected: {f.filename}", "error")
+            manifest = json.loads(manifest_raw)
+            submission_id = str(manifest["submission_id"])
+            entries = list(manifest["files"])
+        except (ValueError, KeyError, TypeError):
+            flash("Upload manifest was malformed. Please try again.", "error")
+            return redirect(url_for("index"))
+
+        # uuid sanity check — keys we issued always live under
+        # submissions/<uuid>/uploads/, so refuse anything that doesn't fit.
+        try:
+            uuid.UUID(submission_id)
+        except (ValueError, TypeError):
+            flash("Invalid submission id.", "error")
+            return redirect(url_for("index"))
+
+        if not entries:
+            flash("Please upload at least one PDF file.", "error")
+            return redirect(url_for("index"))
+        if len(entries) > MAX_PDFS_PER_EMAIL:
+            flash(f"Maximum {MAX_PDFS_PER_EMAIL} files allowed.", "error")
+            return redirect(url_for("index"))
+
+        try:
+            for entry in entries:
+                filename = str(entry.get("filename") or "").strip()
+                key = str(entry.get("key") or "").strip()
+                if not filename or not key:
+                    flash("Upload manifest is missing fields.", "error")
+                    return redirect(url_for("index"))
+                # Defensive: every key must live under THIS submission's prefix.
+                expected_prefix = storage.submission_prefix(submission_id) + "uploads/"
+                if not key.startswith(expected_prefix):
+                    logger.warning("submit: rejecting key %s outside prefix %s (user %s)",
+                                   key, expected_prefix, user_id)
+                    flash("Upload manifest references an unexpected location.", "error")
                     return redirect(url_for("index"))
 
-                local_path = os.path.join(staging, filename)
-                f.save(local_path)
-
-                size_bytes = os.path.getsize(local_path)
+                head = storage.head_object(key)
+                size_bytes = int(head.get("ContentLength") or 0)
+                if size_bytes <= 0:
+                    flash(f"{filename}: upload appears empty. Please try again.", "error")
+                    return redirect(url_for("index"))
                 if size_bytes > MAX_PDF_SIZE_MB * 1024 * 1024:
                     flash(f"{filename} exceeds the {MAX_PDF_SIZE_MB} MB size limit.", "error")
                     return redirect(url_for("index"))
 
-                total_pages += _count_pdf_pages(local_path)
                 if size_bytes > max_size_bytes:
                     max_size_bytes = size_bytes
-
-                key = storage.upload_key(submission_id, filename)
-                storage.upload_file(local_path, key, content_type="application/pdf")
                 uploaded_files.append((filename, key, size_bytes))
-
         except storage.StorageNotConfigured as exc:
             logger.error("R2 not configured: %s", exc)
             flash("Storage is not configured. Please contact support.", "error")
             return redirect(url_for("index"))
         except Exception as exc:
-            logger.error("Upload error for submission %s: %s", submission_id, exc, exc_info=True)
-            flash("An error occurred while uploading your files. Please try again.", "error")
-            try:
-                storage.delete_prefix(storage.submission_prefix(submission_id))
-            except Exception:
-                pass
+            logger.error("submit: manifest verification failed for %s: %s",
+                         submission_id, exc, exc_info=True)
+            flash("Could not verify your uploaded files. Please try again.", "error")
             return redirect(url_for("index"))
+        # Page count is deferred to the worker — the file is in R2, not on disk.
+        # Queue routing falls back to size alone, which is fine: a 660-page PDF
+        # is always large enough to trip HEAVY_QUEUE_FILE_MB.
+    else:
+        # ---- (b) Legacy form-file path ----
+        files = request.files.getlist("attachments")
+        valid_files = [f for f in files if f.filename and f.filename.strip()]
+
+        if not valid_files:
+            flash("Please upload at least one PDF file.", "error")
+            return redirect(url_for("index"))
+
+        if len(valid_files) > MAX_PDFS_PER_EMAIL:
+            flash(f"Maximum {MAX_PDFS_PER_EMAIL} files allowed.", "error")
+            return redirect(url_for("index"))
+
+        submission_id = str(uuid.uuid4())
+
+        with tempfile.TemporaryDirectory(prefix=f"ns-{submission_id}-") as staging:
+            try:
+                for idx, f in enumerate(valid_files):
+                    filename = secure_filename(f.filename) or f"upload_{idx + 1}.pdf"
+                    ext = os.path.splitext(filename)[1].lower()
+                    if ext not in ALLOWED_EXTENSIONS:
+                        flash(f"Only PDF files are accepted. Rejected: {f.filename}", "error")
+                        return redirect(url_for("index"))
+
+                    local_path = os.path.join(staging, filename)
+                    f.save(local_path)
+
+                    size_bytes = os.path.getsize(local_path)
+                    if size_bytes > MAX_PDF_SIZE_MB * 1024 * 1024:
+                        flash(f"{filename} exceeds the {MAX_PDF_SIZE_MB} MB size limit.", "error")
+                        return redirect(url_for("index"))
+
+                    total_pages += _count_pdf_pages(local_path)
+                    if size_bytes > max_size_bytes:
+                        max_size_bytes = size_bytes
+
+                    key = storage.upload_key(submission_id, filename)
+                    storage.upload_file(local_path, key, content_type="application/pdf")
+                    uploaded_files.append((filename, key, size_bytes))
+
+            except storage.StorageNotConfigured as exc:
+                logger.error("R2 not configured: %s", exc)
+                flash("Storage is not configured. Please contact support.", "error")
+                return redirect(url_for("index"))
+            except Exception as exc:
+                logger.error("Upload error for submission %s: %s", submission_id, exc, exc_info=True)
+                flash("An error occurred while uploading your files. Please try again.", "error")
+                try:
+                    storage.delete_prefix(storage.submission_prefix(submission_id))
+                except Exception:
+                    pass
+                return redirect(url_for("index"))
 
     # 4. Persist submission + files to the DB.
     phone = request.form.get("phone", "").strip()

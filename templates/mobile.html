@@ -284,9 +284,11 @@
                                    accept=".pdf,application/pdf" multiple required>
                             <div class="m-icon">&#128203;</div>
                             <p>Tap to choose PDFs</p>
-                            <p class="m-hint">PDF only &bull; up to 25 MB each</p>
+                            <p class="m-hint">PDF only &bull; up to 600 MB each</p>
                         </div>
                         <div class="m-files" id="m-file-list"></div>
+                        <div id="m-upload-progress" style="display:none;margin-top:8px;font-size:0.82rem;color:rgba(226,232,240,0.85);"></div>
+                        <input type="hidden" name="uploaded_manifest" id="m-uploaded-manifest" value="">
                     </div>
 
                     <div class="m-group">
@@ -362,6 +364,7 @@
         onload="window.__bootClerk()"></script>
     {% endif %}
 
+    <script src="{{ url_for('static', filename='upload.js') }}"></script>
     <script>
     (function() {
         const drop = document.getElementById('m-drop');
@@ -369,6 +372,7 @@
         const list = document.getElementById('m-file-list');
         const form = document.getElementById('m-form');
         const btn = document.getElementById('m-submit-btn');
+        const progressEl = document.getElementById('m-upload-progress');
 
         ['dragenter','dragover'].forEach(evt =>
             drop.addEventListener(evt, e => { e.preventDefault(); drop.classList.add('drag-over'); }));
@@ -393,11 +397,40 @@
             }
         }
 
+        // Submit button spinner — runs ahead of the upload driver via capture.
         form.addEventListener('submit', () => {
-            if (btn.disabled) return false;
+            if (btn.disabled) return;
             btn.disabled = true;
             btn.innerHTML = '<span class="spinner"></span>Uploading…';
-        });
+        }, { capture: true });
+
+        // Browser-direct R2 multipart upload. Falls through to the legacy
+        // server-side upload if NSUpload isn't loaded for any reason.
+        const fileSizes = [];
+        function refreshProgress(idx, bytes, total) {
+            fileSizes[idx] = { bytes, total, name: input.files[idx] && input.files[idx].name };
+            const lines = fileSizes.map(f => f
+                ? `${f.name}: ${(f.bytes / 1048576).toFixed(1)} / ${(f.total / 1048576).toFixed(1)} MB`
+                : null).filter(Boolean);
+            progressEl.style.display = '';
+            progressEl.textContent = lines.join('  •  ');
+        }
+        if (window.NSUpload) {
+            window.NSUpload.driveAndSubmit(form, input, {
+                onProgress: refreshProgress,
+                onPhase: (text) => {
+                    progressEl.style.display = '';
+                    progressEl.textContent = text;
+                },
+                onError: (msg) => {
+                    progressEl.style.display = '';
+                    progressEl.style.color = '#fca5a5';
+                    progressEl.textContent = 'Upload failed: ' + msg;
+                    btn.disabled = false;
+                    btn.innerHTML = 'Submit for Estimate';
+                },
+            });
+        }
     })();
     </script>
 </body>
