@@ -67,6 +67,19 @@
             font-size: 0.85rem;
             cursor: pointer;
         }
+        .deny-btn {
+            background: linear-gradient(180deg,#dc2626,#b91c1c);
+            color: #fff;
+            border: 0;
+            padding: 8px 16px;
+            border-radius: 6px;
+            font-weight: 600;
+            font-size: 0.85rem;
+            cursor: pointer;
+        }
+        .action-cell { white-space: nowrap; }
+        .action-cell form { display: inline-block; margin: 0 0 0 6px; }
+        .action-cell form:first-child { margin-left: 0; }
         .empty-row {
             padding: 1.5rem;
             text-align: center;
@@ -146,10 +159,13 @@
                     <td>
                         {% if o.requested_at %}{{ o.requested_at.strftime('%b %d, %Y %H:%M') }}{% else %}&mdash;{% endif %}
                     </td>
-                    <td>
-                        <form method="POST" action="{{ url_for('admin_orgs_approve', org_id=o.id) }}"
-                              style="margin:0;">
+                    <td class="action-cell">
+                        <form method="POST" action="{{ url_for('admin_orgs_approve', org_id=o.id) }}">
                             <button type="submit" class="approve-btn">Approve</button>
+                        </form>
+                        <form method="POST" action="{{ url_for('admin_orgs_deny', org_id=o.id) }}"
+                              onsubmit="return confirm('Deny access for {{ o.name }}? They will be notified.');">
+                            <button type="submit" class="deny-btn">Deny</button>
                         </form>
                     </td>
                 </tr>

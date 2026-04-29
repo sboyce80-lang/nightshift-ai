@@ -40,7 +40,8 @@ from werkzeug.middleware.proxy_fix import ProxyFix
 from redis import Redis
 from rq import Queue
 from rq.job import Job
-from rq.exceptions import NoSuchJobError
+from rq.command import send_stop_job_command
+from rq.exceptions import NoSuchJobError, InvalidJobOperation
 
 # ---------------------------------------------------------------------------
 # Ensure local imports work
@@ -66,6 +67,7 @@ from orgs import FREE_EMAIL_DOMAINS, _domain_of
 from notifications import (
     notify_admin_of_new_signup,
     notify_user_of_approval,
+    notify_user_of_denial,
     notifications_configured,
 )
 
@@ -261,6 +263,7 @@ def _try_signed_in_user_snapshot():
                 "org_name": org.name if org else None,
                 "is_beta_approved": bool(org and org.is_beta_approved),
                 "approval_requested_at": (org.approval_requested_at if org else None),
+                "denied_at": (org.denied_at if org else None),
             }
             # Pre-fetch effective rates while the session is still open.
             rates, markup = _effective_user_overrides(user) if org else (
@@ -303,6 +306,13 @@ def index():
         return redirect(url_for("onboarding"))
 
     if not snap["is_beta_approved"]:
+        if snap["denied_at"] is not None:
+            return render_template(
+                "waitlist.html",
+                org_name=snap["org_name"],
+                requested_at=snap["approval_requested_at"],
+                denied=True,
+            )
         if snap["approval_requested_at"] is None:
             return redirect(url_for("onboarding"))
         return render_template(
@@ -739,21 +749,157 @@ def job_result_api(submission_id):
     })
 
 
+@app.route("/api/jobs/<submission_id>/regenerate", methods=["POST"])
+@require_auth
+def job_regenerate_api(submission_id):
+    """Re-render a completed estimate with adjusted line-item rates / markups.
+
+    Body: {"adjustments": [{"label": "<cleanLabel>", "rate": <float>,
+                            "markup_pct": <float>}, ...]}
+
+    Loads the saved result JSON, applies the new rates/markups to the
+    matching line items, recomputes subtotal, re-renders the PDF, and
+    re-uploads both back to R2. The DB row's subtotal is also updated.
+    No LLM calls — this is a pure pricing recompute.
+    """
+    import re
+    import tempfile
+    from json_to_pdf import json_to_pdf
+
+    uid = current_user_id()
+    payload = request.get_json(silent=True) or {}
+    adjustments = payload.get("adjustments") or []
+    by_label = {}
+    for adj in adjustments:
+        label = (adj.get("label") or "").strip()
+        if not label:
+            continue
+        try:
+            rate = float(adj.get("rate"))
+            markup_pct = float(adj.get("markup_pct"))
+        except (TypeError, ValueError):
+            return jsonify({"error": "invalid rate/markup_pct"}), 400
+        if rate < 0 or markup_pct < 0 or markup_pct > 100:
+            return jsonify({"error": "rate/markup_pct out of range"}), 400
+        by_label[label] = (rate, markup_pct)
+
+    if not by_label:
+        return jsonify({"error": "no adjustments provided"}), 400
+
+    with session_scope() as session:
+        sub = session.get(Submission, submission_id)
+        if sub is None or sub.user_id != uid:
+            return jsonify({"error": "not found"}), 404
+        if sub.status != "completed":
+            return jsonify({"error": "not completed"}), 409
+
+        json_files = [f for f in sub.files
+                      if f.kind == "result"
+                      and f.filename.lower().endswith(".json")]
+        pdf_files = [f for f in sub.files
+                     if f.kind == "result"
+                     and f.filename.lower().endswith(".pdf")]
+        if not json_files:
+            return jsonify({"error": "result JSON not found"}), 404
+
+        json_file = sorted(json_files, key=lambda f: f.id, reverse=True)[0]
+        json_key = json_file.r2_key
+        json_filename = json_file.filename
+        pdf_key = pdf_files[0].r2_key if pdf_files else None
+        pdf_filename = (pdf_files[0].filename if pdf_files
+                        else json_filename.replace(".json", ".pdf"))
+
+    try:
+        raw = storage.get_bytes(json_key)
+        data = json.loads(raw)
+    except Exception as exc:
+        logger.error("Regenerate: failed to load %s: %s", json_key, exc)
+        return jsonify({"error": "failed to load result"}), 500
+
+    cost_estimate = data.get("cost_estimate") or {}
+    line_items = cost_estimate.get("line_items") or []
+    rate_re = re.compile(r"@ \$[\d,]+\.\d+")
+
+    matched = 0
+    for li in line_items:
+        qty = float(li.get("qty") or 0)
+        if qty == 0:
+            continue
+        label = (li.get("item") or "").split(" - ")[0]
+        if label not in by_label:
+            continue
+        rate, markup_pct = by_label[label]
+        cost = qty * rate
+        markup = cost * markup_pct / 100.0
+        total = cost + markup
+        li["cost"] = round(cost, 2)
+        li["markup"] = round(markup, 2)
+        li["total"] = round(total, 2)
+        li["item"] = rate_re.sub(f"@ ${rate:.2f}", li.get("item") or "", count=1)
+        matched += 1
+
+    if matched == 0:
+        return jsonify({"error": "no matching line items"}), 400
+
+    new_subtotal = round(sum(float(li.get("total") or 0) for li in line_items), 2)
+    cost_estimate["subtotal"] = new_subtotal
+    data["cost_estimate"] = cost_estimate
+
+    # Re-render PDF + re-upload both files.
+    with tempfile.TemporaryDirectory(prefix=f"ns-regen-{submission_id}-") as workdir:
+        json_path = os.path.join(workdir, json_filename)
+        pdf_path = os.path.join(workdir, pdf_filename)
+        try:
+            with open(json_path, "w") as f:
+                json.dump(data, f, indent=2)
+            json_to_pdf(json_path, pdf_path)
+            storage.upload_file(json_path, json_key,
+                                content_type="application/json")
+            if pdf_key:
+                storage.upload_file(pdf_path, pdf_key,
+                                    content_type="application/pdf")
+            else:
+                new_pdf_key = storage.result_key(submission_id, pdf_filename)
+                storage.upload_file(pdf_path, new_pdf_key,
+                                    content_type="application/pdf")
+                with session_scope() as session:
+                    session.add(File(
+                        submission_id=submission_id,
+                        kind="result",
+                        filename=pdf_filename,
+                        r2_key=new_pdf_key,
+                        size_bytes=os.path.getsize(pdf_path),
+                        content_type="application/pdf",
+                    ))
+        except Exception as exc:
+            logger.error("Regenerate: render/upload failed for %s: %s",
+                         submission_id, exc, exc_info=True)
+            return jsonify({"error": "failed to regenerate"}), 500
+
+    with session_scope() as session:
+        sub = session.get(Submission, submission_id)
+        if sub is not None:
+            sub.subtotal = new_subtotal
+
+    logger.info("Submission %s regenerated by user %d — new subtotal $%.2f",
+                submission_id, uid, new_subtotal)
+    return jsonify({"ok": True, "subtotal": new_subtotal,
+                    "items_updated": matched})
+
+
 @app.route("/api/jobs/<submission_id>/prioritize", methods=["POST"])
 @require_auth
 def job_prioritize_api(submission_id):
-    """Admin-only: bump a queued job to the front of its RQ queue.
+    """Bump the caller's queued job to the front of its RQ queue.
 
     Implemented by removing the job from its current queue position and
     re-enqueuing with at_front=True. The DB row and job_id are unchanged.
+    Owner-only — non-owners get 404 to avoid leaking IDs.
     """
     uid = current_user_id()
     with session_scope() as session:
-        user = session.get(User, uid)
-        if not is_admin(user):
-            return jsonify({"error": "forbidden"}), 403
         sub = session.get(Submission, submission_id)
-        if sub is None:
+        if sub is None or sub.user_id != uid:
             return jsonify({"error": "not found"}), 404
         if sub.status != "queued":
             return jsonify({"error": f"cannot prioritize a {sub.status} job"}), 409
@@ -780,27 +926,41 @@ def job_prioritize_api(submission_id):
 @app.route("/api/jobs/<submission_id>/cancel", methods=["POST"])
 @require_auth
 def job_cancel_api(submission_id):
-    """Cancel a queued job. Owner-only. Refuses jobs that are already processing."""
+    """Cancel a queued or in-flight job. Owner-only.
+
+    Queued jobs: removed from RQ and marked cancelled.
+    Processing jobs: stop signal sent to the worker; DB row marked cancelled.
+    """
     uid = current_user_id()
     with session_scope() as session:
         sub = session.get(Submission, submission_id)
         if sub is None or sub.user_id != uid:
             return jsonify({"error": "not found"}), 404
-        if sub.status != "queued":
+        if sub.status not in ("queued", "processing"):
             return jsonify({"error": f"cannot cancel a {sub.status} job"}), 409
+        was_processing = sub.status == "processing"
         sub.status = "cancelled"
 
     try:
         job = Job.fetch(submission_id, connection=_redis)
-        job.cancel()
-        job.delete()
+        if was_processing:
+            try:
+                send_stop_job_command(_redis, submission_id)
+            except InvalidJobOperation:
+                # Job finished between status check and stop signal — DB row
+                # already marked cancelled; let the worker's completion no-op.
+                pass
+        else:
+            job.cancel()
+            job.delete()
     except NoSuchJobError:
         # DB row already updated; treat as success.
         pass
     except Exception as exc:
         logger.warning("Cancel: RQ cleanup failed for %s: %s", submission_id, exc)
 
-    logger.info("Submission %s cancelled by user %d", submission_id, uid)
+    logger.info("Submission %s cancelled by user %d (was %s)",
+                submission_id, uid, "processing" if was_processing else "queued")
     return jsonify({"ok": True})
 
 
@@ -1177,6 +1337,8 @@ def onboarding():
             org = user.current_organization if user else None
             if org is not None and org.is_beta_approved:
                 return redirect(url_for("index"))
+            if org is not None and org.denied_at is not None:
+                return redirect(url_for("index"))
             return render_template(
                 "onboarding.html",
                 user_name=user.name or "" if user else "",
@@ -1212,6 +1374,9 @@ def onboarding():
             return redirect(url_for("index"))
 
         if org.is_beta_approved:
+            return redirect(url_for("index"))
+
+        if org.denied_at is not None:
             return redirect(url_for("index"))
 
         user.name = submitted_name
@@ -1261,10 +1426,12 @@ def admin_orgs():
         if not is_admin(user):
             return ("Forbidden", 403)
 
-        # Pending = applied (approval_requested_at NOT NULL) but not yet approved.
+        # Pending = applied (approval_requested_at NOT NULL), not approved,
+        # and not denied.
         pending_q = (session.query(Organization)
                             .filter(Organization.is_beta_approved.is_(False))
                             .filter(Organization.approval_requested_at.isnot(None))
+                            .filter(Organization.denied_at.is_(None))
                             .order_by(Organization.approval_requested_at.desc()))
 
         approved_q = (session.query(Organization)
@@ -1338,6 +1505,47 @@ def admin_orgs_approve(org_id):
             logger.error("Approval notification to %s failed: %s", email, exc)
 
     flash(f"Approved {org_name}.", "success")
+    return redirect(url_for("admin_orgs"))
+
+
+@app.route("/admin/orgs/<int:org_id>/deny", methods=["POST"])
+@require_auth
+def admin_orgs_deny(org_id):
+    """Mark an org's access request as denied and email the owners."""
+    uid = current_user_id()
+    notify = []
+    with session_scope() as session:
+        user = session.get(User, uid)
+        if not is_admin(user):
+            return ("Forbidden", 403)
+
+        org = session.get(Organization, org_id)
+        if org is None:
+            flash("Organization not found.", "error")
+            return redirect(url_for("admin_orgs"))
+
+        if org.is_beta_approved:
+            flash(f"{org.name} is already approved — cannot deny.", "error")
+            return redirect(url_for("admin_orgs"))
+
+        if org.denied_at is not None:
+            flash(f"{org.name} was already denied.", "success")
+            return redirect(url_for("admin_orgs"))
+
+        org.denied_at = datetime.now(timezone.utc)
+
+        org_name = org.name
+        for m in org.memberships:
+            if m.role == "owner" and m.user and m.user.email:
+                notify.append((m.user.email, m.user.name or ""))
+
+    for email, name in notify:
+        try:
+            notify_user_of_denial(email, name, org_name)
+        except Exception as exc:
+            logger.error("Denial notification to %s failed: %s", email, exc)
+
+    flash(f"Denied {org_name}.", "success")
     return redirect(url_for("admin_orgs"))
 
 

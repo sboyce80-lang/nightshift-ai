@@ -94,6 +94,13 @@ class Organization(Base):
         DateTime(timezone=True), nullable=True,
     )
 
+    # When an admin denied this org's access request from /admin/orgs.
+    # NOT NULL → org is excluded from pending list, owners see the denied
+    # screen instead of the waitlist or onboarding form.
+    denied_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False,
     )

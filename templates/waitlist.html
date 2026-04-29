@@ -62,6 +62,17 @@
 <body class="dark-theme">
     <main class="waitlist-shell">
         <div class="waitlist-card">
+            {% if denied %}
+            <h1>Access not approved</h1>
+            <p>
+                Your access request for <strong style="color:#fff;">{{ org_name }}</strong>
+                was not approved. If you believe this was a mistake, please reach
+                out to support.
+            </p>
+            <div class="waitlist-actions">
+                <a href="#" id="signout-link" class="waitlist-btn">Sign out</a>
+            </div>
+            {% else %}
             <h1>Thanks &mdash; you're on the list</h1>
             <p>
                 Your access request has been received. We'll review it
@@ -77,6 +88,7 @@
                 <a href="{{ url_for('onboarding') }}" class="waitlist-btn">Update company info</a>
                 <a href="#" id="signout-link" class="waitlist-btn">Sign out</a>
             </div>
+            {% endif %}
         </div>
     </main>
 

@@ -65,11 +65,13 @@
                         </button>
                         {% endif %}
                         {% if status_filter == 'active' and s.status == 'queued' %}
-                            {% if is_admin %}
                             <button type="button" class="btn-secondary job-prioritize" data-submission-id="{{ s.id }}">
                                 &#9889; Priority
                             </button>
-                            {% endif %}
+                            <button type="button" class="btn-secondary job-cancel" data-submission-id="{{ s.id }}">
+                                &#10005; Cancel
+                            </button>
+                        {% elif status_filter == 'active' and s.status == 'processing' %}
                             <button type="button" class="btn-secondary job-cancel" data-submission-id="{{ s.id }}">
                                 &#10005; Cancel
                             </button>
@@ -103,6 +105,14 @@
                                 <span class="original"></span>
                                 <span class="adjusted">$0</span>
                             </span>
+                        </div>
+                        <div class="breakdown-regen" style="display:none;margin-top:12px;text-align:right;">
+                            <button type="button" class="btn-secondary regen-btn"
+                                    data-submission-id="{{ s.id }}" disabled>
+                                &#8635; Regenerate Estimate
+                            </button>
+                            <span class="regen-status panel-subtle"
+                                  style="margin-left:10px;display:none;"></span>
                         </div>
                     </div>
                     {% endif %}
@@ -181,6 +191,7 @@
                 tr.dataset.origTotal = total;
                 // Strip the "@ $X" annotation from the item label for cleaner display.
                 const cleanLabel = (li.item || "").split(" - ")[0];
+                tr.dataset.label = cleanLabel;
                 tr.innerHTML = `
                     <td>${cleanLabel}</td>
                     <td class="num">${qty.toLocaleString()}</td>
@@ -196,6 +207,9 @@
             const originalEl = totalsBar.querySelector(".original");
             originalEl.textContent = fmtMoney(originalSubtotal);
             adjustedEl.textContent = fmtMoney(originalSubtotal);
+
+            const regenWrap = wrap.querySelector(".breakdown-regen");
+            const regenBtn = wrap.querySelector(".regen-btn");
 
             function recalc() {
                 let sum = 0;
@@ -216,11 +230,28 @@
                 });
                 adjustedEl.textContent = fmtMoney(sum);
                 originalEl.style.display = anyEdited ? "" : "none";
+                if (regenBtn) regenBtn.disabled = !anyEdited;
             }
             tbody.querySelectorAll("input").forEach(inp => inp.addEventListener("input", recalc));
             wrap.querySelector(".breakdown-table").style.display = "";
             totalsBar.style.display = "";
+            if (regenWrap) regenWrap.style.display = "";
             recalc();
+        }
+
+        function collectAdjustments(wrap) {
+            const out = [];
+            wrap.querySelectorAll("tbody tr").forEach(tr => {
+                const rate = Number(tr.querySelector(".rate").value);
+                const markupPct = Number(tr.querySelector(".markup").value);
+                if (Number.isNaN(rate) || Number.isNaN(markupPct)) return;
+                out.push({
+                    label: tr.dataset.label,
+                    rate: rate,
+                    markup_pct: markupPct,
+                });
+            });
+            return out;
         }
 
         document.querySelectorAll(".toggle-breakdown").forEach(btn => {
@@ -273,15 +304,54 @@
             });
         });
 
+        document.querySelectorAll(".regen-btn").forEach(btn => {
+            btn.addEventListener("click", async () => {
+                const subId = btn.dataset.submissionId;
+                const wrap = document.getElementById(`breakdown-${subId}`);
+                const status = wrap.querySelector(".regen-status");
+                const adjustments = collectAdjustments(wrap);
+                if (!adjustments.length) return;
+
+                btn.disabled = true;
+                status.style.display = "";
+                status.textContent = "Regenerating PDF…";
+                try {
+                    const res = await fetch(`/api/jobs/${subId}/regenerate`, {
+                        method: "POST",
+                        credentials: "same-origin",
+                        headers: { "Content-Type": "application/json", "Accept": "application/json" },
+                        body: JSON.stringify({ adjustments }),
+                    });
+                    if (!res.ok) {
+                        let msg = `HTTP ${res.status}`;
+                        try { msg = (await res.json()).error || msg; } catch (_) {}
+                        throw new Error(msg);
+                    }
+                    const data = await res.json();
+                    status.textContent =
+                        `Updated ${data.items_updated} item(s) — new subtotal ${fmtMoney(data.subtotal)}. Reloading…`;
+                    delete cache[subId];
+                    setTimeout(() => window.location.reload(), 900);
+                } catch (e) {
+                    status.textContent = "Failed: " + e.message;
+                    btn.disabled = false;
+                }
+            });
+        });
+
         document.querySelectorAll(".job-cancel").forEach(btn => {
             btn.addEventListener("click", async () => {
                 const subId = btn.dataset.submissionId;
-                if (!confirm("Cancel this queued job? This cannot be undone.")) return;
+                const card = document.querySelector(`.job-card[data-submission-id="${subId}"]`);
+                const isRunning = card && card.querySelector(".status-pill.status-processing");
+                const msg = isRunning
+                    ? "This job is currently running. Cancel and stop the worker? This cannot be undone."
+                    : "Cancel this queued job? This cannot be undone.";
+                if (!confirm(msg)) return;
                 btn.disabled = true;
                 btn.textContent = "Cancelling…";
                 try {
                     await postJobAction(subId, "cancel");
-                    const card = document.querySelector(`.job-card[data-submission-id="${subId}"]`);
                     if (card) card.remove();
                 } catch (e) {
                     alert("Could not cancel: " + e.message);

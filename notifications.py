@@ -137,3 +137,18 @@ If you have any questions, just reply to this email.
 — Knight Shift
 """
     return _send([email], "Your Knight Shift access is approved", body)
+
+
+def notify_user_of_denial(email: str, name: str, org_name: str) -> bool:
+    """Email the requester that their access request was denied."""
+    body = f"""Hi {name or 'there'},
+
+Thank you for your interest in Knight Shift. After reviewing your access
+request for {org_name}, we're unable to approve it at this time.
+
+If you believe this was a mistake or would like to discuss further, please
+reply to this email.
+
+— Knight Shift
+"""
+    return _send([email], "Your Knight Shift access request", body)

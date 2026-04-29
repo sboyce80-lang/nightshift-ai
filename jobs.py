@@ -171,6 +171,15 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
             return {"submission_id": submission_id, "subtotal": subtotal}
 
         except Exception as exc:
+            # If the user cancelled this job mid-flight, the DB row is already
+            # "cancelled" — don't overwrite with "failed" or send an error email.
+            with session_scope() as session:
+                sub = session.get(Submission, submission_id)
+                if sub is not None and sub.status == "cancelled":
+                    logger.info("Submission %s cancelled mid-run; suppressing failure path",
+                                submission_id)
+                    raise
+
             logger.error("Submission %s failed: %s", submission_id, exc, exc_info=True)
             update_status(submission_id, "failed", error=str(exc))
             try:
