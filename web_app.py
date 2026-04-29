@@ -1019,6 +1019,68 @@ def job_result_api(submission_id):
     })
 
 
+CHAT_MAX_MESSAGE_CHARS = 4000
+CHAT_MAX_HISTORY = 40  # 20 turns of user/assistant
+
+
+@app.route("/api/jobs/<submission_id>/chat", methods=["POST"])
+@require_auth
+def job_chat_api(submission_id):
+    """Answer a follow-up question about a completed takeoff job.
+
+    Body: {"messages": [{"role": "user"|"assistant", "content": "..."}, ...]}
+    Returns: {"role": "assistant", "content": "..."}
+
+    Stateless — the client sends the full conversation history each turn.
+    """
+    body = request.get_json(silent=True) or {}
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return jsonify({"error": "messages required"}), 400
+    if len(messages) > CHAT_MAX_HISTORY:
+        return jsonify({"error": "too many messages"}), 400
+    for m in messages:
+        if (not isinstance(m, dict)
+                or m.get("role") not in ("user", "assistant")
+                or not isinstance(m.get("content"), str)
+                or not m["content"].strip()):
+            return jsonify({"error": "invalid message"}), 400
+        if len(m["content"]) > CHAT_MAX_MESSAGE_CHARS:
+            return jsonify({"error": "message too long"}), 400
+    if messages[0].get("role") != "user":
+        return jsonify({"error": "first message must be from user"}), 400
+
+    with session_scope() as session:
+        sub = session.get(Submission, submission_id)
+        if sub is None or sub.user_id != current_user_id():
+            return jsonify({"error": "not found"}), 404
+        if sub.status != "completed":
+            return jsonify({"error": "not completed"}), 409
+
+        json_files = [f for f in sub.files
+                      if f.kind == "result" and f.filename.lower().endswith(".json")]
+        if not json_files:
+            return jsonify({"error": "result JSON not found"}), 404
+        json_file = sorted(json_files, key=lambda f: f.id, reverse=True)[0]
+        r2_key = json_file.r2_key
+
+    try:
+        raw = storage.get_bytes(r2_key)
+        data = json.loads(raw)
+    except Exception as exc:
+        logger.error("Failed to load result JSON %s: %s", r2_key, exc)
+        return jsonify({"error": "failed to load result"}), 500
+
+    try:
+        from chat import chat_about_job
+        reply = chat_about_job(data, messages)
+    except Exception as exc:
+        logger.error("Chat failed for submission %s: %s", submission_id, exc, exc_info=True)
+        return jsonify({"error": "chat failed"}), 500
+
+    return jsonify({"role": "assistant", "content": reply})
+
+
 @app.route("/api/jobs/<submission_id>/regenerate", methods=["POST"])
 @require_auth
 def job_regenerate_api(submission_id):
