@@ -255,7 +255,17 @@ def _try_signed_in_user_snapshot():
                           .filter(User.clerk_user_id == clerk_uid)
                           .one_or_none())
             if user is None:
-                return None, None
+                # Valid Clerk session but no local row yet — happens on the
+                # first landing-page hit after sign-in, since `/` is public
+                # and so never runs @require_auth's _sync_user. Provision
+                # the row + default org now, then re-query.
+                from auth import _sync_user
+                _sync_user(clerk_uid)
+                user = (session.query(User)
+                              .filter(User.clerk_user_id == clerk_uid)
+                              .one_or_none())
+                if user is None:
+                    return None, None
             org = user.current_organization
             snapshot = {
                 "user_id": user.id,
