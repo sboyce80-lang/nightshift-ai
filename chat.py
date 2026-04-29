@@ -95,3 +95,79 @@ def _trim_for_chat(result: Dict[str, Any]) -> Dict[str, Any]:
     for k in ("page_extractions", "raw_pages", "page_text", "tile_extractions"):
         trimmed.pop(k, None)
     return trimmed
+
+
+GENERAL_HELP_SYSTEM_PROMPT = (
+    "You are the Knight Shift product assistant. Knight Shift (also called "
+    "Nightshift AI) generates automated painting estimates from uploaded "
+    "architectural PDFs. Users — painting contractors and estimators — upload "
+    "construction documents and receive a structured takeoff with rooms, "
+    "walls, doors, windows, line items, and a priced proposal.\n\n"
+    "Help users understand how the product works, how to use it, and how to "
+    "interpret their results. Be concise and practical — like a helpful "
+    "support engineer.\n\n"
+    "Key facts about Knight Shift:\n"
+    "- Upload PDF construction documents on the New Estimate tab; the system "
+    "extracts rooms, surfaces, openings, and produces a priced line-item "
+    "estimate.\n"
+    "- Jobs are processed in the background; you can watch progress on the "
+    "job detail page. Status moves queued → processing → completed.\n"
+    "- Once completed, you can download the result PDF and JSON, edit "
+    "line-item rates and markups, and regenerate the proposal.\n"
+    "- Pricing rates and markups are configurable per account on the Pricing "
+    "Defaults tab (interior walls, ceilings, doors, windows, base trim, "
+    "stairs, etc.). Per-job edits override the defaults for that job only.\n"
+    "- The system handles standard and DD-scale (large-format) drawings "
+    "through a multi-layer extraction cascade (native PDF, page tiling, "
+    "image fallback).\n"
+    "- Estimates require human review — they are a starting point, not a "
+    "final number. Always verify against the documents.\n\n"
+    "If a user asks about specifics of a particular job (\"why is room X "
+    "priced at $Y?\", \"how many sqft of walls?\"), tell them to switch to "
+    "**Estimate Help** mode in the chat and pick the job — that mode is "
+    "grounded in the job's actual extracted JSON. You only have generic "
+    "product knowledge here.\n\n"
+    "If asked about something outside Knight Shift (general construction, "
+    "code questions, weather), answer briefly and bring the conversation "
+    "back to how Knight Shift can help."
+)
+
+
+def chat_general_help(history: List[Dict[str, str]]) -> str:
+    """Answer a general product-help question about Knight Shift.
+
+    No job context — system prompt covers product knowledge only. For
+    job-specific questions, the user should use chat_about_job().
+
+    Args:
+        history: Conversation history as [{role, content}, ...]. First message
+                 must be 'user'; roles must alternate user/assistant.
+
+    Returns:
+        The assistant's reply text.
+    """
+    if not history or history[0].get("role") != "user":
+        raise ValueError("history must start with a user message")
+
+    if len(history) > MAX_HISTORY_TURNS * 2:
+        history = history[-(MAX_HISTORY_TURNS * 2):]
+        if history[0].get("role") != "user":
+            history = history[1:]
+
+    client = anthropic.Anthropic(api_key=CLAUDE_API_KEY)
+    response = client.messages.create(
+        model=MODEL,
+        max_tokens=MAX_TOKENS,
+        system=GENERAL_HELP_SYSTEM_PROMPT,
+        messages=history,
+    )
+
+    usage = getattr(response, "usage", None)
+    if usage is not None:
+        logger.info(
+            "general_help usage input=%s output=%s",
+            usage.input_tokens,
+            usage.output_tokens,
+        )
+
+    return next((b.text for b in response.content if b.type == "text"), "")

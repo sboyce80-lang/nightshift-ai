@@ -1081,6 +1081,67 @@ def job_chat_api(submission_id):
     return jsonify({"role": "assistant", "content": reply})
 
 
+@app.route("/api/help/chat", methods=["POST"])
+@require_auth
+def general_help_chat_api():
+    """Answer a general product-help question about Knight Shift.
+
+    Body: {"messages": [{"role": "user"|"assistant", "content": "..."}, ...]}
+    Returns: {"role": "assistant", "content": "..."}
+    """
+    body = request.get_json(silent=True) or {}
+    messages = body.get("messages")
+    if not isinstance(messages, list) or not messages:
+        return jsonify({"error": "messages required"}), 400
+    if len(messages) > CHAT_MAX_HISTORY:
+        return jsonify({"error": "too many messages"}), 400
+    for m in messages:
+        if (not isinstance(m, dict)
+                or m.get("role") not in ("user", "assistant")
+                or not isinstance(m.get("content"), str)
+                or not m["content"].strip()):
+            return jsonify({"error": "invalid message"}), 400
+        if len(m["content"]) > CHAT_MAX_MESSAGE_CHARS:
+            return jsonify({"error": "message too long"}), 400
+    if messages[0].get("role") != "user":
+        return jsonify({"error": "first message must be from user"}), 400
+
+    try:
+        from chat import chat_general_help
+        reply = chat_general_help(messages)
+    except Exception as exc:
+        logger.error("General help chat failed: %s", exc, exc_info=True)
+        return jsonify({"error": "chat failed"}), 500
+
+    return jsonify({"role": "assistant", "content": reply})
+
+
+@app.route("/api/jobs/completed/list", methods=["GET"])
+@require_auth
+def completed_jobs_list_api():
+    """Lightweight list of the current user's completed jobs for the chat picker.
+
+    Returns: [{"id", "label", "submitted_at", "subtotal"}, ...] — newest first.
+    """
+    uid = current_user_id()
+    items = []
+    with session_scope() as session:
+        subs = (session.query(Submission)
+                .filter(Submission.user_id == uid)
+                .filter(Submission.status == "completed")
+                .order_by(Submission.submitted_at.desc())
+                .limit(50).all())
+        for s in subs:
+            label = s.business_name or s.id[:8]
+            items.append({
+                "id": s.id,
+                "label": label,
+                "submitted_at": s.submitted_at.isoformat() if s.submitted_at else None,
+                "subtotal": float(s.subtotal) if s.subtotal is not None else None,
+            })
+    return jsonify(items)
+
+
 @app.route("/api/jobs/<submission_id>/regenerate", methods=["POST"])
 @require_auth
 def job_regenerate_api(submission_id):
