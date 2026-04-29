@@ -11,7 +11,7 @@
         <span class="ks-chat-fab-label">Ask</span>
     </button>
 
-    <div id="ks-chat-drawer" hidden>
+    <div id="ks-chat-drawer" style="display:none;">
         <div class="ks-chat-header">
             <span class="ks-chat-title">Knight Shift Help</span>
             <button id="ks-chat-close" type="button" aria-label="Close">×</button>
@@ -22,7 +22,7 @@
             <button type="button" data-mode="estimate">Estimate Help</button>
         </div>
 
-        <div id="ks-chat-job-picker" class="ks-chat-job-picker" hidden>
+        <div id="ks-chat-job-picker" class="ks-chat-job-picker" style="display:none;">
             <label for="ks-chat-job-select">Which estimate?</label>
             <select id="ks-chat-job-select">
                 <option value="">Loading…</option>
@@ -131,13 +131,13 @@
     const detectedJobId = jobUrlMatch ? jobUrlMatch[1] : null;
 
     function open() {
-        drawer.hidden = false;
+        drawer.style.display = 'flex';
         fab.style.display = 'none';
         renderMode();
         input.focus();
     }
     function close() {
-        drawer.hidden = true;
+        drawer.style.display = 'none';
         fab.style.display = '';
     }
 
@@ -161,10 +161,10 @@
 
     function renderMode() {
         if (state.mode === 'estimate') {
-            jobPicker.hidden = false;
+            jobPicker.style.display = 'flex';
             ensureJobsLoaded();
         } else {
-            jobPicker.hidden = true;
+            jobPicker.style.display = 'none';
         }
         renderLog();
         updateInputState();
