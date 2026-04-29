@@ -63,7 +63,11 @@ from db import session_scope
 from models import User, Submission, File, Organization, OrganizationMembership
 from auth import require_auth, current_user_id, clerk_frontend_api_host, is_admin
 from orgs import FREE_EMAIL_DOMAINS, _domain_of
-from notifications import notify_admin_of_new_signup, notify_user_of_approval
+from notifications import (
+    notify_admin_of_new_signup,
+    notify_user_of_approval,
+    notifications_configured,
+)
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -1290,6 +1294,7 @@ def admin_orgs():
         "admin_orgs.html",
         pending=pending,
         approved=approved,
+        notifications_ok=notifications_configured(),
     )
 
 

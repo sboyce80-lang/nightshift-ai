@@ -375,6 +375,13 @@ EMAIL_SMTP_PORT     = int(os.environ.get("EMAIL_SMTP_PORT", "587"))
 EMAIL_WATCH_FOLDER  = os.environ.get("EMAIL_WATCH_FOLDER", "INBOX")
 EMAIL_POLL_INTERVAL = int(os.environ.get("EMAIL_POLL_INTERVAL", "60"))
 EMAIL_SUBJECT_FILTER = os.environ.get("EMAIL_SUBJECT_FILTER", "")
+
+# Outbound transactional email (Resend HTTP API). Used by notifications.py
+# for signup-approval emails. Distinct from the EMAIL_* IMAP credentials
+# above (which are for inbound RFP ingestion only).
+RESEND_API_KEY    = os.environ.get("RESEND_API_KEY", "")
+RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "")
+RESEND_FROM_NAME  = os.environ.get("RESEND_FROM_NAME", "Knight Shift")
 MAX_PDF_SIZE_MB     = 200
 MAX_PDFS_PER_EMAIL  = 10
 

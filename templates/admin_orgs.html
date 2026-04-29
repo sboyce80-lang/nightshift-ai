@@ -74,6 +74,16 @@
             font-style: italic;
         }
         .flash-messages { margin-bottom: 1rem; }
+        .smtp-warning {
+            background: rgba(234,179,8,0.12);
+            border: 1px solid rgba(234,179,8,0.35);
+            color: #fde68a;
+            padding: 12px 16px;
+            border-radius: 8px;
+            margin-bottom: 1.5rem;
+            font-size: 0.9rem;
+        }
+        .smtp-warning strong { color: #fef3c7; }
         .top-link {
             display: inline-block;
             color: #93c5fd;
@@ -94,6 +104,15 @@
             {% for cat, m in messages %}<div class="flash flash-{{cat}}">{{m}}</div>{% endfor %}
         </div>{% endif %}
         {% endwith %}
+
+        {% if not notifications_ok %}
+        <div class="smtp-warning">
+            <strong>⚠️ Email notifications are disabled.</strong>
+            New signups won't email admins, and approving an org won't email
+            the user. Set <code>RESEND_API_KEY</code> and
+            <code>RESEND_FROM_EMAIL</code> in the Render environment to fix.
+        </div>
+        {% endif %}
 
         <h2>Pending ({{ pending|length }})</h2>
         {% if pending %}

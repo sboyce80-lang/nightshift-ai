@@ -2,7 +2,7 @@
 """
 Knight Shift — Account Notification Emails
 ==========================================
-SMTP helpers for the sign-up / approval flow:
+Resend HTTP API wrapper for the sign-up / approval flow:
 
     notify_admin_of_new_signup(user, org, approve_url)
         Tells every address in ADMIN_EMAILS that a new user has requested
@@ -12,58 +12,95 @@ SMTP helpers for the sign-up / approval flow:
         Tells the requesting user their access is approved and they can
         sign in.
 
-Both fail soft — if SMTP credentials aren't set or sending raises, we log
-and return rather than blocking the request that triggered the email.
+    notifications_configured() -> bool
+        True iff RESEND_API_KEY and RESEND_FROM_EMAIL are both set. Used
+        by /admin/orgs to surface a banner when notifications would
+        silently no-op.
+
+Sends fail-loud — if Resend is misconfigured or returns an error we log
+at ERROR level (not WARNING) so it shows up in Render logs by default.
+We still return False rather than raise, so the caller's request flow
+isn't interrupted.
 """
 
 import logging
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
+
+import requests
 
 from config import (
-    EMAIL_ADDRESS, EMAIL_APP_PASSWORD,
-    EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT,
+    RESEND_API_KEY,
+    RESEND_FROM_EMAIL,
+    RESEND_FROM_NAME,
     ADMIN_EMAILS,
 )
 
 logger = logging.getLogger("nightshift.notifications")
 
-_FROM_NAME = "Knight Shift"
+_RESEND_ENDPOINT = "https://api.resend.com/emails"
+_TIMEOUT_SECONDS = 10
+
+
+def notifications_configured() -> bool:
+    """True iff Resend credentials are set. Safe to call anywhere."""
+    return bool(RESEND_API_KEY and RESEND_FROM_EMAIL)
 
 
 def _send(to_addrs, subject: str, body: str) -> bool:
-    if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD:
-        logger.warning("SMTP not configured — skipping notification (subject=%r)",
-                       subject)
+    if not RESEND_API_KEY:
+        logger.error(
+            "Resend not configured (RESEND_API_KEY missing) — "
+            "notification dropped: %r → %s", subject, to_addrs)
+        return False
+    if not RESEND_FROM_EMAIL:
+        logger.error(
+            "Resend not configured (RESEND_FROM_EMAIL missing) — "
+            "notification dropped: %r → %s", subject, to_addrs)
         return False
     if not to_addrs:
         return False
 
-    msg = MIMEMultipart()
-    msg["From"] = f"{_FROM_NAME} <{EMAIL_ADDRESS}>"
-    msg["To"] = ", ".join(to_addrs)
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body, "plain"))
+    from_header = f"{RESEND_FROM_NAME} <{RESEND_FROM_EMAIL}>"
+    payload = {
+        "from": from_header,
+        "to": list(to_addrs),
+        "subject": subject,
+        "text": body,
+    }
 
     try:
-        with smtplib.SMTP(EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT) as server:
-            server.ehlo()
-            server.starttls()
-            server.ehlo()
-            server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
-            server.send_message(msg)
-        logger.info("Notification sent: %r → %s", subject, to_addrs)
-        return True
-    except Exception as exc:
-        logger.error("Failed to send notification %r: %s", subject, exc)
+        resp = requests.post(
+            _RESEND_ENDPOINT,
+            headers={
+                "Authorization": f"Bearer {RESEND_API_KEY}",
+                "Content-Type": "application/json",
+            },
+            json=payload,
+            timeout=_TIMEOUT_SECONDS,
+        )
+    except requests.RequestException as exc:
+        logger.error("Resend request failed for %r → %s: %s",
+                     subject, to_addrs, exc)
         return False
+
+    if resp.status_code >= 400:
+        logger.error("Resend rejected send (%d) for %r → %s: %s",
+                     resp.status_code, subject, to_addrs, resp.text[:500])
+        return False
+
+    try:
+        msg_id = resp.json().get("id", "?")
+    except ValueError:
+        msg_id = "?"
+    logger.info("Notification sent: %r → %s (resend id=%s)",
+                subject, to_addrs, msg_id)
+    return True
 
 
 def notify_admin_of_new_signup(user, org, approve_url: str) -> bool:
     """Email all ADMIN_EMAILS about a new access request."""
     if not ADMIN_EMAILS:
-        logger.warning("No ADMIN_EMAILS configured — skipping new-signup alert")
+        logger.error("No ADMIN_EMAILS configured — skipping new-signup alert "
+                     "(would have notified about org=%r)", getattr(org, "name", "?"))
         return False
 
     body = f"""A new user has requested access to Knight Shift.
