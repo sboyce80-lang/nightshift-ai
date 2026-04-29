@@ -1308,6 +1308,118 @@ def pricing_settings():
 
 
 # ---------------------------------------------------------------------------
+# Usage / ROI
+# ---------------------------------------------------------------------------
+
+# Industry-average seeds for the "savings" calc:
+#   $36/hr  — BLS "Cost Estimators" median ≈ $75K/yr ÷ 2080 hrs.
+#   8 hrs   — typical commercial-painting takeoff per the PCA references
+#             baked into config.py.
+USAGE_DEFAULT_HOURLY_WAGE = 36.0
+USAGE_DEFAULT_HOURS_PER_ESTIMATE = 8.0
+
+
+@app.route("/usage", methods=["GET", "POST"])
+@require_auth
+def usage_dashboard():
+    """Org-scoped usage and ROI metrics.
+
+    GET  — aggregate completed submissions for the current org and render
+           cards plus a small form for the savings inputs.
+    POST — persist hourly_wage + hours_per_estimate on the org.
+    """
+    uid = current_user_id()
+    with session_scope() as session:
+        user = session.get(User, uid)
+        org = user.current_organization if user else None
+        if org is None:
+            flash("Your account is not yet fully set up. Please contact support.",
+                  "error")
+            return redirect(url_for("index"))
+
+        if request.method == "POST":
+            if request.form.get("reset"):
+                org.usage_settings = None
+                flash("Savings inputs reset to industry averages.", "success")
+                return redirect(url_for("usage_dashboard"))
+
+            errors = []
+            settings = {}
+            for key, lo, hi in (
+                ("hourly_wage", 0, 1000),
+                ("hours_per_estimate", 0, 500),
+            ):
+                raw = (request.form.get(key) or "").strip()
+                if not raw:
+                    continue
+                try:
+                    v = float(raw)
+                    if v < lo or v > hi:
+                        raise ValueError("out of range")
+                    settings[key] = v
+                except ValueError:
+                    errors.append(f"{key}: must be between {lo} and {hi}")
+
+            if errors:
+                for e in errors:
+                    flash(e, "error")
+                return redirect(url_for("usage_dashboard"))
+
+            org.usage_settings = settings or None
+            flash("Savings inputs saved.", "success")
+            return redirect(url_for("usage_dashboard"))
+
+        # Aggregate completed submissions for this org. Failed/cancelled
+        # jobs don't count toward "jobs run" because the value isn't real.
+        completed = (session.query(Submission)
+                     .filter(Submission.org_id == org.id,
+                             Submission.status == "completed")
+                     .all())
+
+        total_jobs = len(completed)
+        total_value = sum(float(s.subtotal or 0) for s in completed)
+        avg_value = (total_value / total_jobs) if total_jobs else 0.0
+
+        runtimes_sec = []
+        for s in completed:
+            if s.submitted_at and s.updated_at:
+                delta = (s.updated_at - s.submitted_at).total_seconds()
+                if delta > 0:
+                    runtimes_sec.append(delta)
+        avg_runtime_sec = (sum(runtimes_sec) / len(runtimes_sec)) if runtimes_sec else 0.0
+
+        us = org.usage_settings or {}
+        hourly_wage = float(us.get("hourly_wage", USAGE_DEFAULT_HOURLY_WAGE))
+        hours_per_estimate = float(us.get(
+            "hours_per_estimate", USAGE_DEFAULT_HOURS_PER_ESTIMATE,
+        ))
+        savings = total_jobs * hourly_wage * hours_per_estimate
+
+        # Whether the user has saved inputs (controls "industry default" hint).
+        wage_saved = "hourly_wage" in us
+        hours_saved = "hours_per_estimate" in us
+
+    return render_template(
+        "usage.html",
+        metrics={
+            "total_jobs": total_jobs,
+            "total_value": total_value,
+            "avg_value": avg_value,
+            "avg_runtime_sec": avg_runtime_sec,
+            "savings": savings,
+        },
+        savings_inputs={
+            "hourly_wage": hourly_wage,
+            "hours_per_estimate": hours_per_estimate,
+            "wage_saved": wage_saved,
+            "hours_saved": hours_saved,
+            "default_hourly_wage": USAGE_DEFAULT_HOURLY_WAGE,
+            "default_hours_per_estimate": USAGE_DEFAULT_HOURS_PER_ESTIMATE,
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # Account / Members
 # ---------------------------------------------------------------------------
 

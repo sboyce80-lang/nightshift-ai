@@ -75,6 +75,11 @@ class Organization(Base):
     # Shape: {"rates": {<key>: <float>, ...}, "markup": <float>}
     pricing_overrides: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
+    # Inputs for the Usage / ROI tab. Shape:
+    #   {"hourly_wage": <float>, "hours_per_estimate": <float>}
+    # NULL → fall back to industry-average defaults in the UI.
+    usage_settings: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+
     # Beta gate. New orgs land with is_beta_approved=False and must be
     # approved (manual SQL flip for now). Migration 0004 grandfathers
     # all pre-existing orgs to True so current users aren't locked out.

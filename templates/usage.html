@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Usage &amp; ROI &mdash; Knight Shift</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <style>
+        .metric-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+            gap: 16px;
+            margin-top: 8px;
+        }
+        .metric-card {
+            background: rgba(8, 18, 32, 0.6);
+            border: 1px solid rgba(96, 165, 250, 0.18);
+            border-radius: 10px;
+            padding: 18px 20px;
+        }
+        .metric-card .metric-label {
+            color: rgba(203, 213, 225, 0.7);
+            font-size: 0.78rem;
+            font-weight: 500;
+            letter-spacing: 0.04em;
+            text-transform: uppercase;
+        }
+        .metric-card .metric-value {
+            color: #ffffff;
+            font-size: 1.7rem;
+            font-weight: 700;
+            margin-top: 6px;
+            letter-spacing: -0.4px;
+        }
+        .metric-card .metric-sub {
+            color: rgba(203, 213, 225, 0.55);
+            font-size: 0.82rem;
+            margin-top: 4px;
+        }
+        .metric-card.metric-savings {
+            background: linear-gradient(135deg, rgba(46, 204, 113, 0.16) 0%, rgba(15, 30, 52, 0.6) 100%);
+            border-color: rgba(46, 204, 113, 0.45);
+        }
+        .metric-card.metric-savings .metric-value { color: #4ade80; }
+
+        .savings-form {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(240px, 1fr));
+            gap: 18px;
+            align-items: end;
+            margin-top: 10px;
+        }
+        .savings-form .form-group { margin-bottom: 0; }
+        .input-hint {
+            color: rgba(148, 163, 184, 0.75);
+            font-size: 0.78rem;
+            margin-top: 4px;
+        }
+    </style>
+</head>
+<body class="dark-theme">
+    {% set active_tab = 'usage' %}
+    {% include "_nav.html" %}
+
+    <div class="page-shell">
+        <main id="main-content" style="display:none;margin-top:28px;">
+            {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}<div class="flash-messages">
+                {% for cat, m in messages %}<div class="flash flash-{{cat}}">{{m}}</div>{% endfor %}
+            </div>{% endif %}
+            {% endwith %}
+
+            <section class="panel">
+                <h2>Usage &amp; ROI</h2>
+                <p class="panel-subtle">
+                    Aggregate metrics across every completed job for your organization.
+                    Estimator-time savings use industry-average defaults until you set your own.
+                </p>
+
+                <div class="metric-grid">
+                    <div class="metric-card">
+                        <div class="metric-label">Total jobs run</div>
+                        <div class="metric-value">{{ "{:,}".format(metrics.total_jobs) }}</div>
+                        <div class="metric-sub">Completed estimates</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Total job value</div>
+                        <div class="metric-value">${{ "{:,.0f}".format(metrics.total_value) }}</div>
+                        <div class="metric-sub">Sum of all subtotals</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Avg job value</div>
+                        <div class="metric-value">${{ "{:,.0f}".format(metrics.avg_value) }}</div>
+                        <div class="metric-sub">Per completed estimate</div>
+                    </div>
+                    <div class="metric-card">
+                        <div class="metric-label">Avg job runtime</div>
+                        <div class="metric-value">
+                            {% set sec = metrics.avg_runtime_sec %}
+                            {% if sec >= 3600 %}
+                                {{ "%.1f"|format(sec / 3600) }}h
+                            {% elif sec >= 60 %}
+                                {{ "%.1f"|format(sec / 60) }}m
+                            {% else %}
+                                {{ "%.0f"|format(sec) }}s
+                            {% endif %}
+                        </div>
+                        <div class="metric-sub">Submission &rarr; completion</div>
+                    </div>
+                    <div class="metric-card metric-savings">
+                        <div class="metric-label">Estimator-time savings</div>
+                        <div class="metric-value">${{ "{:,.0f}".format(metrics.savings) }}</div>
+                        <div class="metric-sub">
+                            {{ "{:,}".format(metrics.total_jobs) }} jobs &times;
+                            {{ "%.1f"|format(savings_inputs.hours_per_estimate) }} hrs &times;
+                            ${{ "%.0f"|format(savings_inputs.hourly_wage) }}/hr
+                        </div>
+                    </div>
+                </div>
+            </section>
+
+            <section class="panel" style="margin-top:24px;">
+                <h2>Savings inputs</h2>
+                <p class="panel-subtle">
+                    Tune these to match your team's true costs. Defaults are industry averages
+                    (BLS median construction-estimator wage and a typical commercial-painting takeoff).
+                </p>
+
+                <form method="POST" action="{{ url_for('usage_dashboard') }}">
+                    <div class="savings-form">
+                        <div class="form-group">
+                            <label for="hourly_wage">Estimator hourly wage ($)</label>
+                            <input type="number" step="0.01" min="0" max="1000"
+                                   id="hourly_wage" name="hourly_wage"
+                                   value="{{ '%.2f'|format(savings_inputs.hourly_wage) if savings_inputs.wage_saved else '' }}"
+                                   placeholder="{{ '%.2f'|format(savings_inputs.default_hourly_wage) }} (industry avg)">
+                            <div class="input-hint">
+                                {% if savings_inputs.wage_saved %}
+                                    Saved value
+                                {% else %}
+                                    Default: BLS median construction estimator
+                                    (${{ "%.0f"|format(savings_inputs.default_hourly_wage) }}/hr)
+                                {% endif %}
+                            </div>
+                        </div>
+                        <div class="form-group">
+                            <label for="hours_per_estimate">Hours to estimate one job</label>
+                            <input type="number" step="0.1" min="0" max="500"
+                                   id="hours_per_estimate" name="hours_per_estimate"
+                                   value="{{ '%.1f'|format(savings_inputs.hours_per_estimate) if savings_inputs.hours_saved else '' }}"
+                                   placeholder="{{ '%.1f'|format(savings_inputs.default_hours_per_estimate) }} (industry avg)">
+                            <div class="input-hint">
+                                {% if savings_inputs.hours_saved %}
+                                    Saved value
+                                {% else %}
+                                    Default: typical commercial-painting takeoff
+                                    ({{ "%.0f"|format(savings_inputs.default_hours_per_estimate) }} hrs)
+                                {% endif %}
+                            </div>
+                        </div>
+                    </div>
+
+                    <div style="display:flex;gap:10px;margin-top:24px;flex-wrap:wrap;">
+                        <button type="submit" class="submit-btn dark-submit-btn" style="max-width:240px;">
+                            Save Inputs
+                        </button>
+                        <button type="submit" name="reset" value="1"
+                                class="submit-btn"
+                                style="max-width:240px;background:rgba(100,116,139,0.4);border:1px solid rgba(148,163,184,0.3);"
+                                onclick="return confirm('Reset savings inputs to industry averages?');">
+                            Reset to defaults
+                        </button>
+                    </div>
+                </form>
+            </section>
+        </main>
+    </div>
+
+    <footer style="text-align:center;padding:20px;color:rgba(203,213,225,0.5);font-size:0.85rem;">
+        &copy; 2026 Knight Shift &mdash; Forged by Willpower
+    </footer>
+
+    {% if clerk_publishable_key and clerk_frontend_api_host %}
+    <script>
+    window.__bootClerk = async function() {
+        const Clerk = window.Clerk;
+        await Clerk.load();
+        const status = document.getElementById('auth-status');
+        const main = document.getElementById('main-content');
+        const tabStrip = document.getElementById('tab-strip');
+        if (!Clerk.user) {
+            if (status) status.textContent = 'Sign in to continue';
+            Clerk.openSignIn({ afterSignInUrl: window.location.href });
+            return;
+        }
+        if (window.__initAccountMenu) window.__initAccountMenu(Clerk.user);
+        if (main) main.style.display = '';
+        if (tabStrip) tabStrip.style.display = '';
+    };
+    </script>
+    <script async crossorigin="anonymous"
+        data-clerk-publishable-key="{{ clerk_publishable_key }}"
+        src="https://{{ clerk_frontend_api_host }}/npm/@clerk/clerk-js@5/dist/clerk.browser.js"
+        onload="window.__bootClerk()"></script>
+    {% endif %}
+</body>
+</html>

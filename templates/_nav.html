@@ -1,6 +1,6 @@
 {# Shared header: brand bar with auth status + tab strip. Included in all
    authenticated pages. Caller passes `active_tab` as one of:
-       new | active | completed | pricing | members | detail
+       new | active | completed | usage | pricing | members | detail
 #}
 <div class="brand-bar">
     <div class="brand-bar-inner">
@@ -60,6 +60,9 @@
         </a>
         <a href="{{ url_for('jobs_list', status='completed') }}" class="tab {% if active_tab == 'completed' %}tab-active{% endif %}">
             <span class="tab-icon">&#128193;</span> Completed
+        </a>
+        <a href="{{ url_for('usage_dashboard') }}" class="tab {% if active_tab == 'usage' %}tab-active{% endif %}">
+            <span class="tab-icon">&#128200;</span> Usage &amp; ROI
         </a>
         <a href="{{ url_for('pricing_settings') }}" class="tab {% if active_tab == 'pricing' %}tab-active{% endif %}">
             <span class="tab-icon">&#128176;</span> Pricing Defaults
