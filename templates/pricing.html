@@ -21,7 +21,7 @@
             <section class="panel">
                 <h2>Pricing Defaults</h2>
                 <p class="panel-subtle">
-                    Override Rider Painting's default rates. Saved per account &mdash; applies to every future submission unless you override on the New Estimate page.
+                    Override the system default rates. Saved per account &mdash; applies to every future submission unless you override on the New Estimate page.
                 </p>
 
                 <form method="POST" action="{{ url_for('pricing_settings') }}">
@@ -35,7 +35,7 @@
 
                     <h3 style="margin-top:24px;">Rate Overrides</h3>
                     <p class="panel-subtle" style="margin-bottom:12px;">
-                        Leave blank to use Rider's tiered defaults. A value here flattens all volume tiers to that single rate.
+                        Leave blank to use the system tiered defaults. A value here flattens all volume tiers to that single rate.
                     </p>
 
                     <table class="pricing-table">
@@ -70,7 +70,7 @@
                         <button type="submit" name="reset" value="1"
                                 class="submit-btn"
                                 style="max-width:240px;background:rgba(100,116,139,0.4);border:1px solid rgba(148,163,184,0.3);"
-                                onclick="return confirm('Reset all pricing to Rider defaults?');">
+                                onclick="return confirm('Reset all pricing to system defaults?');">
                             Reset to defaults
                         </button>
                     </div>

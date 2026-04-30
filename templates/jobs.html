@@ -51,6 +51,9 @@
                     </div>
                     <div class="job-card-meta">
                         <span>&#128197; <strong>{{ s.submitted_at.strftime('%b %d, %Y %H:%M') if s.submitted_at else '—' }}</strong></span>
+                        {% if s.deadline %}
+                        <span>&#9203; Due <strong>{{ s.deadline }}</strong></span>
+                        {% endif %}
                         <span>&#128196; {{ s.upload_count }} file{{ '' if s.upload_count == 1 else 's' }}</span>
                         {% if s.subtotal is not none %}
                         <span>&#128176; <strong>${{ "{:,.0f}".format(s.subtotal) }}</strong></span>

@@ -1050,7 +1050,7 @@ with tab_new:
 
     with col_right:
         st.markdown("#### Pricing — Rates & Markups")
-        st.caption("These are the rates Rider Painting uses for estimates. "
+        st.caption("These are the system default rates. "
                    "Adjust any values below — changes apply to this job only.")
 
         _pricing_display = [

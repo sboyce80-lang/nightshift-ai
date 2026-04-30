@@ -34,9 +34,14 @@
                           enctype="multipart/form-data" id="rfp-form">
 
                         <div class="form-group">
-                            <label for="business_name">Business Name</label>
+                            <label for="business_name">Job or Business Name</label>
                             <input type="text" id="business_name" name="business_name"
-                                   placeholder="Company name (optional)">
+                                   placeholder="Job or company name (optional)">
+                        </div>
+
+                        <div class="form-group">
+                            <label for="deadline">Job Due Date</label>
+                            <input type="date" id="deadline" name="deadline">
                         </div>
 
                         <p style="margin:0 0 14px 0;color:rgba(203,213,225,0.7);font-size:0.85rem;">
@@ -91,8 +96,13 @@
                 <section class="panel" id="pricing-panel">
                     <h2>Pricing &mdash; Rates &amp; Markups</h2>
                     <p class="panel-subtle">
-                        These are the rates Rider Painting uses for estimates. Adjust any values below &mdash; changes apply to this job only.
+                        {% if has_org_overrides %}
+                        These are {{ org_name }}'s saved default rates. Adjust any values below &mdash; changes apply to this job only.
                         <a href="{{ url_for('pricing_settings') }}" style="color:#93c5fd;">Edit account defaults &rarr;</a>
+                        {% else %}
+                        These are the system default rates &mdash; your account hasn't customized them yet. Adjust any values below for this job only,
+                        or <a href="{{ url_for('pricing_settings') }}" style="color:#93c5fd;">set account defaults &rarr;</a>
+                        {% endif %}
                     </p>
 
                     <table class="pricing-table">
