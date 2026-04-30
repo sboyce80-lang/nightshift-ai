@@ -8673,6 +8673,11 @@ def merge_analyses(analyses, file_building_counts=None):
             if bi:
                 combined["building_info"] = bi
 
+        # Carry forward room finish schedule (extend across files; later files win on duplicates)
+        rfs = analysis.get("room_finish_schedule")
+        if rfs:
+            combined.setdefault("room_finish_schedule", []).extend(rfs)
+
         # Carry forward schedule data from schedule-estimated files
         # (these files now have synthetic floors, so they don't hit the no_floor_plans skip above)
         for key in ("door_schedule", "window_schedule", "stair_info"):
@@ -11045,6 +11050,7 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                                 analysis_result[_flag] = False
                             analysis_result["schedule_estimated"] = True
                             analysis_result["building_info"] = room_schedule.get("building_info", {})
+                            analysis_result["room_finish_schedule"] = room_schedule.get("room_finish_schedule", [])
                             schedule_estimated_files.append(filename)
                             total_synth = sum(len(f.get("rooms", [])) for f in synthetic_floors)
                             print(f"   ✅ Schedule estimation: {total_synth} room templates generated")

@@ -244,6 +244,89 @@ def json_to_pdf(json_path, pdf_path):
         story.append(scope_tbl)
         story.append(Spacer(1, 12))
 
+    # ── Project Summary (high-level overview from G-series / coversheet) ──
+    overview = analysis.get('project_overview') or {}
+    summary_text = (overview.get('scope_summary') or '').strip()
+    scope_quote = (overview.get('scope_of_work') or '').strip()
+    overview_notes = (overview.get('notes') or '').strip()
+    stat_pairs = []
+    if overview.get('total_gsf'):
+        try:
+            stat_pairs.append(('Total GSF', f"{int(overview['total_gsf']):,} sf"))
+        except (TypeError, ValueError):
+            pass
+    if overview.get('building_count'):
+        stat_pairs.append(('Buildings', str(overview['building_count'])))
+    if overview.get('stories'):
+        stat_pairs.append(('Stories', str(overview['stories'])))
+    if overview.get('unit_count'):
+        try:
+            stat_pairs.append(('Units', f"{int(overview['unit_count']):,}"))
+        except (TypeError, ValueError):
+            pass
+    if overview.get('occupancy_type'):
+        stat_pairs.append(('Occupancy', str(overview['occupancy_type'])))
+    if overview.get('construction_type'):
+        stat_pairs.append(('Construction', str(overview['construction_type'])))
+
+    if summary_text or stat_pairs or scope_quote or overview_notes:
+        story.append(Paragraph("Project Summary", styles['SectionHead']))
+        story.append(HRFlowable(width="100%", thickness=0.5, color=BORDER_GRAY))
+        story.append(Spacer(1, 4))
+
+        if summary_text:
+            story.append(Paragraph(summary_text, styles['BodyText2']))
+            story.append(Spacer(1, 6))
+
+        if stat_pairs:
+            # Lay out stats as a 3-column-wide bold-label / value strip,
+            # filling row by row.
+            cells = []
+            for label, val in stat_pairs:
+                cells.append(Paragraph(
+                    f'<font color="#0a2540"><b>{label}:</b></font> {val}',
+                    styles['BodyText2']
+                ))
+            # Pad to a multiple of 3 so the table renders evenly
+            while len(cells) % 3 != 0:
+                cells.append('')
+            stat_rows = [cells[i:i + 3] for i in range(0, len(cells), 3)]
+            stat_tbl = Table(
+                stat_rows,
+                colWidths=[2.17 * inch, 2.17 * inch, 2.16 * inch]
+            )
+            stat_tbl.setStyle(TableStyle([
+                ('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                ('BACKGROUND', (0, 0), (-1, -1), LIGHT_GRAY),
+                ('BOX', (0, 0), (-1, -1), 0.5, BORDER_GRAY),
+                ('INNERGRID', (0, 0), (-1, -1), 0.25, BORDER_GRAY),
+                ('LEFTPADDING', (0, 0), (-1, -1), 8),
+                ('RIGHTPADDING', (0, 0), (-1, -1), 8),
+                ('TOPPADDING', (0, 0), (-1, -1), 6),
+                ('BOTTOMPADDING', (0, 0), (-1, -1), 6),
+            ]))
+            story.append(stat_tbl)
+            story.append(Spacer(1, 8))
+
+        # Show the scope-of-work quote only if it adds something the
+        # 1-3 sentence summary doesn't already cover.
+        if scope_quote and scope_quote != summary_text and \
+                scope_quote not in summary_text:
+            story.append(Paragraph(
+                f'<b>Scope of Work (from drawings):</b> {scope_quote}',
+                styles['BodyText2']
+            ))
+            story.append(Spacer(1, 4))
+
+        if overview_notes:
+            story.append(Paragraph(
+                f'<b>Notable:</b> {overview_notes}',
+                styles['BodyText2']
+            ))
+            story.append(Spacer(1, 4))
+
+        story.append(Spacer(1, 4))
+
     # ── Project Information ──
     proj_fields = [
         ('project_name', 'Project Name'),
@@ -315,6 +398,59 @@ def json_to_pdf(json_path, pdf_path):
             ]))
             story.append(Spacer(1, 4))
             story.append(t)
+
+    # ── Room Finish Schedule (architect's per-room finish table) ──
+    rfs_rooms = analysis.get('room_finish_schedule') or []
+    if rfs_rooms:
+        story.append(Spacer(1, 8))
+        story.append(Paragraph("Room Finish Schedule", styles['SectionHead']))
+        story.append(HRFlowable(width="100%", thickness=0.5, color=BORDER_GRAY))
+        story.append(Spacer(1, 4))
+        story.append(Paragraph(
+            f"Extracted from architectural drawings — {len(rfs_rooms)} room types listed.",
+            styles['Note']
+        ))
+
+        def _rfs_cell(v, width):
+            s = '-' if v in (None, '') else str(v)
+            return s if len(s) <= width else s[:width - 1] + '…'
+
+        rfs_data = [['Room #', 'Room', 'Unit', 'Floor', 'Wall', 'Ceiling', 'Base', 'Floor Fin.']]
+        for r in rfs_rooms:
+            rfs_data.append([
+                _rfs_cell(r.get('room_number'), 8),
+                _rfs_cell(r.get('room_name'), 18),
+                _rfs_cell(r.get('unit_type'), 11),
+                _rfs_cell(r.get('floor_level'), 6),
+                _rfs_cell(r.get('wall_finish'), 14),
+                _rfs_cell(r.get('ceiling_finish'), 14),
+                _rfs_cell(r.get('base_finish'), 12),
+                _rfs_cell(r.get('floor_finish'), 14),
+            ])
+
+        rfs_cw = [0.55*inch, 1.25*inch, 0.7*inch, 0.5*inch,
+                  0.95*inch, 1.05*inch, 0.85*inch, 0.85*inch]
+        rfs_t = Table(rfs_data, colWidths=rfs_cw, repeatRows=1)
+        rfs_t.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), DARK_BLUE),
+            ('TEXTCOLOR', (0, 0), (-1, 0), WHITE),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 7),
+            ('LEADING', (0, 0), (-1, -1), 9),
+            ('ALIGN', (0, 0), (-1, 0), 'CENTER'),
+            ('ALIGN', (0, 1), (0, -1), 'CENTER'),
+            ('ALIGN', (2, 1), (3, -1), 'CENTER'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 3),
+            ('TOPPADDING', (0, 0), (-1, -1), 3),
+            ('LEFTPADDING', (0, 0), (-1, -1), 3),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 3),
+            ('BOX', (0, 0), (-1, -1), 0.5, BORDER_GRAY),
+            ('INNERGRID', (0, 0), (-1, -1), 0.25, BORDER_GRAY),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [WHITE, LIGHT_GRAY]),
+        ]))
+        story.append(Spacer(1, 4))
+        story.append(rfs_t)
 
     # ── Room-by-Room Breakdown ──
     floors = analysis.get('floors', [])
