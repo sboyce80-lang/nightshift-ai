@@ -33,7 +33,7 @@ import uuid
 import logging
 import tempfile
 
-from flask import Flask, request, render_template, redirect, url_for, flash, jsonify
+from flask import Flask, request, render_template, redirect, url_for, flash, jsonify, send_from_directory
 from werkzeug.utils import secure_filename
 from werkzeug.middleware.proxy_fix import ProxyFix
 
@@ -281,10 +281,23 @@ def _try_signed_in_user_snapshot():
             )
             snapshot["rates"] = rates
             snapshot["markup"] = markup
+            saved = (org.pricing_overrides or {}) if org else {}
+            snapshot["has_org_overrides"] = bool(
+                saved.get("rates") or saved.get("markup") is not None
+            )
             return user.id, snapshot
     except Exception as exc:
         logger.debug("Optional auth detection failed: %s", exc)
         return None, None
+
+
+@app.route("/favicon.ico")
+def favicon():
+    """Browser tab icon. Browsers auto-request /favicon.ico from the root, so
+    this single route covers every page without touching the 14 templates."""
+    return send_from_directory(
+        app.static_folder, "logo_helm_sm.png", mimetype="image/png",
+    )
 
 
 @app.route("/")
@@ -336,6 +349,8 @@ def index():
         rate_fields=RATE_FIELDS,
         effective_rates=snap["rates"],
         effective_markup=snap["markup"],
+        has_org_overrides=snap["has_org_overrides"],
+        org_name=snap["org_name"],
     )
 
 
@@ -1420,7 +1435,7 @@ def pricing_settings():
         if request.method == "POST":
             if request.form.get("reset"):
                 org.pricing_overrides = None
-                flash("Pricing reset to Rider defaults.", "success")
+                flash("Pricing reset to system defaults.", "success")
                 return redirect(url_for("pricing_settings"))
 
             rates, errors = {}, []
