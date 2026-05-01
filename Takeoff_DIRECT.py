@@ -782,6 +782,11 @@ _DIVISION_9_KEYWORDS = [
     'finish schedule', 'finishing schedule', 'paint schedule', 'color schedule',
     'room finish', 'interior finish', 'division 9', 'division 09', 'section 09',
     '09 91', '09 90', 'paint color', 'wall finish', 'ceiling finish',
+    # Alternative finish-table labels seen on retail/commercial sets (e.g. B&N
+    # used "Finish Legend" rather than "Finish Schedule" — pages with these
+    # labels must still be retained for finish extraction).
+    'finish legend', 'finishes legend', 'finish notes', 'paint legend',
+    'material legend',
 ]
 
 # Sheet prefix → discipline mapping (order matters: check longer prefixes first)
@@ -2736,7 +2741,15 @@ IMPORTANT — UNIQUE ROOM IDENTIFICATION:
 STEP 0: CLASSIFY THE BUILDING (do this FIRST)
 Before extracting any rooms, scan ALL pages and determine:
 - Building type: single-family, multi-family, mixed-use, commercial
-- Number of stories (from building sections, drawing index, title sheets, or notes)
+- Number of stories — count OCCUPIED HUMAN FLOOR LEVELS only, from a building section
+  or elevation. Default for retail/big-box and most commercial tenant fit-outs is 1.
+  DO COUNT: ground floor, second floor, third floor, etc. — anywhere people occupy.
+  DO NOT COUNT: the roof, the parapet, a clerestory, a foundation/crawlspace, a
+    mechanical penthouse, or a mezzanine that is less than 50% of the floor area below it.
+  DO NOT INFER stories from seeing both a "Floor Plan" sheet and a "Roof Plan" sheet —
+    that is still a single-story building.
+  If the only floor plan is sheet A-101 (or equivalent first-floor plan) and there is
+    no A-102/A-201/etc. showing rooms on a higher level, total_stories = 1.
 - Number of units/apartments (from unit schedules, floor plans, light/ventilation tables)
 - Total building footprint (from site plan or floor plan dimensions, e.g. 133' x 70')
 - Presence of commercial/retail spaces on ground floor
@@ -3871,7 +3884,19 @@ Your task: Extract the ROOM FINISH SCHEDULE and BUILDING INFORMATION from this d
    - unit_types: List of apartment/unit types with counts PER BUILDING
      e.g., [{"type": "2BR", "count_per_building": 6}, {"type": "3BR", "count_per_building": 6}]
    - total_units_per_building: Total residential units per building
-   - floors_per_building: Number of floors per building (from sections, elevations, or notes)
+   - floors_per_building: Number of OCCUPIED HUMAN FLOOR LEVELS in the building, counted
+     from a building section or elevation. The default for retail/big-box and most commercial
+     tenant fit-outs is 1.
+     DO COUNT: ground floor, second floor, third floor, etc. — anywhere people occupy.
+     DO NOT COUNT: the roof, the parapet, a clerestory, a foundation/crawlspace, a mechanical
+       penthouse, or a mezzanine that is less than 50% of the floor area below it.
+     DO NOT INFER from the count of unique values in the schedule's "Floor Level" column —
+       that column often contains values like "1" and "Roof" or "1" and "Mezzanine" which
+       must NOT bump the count to 2.
+     DO NOT INFER from seeing both a "Floor Plan" sheet and a "Roof Plan" sheet — that is
+       still a single-story building.
+     If the only floor plan is sheet A-101 (or equivalent first-floor plan), and there is
+     no A-102/A-201/etc. showing rooms on a higher level, the answer is 1.
    - has_garage: Whether the building has a parking garage (true/false)
    - garage_floor_area_sqft: If garage area is noted anywhere, include it (0 if unknown)
    - has_pool: Whether this is a pool/amenities building
@@ -3894,6 +3919,26 @@ Your task: Extract the ROOM FINISH SCHEDULE and BUILDING INFORMATION from this d
    trash rooms, storage rooms) that appear in the finish schedule. These exist once per floor, not per unit.
    Mark their unit_type as "common_area".
 
+4. STRUCTURAL / EXPOSED-SURFACE FINISH CALLOUTS (CRITICAL FOR COMMERCIAL/RETAIL):
+   Many finish schedules — especially on big-box retail, warehouses, and tenant fit-outs — include
+   ROWS THAT ARE NOT ROOMS. They specify finishes for exposed building elements that are painted
+   throughout the space. Examples:
+     - "Exposed structure, roof deck, joists, beams: Semi-Gloss Enamel"
+     - "Exposed HVAC ductwork, conduits, piping: Semi-Gloss"
+     - "Open ceiling — paint deck and structure to match"
+     - "All exposed MEP above ceiling grid: Dryfall, white"
+   These rows describe SURFACES, not rooms. DO NOT try to fit them into the room_finish_schedule.
+   Instead, list them in a separate top-level array "structural_finish_scope" with this shape:
+     {
+       "surfaces": ["roof deck", "structure", "ducts", "conduits", "piping", "joists", "beams"],
+       "finish": "Semi-Gloss Enamel" or "Dryfall" or whatever the schedule specifies,
+       "applies_to": "all" or "open-ceiling areas" or list of specific room names,
+       "color": "<color or null>",
+       "note": "<verbatim text snippet from the schedule>"
+     }
+   Capture EVERY such row. These are typically the single largest dollar item on a retail/commercial
+   project — missing them causes proposals to come in 30-50% low.
+
 Return ONLY this JSON:
 {
   "room_finish_schedule": [
@@ -3907,6 +3952,15 @@ Return ONLY this JSON:
       "unit_type": "2BR",
       "floor_level": "1",
       "is_common_area": false
+    }
+  ],
+  "structural_finish_scope": [
+    {
+      "surfaces": ["roof deck", "structure", "ducts", "conduits"],
+      "finish": "Semi-Gloss Enamel",
+      "applies_to": "all open-ceiling areas",
+      "color": null,
+      "note": "Exposed structure, roof deck, HVAC, ducts, electrical, conduits to be Semi-Gloss enameled"
     }
   ],
   "building_info": {
@@ -3923,8 +3977,8 @@ Return ONLY this JSON:
   "notes": []
 }
 
-If no Room Finish Schedule is found, return {"room_finish_schedule": [], "building_info": {}, "notes": ["No Room Finish Schedule found"]}.
-Be precise — extract every room listed in the schedule."""
+If no Room Finish Schedule is found, return {"room_finish_schedule": [], "structural_finish_scope": [], "building_info": {}, "notes": ["No Room Finish Schedule found"]}.
+Be precise — extract every room listed in the schedule, and capture every structural-surface finish callout."""
 
     try:
         result_parts = []
@@ -3960,6 +4014,7 @@ Be precise — extract every room listed in the schedule."""
             rfs_data = json.loads(json_match.group())
             rooms = rfs_data.get("room_finish_schedule", [])
             bi = rfs_data.get("building_info", {})
+            struct_scope = rfs_data.get("structural_finish_scope", []) or []
             if rooms:
                 print(f"   ✅ Room Finish Schedule extracted: {len(rooms)} room types")
                 n_buildings = bi.get("total_identical_buildings", 1)
@@ -3970,6 +4025,14 @@ Be precise — extract every room listed in the schedule."""
                     print(f"      Unit types: {ut_str}")
                 if n_buildings > 1:
                     print(f"      Identical buildings: {n_buildings}")
+                if struct_scope:
+                    print(f"      Structural finish callouts: {len(struct_scope)}")
+                return rfs_data
+            elif struct_scope:
+                # No room rows but finish-schedule did contain structural-surface callouts
+                # (common on retail/big-box where the schedule is just a legend +
+                # paint-to-deck note). Preserve so downstream can still apply scope.
+                print(f"   ⚠️  No room rows, but {len(struct_scope)} structural finish callout(s) captured")
                 return rfs_data
             else:
                 print(f"   ⚠️  No Room Finish Schedule found in this PDF")
@@ -3981,6 +4044,311 @@ Be precise — extract every room listed in the schedule."""
     except Exception as e:
         print(f"   ❌ Error extracting Room Finish Schedule: {e}")
         return None
+
+
+# ---------------------------------------------------------------------------
+# Exterior Scope Extraction — Dedicated pass on elevation sheets
+# ---------------------------------------------------------------------------
+
+def _identify_elevation_pages(pdf_path):
+    """Return 0-based page indices that look like exterior-elevation sheets.
+
+    Heuristics:
+      1. Sheet number with prefix 'A' and number in 200-399 range (typical
+         elevation/section sheet block). Examples: A-201, A-205, A2.10.
+      2. Full-text contains an elevation cue: "elevation", "north elevation",
+         "south elevation", "east elevation", "west elevation",
+         "exterior elevation", "front elevation", "rear elevation".
+
+    Designed to be cheap (PyMuPDF only, no API calls).
+    """
+    try:
+        import fitz
+    except ImportError:
+        return []
+
+    elevation_indices = []
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception:
+        return []
+
+    elevation_cues = (
+        "exterior elevation", "exterior elevations",
+        "north elevation", "south elevation",
+        "east elevation", "west elevation",
+        "front elevation", "rear elevation", "side elevation",
+        "building elevation", "building elevations",
+    )
+
+    for page_idx in range(len(doc)):
+        page = doc[page_idx]
+        full_text = page.get_text() or ""
+        lower = full_text.lower()
+
+        # Cue-based match (most reliable)
+        if any(cue in lower for cue in elevation_cues):
+            elevation_indices.append(page_idx)
+            continue
+
+        # Sheet-number-based match: A-2xx or A-3xx range
+        for m in _SHEET_NUMBER_RE.finditer(full_text):
+            prefix = m.group(1).upper()
+            number = m.group(2)
+            if prefix == 'A':
+                # Strip decimal portion (A2.10 → "2"); take leading digits
+                base = number.split('.')[0]
+                try:
+                    n = int(base)
+                except ValueError:
+                    continue
+                # A-200..A-399 typically holds exterior elevations & sections
+                if (200 <= n < 400) or (n in (2, 3) and '.' in number):
+                    # A2.x and A3.x conventions also map here
+                    if "elevation" in lower or "section" not in lower:
+                        elevation_indices.append(page_idx)
+                        break
+
+    doc.close()
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for idx in elevation_indices:
+        if idx not in seen:
+            seen.add(idx)
+            unique.append(idx)
+    return unique
+
+
+def _extract_exterior_scope(client, pdf_path):
+    """Extract exterior painting scope from elevation sheets only.
+
+    Mirrors _extract_room_finish_schedule() but focuses on building elevations
+    (A-200/A-300 series). Sends a filtered PDF containing only elevation pages
+    to keep the LLM's attention on exterior scope.
+
+    Returns dict with shape compatible with the analysis 'exterior' section,
+    or None if no elevation pages were found / call failed.
+    """
+    print(f"\n🏛  Extracting exterior scope: {os.path.basename(pdf_path)}")
+
+    elevation_indices = _identify_elevation_pages(pdf_path)
+    if not elevation_indices:
+        print(f"   ⚠️  No elevation pages identified — skipping exterior pass")
+        return None
+    print(f"   📄 Elevation pages: {[i + 1 for i in elevation_indices]}")
+
+    # Build a filtered PDF containing only elevation pages so the LLM is
+    # not distracted by floor plans / schedules.
+    try:
+        filtered_bytes = _create_filtered_pdf(pdf_path, elevation_indices)
+    except Exception as e:
+        print(f"   ❌ Could not build filtered elevation PDF: {e}")
+        return None
+
+    # Size guard: Claude's per-document base64 limit ~5 MB.
+    if len(filtered_bytes) > 5 * 1024 * 1024:
+        print(f"   ⚠️  Filtered elevation PDF is "
+              f"{len(filtered_bytes)/1024/1024:.1f} MB — truncating to first "
+              f"few elevation pages")
+        # Truncate to first 4 pages (typically the 4 cardinal elevations)
+        elevation_indices = elevation_indices[:4]
+        try:
+            filtered_bytes = _create_filtered_pdf(pdf_path, elevation_indices)
+        except Exception as e:
+            print(f"   ❌ Could not build truncated elevation PDF: {e}")
+            return None
+
+    pdf_b64 = base64.standard_b64encode(filtered_bytes).decode("utf-8")
+
+    exterior_prompt = """You are analyzing BUILDING ELEVATION DRAWINGS for exterior painting scope.
+
+Your task: Extract every painted exterior surface visible in these elevations.
+
+WHAT TO MEASURE:
+1. PAINT SURFACES (record sqft):
+   - Painted CMU / masonry / EIFS / stucco / metal panel / precast walls
+   - Painted fascia, soffit, canopy, sign band, parapet cap
+   - Painted exterior trim and corner boards
+   Estimate AREA = width × height, subtracting glazing/storefront/doors.
+
+2. EXTERIOR DOORS (count):
+   - Service doors, rear doors, mechanical doors, hollow-metal doors that
+     are scheduled or noted as "PAINT" or "PT" or have a painted finish.
+   - Storefront/glazed doors are NOT included unless explicitly painted.
+
+3. LINEAR ITEMS (record LF):
+   - Cornice / parapet cap LF (perimeter of the painted top edge)
+   - Painted exterior window trim LF (head + sill + 2 jambs per window)
+   - Painted bollards (count, not LF)
+
+4. SIDING TYPE:
+   - exterior_siding_type = primary cladding name: "hardie", "stucco",
+     "eifs", "cmu", "masonry", "metal panel", "precast", "vinyl", "wood".
+   - If material-specific (hardie, EIFS), set hardie_siding_sqft separately
+     and DO NOT also include in exterior_paint_sqft.
+
+5. LIFT REQUIRED:
+   - Set lift_required = true if the building is 3+ stories OR if any painted
+     surface is above ~14 ft (typical extension-ladder reach).
+
+CRITICAL — RETAIL / TENANT-FIT-OUT GOTCHAS:
+   - Many retail boxes (e.g. Barnes & Noble, target tenant fit-outs) have
+     SMALL exterior scope: just rear doors, fascia/sign band touch-up, and
+     bollards. DO NOT default to 0 — capture every painted item, however small.
+   - If the elevations show storefront glazing on the front and CMU/painted
+     metal on rear/sides, count ONLY the rear and side painted areas.
+
+Return ONLY this JSON (one object, no commentary):
+{
+  "exterior_paint_sqft": 0,
+  "hardie_siding_sqft": 0,
+  "cornice_lf": 0,
+  "window_trim_lf": 0,
+  "soffit_sqft": 0,
+  "azek_trim_lf": 0,
+  "corner_board_lf": 0,
+  "steel_lintel_lf": 0,
+  "exterior_door_count": 0,
+  "bollard_count": 0,
+  "exterior_siding_type": "",
+  "lift_required": false,
+  "notes": "<1-2 sentences describing what was painted and why your numbers reflect that>",
+  "source_sheets": ["A-201", "A-202"]
+}
+
+If the elevations show no painted exterior surfaces, return all zeros with a
+note explaining why (e.g. "Storefront glazing on all four sides; no painted
+exterior scope visible.")."""
+
+    try:
+        result_parts = []
+        with client.messages.stream(
+            model="claude-sonnet-4-20250514",
+            max_tokens=2000,
+            temperature=0,
+            timeout=300.0,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {
+                        "type": "document",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": pdf_b64,
+                        },
+                    },
+                    {
+                        "type": "text",
+                        "text": exterior_prompt,
+                    },
+                ],
+            }],
+        ) as stream:
+            for text in stream.text_stream:
+                result_parts.append(text)
+
+        result_text = "".join(result_parts)
+        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        if not json_match:
+            print(f"   ⚠️  Could not parse exterior scope response")
+            return None
+
+        ext_data = json.loads(json_match.group())
+        ext_data["source_pages"] = [i + 1 for i in elevation_indices]
+
+        sqft = _num(ext_data.get("exterior_paint_sqft", 0))
+        hardie = _num(ext_data.get("hardie_siding_sqft", 0))
+        cornice = _num(ext_data.get("cornice_lf", 0))
+        doors = _num(ext_data.get("exterior_door_count", 0))
+        print(f"   ✅ Exterior scope extracted: "
+              f"{sqft:,.0f} sqft paint, {hardie:,.0f} sqft hardie, "
+              f"{cornice:,.0f} LF cornice, {doors:.0f} ext doors")
+        return ext_data
+
+    except Exception as e:
+        print(f"   ❌ Error extracting exterior scope: {e}")
+        return None
+
+
+def _maybe_run_exterior_pass(client, pdf_path, analysis_result):
+    """If `analysis_result` is missing exterior scope on a commercial job,
+    run a dedicated elevation-only extraction and merge the results.
+
+    Idempotent and side-effect-free if the analysis already has exterior
+    sqft or the building isn't commercial. Mutates `analysis_result`.
+    Emits an RFI note when no elevation pages are found OR the dedicated
+    pass also returns 0 sqft on a commercial job.
+    """
+    if not isinstance(analysis_result, dict):
+        return
+
+    pi = analysis_result.get("project_info", {}) or {}
+    bt = str(pi.get("building_type", "")).lower()
+    is_commercial = any(
+        kw in bt for kw in (
+            "commercial", "auto", "industrial", "warehouse",
+            "retail", "dealership"
+        )
+    )
+    if not is_commercial:
+        return
+
+    exterior = analysis_result.get("exterior", {}) or {}
+    if _num(exterior.get("exterior_paint_sqft", 0)) > 0:
+        return  # Already have exterior scope — don't burn an extra API call
+
+    print(f"   🏛  Commercial job with 0 exterior sqft — running dedicated "
+          f"elevation pass...")
+    time.sleep(10)
+    ext_data = _extract_exterior_scope(client, pdf_path)
+    if ext_data:
+        # Merge non-zero numeric fields into the existing exterior dict
+        # (preserve any prior values; only fill gaps).
+        merged = dict(exterior)
+        for key in (
+            "exterior_paint_sqft", "hardie_siding_sqft", "cornice_lf",
+            "window_trim_lf", "soffit_sqft", "azek_trim_lf",
+            "corner_board_lf", "steel_lintel_lf",
+        ):
+            if _num(merged.get(key, 0)) == 0 and _num(ext_data.get(key, 0)) > 0:
+                merged[key] = ext_data[key]
+        if not merged.get("exterior_siding_type") and ext_data.get("exterior_siding_type"):
+            merged["exterior_siding_type"] = ext_data["exterior_siding_type"]
+        if ext_data.get("lift_required") and not merged.get("lift_required"):
+            merged["lift_required"] = True
+        # Append-only notes
+        ext_note = ext_data.get("notes", "")
+        if ext_note:
+            existing = merged.get("notes", "")
+            merged["notes"] = (existing + " | " if existing else "") + str(ext_note)
+        merged["source_pages"] = ext_data.get("source_pages", [])
+        analysis_result["exterior"] = merged
+
+        # If pass returned all zeros on a commercial job, emit an RFI rather
+        # than silently dropping exterior scope.
+        if _num(merged.get("exterior_paint_sqft", 0)) == 0 \
+                and _num(merged.get("hardie_siding_sqft", 0)) == 0 \
+                and _num(merged.get("cornice_lf", 0)) == 0:
+            analysis_result.setdefault("notes", []).append(
+                "[RFI: Exterior Scope] Commercial building with 0 sqft "
+                "exterior paint extracted from elevation pages "
+                f"({merged.get('source_pages', [])}). Confirm with owner "
+                "whether any exterior painting is required (storefront, "
+                "rear/service doors, fascia, soffit, bollards, sign band, "
+                "exposed CMU). Do not assume zero without confirmation."
+            )
+    else:
+        # No elevation pages found at all — most likely the PDF is a
+        # tenant-fit-out / interior-only set, but flag it as an RFI so
+        # Rider can confirm.
+        analysis_result.setdefault("notes", []).append(
+            "[RFI: Exterior Scope] No exterior elevation sheets identified "
+            "in this PDF, and 0 sqft exterior paint extracted from the "
+            "main pass. Confirm with owner whether exterior painting is "
+            "in scope; if so, request elevation drawings."
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -4774,6 +5142,28 @@ def _estimate_from_room_finish_schedule(room_schedule_data, schedule_data=None):
     floors_per_building = max(bi.get("floors_per_building", 1), 1)
     ceiling_height_override = bi.get("ceiling_height_ft", 0)
 
+    # Validation clamp: if the LLM reported floors_per_building > 1 but every
+    # room in the schedule lives on the same floor_level, the LLM almost
+    # certainly inflated the count (e.g. counted "Roof" or a mezzanine row).
+    # Common failure on retail boxes — see B&N regression. Clamp to 1.
+    if floors_per_building > 1 and rooms_data:
+        # Normalize floor_level values: keep only labels that look like an
+        # occupied floor ("1", "2", "Ground", "Basement"). Drop "Roof",
+        # "Mezzanine", and blanks.
+        seen_levels = set()
+        for r in rooms_data:
+            lvl = str(r.get("floor_level", "")).strip().lower()
+            if not lvl:
+                continue
+            if lvl in ("roof", "mezz", "mezzanine", "penthouse", "attic"):
+                continue
+            seen_levels.add(lvl)
+        if len(seen_levels) <= 1:
+            print(f"   ⚠️  floors_per_building clamp: LLM said {floors_per_building}, "
+                  f"but rooms only span {len(seen_levels)} occupied level(s) "
+                  f"({sorted(seen_levels) or 'none'}). Clamping to 1.")
+            floors_per_building = 1
+
     # Build a unit count map: {"2BR": 6, "3BR": 6}
     unit_count_map = {}
     for ut in unit_types:
@@ -5391,7 +5781,15 @@ def _apply_schedule_overrides(combined):
             "eifs", "exterior paint", "ext paint", "ep-", "masonry paint",
             "stucco", "exterior finish", "ext. paint", "painted masonry",
             "paint masonry", "elastomeric", "acm", "metal panel",
-            "precast", "precast panel"))
+            "precast", "precast panel",
+            # Retail/storefront callouts that are commonly the ONLY exterior
+            # paint scope on a tenant-fit-out (e.g. B&N — fascia, soffit,
+            # rear/service door, bollards) and don't trigger the masonry/EIFS
+            # keywords above:
+            "fascia", "soffit", "rear door", "service door", "sign band",
+            "cmu paint", "painted cmu", "painted metal", "bollard", "bollards",
+            "exterior door", "ext door", "ext. door",
+            "exterior trim", "ext trim", "canopy paint", "painted canopy"))
         if has_ext_paint_refs:
             # Estimate exterior paint from building footprint and stories
             _pi = combined.get("project_info", {})
@@ -7499,10 +7897,27 @@ def _recalculate_totals(analysis):
             # Also scan material legend descriptions
             for entry in analysis.get("material_legend", []):
                 all_notes += " " + str(entry.get("description", ""))
+            # Also scan captured structural_finish_scope rows from the
+            # finish-schedule extraction — these are the most authoritative
+            # source for "paint deck/structure/MEP" callouts.
+            for sfs in analysis.get("structural_finish_scope", []) or []:
+                all_notes += " " + str(sfs.get("note", ""))
+                all_notes += " " + str(sfs.get("finish", ""))
+                for surf in sfs.get("surfaces", []) or []:
+                    all_notes += " " + str(surf)
             all_notes_lower = all_notes.lower()
             dryfall_in_notes = any(kw in all_notes_lower for kw in (
                 "dryfall", "dry fall", "spray-applied", "spray applied",
-                "paint exposed", "painted deck", "paint deck", "dry-fall"))
+                "paint exposed", "painted deck", "paint deck", "dry-fall",
+                # Retail/commercial finish-schedule callouts that imply paint-to-deck
+                # but don't use the literal word "dryfall":
+                "paint to deck", "paint structure", "paint joists",
+                "paint conduit", "paint conduits", "paint duct", "paint ducts",
+                "paint hvac", "paint mep", "paint piping",
+                "semi-gloss enamel", "semi gloss enamel",
+                "enamel on exposed", "enamel exposed",
+                "paint all exposed", "paint exposed structure",
+                "open to structure", "open to deck"))
 
             # Secondary trigger: commercial building with exposed-ceiling rooms
             # at height ≥14ft. In commercial/industrial buildings, high exposed
@@ -7555,6 +7970,31 @@ def _recalculate_totals(analysis):
                         f"EXPOSED ceilings as dryfall (commercial building with high exposed ceilings)")
                     print(f"   🔧 Dryfall safety net: reclassified {reclassified_sqft:,.0f} sqft "
                           f"EXPOSED → dryfall (commercial + high exposed ceilings)")
+
+                # Footprint-based fallback: schedule called out structural-surface
+                # painting (deck/structure/MEP) but no room had ceiling="exposed"
+                # to reclassify. Common on retail boxes where the LLM extracted
+                # only "office" / "stockroom" rooms and missed that the sales
+                # floor is open-to-deck. Estimate dryfall from footprint.
+                if reclassified_sqft == 0:
+                    _pi_dr = analysis.get("project_info", {})
+                    footprint_dr = _num(_pi_dr.get("footprint_sqft", 0))
+                    has_struct_scope = bool(analysis.get("structural_finish_scope"))
+                    if footprint_dr > 0 and has_struct_scope:
+                        # Sales-floor / open area is typically 70-85% of a retail
+                        # footprint (back-of-house and offices ceiling out at ACT).
+                        # Use 0.75 as a defensible mid-point.
+                        est_dryfall = round(footprint_dr * 0.75)
+                        total_dryfall_ceiling += est_dryfall
+                        analysis.setdefault("notes", []).append(
+                            f"[Dryfall Safety Net] Estimated {est_dryfall:,.0f} sqft of "
+                            f"dryfall (75% of {footprint_dr:,.0f} sqft footprint). "
+                            f"Schedule has structural-finish callouts (paint exposed "
+                            f"deck/structure/MEP) but no room ceilings were tagged "
+                            f"EXPOSED for reclassification.")
+                        print(f"   🔧 Dryfall safety net (footprint fallback): "
+                              f"{est_dryfall:,.0f} sqft from {footprint_dr:,.0f} sqft "
+                              f"footprint × 0.75 (structural_finish_scope present)")
 
     # --- Wallcovering estimation fallback ---
     # When finish schedule mentions WC-x codes but LLM extracted 0 wallcovering_sqft,
@@ -11040,6 +11480,12 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                     print(f"   📊 Attempting schedule-based estimation...")
                     time.sleep(15)  # Cooldown before second API call
                     room_schedule = _extract_room_finish_schedule(client, pdf_path)
+                    if room_schedule:
+                        # Preserve structural_finish_scope even if no rooms were
+                        # extracted — downstream dryfall safety net relies on it.
+                        struct_scope = room_schedule.get("structural_finish_scope") or []
+                        if struct_scope:
+                            analysis_result["structural_finish_scope"] = struct_scope
                     if room_schedule and room_schedule.get("room_finish_schedule"):
                         synthetic_floors = _estimate_from_room_finish_schedule(
                             room_schedule, schedule_data
@@ -11061,6 +11507,11 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                         if schedule_data.get(key):
                             analysis_result[key] = schedule_data[key]
                     all_results[-1] = (path, analysis_result)
+
+                # Dedicated exterior pass — schedule-only PDFs almost never
+                # have exterior_paint_sqft populated, so always try.
+                _maybe_run_exterior_pass(client, pdf_path, analysis_result)
+                all_results[-1] = (path, analysis_result)
             else:
                 totals = analysis_result.get('aggregated_totals', {})
                 rooms = analysis_result.get('project_info', {}).get('total_rooms_found', 0)
@@ -11090,6 +11541,11 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                         all_results[-1] = (path, analysis_result)
                     else:
                         print(f"      ⚠️  Schedule re-analysis returned no data")
+
+                # Dedicated exterior pass — only fires for commercial jobs
+                # with 0 sqft exterior. Cheap no-op otherwise.
+                _maybe_run_exterior_pass(client, pdf_path, analysis_result)
+                all_results[-1] = (path, analysis_result)
         else:
             files_skipped.append(filename)
             print(f"\n   ❌ FAILED: {filename} could not be analyzed after 2 attempts")
@@ -11481,6 +11937,59 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         if "markup" in rate_overrides:
             print(f"   Global markup override: {float(rate_overrides['markup'])*100:.1f}%")
 
+    # --- Pre-finalize sanity check ---
+    # Backstop against missed-scope incidents (see Rider B&N regression):
+    # for any commercial job where total extracted paintable surface is
+    # implausibly small relative to building footprint, mark the analysis
+    # for manual review BEFORE pricing runs. Pricing still proceeds (so
+    # Rider sees something), but a high-severity flag bubbles into
+    # validation, RFI, and the saved JSON for downstream UI to surface.
+    _sanity_pi = analysis.get("project_info", {}) or {}
+    _sanity_bt = str(_sanity_pi.get("building_type", "")).lower()
+    _sanity_is_commercial = any(kw in _sanity_bt for kw in (
+        "commercial", "auto", "industrial", "warehouse",
+        "retail", "dealership"))
+    if _sanity_is_commercial:
+        _sanity_agg = analysis.get("aggregated_totals", {}) or {}
+        _sanity_ext = analysis.get("exterior", {}) or {}
+        _wall = _num(_sanity_agg.get("total_paintable_wall_sqft", 0))
+        _ceil_gyp = _num(_sanity_agg.get("total_paintable_gyp_ceiling_sqft", 0))
+        _ceil_dry = _num(_sanity_agg.get("total_dryfall_ceiling_sqft", 0))
+        _ext_paint = _num(_sanity_ext.get("exterior_paint_sqft", 0))
+        _ext_hardie = _num(_sanity_ext.get("hardie_siding_sqft", 0))
+        _total_paintable = _wall + _ceil_gyp + _ceil_dry + _ext_paint + _ext_hardie
+        _footprint = _num(_sanity_pi.get("footprint_sqft", 0))
+
+        # Threshold: paintable_surface < footprint × 3 is structurally
+        # implausible for a commercial building. A typical retail box:
+        #   walls ≈ footprint × 0.4 (perimeter × 14ft / footprint)
+        #   ceiling ≈ footprint × 0.9
+        #   exterior ≈ footprint × 0.4
+        # So footprint × 3 is conservative — most jobs land at 4-6×.
+        if _footprint > 1000 and _total_paintable < _footprint * 3:
+            ratio = (_total_paintable / _footprint) if _footprint else 0
+            flag_msg = (
+                f"[MANUAL REVIEW REQUIRED] Total extracted paintable surface "
+                f"({_total_paintable:,.0f} sqft) is implausibly low relative "
+                f"to building footprint ({_footprint:,.0f} sqft) for a "
+                f"commercial job — ratio is {ratio:.1f}× footprint, expected "
+                f"3-6×. This usually means the finish schedule, exposed "
+                f"structure / paint-to-deck scope, or exterior was missed "
+                f"in extraction. Do NOT send this proposal without a senior "
+                f"reviewer confirming the takeoff."
+            )
+            analysis["manual_review_required"] = True
+            analysis["manual_review_reason"] = flag_msg
+            analysis.setdefault("notes", []).append(flag_msg)
+            print(f"\n🚨 PRE-FINALIZE SANITY CHECK FAILED")
+            print(f"   Paintable: {_total_paintable:,.0f} sqft "
+                  f"(walls {_wall:,.0f}, gyp ceil {_ceil_gyp:,.0f}, "
+                  f"dryfall {_ceil_dry:,.0f}, ext {_ext_paint + _ext_hardie:,.0f})")
+            print(f"   Footprint: {_footprint:,.0f} sqft "
+                  f"(ratio {ratio:.1f}×, expected 3-6×)")
+            print(f"   ⚠️  Flagged for manual review — proposal will print "
+                  f"but should NOT be sent without reviewer sign-off.")
+
     # --- Calculate costs ---
     _update_progress(6, TOTAL_STEPS, "Calculating Costs", "Applying pricing model...")
     print("\n💰 Calculating costs...")
@@ -11578,6 +12087,10 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         "generated": datetime.now().isoformat(),
         "scope_notes": scope_notes if scope_notes else None,
         "building_inventory": building_inventory if building_inventory else None,
+        # Top-level mirror of pre-finalize sanity check so the UI / email
+        # layer can gate proposal sending without descending into `analysis`.
+        "manual_review_required": bool(analysis.get("manual_review_required")),
+        "manual_review_reason": analysis.get("manual_review_reason"),
         "analysis": analysis,
         "cost_estimate": costs,
         "labor_hours_estimate": _compute_labor_hours(analysis),
