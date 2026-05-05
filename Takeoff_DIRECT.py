@@ -11264,6 +11264,10 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     # --- Pre-scan for building inventory from index pages ---
     _update_progress(2, TOTAL_STEPS, "Building Inventory", "Scanning index pages for building data...")
     building_inventory = None
+    # Persisted across the building-inventory loop so the partial-extraction
+    # detector below can compare detected-vs-extracted architectural sheets
+    # and notice silent inventory-call failures.
+    _index_info_per_pdf = []
     try:
         enable_inv_scan = True
         try:
@@ -11278,6 +11282,12 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             all_inventories = []
             for pdf_path_scan in pdf_paths:
                 index_info = _detect_index_pages(pdf_path_scan)
+                if index_info:
+                    _index_info_per_pdf.append({
+                        "pdf": os.path.basename(pdf_path_scan),
+                        "has_building_list": bool(index_info.get("has_building_list")),
+                        "index_text": index_info.get("index_text", ""),
+                    })
                 if index_info and index_info.get("has_building_list"):
                     print(f"\n📑 Index pages detected in {os.path.basename(pdf_path_scan)}: "
                           f"pages {[p + 1 for p in index_info['index_pages']]}")
@@ -12077,6 +12087,96 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             print(f"\n📊 Rate overrides applied: {', '.join(overridden)}")
         if "markup" in rate_overrides:
             print(f"   Global markup override: {float(rate_overrides['markup'])*100:.1f}%")
+
+    # --- Partial-extraction failure detector ---
+    # The unified extraction and the building-inventory pre-scan both swallow
+    # Anthropic InternalServerError / timeout exceptions per chunk and produce
+    # whatever data they got. On a transient API outage this yields a
+    # "looks-fine" analysis with most of the PDF missing — the May 5 Albany
+    # B&N run extracted 4 rooms from 2 sheets when the same PDF on May 1
+    # extracted 26 rooms from 18 sheets. We don't want to ship a bid based on
+    # 1/9th of the PDF, so detect this case and flag for re-run rather than
+    # let the downstream sanity check absorb it as a generic "scope missing"
+    # signal that pricing tries to recover from.
+    def _flag_partial_extraction(reason_msg):
+        analysis["manual_review_required"] = True
+        existing = analysis.get("manual_review_reason") or ""
+        new_reason = f"[EXTRACTION INCOMPLETE — RE-RUN REQUIRED] {reason_msg}"
+        analysis["manual_review_reason"] = (
+            f"{new_reason} | {existing}" if existing else new_reason
+        )
+        analysis.setdefault("notes", []).append(f"[Partial Extraction] {reason_msg}")
+        analysis.setdefault("_pre_pricing_rfis", []).append({
+            "category": "Extraction Incomplete",
+            "question": (
+                f"This extraction appears severely incomplete and the bid below "
+                f"should NOT be sent. {reason_msg} Most likely cause: the "
+                f"Anthropic API returned a transient error during one or more "
+                f"PDF chunks and the pipeline produced a degraded result. "
+                f"Re-run the analysis on the same PDF; if a re-run reproduces "
+                f"the same numbers, escalate."
+            ),
+            "action_required": (
+                "Re-run the analysis. Do not send this proposal — extraction "
+                "missed a significant portion of the PDF."
+            ),
+            "severity": "high",
+            "source": "partial_extraction_detector",
+        })
+        print(f"\n🚨 PARTIAL EXTRACTION FAILURE DETECTED")
+        print(f"   {reason_msg}")
+        print(f"   ⚠️  Job flagged for manual review and re-run")
+
+    # Trigger 1: index page detected a building list but inventory call returned null
+    _inventory_should_have_worked = any(
+        info.get("has_building_list") for info in _index_info_per_pdf
+    )
+    if _inventory_should_have_worked and building_inventory is None:
+        _flag_partial_extraction(
+            "Index pages detected a building list (drawing index, sheet schedule, "
+            "or building schedule) but the building-inventory call returned null "
+            "— the API call likely failed silently during pre-scan."
+        )
+
+    # Trigger 2: architectural-sheet coverage from extracted rooms vs. drawing index
+    _extracted_arch_sheets = set()
+    for _floor in analysis.get("floors", []) or []:
+        for _room in _floor.get("rooms", []) or []:
+            _sheet = re.sub(r'\s+', '', str(_room.get("source_sheet", "")).upper())
+            if re.match(r'^A[D]?\d', _sheet) or re.match(r'^A[D]?-\d', _sheet):
+                _extracted_arch_sheets.add(_sheet)
+
+    _detected_arch_sheets = set()
+    for _info in _index_info_per_pdf:
+        _txt = (_info.get("index_text") or "").upper()
+        # Match A-101, AD-100, A101, etc. Trailing letter for sub-sheets (A-300A).
+        for _m in re.finditer(r'\bA[D]?\s*-?\s*\d{2,3}[A-Z]?\b', _txt):
+            _detected_arch_sheets.add(re.sub(r'\s+', '', _m.group()))
+
+    if (len(_detected_arch_sheets) >= 6
+            and _extracted_arch_sheets
+            and len(_extracted_arch_sheets) / len(_detected_arch_sheets) < 0.30):
+        _coverage_pct = (len(_extracted_arch_sheets)
+                         / len(_detected_arch_sheets)) * 100
+        _flag_partial_extraction(
+            f"Extracted rooms came from only {len(_extracted_arch_sheets)} of "
+            f"{len(_detected_arch_sheets)} architectural sheets detected in the "
+            f"drawing index ({_coverage_pct:.0f}% coverage; ≥30% expected). "
+            f"Extracted: {sorted(_extracted_arch_sheets)[:8]}"
+            f"{'...' if len(_extracted_arch_sheets) > 8 else ''}."
+        )
+
+    # Trigger 3: chunk_tracking shows ≥50% of PDF chunks failed
+    _ct = analysis.get("_chunk_tracking") or {}
+    _total_chunks = int(_ct.get("total_chunks") or 0)
+    _failed = _ct.get("chunks_failed") or []
+    _failed_count = len(_failed) if isinstance(_failed, list) else int(_failed or 0)
+    if _total_chunks > 0 and _failed_count / _total_chunks >= 0.5:
+        _flag_partial_extraction(
+            f"{_failed_count} of {_total_chunks} PDF chunks failed during "
+            f"extraction ({_failed_count/_total_chunks:.0%}). Most of the PDF "
+            f"was not analyzed."
+        )
 
     # --- Pre-finalize sanity check ---
     # Backstop against missed-scope incidents (see Rider B&N regression):
