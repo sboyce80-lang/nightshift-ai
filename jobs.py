@@ -17,7 +17,7 @@ import sys
 import logging
 import smtplib
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.application import MIMEApplication
@@ -183,8 +183,8 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
 
             subtotal = result.get("cost_estimate", {}).get("subtotal", 0) or 0
             update_status(submission_id, "completed", subtotal=subtotal)
-            logger.info("Submission %s completed — $%,.2f estimate",
-                        submission_id, subtotal)
+            logger.info("Submission %s completed — $%s estimate",
+                        submission_id, f"{subtotal:,.2f}")
 
             return {"submission_id": submission_id, "subtotal": subtotal}
 

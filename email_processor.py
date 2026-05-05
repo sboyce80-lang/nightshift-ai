@@ -300,7 +300,7 @@ def process_email(msg, uid, conn):
         _save_processed_id(message_id)
 
         cost_total = result.get("cost_estimate", {}).get("subtotal", 0)
-        logger.info("Analysis complete: $%,.2f", cost_total)
+        logger.info("Analysis complete: $%s", f"{cost_total:,.2f}")
 
         result["source_email_subject"] = subject
         return result

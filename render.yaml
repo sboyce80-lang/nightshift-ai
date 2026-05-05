@@ -27,6 +27,16 @@ envVarGroups:
         sync: false
       - key: CLERK_AUTHORIZED_PARTIES
         sync: false
+      - key: EMAIL_ADDRESS
+        sync: false
+      - key: EMAIL_APP_PASSWORD
+        sync: false
+      - key: EMAIL_SMTP_SERVER
+        value: smtp.gmail.com
+      - key: EMAIL_SMTP_PORT
+        value: "587"
+      - key: INTERNAL_NOTIFY_EMAIL
+        sync: false
       - key: PYTHON_VERSION
         value: "3.11.9"
 
