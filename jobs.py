@@ -58,20 +58,38 @@ if not logger.handlers:
 # ---------------------------------------------------------------------------
 
 def update_status(submission_id, status, error=None, subtotal=None):
-    """Patch the submission row's status (and optionally error/subtotal)."""
+    """Patch the submission row's status (and optionally error/subtotal).
+
+    Uses a raw UPDATE (not the ORM session.get + dirty-tracking path) so
+    behavior is predictable even on the work-horse's first-ever DB call,
+    and logs the affected rowcount so a silent no-op is visible in logs.
+    """
+    values = {
+        "status": status,
+        "updated_at": datetime.now(timezone.utc),
+    }
+    if error is not None:
+        values["error"] = error[:2000]
+    if subtotal is not None:
+        values["subtotal"] = subtotal
+
     try:
         with session_scope() as session:
-            sub = session.get(Submission, submission_id)
-            if sub is None:
-                logger.warning("update_status: no submission %s", submission_id)
-                return
-            sub.status = status
-            if error is not None:
-                sub.error = error[:2000]
-            if subtotal is not None:
-                sub.subtotal = subtotal
+            stmt = (
+                Submission.__table__.update()
+                .where(Submission.id == submission_id)
+                .values(**values)
+            )
+            result = session.execute(stmt)
+            if result.rowcount == 0:
+                logger.warning("update_status: no row affected for %s (status=%s)",
+                               submission_id, status)
+            else:
+                logger.info("update_status: %s -> %s (rows=%d)",
+                            submission_id, status, result.rowcount)
     except Exception as exc:
-        logger.warning("Could not update status for %s: %s", submission_id, exc)
+        logger.warning("Could not update status for %s -> %s: %s",
+                       submission_id, status, exc, exc_info=True)
 
 
 def _record_result_file(submission_id, filename, r2_key, size_bytes, content_type):
