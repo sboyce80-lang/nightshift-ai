@@ -4351,6 +4351,93 @@ def _maybe_run_exterior_pass(client, pdf_path, analysis_result):
         )
 
 
+def _maybe_run_schedule_recovery_pass(client, pdf_path, analysis_result):
+    """When the unified extraction found floor plans but missed the
+    finish-schedule's structural-surface callouts (paint exposed deck /
+    structure / MEP — typically the largest line item on retail / big-box
+    jobs), run a dedicated schedule pass to recover them.
+
+    Trigger conditions (ALL must hold):
+      - building_type is commercial / retail / industrial / warehouse
+      - footprint_sqft > 1000 (real building, not a synthetic test)
+      - aggregated_totals.total_dryfall_ceiling_sqft < footprint × 0.5
+        (the actual recovered dryfall is suspiciously low relative to
+        what the building's footprint implies for an open-ceiling space)
+      - structural_finish_scope is not already present (idempotency)
+
+    This complements the existing "no floor plans found" branch, which
+    only fires for schedule-only PDFs. Here we fire AFTER the LLM has
+    already produced rooms, to fill in scope it missed.
+
+    Mutates analysis_result in place.
+    """
+    if not isinstance(analysis_result, dict):
+        return
+
+    pi = analysis_result.get("project_info", {}) or {}
+    bt = str(pi.get("building_type", "")).lower()
+    is_commercial = any(
+        kw in bt for kw in (
+            "commercial", "auto", "industrial", "warehouse",
+            "retail", "dealership"
+        )
+    )
+    if not is_commercial:
+        return
+
+    footprint = _num(pi.get("footprint_sqft", 0))
+    if footprint <= 1000:
+        return
+
+    if analysis_result.get("structural_finish_scope"):
+        return  # already captured (e.g. by the no-plans branch)
+
+    agg = analysis_result.get("aggregated_totals", {}) or {}
+    dryfall = _num(agg.get("total_dryfall_ceiling_sqft", 0))
+    if dryfall >= footprint * 0.5:
+        return  # dryfall already substantial — no recovery needed
+
+    print(f"   📋 Commercial job with low dryfall ({dryfall:,.0f} sqft "
+          f"vs {footprint:,.0f} sqft footprint) — running schedule "
+          f"recovery pass...")
+    time.sleep(10)
+    rfs_data = _extract_room_finish_schedule(client, pdf_path)
+    if not rfs_data:
+        # No schedule found — let the existing manual-review flag carry the
+        # signal. Don't synthesize anything.
+        return
+
+    struct_scope = rfs_data.get("structural_finish_scope") or []
+    if not struct_scope:
+        print(f"   📋 Schedule recovery pass found no structural-finish callouts")
+        return
+
+    analysis_result["structural_finish_scope"] = struct_scope
+    print(f"   📋 Schedule recovery: captured {len(struct_scope)} structural-"
+          f"finish callout(s); dryfall safety net will pick up on next pass")
+
+    # Apply the dryfall scope-recovery directly here so it lands in
+    # aggregated_totals before pricing runs. We don't rely on
+    # _recalculate_totals re-firing because by this point the per-file
+    # totals are already aggregated and downstream merge logic doesn't
+    # know to re-trigger the safety net.
+    est_dryfall = round(footprint * 0.75)
+    gap = est_dryfall - dryfall
+    if gap > 0:
+        agg["total_dryfall_ceiling_sqft"] = dryfall + gap
+        analysis_result["aggregated_totals"] = agg
+        analysis_result.setdefault("notes", []).append(
+            f"[Dryfall Recovery Pass] Added {gap:,.0f} sqft of dryfall scope "
+            f"based on {len(struct_scope)} structural-finish callout(s) in the "
+            f"finish schedule (deck/structure/MEP paint-to-deck). Total dryfall "
+            f"now {dryfall + gap:,.0f} sqft (75% of {footprint:,.0f} sqft footprint). "
+            f"Original LLM extraction had only {dryfall:,.0f} sqft tagged as EXPOSED."
+        )
+        print(f"   🔧 Dryfall recovery pass: +{gap:,.0f} sqft "
+              f"(now {dryfall + gap:,.0f} sqft from {footprint:,.0f} sqft "
+              f"footprint × 0.75)")
+
+
 # ---------------------------------------------------------------------------
 # Building Inventory Extraction — Lightweight Claude call on index pages
 # ---------------------------------------------------------------------------
@@ -11542,6 +11629,13 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                     else:
                         print(f"      ⚠️  Schedule re-analysis returned no data")
 
+                # Dedicated schedule-recovery pass — only fires for commercial
+                # jobs with implausibly low dryfall vs footprint. Catches the
+                # B&N-style failure where the LLM read floor plans but missed
+                # the finish schedule's "paint exposed deck/structure/MEP"
+                # callout. Cheap no-op otherwise.
+                _maybe_run_schedule_recovery_pass(client, pdf_path, analysis_result)
+
                 # Dedicated exterior pass — only fires for commercial jobs
                 # with 0 sqft exterior. Cheap no-op otherwise.
                 _maybe_run_exterior_pass(client, pdf_path, analysis_result)
@@ -11990,6 +12084,72 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             print(f"   ⚠️  Flagged for manual review — proposal will print "
                   f"but should NOT be sent without reviewer sign-off.")
 
+    # --- Sales-floor-ACT heuristic check ---
+    # Standalone retail buildings >5,000 sqft very rarely have a suspended
+    # ACT ceiling on the main sales floor — they're almost always painted
+    # to the deck (open structure). When the LLM tags the largest retail
+    # room as ACT/not-painted, that's a strong signal the unified extraction
+    # missed the finish-schedule callout. Surface as an RFI rather than
+    # silently dropping ~footprint × $1/sqft of dryfall scope.
+    _floor_is_retail_commercial = False
+    _retail_pi = analysis.get("project_info", {}) or {}
+    _retail_bt = str(_retail_pi.get("building_type", "")).lower()
+    if any(kw in _retail_bt for kw in ("retail", "commercial", "dealership")):
+        _floor_is_retail_commercial = True
+
+    if _floor_is_retail_commercial:
+        _largest_room = None
+        _largest_fa = 0
+        for _floor in analysis.get("floors", []) or []:
+            for _room in _floor.get("rooms", []) or []:
+                if not _room.get("in_scope", True):
+                    continue
+                _fa = _num((_room.get("dimensions") or {}).get("floor_area_sqft", 0))
+                if _fa > _largest_fa:
+                    _largest_fa = _fa
+                    _largest_room = _room
+
+        if _largest_room and _largest_fa >= 5000:
+            _mats = _largest_room.get("materials", {}) or {}
+            _ceil = str(_mats.get("ceiling", "")).lower()
+            _ceil_painted = bool(_mats.get("ceiling_painted", False))
+            _is_act = ("act" in _ceil or "acoustic" in _ceil
+                       or "suspended" in _ceil or "drop" in _ceil)
+            if _is_act and not _ceil_painted:
+                _room_label = (_largest_room.get("room_name")
+                               or _largest_room.get("room_id") or "largest room")
+                rfi_msg = (
+                    f"The largest in-scope room ({_room_label}, "
+                    f"{_largest_fa:,.0f} sqft) on this commercial/retail job "
+                    f"is tagged with an ACT (suspended/acoustic) ceiling and "
+                    f"NOT painted. Standalone retail boxes >5,000 sqft almost "
+                    f"always have OPEN-TO-DECK ceilings with paint-to-deck "
+                    f"scope (sales floor is rarely under a suspended grid). "
+                    f"Confirm whether the sales floor actually has ACT, or "
+                    f"whether the finish schedule calls for paint on the "
+                    f"exposed structure / deck / MEP — in which case this "
+                    f"room should carry ~{_largest_fa:,.0f} sqft of dryfall "
+                    f"or paint-to-deck scope that is currently missing."
+                )
+                analysis.setdefault("notes", []).append(
+                    f"[Sales-Floor-ACT Check] {rfi_msg}")
+                _existing_rfis = analysis.setdefault("_pre_pricing_rfis", [])
+                _existing_rfis.append({
+                    "category": "Scope Conflict",
+                    "question": rfi_msg,
+                    "action_required": (
+                        "Confirm sales-floor ceiling type: ACT (no paint) "
+                        "vs. open-to-deck (paint-to-deck dryfall scope)."
+                    ),
+                    "severity": "high",
+                    "source": "sales_floor_act_heuristic",
+                })
+                print(f"\n⚠️  SALES-FLOOR-ACT HEURISTIC FIRED")
+                print(f"   {_room_label}: {_largest_fa:,.0f} sqft, "
+                      f"ceiling=ACT, painted=False")
+                print(f"   Likely missing ~{_largest_fa:,.0f} sqft of "
+                      f"paint-to-deck scope. RFI surfaced.")
+
     # --- Calculate costs ---
     _update_progress(6, TOTAL_STEPS, "Calculating Costs", "Applying pricing model...")
     print("\n💰 Calculating costs...")
@@ -12027,6 +12187,17 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
 
     # --- Generate RFI items ---
     rfi_items = generate_rfi_items(analysis)
+
+    # Merge in pre-pricing RFIs (e.g. sales-floor-ACT heuristic) emitted
+    # before cost calculation so they reach Will Synthesis and the proposal.
+    pre_pricing_rfis = analysis.pop("_pre_pricing_rfis", []) or []
+    if pre_pricing_rfis:
+        next_num = (max((r.get("number", 0) for r in (rfi_items or [])), default=0) + 1)
+        for r in pre_pricing_rfis:
+            r["number"] = next_num
+            next_num += 1
+        rfi_items = (rfi_items or []) + pre_pricing_rfis
+
     if rfi_items:
         print(f"\n📋 RFI: {len(rfi_items)} items requiring clarification")
         for rfi in rfi_items:

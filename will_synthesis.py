@@ -49,6 +49,40 @@ PROTECTED_CATEGORIES = {
     # Will trying to override hard-coded scope rules.
 }
 
+# Categories whose DOWNWARD adjustments are blocked when the upstream sanity
+# check has flagged the takeoff as "implausibly low / missing scope". Reducing
+# these would compound the miss instead of recovering it.
+SCOPE_RECOVERY_CATEGORIES = {
+    "Gyp. Walls",
+    "Gyp. Ceilings",
+    "CMU Walls",
+    "Dryfall Ceiling",
+    "Doors (Full Paint)",
+    "Doors (HM Panel)",
+    "Doors (Frame Only)",
+    "Base Trim",
+    "Concrete Sealer",
+    "Exterior Painting",
+    "Hardie Siding",
+    "Exterior Cornice",
+}
+
+# Reason-substring markers that indicate the manual-review flag fired because
+# scope was UNDERCOUNTED (not over-extracted). When any of these appear in
+# `analysis.manual_review_reason`, downward adjustments to SCOPE_RECOVERY_CATEGORIES
+# are hard-rejected.
+LOW_SCOPE_REASON_MARKERS = (
+    "implausibly low",
+    "below expected",
+    "missing scope",
+    "missing finish schedule",
+    "exposed structure",
+    "paint-to-deck",
+    "exterior was missed",
+    "expected 3-6",
+    "ratio is",
+)
+
 # Categories Will IS allowed to adjust (line item names from cost_estimate)
 ADJUSTABLE_CATEGORIES = {
     "Gyp. Walls",
@@ -233,12 +267,21 @@ Walk it in this order — same as how you'd review any junior's takeoff:
 
 10. **Round numbers test** — Total feels right? A 2,500 sqft single-family home shouldn't price at $80,000. A 3-story 20-unit building shouldn't price at $35,000.
 
+11. **Manual review flag** — The payload includes a `manual_review_required` boolean and `manual_review_reason` string set by an upstream sanity check. When `manual_review_required == true`, READ THE REASON CAREFULLY before doing anything.
+   - If the reason mentions phrases like "implausibly low", "below expected", "missing scope", "missing finish schedule", "exposed structure", "paint-to-deck", or "exterior was missed" — this is a SCOPE-MISSING signal, NOT an over-extraction signal. The upstream extraction undershot. **DO NOT propose downward adjustments to wall, ceiling, CMU, dryfall, or door counts in this case.** Reducing those would compound the miss. Instead:
+     - Leave existing line items alone (or propose UPWARD adjustments within ±25% if you have a defensible reason)
+     - Surface high-severity RFIs in `additional_rfis` calling out the specific missing scope (finish schedule / Finish Legend, exposed structure / paint-to-deck, exterior, etc.)
+     - Set `pipeline_flags.ready_to_send = false` and `route_to_human_review = true`
+     - In your `estimator_recap`, explicitly call out that the takeoff is suspected to be undercounted and a human reviewer must verify before the proposal goes out.
+   - Only treat the flag as an over-extraction signal if the `manual_review_reason` literally says "over-extracted" or "implausibly high" (it currently never does — the only sanity check that fires writes "implausibly low").
+
 ## Critical constraints
 
 - **Output JSON only.** No markdown, no prose preamble, no code fences. The pipeline will fail to parse anything else.
 - **Adjustments must stay within ±25%.** Going beyond means it becomes an RFI in `rejected_adjustments`, not an `adjustments` entry.
 - **Don't invent line items.** You can only adjust categories that exist in the input estimate.
 - **Sign your scope of work.** End `gc_scope_of_work` with `— Will, Senior Estimator, Rider Painting, Inc.`
+- **When `manual_review_required == true` with a "low/missing" reason, downward adjustments to scope-recovery categories (Gyp. Walls, Gyp. Ceilings, CMU Walls, Dryfall Ceiling, Doors) are auto-rejected by the pipeline.** Don't waste budget proposing them.
 """
 
 
@@ -321,12 +364,28 @@ def _build_review_payload(analysis, cost_estimate, rfi_items, validation):
         "validation_warnings": validation.get("warnings", []) if validation else [],
         "data_quality_score": validation.get("data_quality_score", 0) if validation else 0,
         "scope_notes": pi.get("_scope_notes", "") if isinstance(pi, dict) else "",
+        # Manual-review sanity-check signal — read the reason carefully before
+        # adjusting. A "low/missing" reason means the takeoff undershot;
+        # downward adjustments to scope-recovery categories will be auto-rejected.
+        "manual_review_required": bool(analysis.get("manual_review_required")),
+        "manual_review_reason": analysis.get("manual_review_reason"),
         "pipeline_notes": analysis.get("notes", [])[:30],  # cap to avoid overwhelming context
     }
     return payload
 
 
-def _validate_adjustment(adjustment, line_items_by_category):
+def _is_low_scope_manual_review(analysis):
+    """True when analysis.manual_review_required is set AND the reason text
+    indicates the takeoff is undercounted (not over-extracted)."""
+    if not isinstance(analysis, dict):
+        return False
+    if not analysis.get("manual_review_required"):
+        return False
+    reason = str(analysis.get("manual_review_reason") or "").lower()
+    return any(marker in reason for marker in LOW_SCOPE_REASON_MARKERS)
+
+
+def _validate_adjustment(adjustment, line_items_by_category, analysis=None):
     """Validate a single proposed adjustment against the guardrails.
 
     Returns (is_valid, reason). If invalid, the adjustment should be moved
@@ -365,6 +424,14 @@ def _validate_adjustment(adjustment, line_items_by_category):
     pct_change = abs(proposed_qty - current_qty) / current_qty
     if pct_change > MAX_ADJUSTMENT_PCT:
         return (False, "exceeds_25_percent_band")
+
+    # Low-scope manual review: hard-block downward adjustments to
+    # scope-recovery categories. The upstream sanity check fired because
+    # scope was undercounted; reducing these would compound the miss.
+    # See LOW_SCOPE_REASON_MARKERS for the trigger wording.
+    if proposed_qty < current_qty and cat in SCOPE_RECOVERY_CATEGORIES \
+            and _is_low_scope_manual_review(analysis):
+        return (False, "manual_review_low_scope_blocks_downward")
 
     return (True, "ok")
 
@@ -574,7 +641,7 @@ def run_will_synthesis(analysis, cost_estimate, rfi_items=None, validation=None,
     auto_rejected = []
 
     for adj in proposed_adjustments:
-        is_valid, reason = _validate_adjustment(adj, line_items_by_category)
+        is_valid, reason = _validate_adjustment(adj, line_items_by_category, analysis)
         if is_valid:
             valid_adjustments.append(adj)
         else:
@@ -611,6 +678,26 @@ def run_will_synthesis(analysis, cost_estimate, rfi_items=None, validation=None,
                     f"±25% auto-adjust guardrail. Reason: {rej['original_reason']}"
                 ),
                 "action_required": f"Confirm or override the suggested {direction} for {rej['category']}.",
+                "severity": "high",
+                "source": "will_guardrail",
+            })
+        elif rej["reason_for_rejection"] == "manual_review_low_scope_blocks_downward":
+            auto_rejected_rfis.append({
+                "category": "Scope Conflict",
+                "question": (
+                    f"Will proposed reducing {rej['category']} from "
+                    f"{rej['current_value']:,.0f} to {rej['suggested_value']:,.0f} "
+                    f"({rej['pct_change']:+.0f}%), but the upstream sanity check "
+                    f"already flagged this takeoff as MISSING SCOPE (paintable surface "
+                    f"implausibly low vs footprint). Reducing scope-recovery line items "
+                    f"would compound the miss, so the adjustment was auto-blocked. "
+                    f"Will's stated reason: {rej['original_reason']}"
+                ),
+                "action_required": (
+                    f"Senior reviewer must verify whether {rej['category']} is truly "
+                    f"over-counted (in which case adjust manually) or whether the "
+                    f"missing scope flagged elsewhere should be recovered first."
+                ),
                 "severity": "high",
                 "source": "will_guardrail",
             })
