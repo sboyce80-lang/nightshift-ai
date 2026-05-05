@@ -26,7 +26,7 @@ import hashlib
 from pathlib import Path
 import PyPDF2
 from config import CLAUDE_API_KEY, PRICING_MODEL, SMALL_COMMERCIAL_RATES, PCA_CONSTANTS
-from will_synthesis import run_will_synthesis, LOW_SCOPE_REASON_MARKERS
+from will_synthesis import run_will_synthesis
 import anthropic
 import base64
 from datetime import datetime
@@ -10104,38 +10104,6 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
             f"Interior (Footprint) - {footprint_sqft:,.0f} sqft @ ${_fp_rate:.2f}",
             footprint_sqft, _fp_rate, 0.00  # Rider uses 0% markup on footprint pricing
         ))
-
-    # --- Manual-review price floor (commercial under-extraction) ---
-    # The non-commercial footprint-pricing block above only fires for
-    # residential / institutional. For COMMERCIAL jobs where the pre-finalize
-    # sanity check has flagged the takeoff as implausibly low (extracted
-    # paintable surface < footprint × 3), the per-line subtotal still
-    # understates the bid. Add a "Scope Recovery Allowance" line bringing
-    # subtotal up to footprint × footprint_interior rate so a human reviewer
-    # sees a number in the right order of magnitude. The line is transparent
-    # (shows the gap and references the RFI) and is removed if the GC
-    # confirms the takeoff is complete.
-    if (is_commercial and analysis is not None
-            and analysis.get("manual_review_required")
-            and footprint_sqft > 1000
-            and not _use_footprint_pricing):
-        _mr_reason = str(analysis.get("manual_review_reason", "")).lower()
-        if any(marker in _mr_reason for marker in LOW_SCOPE_REASON_MARKERS):
-            _floor_rate = _get_tiered_rate(pm['footprint_interior'], footprint_sqft) \
-                if 'footprint_interior' in pm else 3.80
-            _floor_total = footprint_sqft * _floor_rate
-            _current_subtotal = sum(li["total"] for li in line_items)
-            _gap = _floor_total - _current_subtotal
-            if _gap > 0:
-                line_items.append(_line(
-                    f"Scope Recovery Allowance - footprint {footprint_sqft:,.0f} SF × "
-                    f"${_floor_rate:.2f} floor (manual review required, pending RFI)",
-                    1, round(_gap, 2), 0.00
-                ))
-                print(f"   📐 Scope recovery allowance: +${_gap:,.0f} "
-                      f"(extracted ${_current_subtotal:,.0f} → "
-                      f"footprint floor ${_floor_total:,.0f} = "
-                      f"{footprint_sqft:,.0f} SF × ${_floor_rate:.2f})")
 
     subtotal = sum(li["total"] for li in line_items)
 
