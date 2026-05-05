@@ -312,6 +312,63 @@ def _category_from_item_label(item_label):
     return item_label.strip()
 
 
+def _detect_pca_under_extraction(analysis):
+    """Scan room notes for PCA cross-check flags indicating wall-area
+    under-extraction.
+
+    The PCA cross-check (computed in Takeoff_DIRECT.py) annotates room
+    notes with strings like:
+      "[PCA check: expected 2600 SF, got 1400 SF (46% deviation)]"
+    when the extracted wall area falls below the perimeter-derived
+    expectation. We surface this signal both in the Will payload and as
+    a guardrail so Will doesn't reduce wall/trim quantities that PCA has
+    already flagged as under-extracted.
+
+    Returns dict:
+      {
+        "walls_under_extracted": bool,
+        "details": [ {room_name, expected, got, deviation_pct}, ... ],
+      }
+    """
+    details = []
+    pca_re = re.compile(
+        r"PCA check:\s*expected\s+(\d[\d,]*)\s*SF[^,]*,\s*got\s+(\d[\d,]*)\s*SF\s*\((\d+)%\s*deviation\)",
+        re.IGNORECASE,
+    )
+    for floor in analysis.get("floors", []) or []:
+        for room in floor.get("rooms", []) or []:
+            if not room.get("in_scope", True):
+                continue
+            note = room.get("notes") or ""
+            m = pca_re.search(note)
+            if not m:
+                continue
+            expected = int(m.group(1).replace(",", ""))
+            got = int(m.group(2).replace(",", ""))
+            dev = int(m.group(3))
+            if got < expected:  # under-extraction
+                details.append({
+                    "room_name": room.get("room_name", "?"),
+                    "room_id": room.get("room_id", "?"),
+                    "expected_wall_sqft": expected,
+                    "got_wall_sqft": got,
+                    "deviation_pct": dev,
+                })
+    return {
+        "walls_under_extracted": len(details) > 0,
+        "details": details,
+    }
+
+
+# Categories whose downward adjustments should be blocked when PCA detects
+# wall-area under-extraction. Trim follows perimeter, so it's affected too.
+PCA_WALL_LINKED_CATEGORIES = {
+    "Gyp. Walls",
+    "CMU Walls",
+    "Base Trim",
+}
+
+
 def _build_review_payload(analysis, cost_estimate, rfi_items, validation):
     """Build the user-message payload for Will's review.
 
@@ -343,6 +400,8 @@ def _build_review_payload(analysis, cost_estimate, rfi_items, validation):
         "indicators": [], "source_pages": []
     }
 
+    pca_signal = _detect_pca_under_extraction(analysis)
+
     payload = {
         "project_info": {
             "building_type": pi.get("building_type", "unknown"),
@@ -369,6 +428,12 @@ def _build_review_payload(analysis, cost_estimate, rfi_items, validation):
         # downward adjustments to scope-recovery categories will be auto-rejected.
         "manual_review_required": bool(analysis.get("manual_review_required")),
         "manual_review_reason": analysis.get("manual_review_reason"),
+        # PCA cross-check: flags rooms where extracted wall area is below the
+        # perimeter-derived expectation. When walls_under_extracted is true,
+        # do NOT propose downward adjustments to Gyp. Walls / CMU Walls /
+        # Base Trim — the pipeline guardrail will reject them. Consider
+        # upward adjustments instead.
+        "pca_cross_check": pca_signal,
         "pipeline_notes": analysis.get("notes", [])[:30],  # cap to avoid overwhelming context
     }
     return payload

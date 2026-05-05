@@ -6905,6 +6905,13 @@ def _audit_room_provenance(analysis, project_overview=None):
                         })
                         suspect_ids.add(rid)
                         room["_provenance_flag"] = "wrong_discipline"
+                        # Wrong-discipline rooms must be excluded from aggregated_totals.
+                        # _recalculate_totals() filters on in_scope, so set it here.
+                        room["in_scope"] = False
+                        room["scope_exclusion_reason"] = (
+                            f"Wrong-discipline source sheet ({sheet}, "
+                            f"discipline '{matched_excl}' excluded from painting scope)"
+                        )
 
             # 2. Outlier wall area
             wall_area = _num(room.get("wall_area_sqft", 0))
@@ -6951,16 +6958,31 @@ def _audit_room_provenance(analysis, project_overview=None):
     pi_units = int(_num(pi.get("total_units", 0)))
     units = overview_units or pi_units
 
-    if units > 0:
+    # The 7-rooms/unit heuristic is a residential studio→3BR mix average.
+    # For commercial/retail/industrial, "units" can mean tenant spaces,
+    # loading docks, or other non-rooms — applying the residential ratio
+    # produces false-positive over-extraction signals (e.g. 14 rooms in a
+    # B&N tenant fit-out flagged as 2× expected).
+    _bt = str(pi.get("building_type", "")).lower()
+    _is_residential_bt = any(kw in _bt for kw in (
+        "residential", "multifamily", "multi-family", "apartment",
+        "condo", "townhouse", "single family", "single-family",
+        "senior", "assisted", "living"
+    ))
+
+    if units > 0 and _is_residential_bt:
         # Rough heuristic: 7 rooms/unit average across studio→3BR mix
         expected_rooms = units * 7
-        expected_basis = f"{units} units × 7 rooms/unit (project overview)"
+        expected_basis = f"{units} units × 7 rooms/unit (residential heuristic)"
     elif project_overview and project_overview.get("total_gsf"):
         # ~200 GSF per room as a very loose fallback
         gsf = int(_num(project_overview.get("total_gsf", 0)))
         if gsf > 0:
             expected_rooms = max(5, gsf // 200)
             expected_basis = f"{gsf:,} GSF ÷ 200 sqft/room"
+    # Non-residential without total_gsf: leave expected_rooms = None.
+    # The audit will fall through to the "no_baseline" branch below
+    # rather than emit a misleading over-extraction status.
 
     if expected_rooms:
         ratio = extracted_rooms / expected_rooms if expected_rooms else 1.0
@@ -9851,6 +9873,31 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     # fraction of rooms (common with large DD-scale PDFs).
     footprint_sqft = _num(project_info.get('footprint_sqft', 0))
 
+    # --- Footprint reconciliation against summed room floor area ---
+    # The LLM-extracted footprint sometimes lags the merged room data —
+    # it's set once during early extraction and not updated when rooms
+    # accumulate across pages/files. If the sum of in-scope room
+    # floor_area_sqft dwarfs the reported footprint, prefer the summed
+    # value (per-floor average × stories) so downstream consumers — the
+    # Will payload, validation thresholds, and footprint-pricing
+    # fallback — see a realistic building size.
+    if analysis:
+        _summed_floor_area = sum(
+            _num((r.get("dimensions") or {}).get("floor_area_sqft", 0))
+            for f in analysis.get("floors", []) or []
+            for r in f.get("rooms", []) or []
+            if r.get("in_scope", True)
+        )
+        if footprint_sqft > 0 and _summed_floor_area > footprint_sqft * 2:
+            _recon_stories = max(_num(project_info.get('total_stories', 0)),
+                                 len(analysis.get("floors", []) or []), 1)
+            _old_fp = footprint_sqft
+            footprint_sqft = round(_summed_floor_area / _recon_stories)
+            project_info['footprint_sqft'] = footprint_sqft
+            print(f"   📐 Footprint reconciled: {_old_fp:,.0f} → "
+                  f"{footprint_sqft:,.0f} SF (summed in-scope room area "
+                  f"{_summed_floor_area:,.0f} SF / {_recon_stories} stories)")
+
     # --- Footprint cross-check for institutional buildings ---
     # The LLM often underestimates footprint for large institutional projects.
     # Cross-check against extracted wall area: footprint should be ≥ wall_sqft / (stories × 3.3).
@@ -12118,18 +12165,31 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             if _is_act and not _ceil_painted:
                 _room_label = (_largest_room.get("room_name")
                                or _largest_room.get("room_id") or "largest room")
+                # Auto-correct: flip ceiling to DRYFALL and add the SF.
+                # This is the high-confidence default for >5,000 SF retail;
+                # the RFI below asks the GC to confirm the assumption.
+                _largest_room.setdefault("materials", {})
+                _largest_room["materials"]["ceiling"] = "DRYFALL"
+                _largest_room["materials"]["ceiling_painted"] = True
+                _largest_room.setdefault("dimensions", {})
+                _largest_room["dimensions"]["ceiling_area_sqft"] = _largest_fa
+                _existing_note = _largest_room.get("notes") or ""
+                _largest_room["notes"] = (
+                    _existing_note + " [Auto-corrected: ACT → DRYFALL per "
+                    "sales-floor heuristic; awaiting RFI confirmation]"
+                ).strip()
+
                 rfi_msg = (
                     f"The largest in-scope room ({_room_label}, "
                     f"{_largest_fa:,.0f} sqft) on this commercial/retail job "
-                    f"is tagged with an ACT (suspended/acoustic) ceiling and "
-                    f"NOT painted. Standalone retail boxes >5,000 sqft almost "
-                    f"always have OPEN-TO-DECK ceilings with paint-to-deck "
-                    f"scope (sales floor is rarely under a suspended grid). "
-                    f"Confirm whether the sales floor actually has ACT, or "
-                    f"whether the finish schedule calls for paint on the "
-                    f"exposed structure / deck / MEP — in which case this "
-                    f"room should carry ~{_largest_fa:,.0f} sqft of dryfall "
-                    f"or paint-to-deck scope that is currently missing."
+                    f"was originally tagged with an ACT (suspended/acoustic) "
+                    f"ceiling and NOT painted. Standalone retail boxes "
+                    f">5,000 sqft almost always have OPEN-TO-DECK ceilings "
+                    f"with paint-to-deck scope. We have ASSUMED open-to-deck "
+                    f"and added ~{_largest_fa:,.0f} sqft of dryfall scope. "
+                    f"Confirm whether the sales floor actually has ACT (in "
+                    f"which case dryfall should be removed) or open-to-deck "
+                    f"(scope as priced)."
                 )
                 analysis.setdefault("notes", []).append(
                     f"[Sales-Floor-ACT Check] {rfi_msg}")
@@ -12138,17 +12198,25 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                     "category": "Scope Conflict",
                     "question": rfi_msg,
                     "action_required": (
-                        "Confirm sales-floor ceiling type: ACT (no paint) "
-                        "vs. open-to-deck (paint-to-deck dryfall scope)."
+                        "Confirm sales-floor ceiling type: ACT (remove "
+                        "auto-added dryfall) vs. open-to-deck (scope as "
+                        "priced)."
                     ),
                     "severity": "high",
                     "source": "sales_floor_act_heuristic",
                 })
                 print(f"\n⚠️  SALES-FLOOR-ACT HEURISTIC FIRED")
                 print(f"   {_room_label}: {_largest_fa:,.0f} sqft, "
-                      f"ceiling=ACT, painted=False")
-                print(f"   Likely missing ~{_largest_fa:,.0f} sqft of "
-                      f"paint-to-deck scope. RFI surfaced.")
+                      f"ceiling auto-flipped ACT → DRYFALL")
+                print(f"   Added ~{_largest_fa:,.0f} sqft of paint-to-deck "
+                      f"scope. RFI surfaced for GC confirmation.")
+                # Recompute aggregated totals to pick up the new dryfall SF
+                # before the cost calculation runs below.
+                try:
+                    _recalculate_totals(analysis)
+                except Exception as _recalc_err:
+                    print(f"   ⚠️  Recalc after ACT auto-flip failed: "
+                          f"{_recalc_err}")
 
     # --- Calculate costs ---
     _update_progress(6, TOTAL_STEPS, "Calculating Costs", "Applying pricing model...")
