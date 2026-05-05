@@ -12178,59 +12178,6 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             f"was not analyzed."
         )
 
-    # --- Pre-finalize sanity check ---
-    # Backstop against missed-scope incidents (see Rider B&N regression):
-    # for any commercial job where total extracted paintable surface is
-    # implausibly small relative to building footprint, mark the analysis
-    # for manual review BEFORE pricing runs. Pricing still proceeds (so
-    # Rider sees something), but a high-severity flag bubbles into
-    # validation, RFI, and the saved JSON for downstream UI to surface.
-    _sanity_pi = analysis.get("project_info", {}) or {}
-    _sanity_bt = str(_sanity_pi.get("building_type", "")).lower()
-    _sanity_is_commercial = any(kw in _sanity_bt for kw in (
-        "commercial", "auto", "industrial", "warehouse",
-        "retail", "dealership"))
-    if _sanity_is_commercial:
-        _sanity_agg = analysis.get("aggregated_totals", {}) or {}
-        _sanity_ext = analysis.get("exterior", {}) or {}
-        _wall = _num(_sanity_agg.get("total_paintable_wall_sqft", 0))
-        _ceil_gyp = _num(_sanity_agg.get("total_paintable_gyp_ceiling_sqft", 0))
-        _ceil_dry = _num(_sanity_agg.get("total_dryfall_ceiling_sqft", 0))
-        _ext_paint = _num(_sanity_ext.get("exterior_paint_sqft", 0))
-        _ext_hardie = _num(_sanity_ext.get("hardie_siding_sqft", 0))
-        _total_paintable = _wall + _ceil_gyp + _ceil_dry + _ext_paint + _ext_hardie
-        _footprint = _num(_sanity_pi.get("footprint_sqft", 0))
-
-        # Threshold: paintable_surface < footprint × 3 is structurally
-        # implausible for a commercial building. A typical retail box:
-        #   walls ≈ footprint × 0.4 (perimeter × 14ft / footprint)
-        #   ceiling ≈ footprint × 0.9
-        #   exterior ≈ footprint × 0.4
-        # So footprint × 3 is conservative — most jobs land at 4-6×.
-        if _footprint > 1000 and _total_paintable < _footprint * 3:
-            ratio = (_total_paintable / _footprint) if _footprint else 0
-            flag_msg = (
-                f"[MANUAL REVIEW REQUIRED] Total extracted paintable surface "
-                f"({_total_paintable:,.0f} sqft) is implausibly low relative "
-                f"to building footprint ({_footprint:,.0f} sqft) for a "
-                f"commercial job — ratio is {ratio:.1f}× footprint, expected "
-                f"3-6×. This usually means the finish schedule, exposed "
-                f"structure / paint-to-deck scope, or exterior was missed "
-                f"in extraction. Do NOT send this proposal without a senior "
-                f"reviewer confirming the takeoff."
-            )
-            analysis["manual_review_required"] = True
-            analysis["manual_review_reason"] = flag_msg
-            analysis.setdefault("notes", []).append(flag_msg)
-            print(f"\n🚨 PRE-FINALIZE SANITY CHECK FAILED")
-            print(f"   Paintable: {_total_paintable:,.0f} sqft "
-                  f"(walls {_wall:,.0f}, gyp ceil {_ceil_gyp:,.0f}, "
-                  f"dryfall {_ceil_dry:,.0f}, ext {_ext_paint + _ext_hardie:,.0f})")
-            print(f"   Footprint: {_footprint:,.0f} sqft "
-                  f"(ratio {ratio:.1f}×, expected 3-6×)")
-            print(f"   ⚠️  Flagged for manual review — proposal will print "
-                  f"but should NOT be sent without reviewer sign-off.")
-
     # --- Sales-floor-ACT heuristic check ---
     # Standalone retail buildings >5,000 sqft very rarely have a suspended
     # ACT ceiling on the main sales floor — they're almost always painted
@@ -12317,6 +12264,69 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                 except Exception as _recalc_err:
                     print(f"   ⚠️  Recalc after ACT auto-flip failed: "
                           f"{_recalc_err}")
+
+    # --- Pre-finalize sanity check ---
+    # Backstop against missed-scope incidents (see Rider B&N regression):
+    # for any commercial job where total extracted paintable surface is
+    # implausibly small relative to building footprint, mark the analysis
+    # for manual review BEFORE pricing runs. Pricing still proceeds (so
+    # Rider sees something), but a high-severity flag bubbles into
+    # validation, RFI, and the saved JSON for downstream UI to surface.
+    #
+    # Runs AFTER the sales-floor-ACT auto-flip so the totals reflect any
+    # dryfall scope the auto-flip just recovered — otherwise the reason
+    # text reports a stale low number (e.g. 16,930 SF / 0.9× footprint)
+    # when the post-flip total is actually 28,584 SF / 1.6× and the flag
+    # may not even need to fire.
+    _sanity_pi = analysis.get("project_info", {}) or {}
+    _sanity_bt = str(_sanity_pi.get("building_type", "")).lower()
+    _sanity_is_commercial = any(kw in _sanity_bt for kw in (
+        "commercial", "auto", "industrial", "warehouse",
+        "retail", "dealership"))
+    if _sanity_is_commercial:
+        _sanity_agg = analysis.get("aggregated_totals", {}) or {}
+        _sanity_ext = analysis.get("exterior", {}) or {}
+        _wall = _num(_sanity_agg.get("total_paintable_wall_sqft", 0))
+        # Canonical key is total_paintable_ceiling_sqft (set in _recalculate_totals
+        # at line ~8339). The previous *_gyp_* variant was a typo that silently
+        # zeroed the ceiling contribution, making the threshold tighter than
+        # intended on borderline jobs.
+        _ceil_gyp = _num(_sanity_agg.get("total_paintable_ceiling_sqft", 0))
+        _ceil_dry = _num(_sanity_agg.get("total_dryfall_ceiling_sqft", 0))
+        _ext_paint = _num(_sanity_ext.get("exterior_paint_sqft", 0))
+        _ext_hardie = _num(_sanity_ext.get("hardie_siding_sqft", 0))
+        _total_paintable = _wall + _ceil_gyp + _ceil_dry + _ext_paint + _ext_hardie
+        _footprint = _num(_sanity_pi.get("footprint_sqft", 0))
+
+        # Threshold: paintable_surface < footprint × 3 is structurally
+        # implausible for a commercial building. A typical retail box:
+        #   walls ≈ footprint × 0.4 (perimeter × 14ft / footprint)
+        #   ceiling ≈ footprint × 0.9
+        #   exterior ≈ footprint × 0.4
+        # So footprint × 3 is conservative — most jobs land at 4-6×.
+        if _footprint > 1000 and _total_paintable < _footprint * 3:
+            ratio = (_total_paintable / _footprint) if _footprint else 0
+            flag_msg = (
+                f"[MANUAL REVIEW REQUIRED] Total extracted paintable surface "
+                f"({_total_paintable:,.0f} sqft) is implausibly low relative "
+                f"to building footprint ({_footprint:,.0f} sqft) for a "
+                f"commercial job — ratio is {ratio:.1f}× footprint, expected "
+                f"3-6×. This usually means the finish schedule, exposed "
+                f"structure / paint-to-deck scope, or exterior was missed "
+                f"in extraction. Do NOT send this proposal without a senior "
+                f"reviewer confirming the takeoff."
+            )
+            analysis["manual_review_required"] = True
+            analysis["manual_review_reason"] = flag_msg
+            analysis.setdefault("notes", []).append(flag_msg)
+            print(f"\n🚨 PRE-FINALIZE SANITY CHECK FAILED")
+            print(f"   Paintable: {_total_paintable:,.0f} sqft "
+                  f"(walls {_wall:,.0f}, gyp ceil {_ceil_gyp:,.0f}, "
+                  f"dryfall {_ceil_dry:,.0f}, ext {_ext_paint + _ext_hardie:,.0f})")
+            print(f"   Footprint: {_footprint:,.0f} sqft "
+                  f"(ratio {ratio:.1f}×, expected 3-6×)")
+            print(f"   ⚠️  Flagged for manual review — proposal will print "
+                  f"but should NOT be sent without reviewer sign-off.")
 
     # --- Calculate costs ---
     _update_progress(6, TOTAL_STEPS, "Calculating Costs", "Applying pricing model...")
