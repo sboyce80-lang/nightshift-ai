@@ -498,6 +498,17 @@ def _validate_adjustment(adjustment, line_items_by_category, analysis=None):
             and _is_low_scope_manual_review(analysis):
         return (False, "manual_review_low_scope_blocks_downward")
 
+    # PCA cross-check guardrail: reject downward adjustments to wall- and
+    # trim-linked categories when the perimeter-derived PCA check has
+    # flagged extracted wall area as under-extracted. Will sometimes
+    # reasons from a stale or wrong footprint and proposes cuts that move
+    # the estimate the wrong direction; this catches that.
+    if proposed_qty < current_qty and cat in PCA_WALL_LINKED_CATEGORIES \
+            and analysis is not None:
+        pca = _detect_pca_under_extraction(analysis)
+        if pca.get("walls_under_extracted"):
+            return (False, "pca_under_extraction_blocks_downward")
+
     return (True, "ok")
 
 
@@ -762,6 +773,28 @@ def run_will_synthesis(analysis, cost_estimate, rfi_items=None, validation=None,
                     f"Senior reviewer must verify whether {rej['category']} is truly "
                     f"over-counted (in which case adjust manually) or whether the "
                     f"missing scope flagged elsewhere should be recovered first."
+                ),
+                "severity": "high",
+                "source": "will_guardrail",
+            })
+        elif rej["reason_for_rejection"] == "pca_under_extraction_blocks_downward":
+            auto_rejected_rfis.append({
+                "category": "Scope Conflict",
+                "question": (
+                    f"Will proposed reducing {rej['category']} from "
+                    f"{rej['current_value']:,.0f} to {rej['suggested_value']:,.0f} "
+                    f"({rej['pct_change']:+.0f}%), but the PCA perimeter cross-check "
+                    f"flagged extracted wall area as UNDER-extracted in one or more "
+                    f"rooms (got < expected). Reducing wall- or trim-linked line "
+                    f"items would move the estimate further in the wrong direction, "
+                    f"so the adjustment was auto-blocked. Will's stated reason: "
+                    f"{rej['original_reason']}"
+                ),
+                "action_required": (
+                    f"Senior reviewer must reconcile: are walls actually over-counted "
+                    f"(in which case adjust manually after re-checking PCA notes), or "
+                    f"should the under-extracted rooms be increased to expected "
+                    f"perimeter-derived values?"
                 ),
                 "severity": "high",
                 "source": "will_guardrail",
