@@ -2347,8 +2347,8 @@ def _floor_room_count(floor):
     """Total effective rooms on a floor accounting for unit_multiplier."""
     total = 0
     for r in floor.get("rooms", []):
-        m = r.get("unit_multiplier")
-        total += int(m) if isinstance(m, (int, float)) and m > 1 else 1
+        mult = max(1, int(_num(r.get("unit_multiplier", 1))))
+        total += mult
     return total
 
 
@@ -2356,9 +2356,8 @@ def _floor_total_wall_area(floor):
     """Total wall area on a floor accounting for unit_multiplier."""
     total = 0
     for r in floor.get("rooms", []):
-        m = r.get("unit_multiplier")
-        mult = int(m) if isinstance(m, (int, float)) and m > 1 else 1
-        total += r.get("dimensions", {}).get("wall_area_sqft", 0) * mult
+        mult = max(1, int(_num(r.get("unit_multiplier", 1))))
+        total += _num(r.get("dimensions", {}).get("wall_area_sqft", 0)) * mult
     return total
 
 
