@@ -1940,20 +1940,103 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
                 break
 
         result_text = "".join(result_parts)
+
+        # Empty-response retry: a successful API call that returned no text
+        # is almost always a transient model issue, not a real "nothing to
+        # extract." Retry once before giving up on the batch.
         if not result_text:
-            continue
+            print(f"   ⚠️  Batch {batch_idx + 1}: empty API response — retrying once")
+            time.sleep(15)
+            try:
+                result_parts = []
+                with client.messages.stream(
+                    model="claude-sonnet-4-20250514",
+                    max_tokens=64000,
+                    temperature=0,
+                    timeout=600.0,
+                    messages=[{"role": "user", "content": content_blocks}]
+                ) as stream:
+                    for text in stream.text_stream:
+                        result_parts.append(text)
+                result_text = "".join(result_parts)
+            except Exception as e:
+                print(f"   ❌ Batch {batch_idx + 1} empty-response retry failed: {e}")
+            if not result_text:
+                print(f"   ❌ Batch {batch_idx + 1}: still empty after retry — skipping")
+                tile_batches[batch_idx] = None
+                continue
 
         # Parse JSON response
+        analysis = None
         json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
         if json_match:
             try:
                 analysis = json.loads(json_match.group())
-                rooms = analysis.get('project_info', {}).get('total_rooms_found', 0)
-                print(f"   🔬 Batch {batch_idx + 1}: extracted {rooms} rooms")
-                if rooms > 0:
-                    all_analysis_results.append(analysis)
             except json.JSONDecodeError:
                 print(f"   ❌ Enhanced extraction batch: could not parse JSON")
+
+        rooms = (analysis or {}).get('project_info', {}).get('total_rooms_found', 0)
+        print(f"   🔬 Batch {batch_idx + 1}: extracted {rooms} rooms")
+
+        # Suspicious-empty retry: 0 rooms on a multi-tile batch (≥4 tiles)
+        # from architectural pages is almost never correct — multi-page
+        # plan tiles virtually always contain labeled spaces. This is the
+        # silent-empty pattern observed across multiple Albany B&N reruns.
+        # Retry once with a sharpened prompt directing Claude to be
+        # exhaustive about identifying ANY labeled space.
+        if rooms == 0 and len(batch_tiles) >= 4:
+            print(f"   ⚠️  Batch {batch_idx + 1}: 0 rooms on "
+                  f"{len(batch_tiles)}-tile batch is suspicious — "
+                  f"retrying with sharpened prompt")
+            time.sleep(15)
+            sharpened_blocks = list(content_blocks[:-1]) + [{
+                "type": "text",
+                "text": (
+                    effective_prompt + "\n\n"
+                    "RETRY DIRECTIVE: A prior attempt at this exact batch "
+                    "returned ZERO rooms. That is almost never correct for a "
+                    "multi-tile batch of architectural plan pages. Re-examine "
+                    "each tile carefully and identify EVERY labeled space — "
+                    "rooms, corridors, stairs, vestibules, mechanical / "
+                    "electrical / storage areas, back-of-house, restrooms, "
+                    "sales floors, dining areas. Return each one in the "
+                    "rooms array with a unique room_id and any dimensions "
+                    "you can read. If a space has no readable label, still "
+                    "include it with a generic room_name like 'Unlabeled "
+                    "Space (Tile R1C2)' so it can be reviewed downstream."
+                )
+            }]
+            try:
+                result_parts2 = []
+                with client.messages.stream(
+                    model="claude-sonnet-4-20250514",
+                    max_tokens=64000,
+                    temperature=0,
+                    timeout=600.0,
+                    messages=[{"role": "user", "content": sharpened_blocks}]
+                ) as stream:
+                    for text in stream.text_stream:
+                        result_parts2.append(text)
+                result_text2 = "".join(result_parts2)
+                json_match2 = re.search(r'\{.*\}', result_text2, re.DOTALL)
+                if json_match2:
+                    try:
+                        analysis2 = json.loads(json_match2.group())
+                        rooms2 = analysis2.get('project_info', {}).get(
+                            'total_rooms_found', 0)
+                        print(f"   🔬 Batch {batch_idx + 1} retry: "
+                              f"extracted {rooms2} rooms")
+                        if rooms2 > 0:
+                            analysis = analysis2
+                            rooms = rooms2
+                    except json.JSONDecodeError:
+                        print(f"   ❌ Batch {batch_idx + 1} retry: "
+                              f"could not parse JSON")
+            except Exception as e:
+                print(f"   ❌ Batch {batch_idx + 1} sharpened retry failed: {e}")
+
+        if rooms > 0 and analysis is not None:
+            all_analysis_results.append(analysis)
 
         # Free this batch's tile data after sending (saves ~5-10MB per batch)
         tile_batches[batch_idx] = None
@@ -4666,11 +4749,87 @@ If you cannot determine building counts from these pages, return:
                 result_parts.append(text)
 
         result_text = "".join(result_parts)
+
+        # Empty-response retry: a successful API call that returned no text
+        # is almost always a transient model issue. Retry once before
+        # falling back to image rendering. We raise with the marker string
+        # the outer except already handles ("Could not process PDF").
+        if not result_text:
+            print(f"   ⚠️  Building inventory: empty API response — retrying once")
+            time.sleep(10)
+            try:
+                result_parts = []
+                with client.messages.stream(
+                    model="claude-sonnet-4-20250514",
+                    max_tokens=2000,
+                    temperature=0,
+                    timeout=180.0,
+                    messages=[{"role": "user", "content": content_blocks}]
+                ) as stream:
+                    for text in stream.text_stream:
+                        result_parts.append(text)
+                result_text = "".join(result_parts)
+            except Exception as e:
+                print(f"   ❌ Building inventory empty-response retry failed: {e}")
+            if not result_text:
+                # Trigger the image-fallback branch in the outer except.
+                raise RuntimeError(
+                    "Could not process PDF — empty inventory response after retry"
+                )
+
         json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
 
         if json_match:
             inventory = json.loads(json_match.group())
             buildings = inventory.get("buildings", [])
+
+            # Empty-buildings retry: Claude sometimes returns a parseable
+            # JSON shell with no buildings on the first pass even when the
+            # index pages clearly list buildings. Retry once with a
+            # sharpened prompt before accepting the empty result.
+            if not buildings:
+                print(f"   ⚠️  Building inventory: empty buildings list — "
+                      f"retrying once with sharpened prompt")
+                time.sleep(10)
+                sharpened_blocks = list(content_blocks[:-1]) + [{
+                    "type": "text",
+                    "text": (
+                        inventory_prompt + "\n\n"
+                        "RETRY DIRECTIVE: A prior attempt returned an empty "
+                        "buildings list. The index pages above contain a "
+                        "drawing index, sheet schedule, or building schedule. "
+                        "Re-examine carefully: list EVERY distinct building or "
+                        "structure referenced (main building, additions, "
+                        "outbuildings, mechanical buildings, etc.). If the "
+                        "project is a single tenant fit-out within an existing "
+                        "structure, return one building with count=1 and the "
+                        "tenant name. Do NOT return an empty array unless you "
+                        "are certain there are zero identifiable buildings."
+                    )
+                }]
+                try:
+                    result_parts2 = []
+                    with client.messages.stream(
+                        model="claude-sonnet-4-20250514",
+                        max_tokens=2000,
+                        temperature=0,
+                        timeout=180.0,
+                        messages=[{"role": "user", "content": sharpened_blocks}]
+                    ) as stream:
+                        for text in stream.text_stream:
+                            result_parts2.append(text)
+                    result_text2 = "".join(result_parts2)
+                    json_match2 = re.search(r'\{.*\}', result_text2, re.DOTALL)
+                    if json_match2:
+                        inventory2 = json.loads(json_match2.group())
+                        buildings2 = inventory2.get("buildings", [])
+                        if buildings2:
+                            inventory = inventory2
+                            buildings = buildings2
+                            print(f"   🔬 Building inventory retry: "
+                                  f"recovered {len(buildings)} building(s)")
+                except Exception as e:
+                    print(f"   ❌ Building inventory sharpened retry failed: {e}")
 
             if not buildings:
                 print(f"   ⚠️  No buildings identified from index pages")
