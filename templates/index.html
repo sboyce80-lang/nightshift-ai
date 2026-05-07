@@ -84,6 +84,9 @@
                         {% for key, _label, _unit, _default in rate_fields %}
                         <input type="hidden" name="rate__{{ key }}" id="hidden_{{ key }}" value="">
                         {% endfor %}
+                        {% for key, _label, _unit, _default, _cat in advanced_rate_fields if key in advanced_enabled %}
+                        <input type="hidden" name="rate__{{ key }}" id="hidden_{{ key }}" value="">
+                        {% endfor %}
                         <input type="hidden" name="rate__markup" id="hidden_markup" value="">
 
                         <button type="submit" class="submit-btn dark-submit-btn" id="submit-btn">
@@ -135,6 +138,35 @@
                                 </td>
                             </tr>
                             {% endfor %}
+                            {% set advanced_rows = advanced_rate_fields|selectattr('0','in',advanced_enabled)|list %}
+                            {% if advanced_rows %}
+                            <tr>
+                                <td colspan="4" style="padding-top:14px;color:#cbd5e1;font-size:0.85rem;text-transform:uppercase;letter-spacing:0.5px;border-top:1px solid rgba(148,163,184,0.18);">
+                                    Advanced &mdash; Faux
+                                    <a href="{{ url_for('pricing_settings') }}" style="color:#93c5fd;font-weight:400;text-transform:none;letter-spacing:0;margin-left:8px;">manage &rarr;</a>
+                                </td>
+                            </tr>
+                            {% for key, label, unit, default, cat in advanced_rows %}
+                            <tr>
+                                <td>{{ label }}</td>
+                                <td class="unit-cell">/{{ unit }}</td>
+                                <td class="num-cell">
+                                    <input type="number" step="0.01" min="0"
+                                           class="rate-input"
+                                           data-key="{{ key }}"
+                                           data-default="{{ advanced_rates.get(key, default) }}"
+                                           value="{{ advanced_rates.get(key, default) }}">
+                                </td>
+                                <td class="num-cell">
+                                    <input type="number" step="0.1" min="0" max="100"
+                                           class="markup-input"
+                                           data-key="{{ key }}"
+                                           data-default="{{ (effective_markup * 100)|round(1) }}"
+                                           value="{{ (effective_markup * 100)|round(1) }}">
+                                </td>
+                            </tr>
+                            {% endfor %}
+                            {% endif %}
                         </tbody>
                     </table>
                 </section>

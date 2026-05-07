@@ -63,6 +63,63 @@
                         </tbody>
                     </table>
 
+                    {% if advanced_rate_fields %}
+                    <details style="margin-top:32px;border:1px solid rgba(148,163,184,0.2);border-radius:8px;padding:14px 18px;background:rgba(15,23,42,0.4);"
+                             {% if overrides.advanced_enabled %}open{% endif %}>
+                        <summary style="cursor:pointer;font-size:1.05rem;font-weight:600;color:#e2e8f0;">
+                            Advanced &mdash; Specialty Items
+                        </summary>
+                        <p class="panel-subtle" style="margin-top:10px;">
+                            Toggle on items your company offers. Enabled items become available as line items
+                            on every estimate &mdash; leave them off to keep estimates uncluttered.
+                        </p>
+
+                        {# Group advanced rows by category for readability. #}
+                        {% set ns = namespace(seen_cats=[]) %}
+                        {% for _k, _l, _u, _d, cat in advanced_rate_fields %}
+                            {% if cat not in ns.seen_cats %}
+                                {% set ns.seen_cats = ns.seen_cats + [cat] %}
+                            {% endif %}
+                        {% endfor %}
+
+                        {% for cat in ns.seen_cats %}
+                        <h4 style="margin-top:18px;margin-bottom:8px;color:#cbd5e1;font-size:0.95rem;text-transform:uppercase;letter-spacing:0.5px;">
+                            {{ cat }}
+                        </h4>
+                        <table class="pricing-table">
+                            <thead>
+                                <tr>
+                                    <th style="width:60px;">Enable</th>
+                                    <th>Item</th>
+                                    <th>Unit</th>
+                                    <th class="num-col">Default</th>
+                                    <th class="num-col">Rate ($)</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {% for key, label, unit, default, rcat in advanced_rate_fields if rcat == cat %}
+                                <tr>
+                                    <td style="text-align:center;">
+                                        <input type="checkbox" name="enable__{{ key }}" id="enable__{{ key }}" value="1"
+                                               {% if key in (overrides.advanced_enabled or []) %}checked{% endif %}
+                                               style="width:18px;height:18px;cursor:pointer;">
+                                    </td>
+                                    <td><label for="enable__{{ key }}" style="cursor:pointer;">{{ label }}</label></td>
+                                    <td class="unit-cell">/{{ unit }}</td>
+                                    <td class="num-cell" style="color:#94a3b8;">${{ default }}</td>
+                                    <td class="num-cell">
+                                        <input type="number" step="0.01" min="0" id="{{ key }}" name="{{ key }}"
+                                               value="{{ overrides.rates.get(key, '') if overrides.rates else '' }}"
+                                               placeholder="{{ default }}">
+                                    </td>
+                                </tr>
+                                {% endfor %}
+                            </tbody>
+                        </table>
+                        {% endfor %}
+                    </details>
+                    {% endif %}
+
                     <div style="display:flex;gap:10px;margin-top:24px;flex-wrap:wrap;">
                         <button type="submit" class="submit-btn dark-submit-btn" style="max-width:240px;">
                             Save Pricing
