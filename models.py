@@ -31,8 +31,8 @@ from datetime import datetime, timezone
 from typing import List, Optional
 
 from sqlalchemy import (
-    String, Integer, BigInteger, Numeric, DateTime, ForeignKey, Index,
-    UniqueConstraint, JSON, Boolean,
+    String, Integer, SmallInteger, BigInteger, Numeric, DateTime, ForeignKey,
+    Index, UniqueConstraint, JSON, Boolean, Text,
 )
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
@@ -231,6 +231,20 @@ class Submission(Base):
     error: Mapped[Optional[str]] = mapped_column(String(2000))
     subtotal: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
 
+    # Versioning for re-runs. v1 has parent_submission_id=NULL; revisions
+    # (revised plans, RFI responses, amendments) point at the parent and
+    # increment version. The merge worker re-extracts only the new files
+    # and merges into the parent's stored result JSON.
+    parent_submission_id: Mapped[Optional[str]] = mapped_column(
+        String(36), ForeignKey("submissions.id", ondelete="SET NULL"),
+        nullable=True,
+    )
+    version: Mapped[int] = mapped_column(
+        SmallInteger, nullable=False, default=1, server_default="1",
+    )
+    merge_notes: Mapped[Optional[str]] = mapped_column(Text)
+    merge_scope_tags: Mapped[Optional[list]] = mapped_column(JSON)
+
     submitted_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False,
     )
@@ -244,12 +258,18 @@ class Submission(Base):
         back_populates="submission", cascade="all, delete-orphan",
     )
 
+    parent: Mapped[Optional["Submission"]] = relationship(
+        "Submission", remote_side="Submission.id", foreign_keys=[parent_submission_id],
+        backref="revisions",
+    )
+
     __table_args__ = (
         Index("ix_submissions_user_submitted", "user_id", "submitted_at"),
+        Index("ix_submissions_parent_version", "parent_submission_id", "version"),
     )
 
     def __repr__(self) -> str:
-        return f"<Submission id={self.id} status={self.status}>"
+        return f"<Submission id={self.id} v={self.version} status={self.status}>"
 
 
 # ---------------------------------------------------------------------------

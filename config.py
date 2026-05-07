@@ -266,6 +266,12 @@ PRICING_MODEL = {
         "unit": "lf", "markup": 0.05,
         "tiers": [{"min_qty": 0, "max_qty": None, "rate": 32.00}],   # Stained wood railing (Rider Edgehill)
     },
+    # ── Painted Railings ── (interior stair handrails + exterior porch/balcony/deck rails)
+    # Distinct from exterior_stain_railing (which covers natural-wood stained rails).
+    "painted_railing": {
+        "unit": "lf", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 18.00}],   # Painted metal/wood rail per Rider
+    },
     # ── Footprint-Based Interior Rate ── (for senior living / large residential)
     # When room-by-room extraction is incomplete, use footprint × rate as fallback.
     # $3.80/SF footprint is Rider's all-inclusive interior rate (Edgehill).
@@ -280,6 +286,16 @@ PRICING_MODEL = {
             {"min_qty": 0,    "max_qty": 3499, "rate": 0.85},        # Same as GYP wall rate per Rider
             {"min_qty": 3500, "max_qty": None,  "rate": 0.80},
         ],
+    },
+    # ── Faux / Specialty Wall Finishes (Advanced) ──
+    # Toggleable per-org via pricing_overrides.advanced_enabled.
+    "lymewash": {
+        "unit": "sqft", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 4.50}],
+    },
+    "plaster": {
+        "unit": "sqft", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 7.50}],
     },
 }
 

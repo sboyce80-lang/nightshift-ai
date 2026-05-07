@@ -33,7 +33,7 @@ from config import (
 import storage
 from db import session_scope
 from models import Submission, File
-from Takeoff_DIRECT import run_analysis
+from Takeoff_DIRECT import run_analysis, run_analysis_merge
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -90,6 +90,110 @@ def update_status(submission_id, status, error=None, subtotal=None):
     except Exception as exc:
         logger.warning("Could not update status for %s -> %s: %s",
                        submission_id, status, exc, exc_info=True)
+
+
+# Submissions older than this still in queued/processing on worker startup
+# are treated as abandoned. 4h leaves a wide margin past the longest
+# realistic DD-scale takeoff (~1.5h) so live jobs are never false-positived.
+ABANDONED_AGE_SECONDS = int(os.environ.get("ABANDONED_AGE_SECONDS", "14400"))
+
+
+def reconcile_abandoned_submissions(redis_conn, queue_names):
+    """Sweep DB rows whose RQ jobs are gone or failed but DB still says active.
+
+    Called from worker startup. When a worker is killed by OOM, deploy,
+    Render eviction, or RQ's own job_timeout, the SIGKILL bypasses Python
+    and `update_status('failed')` never runs. The DB row stays at
+    queued/processing forever. RQ marks the job AbandonedJobError in its
+    failed registry, but we don't pick that up unless we look.
+
+    For each old still-active DB row, check what RQ thinks:
+        - job missing entirely      -> ghost, mark failed
+        - job in failed registry    -> mark failed, copy exc info
+        - job still queued/started  -> leave alone (legitimate long run)
+        - job finished              -> anomaly, mark failed with note
+
+    Idempotent and safe to run repeatedly. Returns a count of rows changed.
+    """
+    from rq.job import Job
+    from rq.exceptions import NoSuchJobError
+
+    cutoff = datetime.now(timezone.utc) - timedelta(seconds=ABANDONED_AGE_SECONDS)
+    rows_changed = 0
+
+    try:
+        with session_scope() as session:
+            stuck = (session.query(Submission)
+                     .filter(Submission.status.in_(("queued", "processing")),
+                             Submission.updated_at < cutoff)
+                     .all())
+            stuck_snapshot = [
+                (s.id, s.status, s.updated_at) for s in stuck
+            ]
+    except Exception as exc:
+        logger.warning("Reconcile: failed to query stuck submissions: %s",
+                       exc, exc_info=True)
+        return 0
+
+    if not stuck_snapshot:
+        logger.info("Reconcile: no stuck submissions older than %ds", ABANDONED_AGE_SECONDS)
+        return 0
+
+    logger.info("Reconcile: examining %d candidate submission(s) older than %ds",
+                len(stuck_snapshot), ABANDONED_AGE_SECONDS)
+
+    for sid, db_status, last_seen in stuck_snapshot:
+        # 1. Look up the RQ job by its id (which equals submission_id).
+        try:
+            job = Job.fetch(sid, connection=redis_conn)
+            rq_status = job.get_status()
+            exc_summary = (job.exc_info or "").splitlines()[-1] if job.exc_info else ""
+        except NoSuchJobError:
+            job = None
+            rq_status = "missing"
+            exc_summary = ""
+        except Exception as exc:
+            logger.warning("Reconcile: Job.fetch failed for %s: %s", sid, exc)
+            continue
+
+        # 2. Active RQ states mean the job is legitimately still in flight.
+        if rq_status in ("queued", "started", "scheduled", "deferred"):
+            logger.info("Reconcile: %s still %s in RQ — leaving alone",
+                        sid, rq_status)
+            continue
+
+        # 3. Anything else is a stuck row. Build a clear error message and
+        #    flip the DB row to 'failed' (use update_status so the change
+        #    goes through the same observable code path).
+        if rq_status == "missing":
+            err_msg = (
+                "Worker crashed before completion (RQ job no longer exists). "
+                f"Last seen at {last_seen.isoformat()}. Please re-submit."
+            )
+        elif rq_status == "failed":
+            tail = exc_summary or "AbandonedJobError or unhandled exception"
+            err_msg = (
+                f"Worker crashed before completion: {tail}. "
+                f"Last seen at {last_seen.isoformat()}. Please re-submit."
+            )
+        elif rq_status == "finished":
+            err_msg = (
+                "Anomaly: RQ marked the job finished but the DB never recorded "
+                "completion. Files (if any) may be in storage — contact support."
+            )
+        else:
+            err_msg = (
+                f"Worker reconciliation found job in unexpected state: {rq_status}. "
+                f"Last seen at {last_seen.isoformat()}. Please re-submit."
+            )
+
+        update_status(sid, "failed", error=err_msg)
+        logger.warning("Reconcile: %s flipped to 'failed' (was '%s', RQ='%s')",
+                       sid, db_status, rq_status)
+        rows_changed += 1
+
+    logger.info("Reconcile: complete — %d row(s) reconciled", rows_changed)
+    return rows_changed
 
 
 def _record_result_file(submission_id, filename, r2_key, size_bytes, content_type):
@@ -199,6 +303,137 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
                     raise
 
             logger.error("Submission %s failed: %s", submission_id, exc, exc_info=True)
+            update_status(submission_id, "failed", error=str(exc))
+            try:
+                send_error_email(contact_info, str(exc))
+            except Exception as email_exc:
+                logger.error("Failed to send error email: %s", email_exc)
+            raise
+
+
+# ---------------------------------------------------------------------------
+# Merge worker — incremental re-run on a parent submission's stored JSON
+# ---------------------------------------------------------------------------
+
+def _find_parent_result_json_key(parent_id):
+    """Return the R2 key of parent_id's most recent result JSON, or None.
+
+    A submission can have at most one result JSON (uq_files_submission_kind_filename
+    enforces uniqueness on filename), but if a worker rerun ever produced a
+    second one we pick the latest by created_at.
+    """
+    with session_scope() as session:
+        row = (
+            session.query(File)
+            .filter(
+                File.submission_id == parent_id,
+                File.kind == "result",
+                File.filename.like("%.json"),
+            )
+            .order_by(File.created_at.desc())
+            .first()
+        )
+        return row.r2_key if row else None
+
+
+def merge_submission(submission_id, parent_id, new_pdf_keys, contact_info,
+                      scope_notes=None, scope_tags=None, rate_overrides=None):
+    """Incremental re-run for a v2+ child submission.
+
+    Loads the parent's stored result JSON from R2, runs extraction on ONLY
+    the new PDFs, calls run_analysis_merge() to merge + recompute, uploads
+    the new result files under THIS submission's prefix, emails the contact,
+    and marks the child `completed` with the new subtotal.
+
+    Args:
+        submission_id: UUID of the new (v2+) submission row to update.
+        parent_id: UUID of the parent (v1 or earlier) whose JSON is baseline.
+        new_pdf_keys: R2 keys of files uploaded for THIS version only.
+        contact_info: same dict shape as process_submission.
+        scope_notes: optional string the user typed describing the change.
+        scope_tags: optional list like ["Basement","DoorSchedule"] driving
+                    replace-vs-union semantics in merge_analyses().
+        rate_overrides: passed through to run_analysis_merge for symmetry,
+                        but pricing primarily uses the parent's snapshot.
+
+    Failures: mark `failed` + email; re-raise so RQ records the failure.
+    """
+    logger.info("Merging submission %s onto parent %s (%d new PDFs, tags=%s)",
+                submission_id, parent_id, len(new_pdf_keys), scope_tags)
+    update_status(submission_id, "processing")
+
+    parent_json_key = _find_parent_result_json_key(parent_id)
+    if not parent_json_key:
+        msg = (f"Parent submission {parent_id} has no stored result JSON — "
+               f"cannot merge. Re-submit fresh instead.")
+        logger.error(msg)
+        update_status(submission_id, "failed", error=msg)
+        try:
+            send_error_email(contact_info, msg)
+        except Exception:
+            pass
+        raise RuntimeError(msg)
+
+    with tempfile.TemporaryDirectory(prefix=f"ns-merge-{submission_id}-") as workdir:
+        local_pdfs = []
+        try:
+            # Pull parent JSON
+            import json
+            parent_json_local = os.path.join(workdir, "_parent_result.json")
+            storage.download_file(parent_json_key, parent_json_local)
+            with open(parent_json_local, "r") as fh:
+                prior_json = json.load(fh)
+
+            # Pull new PDFs
+            for key in new_pdf_keys:
+                filename = key.rsplit("/", 1)[-1]
+                local_path = os.path.join(workdir, filename)
+                storage.download_file(key, local_path)
+                local_pdfs.append(local_path)
+
+            result = run_analysis_merge(
+                prior_json,
+                local_pdfs,
+                scope_tags=scope_tags or [],
+                contact_name=contact_info.get("name", ""),
+                contact_email=contact_info.get("email", ""),
+                scope_notes=scope_notes or "",
+                rate_overrides=rate_overrides,
+            )
+
+            for key_name, content_type in (
+                ("output_json_path", "application/json"),
+                ("output_pdf_path", "application/pdf"),
+            ):
+                src = result.get(key_name)
+                if src and os.path.exists(src):
+                    filename = os.path.basename(src)
+                    r2_key = storage.result_key(submission_id, filename)
+                    size_bytes = os.path.getsize(src)
+                    storage.upload_file(src, r2_key, content_type=content_type)
+                    _record_result_file(submission_id, filename, r2_key,
+                                        size_bytes, content_type)
+
+            send_result_email(contact_info, result)
+
+            subtotal = result.get("cost_estimate", {}).get("subtotal", 0) or 0
+            update_status(submission_id, "completed", subtotal=subtotal)
+            logger.info("Merge submission %s completed — $%s estimate",
+                        submission_id, f"{subtotal:,.2f}")
+
+            return {"submission_id": submission_id,
+                    "parent_id": parent_id,
+                    "subtotal": subtotal}
+
+        except Exception as exc:
+            with session_scope() as session:
+                sub = session.get(Submission, submission_id)
+                if sub is not None and sub.status == "cancelled":
+                    logger.info("Merge %s cancelled mid-run; suppressing failure path",
+                                submission_id)
+                    raise
+
+            logger.error("Merge submission %s failed: %s", submission_id, exc, exc_info=True)
             update_status(submission_id, "failed", error=str(exc))
             try:
                 send_error_email(contact_info, str(exc))

@@ -3056,6 +3056,18 @@ Stained Wood / Clear-Coat Panels: Check finish schedules and interior elevations
   - Calculate: stained_wood_sqft = panel area (height × width per panel × count)
   - SUBTRACT stained wood walls from wall_area_sqft — do NOT double-count as painted
   - Record as "stained_wood_sqft" per room (set to 0 if none)
+
+Faux / Specialty Wall Finishes (Plaster, Lyme Wash): Check finish schedules and spec sections
+  for specialty wall coatings that are NOT standard paint:
+  - Plaster: "plaster", "Venetian plaster", "decorative plaster", "smooth plaster",
+    "skim plaster", finish codes like PL-1, VP-1
+  - Lyme wash / Lime wash: "lyme wash", "lime wash", "limewash", "mineral wash",
+    finish codes like LW-1
+  - When a room's wall finish is plaster or lyme wash, set materials.walls to that finish
+    string EXACTLY as written ("Plaster", "Lyme Wash") — the pricing pipeline routes to
+    the correct rate by reading materials.walls. Do NOT translate to "Paint" or "GYP".
+  - Wall area for the room stays in wall_area_sqft as normal; the material string drives
+    the pricing bucket downstream.
   - Common locations: lobbies, elevator lobbies, accent walls, feature walls
 
 Soffits & Ceiling Types from RCP (REFLECTED CEILING PLAN):
@@ -3229,6 +3241,12 @@ STEP 6: STAIRS — COUNT ACROSS ENTIRE BUILDING
 - Only count stairs with painted components (wood treads, risers, railings, stringers)
 - Estimate gyp wall area between/around ALL stair runs as "gyp_between_stairs_sqft"
 - Include landings in the gyp wall area calculation
+- INTERIOR HANDRAILS / GUARDRAILS: when stairs have a painted handrail, balcony
+  rail, or open-stringer guardrail, record the rail run in LINEAR FEET on the
+  stair room as "painted_railing_lf". Measure the rail length along the slope
+  (stairs) or along the run (balcony/landing). Record on the room that contains
+  the railing. Set to 0 when rails are stained/clear-coated, factory-finished
+  metal, or glass — those are not painted.
 STAIR ESTIMATION HINT: If this is a multi-story building with N floors and S stairwells:
 - Typical stair sections ≈ S × (N-1) × 2 (two flights per floor transition)
 - A 4-story building with 2 stairwells ≈ 2 × 3 × 2 = 12 sections
@@ -3246,7 +3264,10 @@ Look at building elevations (A-201, A-202) and exterior detail sheets:
   If painted exterior trim IS shown, measure total LINEAR FEET (head + sill + 2 jambs per window).
   Store this in "window_trim_lf". Set to 0 if not explicitly visible in exterior details.
 - Soffits (if painted) → estimate sqft
-- Railings on balconies, decks, roof areas → estimate LF
+- Railings on balconies, decks, roof areas → estimate LF as "railing_lf".
+  Use this field for PAINTED rails (metal or wood). For natural-wood STAINED
+  rails (cedar/Ipe/etc. with stain or clear coat), record under "stain_railing_lf"
+  instead. Glass and factory-finished aluminum rails are excluded.
 - SIDING / CLADDING MATERIALS — identify from elevation notes, details, and material callouts:
   * Hardie / fiber cement siding → measure total SQFT from elevation drawings ("hardie_siding_sqft")
   * Azek / PVC trim boards → measure total LF of trim runs ("azek_trim_lf")
@@ -3343,7 +3364,8 @@ IMPORTANT RULES:
             "painted_columns_ea": 0,
             "wallcovering_sqft": 0,
             "stained_wood_sqft": 0,
-            "soffit_sqft": 0
+            "soffit_sqft": 0,
+            "painted_railing_lf": 0
           },
           "notes": ""
         }
@@ -3354,6 +3376,8 @@ IMPORTANT RULES:
     "total_paintable_wall_sqft": 0,
     "total_paintable_ceiling_sqft": 0,
     "total_cmu_wall_sqft": 0,
+    "total_lymewash_wall_sqft": 0,
+    "total_plaster_wall_sqft": 0,
     "total_dryfall_ceiling_sqft": 0,
     "total_base_trim_lf": 0,
     "total_doors_full_paint": 0,
@@ -3370,7 +3394,8 @@ IMPORTANT RULES:
     "total_painted_columns_ea": 0,
     "total_wallcovering_sqft": 0,
     "total_stained_wood_sqft": 0,
-    "total_soffit_sqft": 0
+    "total_soffit_sqft": 0,
+    "total_painted_railing_lf": 0
   },
   "exterior": {
     "cornice_lf": 0,
@@ -3948,7 +3973,9 @@ Your task: Extract the ROOM FINISH SCHEDULE and BUILDING INFORMATION from this d
    For EACH room listed in the Room Finish Schedule, extract:
    - room_name: The room name/type (e.g., "Living Room", "Bedroom 1", "Kitchen", "Bathroom", "Hallway", "Closet")
    - room_number: The room number if shown
-   - wall_finish: What's specified for walls (e.g., "Paint", "PT-1", "Wallcovering", "Tile", "CMU Paint")
+   - wall_finish: What's specified for walls (e.g., "Paint", "PT-1", "Wallcovering", "Tile", "CMU Paint",
+     "Plaster", "Venetian Plaster", "Lyme Wash", "Lime Wash"). Preserve the exact spec wording —
+     specialty finishes like plaster and lyme wash are priced separately from standard paint.
    - ceiling_finish: What's specified for ceiling (e.g., "GWB - Paint", "ACT", "Exposed")
    - base_finish: What's specified for base/baseboard (e.g., "Wood Base", "WD-1", "Rubber Base", "Tile Base", "None")
    - floor_finish: What's specified for floor (e.g., "Hardwood", "Carpet", "Tile", "Concrete", "VCT")
@@ -4288,6 +4315,7 @@ Return ONLY this JSON (one object, no commentary):
   "cornice_lf": 0,
   "window_trim_lf": 0,
   "soffit_sqft": 0,
+  "railing_lf": 0,
   "azek_trim_lf": 0,
   "corner_board_lf": 0,
   "steel_lintel_lf": 0,
@@ -4391,7 +4419,7 @@ def _maybe_run_exterior_pass(client, pdf_path, analysis_result):
         merged = dict(exterior)
         for key in (
             "exterior_paint_sqft", "hardie_siding_sqft", "cornice_lf",
-            "window_trim_lf", "soffit_sqft", "azek_trim_lf",
+            "window_trim_lf", "soffit_sqft", "railing_lf", "azek_trim_lf",
             "corner_board_lf", "steel_lintel_lf",
         ):
             if _num(merged.get(key, 0)) == 0 and _num(ext_data.get(key, 0)) > 0:
@@ -5329,12 +5357,24 @@ def _estimate_from_room_finish_schedule(room_schedule_data, schedule_data=None):
         return True
 
     def _get_wall_material(wall_finish):
-        """Determine wall material type from finish spec."""
+        """Determine wall material type from finish spec.
+
+        Faux finishes (lyme wash, plaster) are checked before GYP so that
+        a substrate-plus-finish spec like "GYP / Plaster" routes to the
+        finish bucket — the labor rate reflects the finish, not the
+        substrate.
+        """
         if not wall_finish:
             return "GYP"
         wf = wall_finish.lower()
         if any(kw in wf for kw in ("cmu", "block", "masonry", "concrete")):
             return "CMU"
+        if any(kw in wf for kw in (
+                "lyme wash", "lyme-wash", "lymewash",
+                "lime wash", "lime-wash", "limewash")):
+            return "LYMEWASH"
+        if "plaster" in wf:
+            return "PLASTER"
         return "GYP"
 
     def _is_painted_ceiling(ceiling_finish):
@@ -5512,6 +5552,7 @@ def _estimate_from_room_finish_schedule(room_schedule_data, schedule_data=None):
                     "wallcovering_sqft": 0,
                     "stained_wood_sqft": 0,
                     "soffit_sqft": 0,
+                    "painted_railing_lf": 0,
                 },
                 "notes": f"Schedule-estimated room ({total_multiplier}x: {units_per_building} units/bldg × {n_buildings} buildings). "
                          f"Wall finish: {wall_finish}. Ceiling: {ceiling_finish}. Base: {base_finish}.",
@@ -5587,6 +5628,7 @@ def _estimate_from_room_finish_schedule(room_schedule_data, schedule_data=None):
                 "wallcovering_sqft": 0,
                 "stained_wood_sqft": 0,
                 "soffit_sqft": 0,
+                "painted_railing_lf": 0,
             },
             "notes": f"Schedule-estimated common area ({common_multiplier}x: {floors_per_building} floors × {n_buildings} buildings). "
                      f"Wall: {wall_finish}. Ceiling: {ceiling_finish}. Base: {base_finish}.",
@@ -5637,6 +5679,7 @@ def _estimate_from_room_finish_schedule(room_schedule_data, schedule_data=None):
                 "wallcovering_sqft": 0,
                 "stained_wood_sqft": 0,
                 "soffit_sqft": 0,
+                "painted_railing_lf": 0,
             },
             "notes": f"Parking garage ({n_buildings}x buildings × {garage_sqft:,.0f} sqft/building). Concrete sealer excluded unless specs explicitly require it.",
             "source": "schedule_estimate",
@@ -7851,6 +7894,8 @@ def _recalculate_totals(analysis):
     total_wall = 0
     total_ceiling = 0
     total_cmu_wall = 0
+    total_lymewash_wall = 0
+    total_plaster_wall = 0
     total_dryfall_ceiling = 0
     total_trim = 0
     total_doors_full = 0
@@ -7866,6 +7911,7 @@ def _recalculate_totals(analysis):
     total_wallcovering = 0
     total_stained_wood = 0
     total_soffit = 0
+    total_painted_railing = 0
 
     for floor in analysis.get("floors", []):
         for room in floor.get("rooms", []):
@@ -7899,6 +7945,12 @@ def _recalculate_totals(analysis):
             wall_mat = str(mats.get("walls", "")).lower()
             if "cmu" in wall_mat:
                 total_cmu_wall += _adjusted_wall_area * multiplier
+            elif any(kw in wall_mat for kw in (
+                    "lyme wash", "lyme-wash", "lymewash",
+                    "lime wash", "lime-wash", "limewash")):
+                total_lymewash_wall += _adjusted_wall_area * multiplier
+            elif "plaster" in wall_mat:
+                total_plaster_wall += _adjusted_wall_area * multiplier
             elif any(kw in wall_mat for kw in ("gyp", "gwb", "gypsum", "paintable")):
                 total_wall += _adjusted_wall_area * multiplier
 
@@ -7994,6 +8046,9 @@ def _recalculate_totals(analysis):
 
             # Interior soffits (GYP drywall drops)
             total_soffit += _num(elems.get("soffit_sqft", 0)) * multiplier
+
+            # Painted interior railings (stair handrails, balcony rails)
+            total_painted_railing += _num(elems.get("painted_railing_lf", 0)) * multiplier
 
     # ── PCA Room SF Cross-Check (informational) ──
     # Validate extracted room areas against PCA Section 4D formula:
@@ -8496,6 +8551,8 @@ def _recalculate_totals(analysis):
         "total_paintable_wall_sqft": total_wall,
         "total_paintable_ceiling_sqft": total_ceiling,
         "total_cmu_wall_sqft": total_cmu_wall,
+        "total_lymewash_wall_sqft": total_lymewash_wall,
+        "total_plaster_wall_sqft": total_plaster_wall,
         "total_dryfall_ceiling_sqft": total_dryfall_ceiling,
         "total_base_trim_lf": total_trim,
         "total_doors_full_paint": total_doors_full,
@@ -8511,6 +8568,7 @@ def _recalculate_totals(analysis):
         "total_wallcovering_sqft": total_wallcovering,
         "total_stained_wood_sqft": total_stained_wood,
         "total_soffit_sqft": total_soffit,
+        "total_painted_railing_lf": total_painted_railing,
     }
 
     # --- Small space ceiling supplement for residential ---
@@ -9458,6 +9516,8 @@ def _apply_rate_overrides(rate_overrides):
         "dryfall_rate":  "dryfall_ceiling",
         "concrete_rate": "concrete_sealer",
         "column_rate":   "painted_columns",
+        "lymewash_rate": "lymewash",
+        "plaster_rate":  "plaster",
     }
 
     for key, val in rate_overrides.items():
@@ -9611,7 +9671,9 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     # extraction — e.g., Mazda footprint=4K but showroom alone is 4,104 SF, walls=44K).
     _footprint = _num(project_info.get('footprint_sqft', 0))
     _total_wall_area = _num(aggregated_totals.get('total_paintable_wall_sqft', 0)) + \
-                       _num(aggregated_totals.get('total_cmu_wall_sqft', 0))
+                       _num(aggregated_totals.get('total_cmu_wall_sqft', 0)) + \
+                       _num(aggregated_totals.get('total_lymewash_wall_sqft', 0)) + \
+                       _num(aggregated_totals.get('total_plaster_wall_sqft', 0))
     is_large_commercial = is_commercial and (_footprint > 10000 or _total_wall_area > 10000)
 
     # Footprint sanity check: if extracted room floor area on any single floor exceeds
@@ -9670,6 +9732,8 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     wall_sqft = _num(aggregated_totals.get('total_paintable_wall_sqft', 0))
     ceil_sqft = _num(aggregated_totals.get('total_paintable_ceiling_sqft', 0))
     cmu_wall_sqft = _num(aggregated_totals.get('total_cmu_wall_sqft', 0))
+    lymewash_sqft = _num(aggregated_totals.get('total_lymewash_wall_sqft', 0))
+    plaster_sqft = _num(aggregated_totals.get('total_plaster_wall_sqft', 0))
     dryfall_sqft = _num(aggregated_totals.get('total_dryfall_ceiling_sqft', 0))
     trim_lf = _num(aggregated_totals.get('total_base_trim_lf', 0))
 
@@ -9713,6 +9777,13 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     azek_lf = _num(exterior.get('azek_trim_lf', 0))
     corner_lf = _num(exterior.get('corner_board_lf', 0))
     steel_lintel_lf_ext = _num(exterior.get('steel_lintel_lf', 0))
+
+    # Painted railings — interior handrails + exterior porch/balcony/deck rails.
+    # Sum both buckets into a single line item; stained-wood rails are priced
+    # separately under exterior_stain_railing.
+    interior_railing_lf = _num(aggregated_totals.get('total_painted_railing_lf', 0))
+    exterior_railing_lf = _num(exterior.get('railing_lf', 0))
+    total_painted_railing_lf = interior_railing_lf + exterior_railing_lf
     # When material-specific items present, subtract from generic exterior_paint_sqft
     if hardie_sqft > 0:
         ext_paint_sqft = max(0, ext_paint_sqft - hardie_sqft)
@@ -9863,6 +9934,8 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     wall_rate   = _get_tiered_rate(pm['gyp_walls'], wall_sqft)
     ceil_rate   = _get_tiered_rate(pm['gyp_ceilings'], ceil_sqft)
     cmu_rate    = _get_tiered_rate(pm['cmu_walls_full'], cmu_wall_sqft)
+    lymewash_rate = _get_tiered_rate(pm['lymewash'], lymewash_sqft) if 'lymewash' in pm else 4.50
+    plaster_rate  = _get_tiered_rate(pm['plaster'], plaster_sqft) if 'plaster' in pm else 7.50
     dryfall_rate = _get_tiered_rate(pm['dryfall_ceiling'], dryfall_sqft)
     trim_rate   = _get_tiered_rate(pm['base_trim'], trim_lf)
     door_fp_rate = _get_tiered_rate(pm['doors_full_paint'], doors_full)
@@ -10024,6 +10097,7 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     stain_sid_rate = _get_tiered_rate(pm['exterior_stain_siding'], stain_siding_sqft) if 'exterior_stain_siding' in pm else 1.85
     stain_trim_rate = _get_tiered_rate(pm['exterior_stain_trim'], stain_trim_lf) if 'exterior_stain_trim' in pm else 2.50
     stain_rail_rate = _get_tiered_rate(pm['exterior_stain_railing'], stain_railing_lf) if 'exterior_stain_railing' in pm else 32.00
+    painted_rail_rate = _get_tiered_rate(pm['painted_railing'], total_painted_railing_lf) if 'painted_railing' in pm else 18.00
 
     # --- Footprint-based interior pricing fallback ---
     # When room-by-room extraction is severely incomplete, use footprint × all-inclusive
@@ -10171,6 +10245,8 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
             _room_interior_est = (
                 wall_sqft * wall_rate +
                 ceil_sqft * ceil_rate +
+                lymewash_sqft * lymewash_rate +
+                plaster_sqft * plaster_rate +
                 trim_lf * trim_rate +
                 doors_full * door_fp_rate +
                 doors_hm * door_hm_rate
@@ -10192,6 +10268,10 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
               ceil_rate, _get_markup('gyp_ceilings')),
         _line(f"CMU Walls (Full System) - {cmu_wall_sqft:,.0f} sqft @ ${cmu_rate:.2f}", cmu_wall_sqft,
               cmu_rate, _get_markup('cmu_walls_full')),
+        _line(f"Lyme Wash Walls - {lymewash_sqft:,.0f} sqft @ ${lymewash_rate:.2f}", lymewash_sqft,
+              lymewash_rate, _get_markup('lymewash') if 'lymewash' in pm else 0.06),
+        _line(f"Plaster Walls - {plaster_sqft:,.0f} sqft @ ${plaster_rate:.2f}", plaster_sqft,
+              plaster_rate, _get_markup('plaster') if 'plaster' in pm else 0.06),
         _line(f"Dryfall Ceiling - {dryfall_sqft:,.0f} sqft @ ${dryfall_rate:.2f}", dryfall_sqft,
               dryfall_rate, _get_markup('dryfall_ceiling')),
         _line(f"Base Trim - {trim_lf:,.0f} LF @ ${trim_rate:.2f}", trim_lf,
@@ -10244,6 +10324,9 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
               stain_trim_rate, 0.05),
         _line(f"Ext. Stain Railing - {stain_railing_lf:,.0f} LF @ ${stain_rail_rate:.2f}", stain_railing_lf,
               stain_rail_rate, 0.05),
+        _line(f"Painted Railings - {total_painted_railing_lf:,.0f} LF @ ${painted_rail_rate:.2f}",
+              total_painted_railing_lf, painted_rail_rate,
+              _get_markup('painted_railing') if 'painted_railing' in pm else 0.06),
     ]
 
     # If footprint pricing is active, replace individual interior line items
@@ -10252,7 +10335,8 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
         _interior_keys = {"Gyp. Walls", "Gyp. Ceilings", "CMU Walls", "Dryfall Ceiling",
                           "Base Trim", "Doors", "Windows", "Stairs", "Gyp. Between",
                           "Level 5", "Concrete Sealer", "Painted Columns",
-                          "Wallcovering", "Stained Wood", "Interior Soffits", "Interior Lift"}
+                          "Wallcovering", "Stained Wood", "Interior Soffits", "Interior Lift",
+                          "Lyme Wash", "Plaster Walls"}
         # Remove individual interior items
         line_items = [li for li in line_items
                       if not any(li["item"].startswith(k) for k in _interior_keys)]
@@ -11158,6 +11242,31 @@ def analyze_and_parse(client, pdf_path, scope_notes="", schedule_hints=None,
         print(f"\n❌ Error analyzing {filename}: {e}")
         print(f"   Traceback: {traceback.format_exc()}")
         return None
+
+
+def run_analysis_merge(prior_json, new_pdf_paths, scope_tags=None,
+                        contact_name="", contact_email="", scope_notes="",
+                        rate_overrides=None):
+    """Re-run analysis using a prior result JSON as the baseline, merging
+    in extraction from `new_pdf_paths` only.
+
+    The prior JSON is the full result dict from a completed `run_analysis`
+    (read from R2 by the merge worker). `scope_tags` is a list of structured
+    tags driving merge semantics — e.g. ["Basement", "DoorSchedule"] tells
+    the merger to REPLACE the parent's Basement floor and door schedule
+    rather than UNIONING them.
+
+    Returns the same shape `run_analysis` returns: {analysis, cost_estimate,
+    output_json_path, output_pdf_path, ...}.
+
+    Pricing uses `prior_json['pricing_model']` snapshot — quotes stay rate-
+    consistent across versions even if PRICING_MODEL changes upstream.
+    """
+    raise NotImplementedError(
+        "run_analysis_merge is Phase 2 of the merge feature. "
+        "Worker plumbing (Phase 1B) is wired; merge engine + post-merge "
+        "re-runs (Phase 2-3) land next."
+    )
 
 
 def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",

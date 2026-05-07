@@ -119,6 +119,15 @@ RATE_FIELDS = [
     ("column_rate",   "Painted columns",          "ea",   "200.00"),
 ]
 
+# Advanced/specialty items hidden by default — admins toggle them on per org.
+# Stored shape on org.pricing_overrides:
+#   {"advanced_enabled": ["lymewash_rate", ...]}
+# Tuple: (key, label, unit, default, category)
+ADVANCED_RATE_FIELDS = [
+    ("lymewash_rate", "Lyme wash", "sqft", "4.50", "Faux"),
+    ("plaster_rate",  "Plaster",   "sqft", "7.50", "Faux"),
+]
+
 
 def _flatten_overrides(po):
     """Convert {"rates": {...}, "markup": x} -> flat dict for run_analysis."""
@@ -156,6 +165,35 @@ def _pick_queue(total_pages, max_size_bytes):
     if total_pages >= HEAVY_QUEUE_PAGE_THRESHOLD or max_mb >= HEAVY_QUEUE_FILE_MB:
         return _queue_heavy, RQ_QUEUE_HEAVY
     return _queue_fast, RQ_QUEUE_FAST
+
+
+def _pick_timeout(total_pages, max_size_bytes):
+    """Per-submission RQ job_timeout, scaled to payload.
+
+    A flat 2h timeout was too tight for 4-PDF DD-scale sets (one SUMMIT
+    submission was killed at the 91-min mark with no completion in sight)
+    and far too generous for small jobs (which then squat the queue when
+    truly hung). Tier the limit so big payloads get room and small ones
+    fail fast.
+
+    Returns seconds. Falls back to RQ_JOB_TIMEOUT (the env-configurable
+    safety net) if anything goes sideways.
+    """
+    try:
+        max_mb = max_size_bytes / (1024 * 1024)
+        # DD-scale (300+ MB or 50+ pages): 4h
+        if max_mb >= 300 or total_pages >= 50:
+            return 4 * 3600
+        # Large (100-300 MB): 2h
+        if max_mb >= 100 or total_pages >= 25:
+            return 2 * 3600
+        # Medium (30-100 MB or 10+ pages): 1h
+        if max_mb >= 30 or total_pages >= 10:
+            return 3600
+        # Small everything else: 30 min
+        return 1800
+    except Exception:
+        return RQ_JOB_TIMEOUT
 
 
 # ---------------------------------------------------------------------------
@@ -196,11 +234,14 @@ def _effective_user_overrides(user):
         "dryfall_rate":  "dryfall_ceiling",
         "concrete_rate": "concrete_sealer",
         "column_rate":   "painted_columns",
+        "lymewash_rate": "lymewash",
+        "plaster_rate":  "plaster",
     }
     org = user.current_organization if user else None
     saved = (org.pricing_overrides or {}) if org else {}
     saved_rates = saved.get("rates") or {}
     saved_markup = saved.get("markup")
+    advanced_enabled = set(saved.get("advanced_enabled") or [])
 
     rates = {}
     for shorthand, _label, _unit, _default in RATE_FIELDS:
@@ -211,8 +252,17 @@ def _effective_user_overrides(user):
             tiers = (PRICING_MODEL.get(pm_key) or {}).get("tiers") or []
             rates[shorthand] = float(tiers[0]["rate"]) if tiers else 0.0
 
+    advanced_rates = {}
+    for shorthand, _label, _unit, _default, _cat in ADVANCED_RATE_FIELDS:
+        if shorthand in saved_rates:
+            advanced_rates[shorthand] = float(saved_rates[shorthand])
+        else:
+            pm_key = _rate_map.get(shorthand)
+            tiers = (PRICING_MODEL.get(pm_key) or {}).get("tiers") or []
+            advanced_rates[shorthand] = float(tiers[0]["rate"]) if tiers else 0.0
+
     markup = float(saved_markup) if saved_markup is not None else 0.06
-    return rates, markup
+    return rates, markup, advanced_rates, advanced_enabled
 
 
 _MOBILE_UA_RE = re.compile(
@@ -276,14 +326,19 @@ def _try_signed_in_user_snapshot():
                 "denied_at": (org.denied_at if org else None),
             }
             # Pre-fetch effective rates while the session is still open.
-            rates, markup = _effective_user_overrides(user) if org else (
-                _effective_user_overrides(None)
+            rates, markup, adv_rates, adv_enabled = (
+                _effective_user_overrides(user) if org
+                else _effective_user_overrides(None)
             )
             snapshot["rates"] = rates
             snapshot["markup"] = markup
+            snapshot["advanced_rates"] = adv_rates
+            snapshot["advanced_enabled"] = adv_enabled
             saved = (org.pricing_overrides or {}) if org else {}
             snapshot["has_org_overrides"] = bool(
-                saved.get("rates") or saved.get("markup") is not None
+                saved.get("rates")
+                or saved.get("markup") is not None
+                or saved.get("advanced_enabled")
             )
             return user.id, snapshot
     except Exception as exc:
@@ -347,8 +402,11 @@ def index():
     return render_template(
         "index.html",
         rate_fields=RATE_FIELDS,
+        advanced_rate_fields=ADVANCED_RATE_FIELDS,
         effective_rates=snap["rates"],
         effective_markup=snap["markup"],
+        advanced_rates=snap["advanced_rates"],
+        advanced_enabled=snap["advanced_enabled"],
         has_org_overrides=snap["has_org_overrides"],
         org_name=snap["org_name"],
     )
@@ -846,6 +904,16 @@ def submit():
                 per_job[key] = v
         except ValueError:
             pass
+    for key, _label, _unit, _default, _cat in ADVANCED_RATE_FIELDS:
+        raw = (request.form.get(f"rate__{key}") or "").strip()
+        if not raw:
+            continue
+        try:
+            v = float(raw)
+            if 0 <= v <= 100000:
+                per_job[key] = v
+        except ValueError:
+            pass
 
     raw_markup = (request.form.get("rate__markup") or "").strip()
     if raw_markup:
@@ -860,9 +928,12 @@ def submit():
         rate_overrides = dict(rate_overrides or {})
         rate_overrides.update(per_job)
 
-    # 6. Enqueue the job — route to fast or heavy queue based on size/pages.
+    # 6. Enqueue the job — route to fast or heavy queue and pick a per-job
+    #    timeout sized to the payload (big DD-scale sets need 4h, small
+    #    single-PDF jobs only need 30 min).
     pdf_keys = [k for (_, k, _) in uploaded_files]
     queue, queue_name = _pick_queue(total_pages, max_size_bytes)
+    job_timeout = _pick_timeout(total_pages, max_size_bytes)
     try:
         job = queue.enqueue(
             "jobs.process_submission",
@@ -879,7 +950,7 @@ def submit():
                 "rate_overrides": rate_overrides,
             },
             job_id=submission_id,
-            job_timeout=RQ_JOB_TIMEOUT,
+            job_timeout=job_timeout,
             result_ttl=RQ_RESULT_TTL,
             failure_ttl=RQ_RESULT_TTL,
         )
@@ -897,12 +968,285 @@ def submit():
             pass
         return redirect(url_for("index"))
 
-    logger.info("Submission %s enqueued on %s — %d PDFs, %d pages, %.1f MB max from %s <%s> (job %s)",
+    logger.info("Submission %s enqueued on %s — %d PDFs, %d pages, %.1f MB max, timeout=%ds from %s <%s> (job %s)",
                 submission_id, queue_name, len(pdf_keys), total_pages,
-                max_size_bytes / (1024 * 1024), name, email_addr, job.id)
+                max_size_bytes / (1024 * 1024), job_timeout, name, email_addr, job.id)
 
     # Post/Redirect/Get: land the user on a GET-able URL so that refresh,
     # back-button, or a shared link doesn't reload as `GET /submit` (405).
+    return redirect(url_for("thank_you", submission_id=submission_id))
+
+
+# Hard cap on how many revisions a single project tree can spawn. Sanity
+# guard — if Rider is on v10 of a project, something process-wise is wrong
+# and a fresh submission is the right move.
+MAX_SUBMISSION_VERSIONS = 10
+
+
+@app.route("/submit/<parent_id>/resubmit", methods=["POST"])
+@require_auth
+def resubmit(parent_id):
+    """Add files to an existing submission and re-run incrementally.
+
+    Creates a v2+ child submission pointing at `parent_id`, uploads the new
+    PDFs to the child's R2 prefix, and enqueues `jobs.merge_submission`. The
+    parent's stored result JSON is the baseline; only the new files are
+    re-extracted, then merged with replace-vs-union semantics driven by the
+    posted `merge_scope_tags`.
+    """
+    user_id = current_user_id()
+    with session_scope() as session:
+        user = session.get(User, user_id)
+        name = user.name or ""
+        email_addr = user.email
+        org_id = user.current_organization_id
+
+    if org_id is None:
+        logger.error("resubmit blocked: user %s has no current_organization_id",
+                     user_id)
+        flash("Your account is not yet fully set up. Please contact support.",
+              "error")
+        return redirect(url_for("index"))
+
+    # Beta gate + daily cap apply to merge re-runs the same as fresh submissions.
+    with session_scope() as session:
+        org = session.get(Organization, org_id)
+        if org is None or not org.is_beta_approved:
+            logger.info("resubmit blocked: org %s not beta-approved (user %s)",
+                        org_id, user_id)
+            flash(
+                "Your organization is on the Nightshift AI beta waitlist. "
+                "We'll email you as soon as your access is approved.",
+                "error",
+            )
+            return redirect(url_for("index"))
+
+        cap = org.daily_submission_cap or BETA_DAILY_SUBMISSION_CAP_DEFAULT
+        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
+        recent_count = (
+            session.query(Submission)
+            .filter(Submission.org_id == org_id, Submission.submitted_at >= cutoff)
+            .count()
+        )
+        if recent_count >= cap:
+            logger.info("resubmit blocked: org %s hit daily cap %d (user %s)",
+                        org_id, cap, user_id)
+            flash(
+                f"Your organization has reached its daily submission limit "
+                f"({cap} per 24 hours). Please try again later.",
+                "error",
+            )
+            return redirect(url_for("index"))
+
+    # Parent lookup + access checks (org-scoped so a teammate can revise).
+    with session_scope() as session:
+        parent = session.get(Submission, parent_id)
+        if parent is None:
+            return ("Not found", 404)
+        if parent.org_id != org_id:
+            logger.warning("resubmit blocked: user %s tried to revise %s (org mismatch)",
+                           user_id, parent_id)
+            return ("Not found", 404)
+        if parent.status != "completed":
+            flash(
+                f"This submission is in status '{parent.status}' — only completed "
+                f"submissions can be re-run incrementally. Submit fresh instead.",
+                "error",
+            )
+            return redirect(url_for("job_detail", submission_id=parent_id)
+                            if "job_detail" in app.view_functions
+                            else url_for("index"))
+        if (parent.version or 1) >= MAX_SUBMISSION_VERSIONS:
+            flash(
+                f"This project has reached the {MAX_SUBMISSION_VERSIONS}-revision "
+                f"limit. Please start a fresh submission.",
+                "error",
+            )
+            return redirect(url_for("index"))
+
+        parent_user_id = parent.user_id
+        parent_version = parent.version or 1
+        parent_root_id = parent.parent_submission_id or parent.id
+        parent_business_name = parent.business_name
+        parent_phone = parent.phone
+
+    # Verify a parent result JSON exists in R2 — without it, merge_submission
+    # has no baseline to load.
+    has_parent_json = False
+    with session_scope() as session:
+        has_parent_json = (
+            session.query(File)
+            .filter(
+                File.submission_id == parent_id,
+                File.kind == "result",
+                File.filename.like("%.json"),
+            )
+            .first()
+            is not None
+        )
+    if not has_parent_json:
+        flash(
+            "We couldn't find the original analysis JSON for this submission. "
+            "Please re-submit fresh.",
+            "error",
+        )
+        return redirect(url_for("index"))
+
+    # Phase 1B accepts only the legacy multipart form path. The browser-direct
+    # R2 manifest flow used by /submit is not yet wired for resubmit.
+    files = request.files.getlist("attachments")
+    valid_files = [f for f in files if f.filename and f.filename.strip()]
+
+    if not valid_files:
+        flash("Please upload at least one PDF file to merge.", "error")
+        return redirect(url_for("index"))
+    if len(valid_files) > MAX_PDFS_PER_EMAIL:
+        flash(f"Maximum {MAX_PDFS_PER_EMAIL} files allowed per re-run.", "error")
+        return redirect(url_for("index"))
+
+    submission_id = str(uuid.uuid4())
+    uploaded_files = []   # (filename, key, size_bytes)
+    total_pages = 0
+    max_size_bytes = 0
+
+    with tempfile.TemporaryDirectory(prefix=f"ns-resubmit-{submission_id}-") as staging:
+        try:
+            for idx, f in enumerate(valid_files):
+                filename = secure_filename(f.filename) or f"upload_{idx + 1}.pdf"
+                ext = os.path.splitext(filename)[1].lower()
+                if ext not in ALLOWED_EXTENSIONS:
+                    flash(f"Only PDF files are accepted. Rejected: {f.filename}",
+                          "error")
+                    return redirect(url_for("index"))
+
+                local_path = os.path.join(staging, filename)
+                f.save(local_path)
+
+                size_bytes = os.path.getsize(local_path)
+                if size_bytes > MAX_PDF_SIZE_MB * 1024 * 1024:
+                    flash(f"{filename} exceeds the {MAX_PDF_SIZE_MB} MB size limit.",
+                          "error")
+                    return redirect(url_for("index"))
+
+                total_pages += _count_pdf_pages(local_path)
+                if size_bytes > max_size_bytes:
+                    max_size_bytes = size_bytes
+
+                key = storage.upload_key(submission_id, filename)
+                storage.upload_file(local_path, key, content_type="application/pdf")
+                uploaded_files.append((filename, key, size_bytes))
+
+        except storage.StorageNotConfigured as exc:
+            logger.error("R2 not configured: %s", exc)
+            flash("Storage is not configured. Please contact support.", "error")
+            return redirect(url_for("index"))
+        except Exception as exc:
+            logger.error("Upload error for resubmit %s: %s", submission_id,
+                         exc, exc_info=True)
+            flash("An error occurred while uploading your files. Please try again.",
+                  "error")
+            try:
+                storage.delete_prefix(storage.submission_prefix(submission_id))
+            except Exception:
+                pass
+            return redirect(url_for("index"))
+
+    # Form fields specific to a re-run.
+    merge_notes_text = (request.form.get("merge_notes") or "").strip() or None
+    raw_tags = request.form.getlist("merge_scope_tags")
+    if not raw_tags:
+        # Allow comma-separated single field as well as repeated form fields.
+        single = (request.form.get("merge_scope_tags") or "").strip()
+        raw_tags = [t.strip() for t in single.split(",") if t.strip()] if single else []
+    merge_scope_tags = [t for t in raw_tags if t]
+
+    # Persist child submission + uploaded files.
+    try:
+        with session_scope() as session:
+            sub = Submission(
+                id=submission_id,
+                user_id=user_id,
+                org_id=org_id,
+                parent_submission_id=parent_id,
+                version=parent_version + 1,
+                merge_notes=merge_notes_text,
+                merge_scope_tags=merge_scope_tags or None,
+                phone=parent_phone,
+                business_name=parent_business_name,
+                status="queued",
+            )
+            session.add(sub)
+            for filename, r2_key, size_bytes in uploaded_files:
+                session.add(File(
+                    submission_id=submission_id,
+                    kind="upload",
+                    filename=filename,
+                    r2_key=r2_key,
+                    size_bytes=size_bytes,
+                    content_type="application/pdf",
+                ))
+    except Exception as exc:
+        logger.error("DB write failed for resubmit %s: %s", submission_id,
+                     exc, exc_info=True)
+        flash("An error occurred while saving your re-run. Please try again.",
+              "error")
+        try:
+            storage.delete_prefix(storage.submission_prefix(submission_id))
+        except Exception:
+            pass
+        return redirect(url_for("index"))
+
+    # Pricing: child uses parent's snapshot (carried in prior_json). Per-job
+    # rate overrides on the resubmit form aren't supported in Phase 1B —
+    # keep the quote rate-stable across versions by default.
+
+    pdf_keys = [k for (_, k, _) in uploaded_files]
+    queue, queue_name = _pick_queue(total_pages, max_size_bytes)
+    job_timeout = _pick_timeout(total_pages, max_size_bytes)
+    try:
+        job = queue.enqueue(
+            "jobs.merge_submission",
+            kwargs={
+                "submission_id": submission_id,
+                "parent_id": parent_id,
+                "new_pdf_keys": pdf_keys,
+                "contact_info": {
+                    "name": name,
+                    "email": email_addr,
+                    "phone": parent_phone or "",
+                    "business_name": parent_business_name or "",
+                },
+                "scope_notes": merge_notes_text,
+                "scope_tags": merge_scope_tags,
+                "rate_overrides": None,
+            },
+            job_id=submission_id,
+            job_timeout=job_timeout,
+            result_ttl=RQ_RESULT_TTL,
+            failure_ttl=RQ_RESULT_TTL,
+        )
+    except Exception as exc:
+        logger.error("Failed to enqueue merge %s: %s", submission_id, exc)
+        flash("Our queue is unavailable right now. Please try again in a few minutes.",
+              "error")
+        try:
+            with session_scope() as session:
+                sub = session.get(Submission, submission_id)
+                if sub:
+                    sub.status = "failed"
+                    sub.error = f"enqueue failed: {exc}"
+        except Exception:
+            pass
+        return redirect(url_for("index"))
+
+    logger.info(
+        "Resubmit %s enqueued on %s — parent=%s (root=%s) v%d→v%d, "
+        "%d new PDFs, tags=%s (job %s)",
+        submission_id, queue_name, parent_id, parent_root_id,
+        parent_version, parent_version + 1, len(pdf_keys),
+        merge_scope_tags, job.id,
+    )
+
     return redirect(url_for("thank_you", submission_id=submission_id))
 
 
@@ -1451,6 +1795,24 @@ def pricing_settings():
                 except ValueError:
                     errors.append(f"{key}: must be a number between 0 and 100000")
 
+            # Advanced (toggleable) items — only persist a rate if the item
+            # is enabled, so a disabled item resets to the system default.
+            advanced_enabled = []
+            for key, _label, _unit, _default, _cat in ADVANCED_RATE_FIELDS:
+                if not request.form.get(f"enable__{key}"):
+                    continue
+                advanced_enabled.append(key)
+                raw = (request.form.get(key) or "").strip()
+                if not raw:
+                    continue
+                try:
+                    v = float(raw)
+                    if v < 0 or v > 100000:
+                        raise ValueError("out of range")
+                    rates[key] = v
+                except ValueError:
+                    errors.append(f"{key}: must be a number between 0 and 100000")
+
             markup = None
             raw_m = (request.form.get("markup") or "").strip()
             if raw_m:
@@ -1471,6 +1833,8 @@ def pricing_settings():
                 overrides["rates"] = rates
             if markup is not None:
                 overrides["markup"] = markup
+            if advanced_enabled:
+                overrides["advanced_enabled"] = advanced_enabled
             org.pricing_overrides = overrides or None
             flash("Pricing saved.", "success")
             return redirect(url_for("pricing_settings"))
@@ -1482,8 +1846,10 @@ def pricing_settings():
         overrides={
             "markup": overrides.get("markup"),
             "rates": overrides.get("rates", {}),
+            "advanced_enabled": set(overrides.get("advanced_enabled") or []),
         },
         rate_fields=RATE_FIELDS,
+        advanced_rate_fields=ADVANCED_RATE_FIELDS,
     )
 
 
