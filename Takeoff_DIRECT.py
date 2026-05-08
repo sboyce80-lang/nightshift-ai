@@ -33,6 +33,17 @@ from datetime import datetime
 import os
 
 
+# Multi-modal extraction toggle. When True (default), pages that fail native
+# PDF mode with a "Request exceeds the maximum size" (413) error are retried
+# via _multimodal_chunk_retry — Claude gets a rendered JPEG of each page plus
+# the PyMuPDF-extracted text layer in a single API call. Set
+# NIGHTSHIFT_DISABLE_MULTIMODAL=1 in the env to fall back to the legacy
+# per-page validation retry only.
+_MULTIMODAL_DENSE_PAGES_ENABLED = (
+    os.environ.get("NIGHTSHIFT_DISABLE_MULTIMODAL", "").strip() not in ("1", "true", "True")
+)
+
+
 # Silence MuPDF's xref/format warnings on the console and drain them to
 # logs/mupdf.log instead. PyMuPDF emits these to stdout via C, so a Python-level
 # stderr redirect won't help — disable display and drain the internal buffer.
@@ -1484,6 +1495,237 @@ def _is_large_format_page(pdf_path, page_index, threshold_pt=2000):
         return (max(w, h) >= threshold_pt, w, h)
     except Exception:
         return (False, 0, 0)
+
+
+def _render_page_to_jpeg_b64(pdf_path, page_index, dpi=300, quality=90,
+                              max_dim=7800):
+    """Render a single PDF page as a base64-encoded JPEG.
+
+    DPI is the requested rendering resolution; if the resulting image's
+    long edge exceeds max_dim, the image is downscaled (preserving aspect
+    ratio) so the long edge equals max_dim. This keeps us under Anthropic's
+    8000 px image dimension limit while pushing toward the highest fidelity
+    a single image can carry.
+
+    Returns (jpeg_b64_str, width_px, height_px) or None on failure.
+    """
+    try:
+        import fitz
+        from PIL import Image as _PILImage
+        import io as _io
+    except ImportError:
+        return None
+
+    try:
+        doc = fitz.open(pdf_path)
+        try:
+            if page_index >= len(doc):
+                return None
+            page = doc[page_index]
+            zoom = dpi / 72.0
+            matrix = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=matrix)
+            img = _PILImage.frombytes("RGB", [pix.width, pix.height], pix.samples)
+        finally:
+            doc.close()
+
+        if max(img.size) > max_dim:
+            scale = max_dim / max(img.size)
+            new_size = (int(img.size[0] * scale), int(img.size[1] * scale))
+            img = img.resize(new_size, _PILImage.LANCZOS)
+
+        buf = _io.BytesIO()
+        img.save(buf, format="JPEG", quality=quality, optimize=True)
+        b64 = base64.standard_b64encode(buf.getvalue()).decode("utf-8")
+        return (b64, img.size[0], img.size[1])
+    except Exception as e:
+        print(f"      ⚠️  Render failed for page {page_index + 1}: {e}")
+        return None
+
+
+def _format_page_text_for_prompt(text_layer, max_chars=20000):
+    """Convert _extract_page_text_layer output into a compact text block
+    suitable for a Claude content block.
+
+    Includes positional hints (top-left x/y in points) so Claude can correlate
+    text spans with the image. Truncates at max_chars to stay within prompt
+    budgets on extremely text-dense sheets.
+    """
+    if not text_layer or not text_layer.get("blocks"):
+        return ""
+
+    rect = text_layer.get("page_rect", {})
+    pw = rect.get("width", 0)
+    ph = rect.get("height", 0)
+
+    lines = [
+        f"PAGE TEXT LAYER (vector text extracted via PyMuPDF — read these losslessly):",
+        f"Page size (points): {pw:.0f} × {ph:.0f}",
+        f"",
+        f"Format: <x>,<y>: <text>  where x,y is the top-left of the text span in PDF points.",
+        f"",
+    ]
+
+    blocks = text_layer["blocks"]
+    blocks_sorted = sorted(blocks, key=lambda b: (b["bbox"][1], b["bbox"][0]))
+
+    out = []
+    used = 0
+    for b in blocks_sorted:
+        bx, by = b["bbox"][0], b["bbox"][1]
+        line = f"{bx:.0f},{by:.0f}: {b['text']}"
+        if used + len(line) + 1 > max_chars:
+            out.append(f"... [{len(blocks) - len(out)} more text spans truncated]")
+            break
+        out.append(line)
+        used += len(line) + 1
+
+    return "\n".join(lines + out)
+
+
+def _analyze_page_multimodal(client, pdf_path, page_index, prompt_text,
+                              label="", dpi=300, jpeg_quality=90,
+                              max_retries=5, base_delay=30):
+    """Multi-modal extraction for a single oversized PDF page.
+
+    Sends Claude a single API call containing:
+      1. A rendered JPEG of the page (capped at 7800 px long edge)
+      2. A text content block with the PyMuPDF-extracted vector text layer
+         (positions + text spans), so dimension labels and room IDs are
+         readable losslessly even when JPEG compression blurs them.
+      3. The standard extraction prompt.
+
+    Mirrors `_call_api`'s retry behavior for rate-limit / 5xx / timeout.
+
+    Returns the response text (Claude's JSON output as a string) on success,
+    or None on unrecoverable failure.
+    """
+    rendered = _render_page_to_jpeg_b64(pdf_path, page_index, dpi=dpi,
+                                         quality=jpeg_quality)
+    if rendered is None:
+        print(f"      ⚠️  Multi-modal: could not render page {page_index + 1}")
+        return None
+    img_b64, img_w, img_h = rendered
+
+    text_layer = _extract_page_text_layer(pdf_path, page_index)
+    text_block = _format_page_text_for_prompt(text_layer) if text_layer else ""
+
+    img_kb = len(img_b64) * 3 // 4 // 1024  # rough decoded size
+    text_chars = len(text_block)
+    print(f"      🔀 Multi-modal page {page_index + 1}: image {img_w}×{img_h}px "
+          f"(~{img_kb} KB), text layer {text_chars} chars")
+
+    content_blocks = [
+        {
+            "type": "image",
+            "source": {
+                "type": "base64",
+                "media_type": "image/jpeg",
+                "data": img_b64,
+            },
+        }
+    ]
+    if text_block:
+        content_blocks.append({
+            "type": "text",
+            "text": text_block,
+        })
+    content_blocks.append({
+        "type": "text",
+        "text": prompt_text,
+    })
+
+    if label:
+        print(f"      📨 {label}")
+
+    for attempt in range(max_retries):
+        try:
+            result_parts = []
+            with client.messages.stream(
+                model="claude-sonnet-4-20250514",
+                max_tokens=64000,
+                temperature=0,
+                timeout=300.0,
+                messages=[{"role": "user", "content": content_blocks}],
+            ) as stream:
+                for text in stream.text_stream:
+                    result_parts.append(text)
+            return "".join(result_parts)
+        except anthropic.RateLimitError:
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                print(f"      ⏳ Multi-modal rate limit — waiting {delay}s "
+                      f"(attempt {attempt + 1}/{max_retries})")
+                time.sleep(delay)
+            else:
+                print(f"      ❌ Multi-modal: rate limit exhausted on page {page_index + 1}")
+                return None
+        except anthropic.InternalServerError:
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                print(f"      ⏳ Multi-modal API overloaded — waiting {delay}s "
+                      f"(attempt {attempt + 1}/{max_retries})")
+                time.sleep(delay)
+            else:
+                print(f"      ❌ Multi-modal: server errors exhausted on page {page_index + 1}")
+                return None
+        except anthropic.APITimeoutError:
+            if attempt < max_retries - 1:
+                delay = base_delay * (2 ** attempt)
+                print(f"      ⏳ Multi-modal timeout — waiting {delay}s "
+                      f"(attempt {attempt + 1}/{max_retries})")
+                time.sleep(delay)
+            else:
+                print(f"      ❌ Multi-modal: timeouts exhausted on page {page_index + 1}")
+                return None
+        except anthropic.BadRequestError as e:
+            print(f"      ❌ Multi-modal: bad request on page {page_index + 1} — {str(e)[:120]}")
+            return None
+        except Exception as e:
+            print(f"      ❌ Multi-modal: unexpected error on page {page_index + 1} — "
+                  f"{type(e).__name__}: {str(e)[:120]}")
+            return None
+    return None
+
+
+def _multimodal_chunk_retry(client, chunk_path, prompt_text, chunk_label=""):
+    """Retry a chunk that failed native-PDF mode (typically 413) by sending
+    each page through `_analyze_page_multimodal` and concatenating responses.
+
+    Returns the merged response text, or None if no pages produced output.
+    """
+    try:
+        reader = PyPDF2.PdfReader(chunk_path)
+    except Exception as e:
+        print(f"   ⚠️  Multi-modal: could not open {chunk_label} — {e}")
+        return None
+
+    total_pages = len(reader.pages)
+    print(f"   🔀 {chunk_label}: multi-modal retry across {total_pages} page(s)")
+
+    page_responses = []
+    for i in range(total_pages):
+        resp = _analyze_page_multimodal(
+            client, chunk_path, i, prompt_text,
+            label=f"{chunk_label} page {i+1}/{total_pages}",
+        )
+        if resp:
+            page_responses.append(resp)
+        else:
+            print(f"      ⚠️  Multi-modal: page {i+1} produced no output")
+
+    if not page_responses:
+        print(f"   ❌ Multi-modal: no pages produced output for {chunk_label}")
+        return None
+
+    if len(page_responses) == 1:
+        return page_responses[0]
+
+    try:
+        return _merge_chunk_responses(page_responses)
+    except Exception as e:
+        print(f"   ⚠️  Multi-modal merge failed ({e}) — returning first page only")
+        return page_responses[0]
 
 
 def _analyze_floor_plan_as_images(client, pdf_path, scope_notes="",
@@ -3587,7 +3829,34 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
         try:
             result_text = _call_api(pdf_data)
         except anthropic.BadRequestError as e:
-            if "Could not process" in str(e):
+            err_str = str(e)
+            is_too_large = (
+                "Request exceeds the maximum size" in err_str
+                or "request_too_large" in err_str.lower()
+                or "413" in err_str
+            )
+            if _MULTIMODAL_DENSE_PAGES_ENABLED and is_too_large:
+                print(f"   🔀 First chunk too large for native PDF — trying multi-modal retry")
+                raw_bytes = base64.standard_b64decode(pdf_data)
+                first_tmp = None
+                try:
+                    with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
+                        tmp.write(raw_bytes)
+                        first_tmp = tmp.name
+                    result_text = _multimodal_chunk_retry(
+                        client, first_tmp, prompt, chunk_label="chunk 1"
+                    )
+                finally:
+                    if first_tmp:
+                        try:
+                            os.unlink(first_tmp)
+                        except Exception:
+                            pass
+
+                if result_text is None and not _pending_chunks:
+                    raise  # multi-modal didn't recover, no fallback chunks
+
+            elif "Could not process" in err_str:
                 print(f"   ⚠️  First chunk failed — attempting page-level retry")
                 # Reconstruct a temp file from base64 so retry helper can read pages
                 raw_bytes = base64.standard_b64decode(pdf_data)
@@ -3609,7 +3878,7 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
                 if result_text is None and not _pending_chunks:
                     raise  # No other chunks to fall back on
             else:
-                raise  # Not a "Could not process PDF" error
+                raise  # Not a recoverable BadRequestError
 
         # --- Process remaining chunks (if PDF was split) ---
         if _pending_chunks:
@@ -3704,8 +3973,27 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
                     all_texts.append(txt)
                     chunks_succeeded.append(idx)
                 except anthropic.BadRequestError as e:
-                    if "Could not process" in str(e) or "500" in str(e):
-                        print(f"   ⚠️  Chunk {idx}/{total_chunks} failed ({str(e)[:120]}) — attempting page-level retry")
+                    err_str = str(e)
+                    is_too_large = (
+                        "Request exceeds the maximum size" in err_str
+                        or "request_too_large" in err_str.lower()
+                        or "413" in err_str
+                    )
+                    chunk_prompt = (chunk_context + prompt) if chunk_context else prompt
+                    if _MULTIMODAL_DENSE_PAGES_ENABLED and is_too_large:
+                        print(f"   🔀 Chunk {idx}/{total_chunks} too large for native PDF — trying multi-modal retry")
+                        retry_result = _multimodal_chunk_retry(
+                            client, chunk_path, chunk_prompt,
+                            chunk_label=f"chunk {idx}/{total_chunks}"
+                        )
+                        if retry_result:
+                            all_texts.append(retry_result)
+                            chunks_succeeded.append(idx)
+                        else:
+                            print(f"   ⚠️  Chunk {idx}/{total_chunks} — multi-modal recovered nothing")
+                            chunks_failed.append(idx)
+                    elif "Could not process" in err_str or "500" in err_str:
+                        print(f"   ⚠️  Chunk {idx}/{total_chunks} failed ({err_str[:120]}) — attempting page-level retry")
                         retry_result = _retry_chunk_without_bad_pages(
                             chunk_path, _call_api, chunk_label=f"chunk {idx}/{total_chunks}"
                         )
