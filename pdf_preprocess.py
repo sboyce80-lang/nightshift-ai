@@ -201,17 +201,23 @@ def normalize_oversized_pages(
     print(f"   📐 Normalizing {len(oversized)}/{total} oversized pages "
           f"at {dpi} DPI, JPEG q={quality} (with invisible-text preservation)...", flush=True)
 
-    # Use PyMuPDF for the whole assembly so we can:
-    # - Copy lean pages through losslessly (insert_pdf preserves text/vector)
-    # - Build searchable rasterized pages for oversized ones (JPEG + invisible
-    #   text via render_mode=3, so dimension labels and room IDs survive
-    #   the rasterization losslessly — Claude reads them from the embedded
-    #   text stream while still using the JPEG for spatial layout)
+    # Hybrid assembly:
+    # - PyPDF2's PdfWriter is the output container — non-recursive add_page,
+    #   never crashes on large multi-page docs
+    # - For LEAN pages: writer.add_page(reader.pages[i]) — fast, lossless,
+    #   preserves vector text + drawings
+    # - For RASTERIZED pages: PyMuPDF builds a single-page PDF in memory
+    #   (JPEG + invisible-text-layer via render_mode=3), serialize to bytes,
+    #   read into PyPDF2 and append.
+    #
+    # This avoids PyMuPDF's insert_pdf, which hit a `code=5: exception stack
+    # overflow!` on the 583-page Waverly source PDF — likely deeply-nested
+    # xref recursion when copying through PyMuPDF on a doc that large.
     import fitz
     src_doc = fitz.open(src_path)
-    out_doc = fitz.open()
     oversized_set = {idx for idx, _ in oversized}
     text_spans_preserved = 0
+    out_writer = PdfWriter()
     try:
         for i in range(total):
             if i in oversized_set:
@@ -219,7 +225,15 @@ def normalize_oversized_pages(
                 jpeg = _render_page_to_jpeg(
                     src_page, dpi=dpi, quality=quality, max_dim=max_dim,
                 )
-                _build_searchable_page(out_doc, src_page, jpeg)
+                # Build a one-page in-memory PDF (JPEG + invisible text)
+                tmp_doc = fitz.open()
+                try:
+                    _build_searchable_page(tmp_doc, src_page, jpeg)
+                    page_bytes = tmp_doc.tobytes(garbage=4, deflate=True)
+                finally:
+                    tmp_doc.close()
+                tmp_reader = PdfReader(io.BytesIO(page_bytes))
+                out_writer.add_page(tmp_reader.pages[0])
                 # Tally spans for the run summary
                 td = src_page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
                 for blk in td.get("blocks", []):
@@ -231,10 +245,10 @@ def normalize_oversized_pages(
                                 text_spans_preserved += 1
             else:
                 # Lean page — copy through losslessly (preserves vector text + drawings)
-                out_doc.insert_pdf(src_doc, from_page=i, to_page=i)
-        out_doc.save(dst_path, garbage=4, deflate=True)
+                out_writer.add_page(reader.pages[i])
+        with open(dst_path, "wb") as f:
+            out_writer.write(f)
     finally:
-        out_doc.close()
         src_doc.close()
 
     dst_size_mb = os.path.getsize(dst_path) / (1024 * 1024)
