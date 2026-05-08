@@ -10295,7 +10295,11 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     azek_rate   = _get_tiered_rate(pm['exterior_azek_trim'], azek_lf) if 'exterior_azek_trim' in pm else 9.00
     corner_rate = _get_tiered_rate(pm['exterior_corner_board'], corner_lf) if 'exterior_corner_board' in pm else 9.00
     lintel_rate = _get_tiered_rate(pm['exterior_steel_lintel'], steel_lintel_lf_ext) if 'exterior_steel_lintel' in pm else 32.00
-    lift_rate   = _get_tiered_rate(pm['exterior_lift_rental'], lift_needed)
+    # Lift rate scales with building height — a 12-story job needs a different
+    # lift class and longer rental than a 3-story. Pass stories (not the binary
+    # lift_needed flag) into the tiered-rate lookup. Rate is zeroed when no lift.
+    _lift_stories_qty = _num(project_info.get('total_stories', 1)) if lift_needed else 0
+    lift_rate   = _get_tiered_rate(pm['exterior_lift_rental'], _lift_stories_qty)
     int_lift_rate = _get_tiered_rate(pm['interior_lift_rental'], int_lift_needed)
 
     # Single-family rate overrides: force small-project rates regardless of quantity
@@ -13272,6 +13276,32 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             )
             print(f"   🧱 Gyp between stairs: estimated {expected_gyp:,} sqft "
                   f"({final_stairs} sections x 130 sqft)")
+
+    # --- Painted railing auto-boost ---
+    # Stair railings should propagate with stair_sections, but unit-multipliers
+    # are per-room (not per-floor) so railings on upper floors are silently dropped
+    # when extraction only catches Level 1 stair rooms. Mirror the stair-section
+    # boost: ~15 LF painted railing per stair section (calibrated from stair
+    # rooms in recent runs — typical 12-15 LF/section per flight, both sides).
+    current_railing = _num(agg.get("total_painted_railing_lf", 0))
+    expected_railing = round(final_stairs * 15) if final_stairs > 0 else 0
+    if final_stairs > 0 and current_railing < expected_railing * 0.5:
+        agg["total_painted_railing_lf"] = expected_railing
+        analysis["aggregated_totals"] = agg
+        if current_railing > 0:
+            analysis.setdefault("notes", []).append(
+                f"[Railing Boost] Painted railing boosted from {current_railing:,} to "
+                f"{expected_railing:,} LF ({final_stairs} sections x 15 LF/section)"
+            )
+            print(f"   🪜 Railing boost: {current_railing:,} -> {expected_railing:,} LF "
+                  f"({final_stairs} sections x 15 LF/section)")
+        else:
+            analysis.setdefault("notes", []).append(
+                f"[Railing Estimate] Estimated {expected_railing:,} LF painted railing "
+                f"({final_stairs} sections x 15 LF/section)"
+            )
+            print(f"   🪜 Railing fallback: estimated {expected_railing:,} LF "
+                  f"({final_stairs} sections x 15 LF/section)")
 
     # --- Save analysis to cache (before cost calc, which uses current pricing) ---
     if use_cache and combined_cache_dir:

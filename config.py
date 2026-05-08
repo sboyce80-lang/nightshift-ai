@@ -166,7 +166,20 @@ PRICING_MODEL = {
     },
     "exterior_lift_rental": {
         "unit": "ea", "markup": 0.04,
-        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 4000.00}], # Monthly
+        # Tiered by building stories (caller passes total_stories as qty).
+        # Reflects required lift class and expected rental duration:
+        #   1-2 stories: scissor lift / ladder, brief
+        #   3-4 stories: small boom (Rider baseline, monthly)
+        #   5-8 stories: medium boom (~60-90' reach), ~6 weeks
+        #   9-12 stories: large boom (130'+) or swing stage, 8-12 weeks
+        #   13+ stories: swing stage with multi-week setup
+        "tiers": [
+            {"min_qty": 0,  "max_qty": 2,    "rate": 1500.00},
+            {"min_qty": 3,  "max_qty": 4,    "rate": 4000.00},
+            {"min_qty": 5,  "max_qty": 8,    "rate": 8000.00},
+            {"min_qty": 9,  "max_qty": 12,   "rate": 15000.00},
+            {"min_qty": 13, "max_qty": None, "rate": 25000.00},
+        ],
     },
     # ── Interior Lift (commercial high-ceiling) ──
     "interior_lift_rental": {
