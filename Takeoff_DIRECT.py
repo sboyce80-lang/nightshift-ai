@@ -8193,6 +8193,182 @@ def _validate_building_inventory(analysis, building_inventory, file_building_cou
     return analysis
 
 
+_FLOOR_RANGE_RE = re.compile(
+    r'(?:level|levels|floor|floors)\s*\(?\s*(\d+)\s*[-–to]+\s*(\d+)',
+    re.IGNORECASE,
+)
+_FLOOR_SINGLE_RE = re.compile(
+    r'(?:level|levels|floor|floors)\s+(\d+)',
+    re.IGNORECASE,
+)
+
+
+def _parse_floor_range(name):
+    """Return the set of physical-floor numbers a floor's name covers.
+
+    Examples:
+      'Typical Residential Floors (Levels 1-7)' → {1,2,3,4,5,6,7}
+      'Typical Residential Levels (Floors 2-9)' → {2,3,4,5,6,7,8,9}
+      'Level 0 - Dining'                        → {0}
+      'Penthouse'                               → set()  (unparseable, won't dedupe)
+
+    Unparseable floor names return an empty set, which means the dedup
+    pass leaves them alone — safer to keep a possibly-unique floor than
+    to merge two semantically-different ones.
+    """
+    if not name:
+        return set()
+    if m := _FLOOR_RANGE_RE.search(name):
+        a, b = int(m.group(1)), int(m.group(2))
+        lo, hi = min(a, b), max(a, b)
+        # Sanity: an architectural set with floors 1..50+ is plausible
+        # but a parsed range >25 is more likely a misparse (e.g., room
+        # numbers being treated as floor numbers). Bail.
+        if hi - lo > 25:
+            return set()
+        return set(range(lo, hi + 1))
+    if m := _FLOOR_SINGLE_RE.search(name):
+        return {int(m.group(1))}
+    return set()
+
+
+def _dedupe_overlapping_template_floors(analysis):
+    """Detect and merge template floors whose floor-name ranges overlap.
+
+    Background — 2026-05-08 Waverly investigation: chunked extraction over
+    a multi-sheet DD-scale PDF produces per-chunk template floors that
+    look distinct by name but cover the same physical floors. Example
+    from Waverly Final ($3.46M output, suspected 2-3× over-counted):
+
+      'Typical Residential Floors (Levels 1-7)'  — 32 rooms (richest)
+      'Typical Residential Levels (Floors 2-9)'  — 16 rooms (overlaps)
+      'Typical Residential Units (Levels 1-10)'  — 4 rooms (overlaps)
+
+    All three describe the same residential block; Claude saw it on
+    sheets A1.04, A1.21, and A-102 respectively. The downstream
+    aggregator sums their multipliers, inflating wall_sqft, doors,
+    trim, etc. by ~3×.
+
+    Heuristic:
+      1. For each floor, parse a numeric floor-range from floor_name
+      2. Pairwise Jaccard on those ranges; pairs with >50% overlap go
+         in the same group (transitively)
+      3. In each multi-floor group, KEEP the floor with the most rooms
+         (Waverly: 32 > 16 > 4) and DROP the others entirely
+      4. Append a 'notes' entry describing what was dropped, so the
+         decision is auditable in the proposal output
+
+    Idempotent — sets analysis['_template_floors_deduped'] = True after
+    one run so it's safe to call from inside _recalculate_totals (which
+    fires multiple times in some pipelines).
+
+    Returns the analysis dict (mutated in place; also returned for chain).
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if analysis.get('_template_floors_deduped'):
+        return analysis
+
+    floors = analysis.get('floors') or []
+    if len(floors) < 2:
+        analysis['_template_floors_deduped'] = True
+        return analysis
+
+    # Parse each floor's numeric range. Floors with no parseable range
+    # are excluded from dedup consideration entirely.
+    parsed = []
+    for i, f in enumerate(floors):
+        rng = _parse_floor_range(f.get('floor_name', ''))
+        if rng:
+            parsed.append((i, rng))
+
+    if len(parsed) < 2:
+        analysis['_template_floors_deduped'] = True
+        return analysis
+
+    # Build dedup groups by union-find: any two floors with Jaccard > 0.5
+    # land in the same group (transitively).
+    OVERLAP_THRESHOLD = 0.5
+    parent = {i: i for i, _ in parsed}
+
+    def _find(x):
+        while parent[x] != x:
+            parent[x] = parent[parent[x]]  # path compression
+            x = parent[x]
+        return x
+
+    def _union(a, b):
+        ra, rb = _find(a), _find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    for ai in range(len(parsed)):
+        i, ri = parsed[ai]
+        for aj in range(ai + 1, len(parsed)):
+            j, rj = parsed[aj]
+            if not ri or not rj:
+                continue
+            jaccard = len(ri & rj) / len(ri | rj)
+            if jaccard > OVERLAP_THRESHOLD:
+                _union(i, j)
+
+    # Collect groups
+    groups = {}
+    for i, _ in parsed:
+        root = _find(i)
+        groups.setdefault(root, []).append(i)
+    multi_floor_groups = [g for g in groups.values() if len(g) > 1]
+
+    if not multi_floor_groups:
+        analysis['_template_floors_deduped'] = True
+        return analysis
+
+    # In each group, pick canonical = floor with the most rooms (and as
+    # tiebreaker, the floor whose multipliers sum highest — i.e., richest
+    # extraction). Drop the others.
+    floors_to_drop = set()
+    dedup_notes = []
+    for group in multi_floor_groups:
+        scored = sorted(
+            group,
+            key=lambda i: (
+                len(floors[i].get('rooms', []) or []),
+                sum((r or {}).get('unit_multiplier', 1)
+                    for r in (floors[i].get('rooms', []) or [])),
+            ),
+            reverse=True,
+        )
+        canonical_idx = scored[0]
+        dropped_idxs = scored[1:]
+        floors_to_drop.update(dropped_idxs)
+        canonical_name = floors[canonical_idx].get('floor_name', '?')
+        canonical_rooms = len(floors[canonical_idx].get('rooms', []) or [])
+        dropped_summary = "; ".join(
+            f"'{floors[i].get('floor_name','?')}' "
+            f"({len(floors[i].get('rooms', []) or [])} rooms)"
+            for i in dropped_idxs
+        )
+        dedup_notes.append(
+            f"[dedup] Template floors with overlapping floor ranges merged: "
+            f"kept '{canonical_name}' ({canonical_rooms} rooms); "
+            f"dropped {dropped_summary}"
+        )
+
+    if floors_to_drop:
+        analysis['floors'] = [
+            f for i, f in enumerate(floors) if i not in floors_to_drop
+        ]
+        existing_notes = analysis.get('notes') or []
+        if not isinstance(existing_notes, list):
+            existing_notes = [existing_notes] if existing_notes else []
+        analysis['notes'] = list(existing_notes) + dedup_notes
+        for note in dedup_notes:
+            print(f"   🪞 {note}", flush=True)
+
+    analysis['_template_floors_deduped'] = True
+    return analysis
+
+
 def _recalculate_totals(analysis):
     """
     Recalculate aggregated_totals from individual room data.
@@ -8200,6 +8376,13 @@ def _recalculate_totals(analysis):
     and unit_multiplier for repeated/typical unit types.
     Works for both single-file and merged multi-file analyses.
     """
+    # Dedupe template floors with overlapping ranges before any totals are
+    # computed. Cross-chunk extraction can produce 'Levels 1-7' AND
+    # 'Floors 2-9' AND 'Levels 1-10' for the same residential block;
+    # without dedup their unit_multipliers all get summed and the totals
+    # inflate ~3×. Idempotent via _template_floors_deduped flag.
+    _dedupe_overlapping_template_floors(analysis)
+
     # Pre-pass: estimate missing wall area from floor area for rooms that have
     # floor_area but zero wall_area/perimeter (common with chunk-processing gaps)
     for floor in analysis.get("floors", []):
