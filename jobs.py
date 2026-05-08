@@ -262,6 +262,39 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
                 storage.download_file(key, local_path)
                 local_pdfs.append(local_path)
 
+            # Pre-normalize any pages that would be too dense for the heavy
+            # worker to process without triggering Render's CPU-load
+            # preemption. Pages whose single-serialized PDF size exceeds
+            # 25 MB get rasterized to JPEG-embedded PDF pages at 150 DPI.
+            # Lean pages pass through untouched so non-DD-scale jobs incur
+            # no quality penalty. See pdf_preprocess.py docstring for
+            # background. Toggleable via NIGHTSHIFT_DISABLE_PDF_NORMALIZE=1.
+            try:
+                from pdf_preprocess import normalize_oversized_pages
+                normalized_pdfs = []
+                for p in local_pdfs:
+                    res = normalize_oversized_pages(p)
+                    if res["did_normalize"]:
+                        logger.info(
+                            "Normalized %s: %d/%d pages rasterized at %d DPI "
+                            "(%.1f MB → %.1f MB)",
+                            os.path.basename(p),
+                            res["pages_normalized"], res["total_pages"],
+                            res["dpi"], res["src_size_mb"], res["dst_size_mb"]
+                        )
+                        normalized_pdfs.append(res["dst_path"])
+                    else:
+                        normalized_pdfs.append(p)
+                local_pdfs = normalized_pdfs
+            except Exception as norm_exc:
+                # Don't let preprocessing failures kill the job — fall
+                # through to analysis on the original PDFs and let the
+                # downstream cascade handle whatever it can.
+                logger.warning(
+                    "PDF normalization failed for %s — analyzing unmodified PDFs (%s)",
+                    submission_id, norm_exc, exc_info=True
+                )
+
             result = run_analysis(
                 local_pdfs,
                 contact_name=contact_info["name"],
