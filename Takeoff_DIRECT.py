@@ -44,6 +44,36 @@ _MULTIMODAL_DENSE_PAGES_ENABLED = (
 )
 
 
+def _release_memory(label=""):
+    """Force the Python heap and the C allocator to return freed memory to
+    the OS at a phase boundary.
+
+    Investigation of the 2026-05-08 Waverly Part 1B preemption pattern
+    showed the worker dying after roughly 2 minutes despite peak transient
+    memory of only ~1.2 GB on an 8 GB plan — i.e. allocator fragmentation,
+    not absolute usage. Python's gc.collect() reclaims unreferenced objects
+    but glibc's malloc keeps freed pages in the process heap by default.
+    `malloc_trim(0)` instructs glibc to release as many free pages as
+    possible back to the kernel, dropping RSS without affecting
+    application state. Logs the RSS before/after so we can SEE whether
+    each phase boundary is actually shedding memory.
+    """
+    import gc
+    import resource
+    rss_before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss  # KB on Linux
+    gc.collect()
+    try:
+        import ctypes
+        # Linux glibc: returns 1 if memory was released, 0 if none could be
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except (OSError, AttributeError):
+        pass  # Not on glibc (macOS dev box) — gc.collect() alone has to suffice
+    rss_after = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    tag = f" [{label}]" if label else ""
+    print(f"   🧹 mem-release{tag}: RSS peak {rss_before/1024:.0f} MB "
+          f"(maxrss; not pre/post — Linux ru_maxrss is monotonic)", flush=True)
+
+
 # Silence MuPDF's xref/format warnings on the console and drain them to
 # logs/mupdf.log instead. PyMuPDF emits these to stdout via C, so a Python-level
 # stderr redirect won't help — disable display and drain the internal buffer.
@@ -2492,6 +2522,7 @@ def analyze_schedule_images(client, pdf_path, schedule_page_nums):
                 result_parts.append(text)
     except Exception as e:
         print(f"   ❌ Schedule image API call failed: {e}")
+        _release_memory("after schedule API failure")
         return None
 
     raw = "".join(result_parts)
@@ -2526,6 +2557,7 @@ def analyze_schedule_images(client, pdf_path, schedule_page_nums):
     if si.get("total_stair_sections"):
         print(f"      Stairs: {si['total_stair_sections']} flight sections")
 
+    _release_memory("after schedule extraction")
     return schedule_data
 
 
@@ -3932,6 +3964,15 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
             for idx, chunk_info in enumerate(_pending_chunks, 2):
                 chunk_path, _chunk_start = chunk_info if isinstance(chunk_info, tuple) else (chunk_info, 1)
 
+                # Release memory between chunks — Python's heap grows as chunks
+                # are loaded/encoded/sent, and glibc malloc holds onto freed
+                # pages by default. The 15-sec pause is a natural boundary to
+                # call malloc_trim and shed RSS before the next chunk grows it
+                # again. Critical for dense-vector PDFs where worker preemption
+                # was triggering ~2 min into chunked extraction (2026-05-08
+                # Waverly investigation).
+                _release_memory(f"before chunk {idx}/{total_chunks}")
+
                 # Preventive delay between chunks to stay under rate limit
                 print(f"   ⏱️  Pausing 15s between chunks to respect rate limit...")
                 time.sleep(15)
@@ -5168,9 +5209,11 @@ If you cannot determine building counts from these pages, return:
                 units = b.get("units_per_building", "?")
                 print(f"      • {name} [{code}]: {count} building(s), {units} unit(s) each")
 
+            _release_memory("after building inventory")
             return inventory
         else:
             print(f"   ⚠️  Could not parse building inventory response")
+            _release_memory("after building inventory (no parse)")
             return None
 
     except Exception as e:
@@ -5540,9 +5583,11 @@ If a field is not stated on these pages, use 0 for numbers and "" for strings.""
             print(f"      • Occupancy: {overview['occupancy_type']}")
         if overview.get("unit_count"):
             print(f"      • Units: {overview['unit_count']}")
+        _release_memory("after project overview")
         return overview
     except Exception as e:
         print(f"   ❌ Project overview extraction failed: {e}")
+        _release_memory("after project overview (failure)")
         return None
 
 
