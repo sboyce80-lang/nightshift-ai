@@ -157,6 +157,7 @@
     jobSelect.addEventListener('change', () => {
         state.currentJobId = jobSelect.value || null;
         renderLog();
+        updateInputState();
     });
 
     function renderMode() {
@@ -171,11 +172,12 @@
     }
 
     function updateInputState() {
-        const ready = state.mode === 'general' || (state.mode === 'estimate' && state.currentJobId);
-        input.disabled = !ready;
-        sendBtn.disabled = !ready;
+        // Keep the input always typeable — submit-time check handles the
+        // estimate-mode-without-a-job case so the field never feels locked.
+        input.disabled = false;
+        sendBtn.disabled = false;
         if (state.mode === 'estimate' && !state.currentJobId) {
-            input.placeholder = 'Pick an estimate above…';
+            input.placeholder = 'Pick an estimate above to chat about it…';
         } else {
             input.placeholder = state.mode === 'estimate'
                 ? 'Ask about this estimate…'
@@ -277,6 +279,14 @@
         e.preventDefault();
         const text = input.value.trim();
         if (!text) return;
+
+        if (state.mode === 'estimate' && !state.currentJobId) {
+            appendMessage('assistant',
+                'Pick an estimate from the dropdown above to ask about it, ' +
+                'or switch to General Help for product questions.', true);
+            return;
+        }
+
         const history = getActiveHistory();
 
         appendMessage('user', text);
