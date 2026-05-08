@@ -16,6 +16,18 @@ import sys
 import uuid
 import logging
 
+# Force line-buffered stdout so print() statements from Takeoff_DIRECT.py
+# (the takeoff engine the worker invokes) reach Render's log stream
+# immediately rather than being held in a 4KB block buffer that only
+# flushes on process exit. Equivalent to running the worker with
+# `python -u`, but a code-side change auto-deploys with each commit
+# whereas startCommand changes need a Render Blueprint sync.
+try:
+    sys.stdout.reconfigure(line_buffering=True)
+    sys.stderr.reconfigure(line_buffering=True)
+except AttributeError:
+    pass  # Python <3.7 — should not happen, render.yaml pins 3.11
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from redis import Redis
