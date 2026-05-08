@@ -11577,29 +11577,646 @@ def analyze_and_parse(client, pdf_path, scope_notes="", schedule_hints=None,
         return None
 
 
+# ---------------------------------------------------------------------------
+# Merge feature — Phase 2: incremental re-run of a prior analysis with new
+# files merged in. Used when a customer sends a revised plan, an RFI
+# response, or an amendment instead of re-submitting fresh.
+# ---------------------------------------------------------------------------
+
+# Non-floor scope tags. Anything not in this set is treated as a floor name
+# and matched case-insensitively against floor.floor_name.
+_SCOPE_TAG_DOOR_SCHEDULE = "doorschedule"
+_SCOPE_TAG_WINDOW_SCHEDULE = "windowschedule"
+_SCOPE_TAG_FINISH_SCHEDULE = "finishschedule"
+_SCOPE_TAG_EXTERIOR = "exterior"
+_SCOPE_TAG_NONE = "none"  # explicit "additive only" tag — no replacements
+
+_NON_FLOOR_SCOPE_TAGS = {
+    _SCOPE_TAG_DOOR_SCHEDULE,
+    _SCOPE_TAG_WINDOW_SCHEDULE,
+    _SCOPE_TAG_FINISH_SCHEDULE,
+    _SCOPE_TAG_EXTERIOR,
+    _SCOPE_TAG_NONE,
+}
+
+
+def _norm_scope_tags(scope_tags):
+    """Lowercase + strip-spaces normalize so 'Door Schedule' / 'doorschedule'
+    / 'DoorSchedule' all collapse to the canonical key."""
+    out = set()
+    for t in scope_tags or []:
+        if not isinstance(t, str):
+            continue
+        norm = t.strip().lower().replace(" ", "").replace("_", "")
+        if norm:
+            out.add(norm)
+    return out
+
+
+def _floor_tags_in_scope(scope_tags_normalized):
+    """Floor-name tags only (everything not in the special non-floor set)."""
+    return scope_tags_normalized - _NON_FLOOR_SCOPE_TAGS
+
+
+def _floor_name_matches_tag(floor_name, scope_tag_normalized):
+    """Match a floor's display name against a normalized scope tag.
+
+    Comparison is case-insensitive, ignores spaces/underscores. Both sides
+    are normalized so 'Basement' / 'basement' / 'BASEMENT' all match the
+    'basement' tag, and '2nd Floor' / 'Second Floor' / 'second_floor' all
+    collapse correctly.
+    """
+    if not floor_name:
+        return False
+    fnorm = str(floor_name).strip().lower().replace(" ", "").replace("_", "")
+    return fnorm == scope_tag_normalized
+
+
+def merge_versioned_analyses(prior_analysis, delta_analysis, scope_tags=None):
+    """Merge `delta_analysis` (from re-extracting only the new PDFs) into
+    `prior_analysis` (from the parent submission's stored JSON).
+
+    Returns a NEW analysis dict — neither input is mutated.
+
+    Merge semantics by section:
+
+      floors[]: per-floor name. If the floor matches a scope tag in
+        `scope_tags`, REPLACE that floor wholesale with delta's. Otherwise
+        UNION rooms by (floor_name, room_name); delta wins on collisions.
+        Floors present only in delta are appended.
+
+      exterior: MAX-merge per numeric field. If `Exterior` is in scope_tags,
+        replace wholesale with delta's. Booleans (lift_required) OR'd.
+        notes appended.
+
+      schedule_data:
+        - door_schedule: replace if 'DoorSchedule' tag OR if delta's
+          door_marks_counted list is longer than prior's.
+        - window_schedule: replace if 'WindowSchedule' tag OR if delta has
+          more window_types entries.
+        - stair_info: replace if delta has more stair_sections.
+
+      has_door_schedule / has_window_schedule: OR.
+
+      material_legend: union by code.
+
+      project_info: keep prior; do NOT update aggregated counts here
+        (downstream _recalculate_totals + post-extraction passes do that).
+
+      project_overview: keep prior, append source_pdfs from delta.
+
+      Recomputed downstream (orchestrator calls these after merge):
+        - aggregated_totals, _perimeter_cross_check, provenance_audit
+        - manual_review_required, manual_review_reason
+        - notes that came from validation/audit passes
+
+      `notes` here: keep only entries that look like LLM-emitted observations
+      (those without bracketed-prefix pipeline markers). Pipeline notes are
+      regenerated.
+    """
+    import copy as _copy
+
+    if not isinstance(prior_analysis, dict):
+        raise TypeError("prior_analysis must be a dict")
+    if not isinstance(delta_analysis, dict):
+        raise TypeError("delta_analysis must be a dict")
+
+    norm_tags = _norm_scope_tags(scope_tags)
+    floor_tags = _floor_tags_in_scope(norm_tags)
+    additive_only = (_SCOPE_TAG_NONE in norm_tags) or (not norm_tags)
+
+    merged = _copy.deepcopy(prior_analysis)
+
+    # ── Floors ────────────────────────────────────────────────────────────
+    prior_floors = merged.get("floors", []) or []
+    delta_floors = delta_analysis.get("floors", []) or []
+
+    # Index prior floors by normalized name
+    def _norm_floor_name(fname):
+        return str(fname or "").strip().lower().replace(" ", "").replace("_", "")
+
+    prior_by_name = {_norm_floor_name(f.get("floor_name", "")): f for f in prior_floors}
+    delta_by_name = {_norm_floor_name(f.get("floor_name", "")): f for f in delta_floors}
+
+    merged_floors = []
+    seen_names = set()
+
+    for prior_floor in prior_floors:
+        fname = prior_floor.get("floor_name", "")
+        fnorm = _norm_floor_name(fname)
+        seen_names.add(fnorm)
+
+        # Does any scope tag match this floor name?
+        floor_in_scope = (
+            not additive_only
+            and any(_floor_name_matches_tag(fname, t) for t in floor_tags)
+        )
+
+        delta_floor = delta_by_name.get(fnorm)
+
+        if floor_in_scope and delta_floor:
+            # REPLACE: scope tag instructs us to drop prior's rooms for this
+            # floor and use delta's wholesale. Floors not present in delta
+            # but tagged for replacement keep prior (no data to replace with).
+            merged_floors.append(_copy.deepcopy(delta_floor))
+        elif delta_floor:
+            # UNION: combine prior's rooms with delta's rooms, keyed by
+            # room_name (case-insensitive). Delta wins on collisions.
+            merged_floors.append(_union_floor_rooms(prior_floor, delta_floor))
+        else:
+            # Floor exists in prior but not in delta — keep as-is.
+            merged_floors.append(_copy.deepcopy(prior_floor))
+
+    # Floors only in delta — append.
+    for delta_floor in delta_floors:
+        fnorm = _norm_floor_name(delta_floor.get("floor_name", ""))
+        if fnorm and fnorm not in seen_names:
+            merged_floors.append(_copy.deepcopy(delta_floor))
+            seen_names.add(fnorm)
+
+    merged["floors"] = merged_floors
+
+    # ── Exterior ──────────────────────────────────────────────────────────
+    prior_ext = merged.get("exterior", {}) or {}
+    delta_ext = delta_analysis.get("exterior", {}) or {}
+    if delta_ext:
+        replace_exterior = (
+            not additive_only and _SCOPE_TAG_EXTERIOR in norm_tags
+        )
+        if replace_exterior:
+            merged["exterior"] = _copy.deepcopy(delta_ext)
+        else:
+            merged["exterior"] = _max_merge_exterior(prior_ext, delta_ext)
+
+    # ── Schedule data ─────────────────────────────────────────────────────
+    prior_sched = merged.get("schedule_data", {}) or {}
+    delta_sched = delta_analysis.get("schedule_data", {}) or {}
+    merged_sched = dict(prior_sched)
+
+    # Door schedule: replace if tag OR delta is richer
+    p_door = prior_sched.get("door_schedule") or {}
+    d_door = delta_sched.get("door_schedule") or {}
+    door_tag_replace = (not additive_only) and (_SCOPE_TAG_DOOR_SCHEDULE in norm_tags)
+    p_door_marks = len(p_door.get("door_marks_counted") or [])
+    d_door_marks = len(d_door.get("door_marks_counted") or [])
+    if d_door and (door_tag_replace or d_door_marks > p_door_marks):
+        merged_sched["door_schedule"] = _copy.deepcopy(d_door)
+        merged["has_door_schedule"] = True
+
+    # Window schedule: replace if tag OR delta is richer
+    p_win = prior_sched.get("window_schedule") or {}
+    d_win = delta_sched.get("window_schedule") or {}
+    win_tag_replace = (not additive_only) and (_SCOPE_TAG_WINDOW_SCHEDULE in norm_tags)
+    p_win_types = len(p_win.get("window_types") or [])
+    d_win_types = len(d_win.get("window_types") or [])
+    if d_win and (win_tag_replace or d_win_types > p_win_types):
+        merged_sched["window_schedule"] = _copy.deepcopy(d_win)
+        merged["has_window_schedule"] = True
+
+    # Stair info: replace if delta has more stair_sections
+    p_stair = prior_sched.get("stair_info") or {}
+    d_stair = delta_sched.get("stair_info") or {}
+    if d_stair:
+        p_secs = float((p_stair.get("total_stair_sections") or 0))
+        d_secs = float((d_stair.get("total_stair_sections") or 0))
+        if d_secs > p_secs:
+            merged_sched["stair_info"] = _copy.deepcopy(d_stair)
+
+    if merged_sched:
+        merged["schedule_data"] = merged_sched
+
+    # has_*_schedule: OR with delta
+    if delta_analysis.get("has_door_schedule"):
+        merged["has_door_schedule"] = True
+    if delta_analysis.get("has_window_schedule"):
+        merged["has_window_schedule"] = True
+
+    # ── Material legend: union by code ────────────────────────────────────
+    p_legend = merged.get("material_legend", []) or []
+    d_legend = delta_analysis.get("material_legend", []) or []
+    seen_codes = {str(m.get("code", "")).strip().upper() for m in p_legend if isinstance(m, dict)}
+    for m in d_legend:
+        if isinstance(m, dict):
+            code = str(m.get("code", "")).strip().upper()
+            if code and code not in seen_codes:
+                p_legend.append(_copy.deepcopy(m))
+                seen_codes.add(code)
+    merged["material_legend"] = p_legend
+
+    # ── Project overview: keep prior, extend source_pdfs ──────────────────
+    p_overview = merged.get("project_overview") or {}
+    d_overview = delta_analysis.get("project_overview") or {}
+    if d_overview:
+        p_pdfs = list(p_overview.get("source_pdfs") or [])
+        d_pdfs = list(d_overview.get("source_pdfs") or [])
+        for pdf in d_pdfs:
+            if pdf and pdf not in p_pdfs:
+                p_pdfs.append(pdf)
+        if p_pdfs:
+            p_overview["source_pdfs"] = p_pdfs
+        # Carry forward any source_pages dict updates (don't override prior keys).
+        d_pages = (d_overview.get("source_pages") or {})
+        if isinstance(d_pages, dict):
+            p_pages = p_overview.get("source_pages") or {}
+            if isinstance(p_pages, dict):
+                for pdf_key, page_list in d_pages.items():
+                    if pdf_key not in p_pages:
+                        p_pages[pdf_key] = list(page_list or [])
+                p_overview["source_pages"] = p_pages
+        merged["project_overview"] = p_overview
+
+    # ── Notes: keep LLM-content notes; drop pipeline-emitted bracketed ones
+    # so post-extraction passes can re-emit fresh ones.
+    raw_notes = merged.get("notes", []) or []
+    kept_notes = []
+    for n in raw_notes:
+        s = str(n).strip()
+        if s.startswith("[") and "]" in s:
+            # Pipeline-marker note (e.g. "[Validation]", "[Schedule Override]",
+            # "[Perimeter Cross-Check]"). Drop — will be regenerated.
+            continue
+        if s:
+            kept_notes.append(s)
+    # Also keep delta's LLM notes that aren't bracketed pipeline markers.
+    for n in delta_analysis.get("notes", []) or []:
+        s = str(n).strip()
+        if s and not (s.startswith("[") and "]" in s) and s not in kept_notes:
+            kept_notes.append(s)
+    merged["notes"] = kept_notes
+
+    # ── Drop fields recomputed downstream ─────────────────────────────────
+    for field in (
+        "aggregated_totals", "_perimeter_cross_check", "provenance_audit",
+        "manual_review_required", "manual_review_reason",
+    ):
+        merged.pop(field, None)
+
+    return merged
+
+
+def _union_floor_rooms(prior_floor, delta_floor):
+    """Union the rooms of two floors (same floor_name) by room_name.
+    Delta wins on collisions. Returns a new floor dict."""
+    import copy as _copy
+
+    out = _copy.deepcopy(prior_floor)
+    prior_rooms = out.get("rooms", []) or []
+    delta_rooms = (delta_floor.get("rooms") or [])
+
+    def _room_key(r):
+        rn = str((r or {}).get("room_name", "")).strip().lower()
+        rid = str((r or {}).get("room_id", "")).strip()
+        # Prefer room_id if available; fall back to name.
+        return rid or rn
+
+    prior_index = {}
+    for i, r in enumerate(prior_rooms):
+        k = _room_key(r)
+        if k:
+            prior_index[k] = i
+
+    merged_rooms = list(prior_rooms)
+    for d_room in delta_rooms:
+        k = _room_key(d_room)
+        if k and k in prior_index:
+            # Collision: delta wins (revised dimensions/elements override).
+            merged_rooms[prior_index[k]] = _copy.deepcopy(d_room)
+        else:
+            merged_rooms.append(_copy.deepcopy(d_room))
+
+    out["rooms"] = merged_rooms
+    return out
+
+
+def _max_merge_exterior(prior_ext, delta_ext):
+    """Merge two exterior dicts by taking the MAX of numeric fields, OR of
+    booleans, and appending notes. Strings on prior are kept unless empty."""
+    import copy as _copy
+
+    out = _copy.deepcopy(prior_ext)
+
+    numeric_fields = (
+        "cornice_lf", "window_trim_lf", "soffit_sqft", "railing_lf",
+        "exterior_paint_sqft", "hardie_siding_sqft", "azek_trim_lf",
+        "corner_board_lf", "steel_lintel_lf",
+        "stain_siding_sqft", "stain_trim_lf", "stain_railing_lf",
+    )
+    for field in numeric_fields:
+        try:
+            p_val = float(out.get(field, 0) or 0)
+            d_val = float(delta_ext.get(field, 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if d_val > p_val:
+            out[field] = d_val if d_val != int(d_val) else int(d_val)
+
+    # Booleans — OR
+    for bfield in ("lift_required", "interior_lift_required"):
+        if delta_ext.get(bfield):
+            out[bfield] = True
+
+    # Strings — keep prior unless empty
+    for sfield in ("exterior_siding_type",):
+        if not out.get(sfield) and delta_ext.get(sfield):
+            out[sfield] = delta_ext[sfield]
+
+    # Notes — append
+    p_notes = str(out.get("notes", "") or "")
+    d_notes = str(delta_ext.get("notes", "") or "")
+    if d_notes and d_notes not in p_notes:
+        out["notes"] = (p_notes + " | " if p_notes else "") + d_notes
+
+    return out
+
+
 def run_analysis_merge(prior_json, new_pdf_paths, scope_tags=None,
                         contact_name="", contact_email="", scope_notes="",
-                        rate_overrides=None):
+                        rate_overrides=None, version=None, parent_id=None):
     """Re-run analysis using a prior result JSON as the baseline, merging
     in extraction from `new_pdf_paths` only.
 
-    The prior JSON is the full result dict from a completed `run_analysis`
-    (read from R2 by the merge worker). `scope_tags` is a list of structured
-    tags driving merge semantics — e.g. ["Basement", "DoorSchedule"] tells
-    the merger to REPLACE the parent's Basement floor and door schedule
-    rather than UNIONING them.
-
-    Returns the same shape `run_analysis` returns: {analysis, cost_estimate,
-    output_json_path, output_pdf_path, ...}.
-
     Pricing uses `prior_json['pricing_model']` snapshot — quotes stay rate-
     consistent across versions even if PRICING_MODEL changes upstream.
+
+    Phase 2 implementation: orchestrator wired around merge_versioned_analyses().
+    Per-PDF extraction reuses run_analysis() on the new files (some compute
+    is wasted on the delta's own cost/Will pass which we discard, but it
+    keeps extraction logic in one place — Phase 2.1 can optimize).
     """
-    raise NotImplementedError(
-        "run_analysis_merge is Phase 2 of the merge feature. "
-        "Worker plumbing (Phase 1B) is wired; merge engine + post-merge "
-        "re-runs (Phase 2-3) land next."
+    if not isinstance(prior_json, dict):
+        raise TypeError("prior_json must be a dict (the parent's stored result)")
+
+    prior_analysis = prior_json.get("analysis") or {}
+    if not prior_analysis:
+        raise ValueError("prior_json has no 'analysis' field — not a valid parent result")
+
+    if not new_pdf_paths:
+        raise ValueError("No new PDFs provided for merge — re-submit fresh instead.")
+
+    print("\n" + "=" * 80)
+    print(f"🔄 NIGHTSHIFT AI — INCREMENTAL RE-RUN (merge)")
+    print("=" * 80)
+    print(f"   Parent doc:    {prior_json.get('document', '?')}")
+    print(f"   New files:     {[os.path.basename(p) for p in new_pdf_paths]}")
+    print(f"   Scope tags:    {scope_tags or '(none — additive only)'}")
+    print(f"   Pricing model: parent snapshot ({len(prior_json.get('pricing_model', {}))} items)")
+    print("=" * 80)
+
+    # 1. Run extraction on the new PDFs only. We reuse run_analysis here for
+    #    per-PDF extraction + post-extraction passes; the result's analysis
+    #    dict is what we merge with the prior. cost_estimate and will_synthesis
+    #    on the delta are discarded — we'll recompute on the merged whole.
+    delta_result = run_analysis(
+        new_pdf_paths,
+        contact_name=contact_name,
+        contact_email=contact_email,
+        scope_notes=scope_notes,
+        rate_overrides=rate_overrides,
     )
+    delta_analysis = delta_result.get("analysis") or {}
+
+    # 2. Pure merge.
+    merged_analysis = merge_versioned_analyses(prior_analysis, delta_analysis,
+                                     scope_tags=scope_tags)
+
+    # 3. Re-run post-extraction passes on the merged whole. These mutate
+    #    in place and re-derive aggregated_totals + validation notes.
+    print("\n🧮 Re-running post-extraction passes on merged data...")
+    try:
+        merged_analysis = _recalculate_totals(merged_analysis)
+        merged_analysis = _apply_schedule_overrides(merged_analysis)
+        merged_analysis = _supplement_missing_secondary_spaces(merged_analysis)
+        merged_analysis = _validate_wall_area_by_perimeter(merged_analysis)
+        merged_analysis = _validate_and_boost_walls(merged_analysis)
+        merged_analysis = _apply_commercial_window_exclusion(merged_analysis)
+        merged_analysis = _check_wall_ceiling_ratio(merged_analysis)
+    except Exception as exc:
+        print(f"⚠️  Post-extraction pass failed: {exc}")
+        raise
+
+    # 4. Recompute cost using parent's pricing snapshot — NOT the live
+    #    PRICING_MODEL. This is the rate-stability rule: a v2 quote uses the
+    #    same rates v1 was priced at, so deltas are pure-quantity changes.
+    pricing_snapshot = prior_json.get("pricing_model") or PRICING_MODEL
+    print(f"💰 Re-pricing with parent snapshot...")
+    costs = calculate_costs(
+        merged_analysis.get("aggregated_totals", {}),
+        exterior=merged_analysis.get("exterior", {}),
+        building_type=merged_analysis.get("project_info", {}).get("building_type", ""),
+        project_info=merged_analysis.get("project_info", {}),
+        analysis=merged_analysis,
+        pricing_model_override=pricing_snapshot,
+    )
+
+    print_estimate(merged_analysis, costs)
+
+    # 5. Re-run validation and RFIs on merged data. RFIs regenerate from
+    #    current state, so any RFI Matt resolved by uploading a new
+    #    schedule simply doesn't re-fire.
+    validation = _validate_cost_estimate(merged_analysis, costs)
+    rfi_items = generate_rfi_items(merged_analysis) or []
+
+    pre_pricing_rfis = merged_analysis.pop("_pre_pricing_rfis", []) or []
+    if pre_pricing_rfis:
+        next_num = max((r.get("number", 0) for r in rfi_items), default=0) + 1
+        for r in pre_pricing_rfis:
+            r["number"] = next_num
+            next_num += 1
+        rfi_items = rfi_items + pre_pricing_rfis
+
+    # 6. Fresh Will synthesis on merged data.
+    print("\n🧑‍💼 Re-running Will Synthesis on merged data...")
+    try:
+        from anthropic import Anthropic
+        will_client = Anthropic(api_key=CLAUDE_API_KEY)
+    except Exception as _exc:
+        will_client = None
+        print(f"⚠️  Could not init Anthropic client for Will: {_exc}")
+
+    will_result = {"will_synthesis": None, "adjustments_log": [], "rejected_log": [],
+                   "new_rfis": [], "error": None}
+    if will_client is not None:
+        try:
+            will_result = run_will_synthesis(
+                analysis=merged_analysis,
+                cost_estimate=costs,
+                rfi_items=rfi_items,
+                validation=validation,
+                client=will_client,
+            )
+        except Exception as exc:
+            print(f"⚠️  Will Synthesis failed: {exc}")
+            will_result = {"will_synthesis": None, "adjustments_log": [],
+                           "rejected_log": [], "new_rfis": [], "error": str(exc)}
+
+    if will_result.get("will_synthesis"):
+        will_rfis = will_result.get("new_rfis", []) or []
+        next_num = (max((r.get("number", 0) for r in rfi_items), default=0) + 1
+                    if rfi_items else 1)
+        for rfi in will_rfis:
+            rfi["number"] = next_num
+            next_num += 1
+        rfi_items = rfi_items + will_rfis
+        validation = _validate_cost_estimate(merged_analysis, costs)
+
+    # 7. Append to merge_log so audit history is queryable from the JSON.
+    prior_log = list(prior_json.get("merge_log") or [])
+    subtotal_before = (prior_json.get("cost_estimate") or {}).get("subtotal", 0) or 0
+    subtotal_after = (costs or {}).get("subtotal", 0) or 0
+    prior_log.append({
+        "version": version,
+        "parent_id": parent_id,
+        "files_added": [os.path.basename(p) for p in new_pdf_paths],
+        "scope_tags": list(scope_tags or []),
+        "scope_notes": scope_notes or "",
+        "merged_at": datetime.now().isoformat(),
+        "subtotal_before": float(subtotal_before),
+        "subtotal_after": float(subtotal_after),
+        "subtotal_delta": round(float(subtotal_after) - float(subtotal_before), 2),
+    })
+
+    # 8. Source-file tracking: combine prior + delta document references.
+    prior_doc = prior_json.get("document", "")
+    new_doc_refs = ", ".join(os.path.basename(p) for p in new_pdf_paths)
+    document_ref = (prior_doc + " | " + new_doc_refs) if prior_doc else new_doc_refs
+
+    prior_sources = list(prior_json.get("source_files") or []) or (
+        [prior_doc] if prior_doc and "|" not in prior_doc else []
+    )
+    new_sources = [os.path.basename(p) for p in new_pdf_paths]
+    combined_sources = list(prior_sources)
+    for s in new_sources:
+        if s not in combined_sources:
+            combined_sources.append(s)
+
+    # 9. Save JSON + PDF.
+    output_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "output")
+    os.makedirs(output_dir, exist_ok=True)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_json = os.path.join(output_dir, f"construction_analysis_{timestamp}.json")
+
+    result_data = {
+        "contact": {"name": contact_name, "email": contact_email},
+        "document": document_ref,
+        "source_files": combined_sources,
+        "files_analyzed": delta_result.get("analysis", {}).get("files_analyzed"),
+        "generated": datetime.now().isoformat(),
+        "scope_notes": scope_notes if scope_notes else prior_json.get("scope_notes"),
+        "building_inventory": _merge_building_inventory(
+            prior_json.get("building_inventory"),
+            delta_result.get("analysis", {}).get("_building_inventory")
+                or delta_analysis.get("_building_inventory")
+                or None,
+        ),
+        "manual_review_required": bool(merged_analysis.get("manual_review_required")),
+        "manual_review_reason": merged_analysis.get("manual_review_reason"),
+        "analysis": merged_analysis,
+        "cost_estimate": costs,
+        "labor_hours_estimate": _compute_labor_hours(merged_analysis),
+        "validation": validation,
+        "pricing_model": pricing_snapshot,
+        "rfi_items": rfi_items if rfi_items else None,
+        "will_synthesis": will_result.get("will_synthesis"),
+        "will_adjustments_log": will_result.get("adjustments_log"),
+        "will_rejected_log": will_result.get("rejected_log"),
+        "merge_log": prior_log,
+        "is_merge_result": True,
+        "parent_submission_id": parent_id,
+        "version": version,
+    }
+
+    with open(output_json, "w") as f:
+        json.dump(result_data, f, indent=2)
+    print(f"\n📁 Merged JSON saved to: {output_json}")
+
+    # PDF report
+    output_pdf = output_json.replace(".json", ".pdf")
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        from json_to_pdf import json_to_pdf as generate_pdf_report
+        generate_pdf_report(output_json, output_pdf)
+        print(f"📄 Merged PDF report saved to: {output_pdf}")
+    except Exception as e:
+        print(f"⚠️  Could not generate merged PDF report: {e}")
+        output_pdf = None
+
+    print(f"\n✅ MERGE COMPLETE")
+    print(f"   Subtotal: ${subtotal_before:,.2f} → ${subtotal_after:,.2f} "
+          f"(Δ ${subtotal_after - subtotal_before:+,.2f})")
+
+    return {
+        "analysis": merged_analysis,
+        "cost_estimate": costs,
+        "output_json_path": output_json,
+        "output_pdf_path": output_pdf,
+        "contact": {"name": contact_name, "email": contact_email},
+        "document": document_ref,
+        "rfi_items": rfi_items,
+        "will_synthesis": will_result.get("will_synthesis"),
+        "merge_log": prior_log,
+        "is_merge_result": True,
+        "parent_submission_id": parent_id,
+        "version": version,
+    }
+
+
+def _merge_building_inventory(prior_inv, delta_inv):
+    """Union two building_inventory dicts. New buildings/units appended;
+    name conflicts → keep highest count."""
+    import copy as _copy
+    if not prior_inv:
+        return _copy.deepcopy(delta_inv) if delta_inv else None
+    if not delta_inv:
+        return _copy.deepcopy(prior_inv)
+
+    out = _copy.deepcopy(prior_inv)
+    p_buildings = list(out.get("buildings") or [])
+    d_buildings = list(delta_inv.get("buildings") or [])
+
+    by_key = {}
+    for i, b in enumerate(p_buildings):
+        if isinstance(b, dict):
+            key = (str(b.get("building_type_code") or "").strip().upper(),
+                   str(b.get("building_name") or "").strip().lower())
+            by_key[key] = i
+
+    for b in d_buildings:
+        if not isinstance(b, dict):
+            continue
+        key = (str(b.get("building_type_code") or "").strip().upper(),
+               str(b.get("building_name") or "").strip().lower())
+        if key in by_key:
+            # Keep max count when same building appears in both.
+            existing = p_buildings[by_key[key]]
+            try:
+                e_ct = int(existing.get("count", 0) or 0)
+                d_ct = int(b.get("count", 0) or 0)
+                if d_ct > e_ct:
+                    existing["count"] = d_ct
+            except (TypeError, ValueError):
+                pass
+        else:
+            p_buildings.append(_copy.deepcopy(b))
+            by_key[key] = len(p_buildings) - 1
+
+    out["buildings"] = p_buildings
+    out["total_buildings"] = sum(int(b.get("count", 0) or 0)
+                                  for b in p_buildings if isinstance(b, dict))
+    out["total_units"] = sum(
+        int(b.get("count", 0) or 0) * int(b.get("units_per_building", 1) or 1)
+        for b in p_buildings if isinstance(b, dict)
+    )
+
+    # Append source pages
+    p_pages = list(out.get("source_pages") or [])
+    for pg in (delta_inv.get("source_pages") or []):
+        if pg not in p_pages:
+            p_pages.append(pg)
+    out["source_pages"] = p_pages
+
+    return out
+
+
 
 
 def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",

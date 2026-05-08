@@ -34,12 +34,112 @@
                 <ul id="result-files" style="list-style:none;padding:0;margin-top:12px;"></ul>
             </section>
 
+            <section class="panel" id="resubmit-section" style="display:none;margin-top:20px;">
+                <h2>Re-run with revisions</h2>
+                <p class="panel-subtle" id="resubmit-blurb">
+                    Got a revised plan, an RFI response, or an amendment? Add files
+                    and we'll merge them into this estimate without starting over.
+                </p>
+                <p style="color:#cbd5e1;margin-top:12px;">
+                    <span style="color:rgba(203,213,225,0.7);">Current version:</span>
+                    <strong id="resubmit-version">v1</strong>
+                    <span id="resubmit-version-cap" style="color:rgba(203,213,225,0.5);margin-left:6px;"></span>
+                </p>
+                <div id="merge-log-section" style="display:none;margin-top:12px;">
+                    <h3 style="font-size:0.95rem;color:#cbd5e1;margin-bottom:6px;">Revision history</h3>
+                    <ul id="merge-log-list" style="list-style:none;padding:0;font-size:0.9rem;color:rgba(203,213,225,0.85);"></ul>
+                </div>
+                <button type="button" id="resubmit-open-btn" class="btn-primary" style="margin-top:14px;">
+                    Add files &amp; re-run
+                </button>
+                <p id="resubmit-disabled-msg" style="display:none;color:#fbbf24;margin-top:10px;font-size:0.9rem;"></p>
+            </section>
+
             <section class="panel" id="error-section" style="display:none;margin-top:20px;border-color:rgba(220,38,38,0.4);">
                 <h2 style="color:#f87171;">Error</h2>
                 <pre id="error-text" style="white-space:pre-wrap;color:#fecaca;background:rgba(127,29,29,0.25);padding:14px;border-radius:6px;"></pre>
             </section>
         </main>
     </div>
+
+    <div id="resubmit-modal" style="display:none;position:fixed;inset:0;background:rgba(2,8,20,0.78);z-index:1000;align-items:center;justify-content:center;padding:20px;">
+        <div style="background:#0b1626;border:1px solid rgba(255,255,255,0.08);border-radius:10px;max-width:640px;width:100%;max-height:92vh;overflow:auto;padding:24px;">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
+                <h2 style="margin:0;color:#e2e8f0;">Re-run with revisions</h2>
+                <button type="button" id="resubmit-close-btn" aria-label="Close"
+                        style="background:transparent;border:0;color:#cbd5e1;font-size:1.4rem;cursor:pointer;line-height:1;">&times;</button>
+            </div>
+            <p style="color:rgba(203,213,225,0.85);margin-top:6px;font-size:0.92rem;">
+                Upload only the new or revised files. The previous extraction is the
+                baseline; we merge new data in and re-price using the same rates.
+            </p>
+
+            <form id="resubmit-form" method="POST" enctype="multipart/form-data" style="margin-top:18px;">
+                <label for="resubmit-files" style="display:block;color:#cbd5e1;font-weight:500;margin-bottom:6px;">
+                    New PDFs <span style="color:rgba(203,213,225,0.6);font-weight:400;">(revised plan, RFI response, etc.)</span>
+                </label>
+                <input id="resubmit-files" type="file" name="attachments" multiple accept="application/pdf" required
+                       style="width:100%;padding:8px;background:rgba(8,18,32,0.7);border:1px solid rgba(255,255,255,0.12);border-radius:6px;color:#cbd5e1;" />
+
+                <label for="merge-notes" style="display:block;color:#cbd5e1;font-weight:500;margin-top:18px;margin-bottom:6px;">
+                    What changed? <span style="color:rgba(203,213,225,0.6);font-weight:400;">(optional)</span>
+                </label>
+                <textarea id="merge-notes" name="merge_notes" rows="2" placeholder="Revised basement plan from architect"
+                          style="width:100%;padding:8px;background:rgba(8,18,32,0.7);border:1px solid rgba(255,255,255,0.12);border-radius:6px;color:#cbd5e1;font-family:inherit;font-size:0.95rem;"></textarea>
+
+                <div style="margin-top:18px;">
+                    <p style="color:#cbd5e1;font-weight:500;margin-bottom:4px;">Scope of revision</p>
+                    <p style="color:rgba(203,213,225,0.65);font-size:0.85rem;margin:0 0 10px 0;">
+                        Check boxes for areas the new files <em>replace</em> in the prior
+                        extraction. Leave all unchecked if the new files just add to what was there.
+                    </p>
+
+                    <div id="scope-tags-floors" style="margin-bottom:8px;"></div>
+
+                    <div id="scope-tags-other" style="display:flex;flex-wrap:wrap;gap:14px;">
+                        <label class="scope-tag-label">
+                            <input type="checkbox" name="merge_scope_tags" value="DoorSchedule" />
+                            <span>Door schedule</span>
+                        </label>
+                        <label class="scope-tag-label">
+                            <input type="checkbox" name="merge_scope_tags" value="WindowSchedule" />
+                            <span>Window schedule</span>
+                        </label>
+                        <label class="scope-tag-label">
+                            <input type="checkbox" name="merge_scope_tags" value="FinishSchedule" />
+                            <span>Finish schedule</span>
+                        </label>
+                        <label class="scope-tag-label">
+                            <input type="checkbox" name="merge_scope_tags" value="Exterior" />
+                            <span>Exterior elevations</span>
+                        </label>
+                    </div>
+                </div>
+
+                <div style="display:flex;gap:10px;margin-top:22px;">
+                    <button type="submit" class="btn-primary">Submit &amp; re-run</button>
+                    <button type="button" id="resubmit-cancel-btn" class="btn-secondary">Cancel</button>
+                </div>
+                <p id="resubmit-form-error" style="display:none;color:#f87171;margin-top:10px;font-size:0.9rem;"></p>
+            </form>
+        </div>
+    </div>
+
+    <style>
+        .scope-tag-label {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+            color: #cbd5e1;
+            cursor: pointer;
+            user-select: none;
+            font-size: 0.92rem;
+        }
+        .scope-tag-label input[type="checkbox"] {
+            cursor: pointer;
+            margin: 0;
+        }
+    </style>
 
     <footer style="text-align:center;padding:20px;color:rgba(203,213,225,0.5);font-size:0.85rem;">
         &copy; 2026 Knight Shift &mdash; Forged by Willpower
@@ -87,6 +187,8 @@
     };
     let pollTimer = null;
 
+    let resubmitContextLoaded = false;
+
     function render(d) {
         const pill = document.getElementById("status-pill");
         pill.textContent = d.status;
@@ -112,12 +214,141 @@
                 li.appendChild(a);
                 ul.appendChild(li);
             });
+
+            // Load the resubmit panel context once the job is completed.
+            if (!resubmitContextLoaded) {
+                resubmitContextLoaded = true;
+                loadResubmitContext();
+            }
         }
         if (d.status === "failed" && d.error) {
             document.getElementById("error-section").style.display = "";
             document.getElementById("error-text").textContent = d.error;
         }
     }
+
+    async function loadResubmitContext() {
+        try {
+            const res = await fetch(`/api/jobs/${SUB_ID}/resubmit-context`,
+                                     { credentials: "same-origin" });
+            if (!res.ok) {
+                console.warn("resubmit-context fetch failed", res.status);
+                return;
+            }
+            const ctx = await res.json();
+            renderResubmitPanel(ctx);
+        } catch (e) {
+            console.warn("resubmit-context error", e);
+        }
+    }
+
+    function renderResubmitPanel(ctx) {
+        const section = document.getElementById("resubmit-section");
+        section.style.display = "";
+
+        document.getElementById("resubmit-version").textContent = "v" + (ctx.version || 1);
+        const cap = document.getElementById("resubmit-version-cap");
+        cap.textContent = ctx.max_versions
+            ? `(max ${ctx.max_versions} per project)` : "";
+
+        // Floor checkboxes auto-populated from parent's known floors.
+        const floorsDiv = document.getElementById("scope-tags-floors");
+        floorsDiv.innerHTML = "";
+        (ctx.floor_names || []).forEach(name => {
+            const label = document.createElement("label");
+            label.className = "scope-tag-label";
+            label.style.marginRight = "14px";
+            label.innerHTML = `<input type="checkbox" name="merge_scope_tags" value="${escapeHTML(name)}" /><span>${escapeHTML(name)}</span>`;
+            floorsDiv.appendChild(label);
+        });
+
+        // Merge log (revision history) — only show if non-empty.
+        const log = ctx.merge_log || [];
+        if (log.length) {
+            document.getElementById("merge-log-section").style.display = "";
+            const list = document.getElementById("merge-log-list");
+            list.innerHTML = "";
+            log.forEach(entry => {
+                const li = document.createElement("li");
+                li.style.padding = "4px 0";
+                const delta = entry.subtotal_delta;
+                const deltaTxt = delta != null
+                    ? ` (${delta >= 0 ? "+" : ""}$${Math.abs(delta).toLocaleString(undefined, {maximumFractionDigits: 0})})`
+                    : "";
+                const tags = (entry.scope_tags || []).join(", ") || "additive";
+                const files = (entry.files_added || []).join(", ");
+                li.textContent = `v${entry.version || "?"}: ${files} — scope: ${tags}${deltaTxt}`;
+                list.appendChild(li);
+            });
+        }
+
+        // Disable button at the version cap.
+        const btn = document.getElementById("resubmit-open-btn");
+        const disabledMsg = document.getElementById("resubmit-disabled-msg");
+        if (!ctx.can_resubmit) {
+            btn.disabled = true;
+            btn.style.opacity = "0.5";
+            btn.style.cursor = "not-allowed";
+            disabledMsg.style.display = "";
+            disabledMsg.textContent =
+                `This project has reached the ${ctx.max_versions}-revision limit. Start a fresh submission instead.`;
+        }
+    }
+
+    function escapeHTML(s) {
+        return String(s).replace(/[&<>"']/g, c => ({
+            "&": "&amp;", "<": "&lt;", ">": "&gt;",
+            "\"": "&quot;", "'": "&#39;"
+        }[c]));
+    }
+
+    function openResubmitModal() {
+        const modal = document.getElementById("resubmit-modal");
+        modal.style.display = "flex";
+        const form = document.getElementById("resubmit-form");
+        form.action = `/submit/${SUB_ID}/resubmit`;
+        form.reset();
+        document.getElementById("resubmit-form-error").style.display = "none";
+    }
+
+    function closeResubmitModal() {
+        document.getElementById("resubmit-modal").style.display = "none";
+    }
+
+    document.addEventListener("DOMContentLoaded", () => {
+        const openBtn = document.getElementById("resubmit-open-btn");
+        const closeBtn = document.getElementById("resubmit-close-btn");
+        const cancelBtn = document.getElementById("resubmit-cancel-btn");
+        const modal = document.getElementById("resubmit-modal");
+        if (openBtn) openBtn.addEventListener("click", openResubmitModal);
+        if (closeBtn) closeBtn.addEventListener("click", closeResubmitModal);
+        if (cancelBtn) cancelBtn.addEventListener("click", closeResubmitModal);
+        // Click-outside-to-close.
+        if (modal) {
+            modal.addEventListener("click", (e) => {
+                if (e.target === modal) closeResubmitModal();
+            });
+        }
+        // Esc-to-close.
+        document.addEventListener("keydown", (e) => {
+            if (e.key === "Escape" && modal && modal.style.display !== "none") {
+                closeResubmitModal();
+            }
+        });
+        // Light client-side validation for the form (must have at least 1 file).
+        const form = document.getElementById("resubmit-form");
+        if (form) {
+            form.addEventListener("submit", (e) => {
+                const files = document.getElementById("resubmit-files");
+                if (!files || !files.files || files.files.length === 0) {
+                    e.preventDefault();
+                    const errEl = document.getElementById("resubmit-form-error");
+                    errEl.style.display = "";
+                    errEl.textContent = "Please attach at least one PDF.";
+                }
+            });
+        }
+    });
 
     async function poll() {
         try {

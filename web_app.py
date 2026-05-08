@@ -1383,6 +1383,58 @@ def job_status_api(submission_id):
     return jsonify(payload)
 
 
+@app.route("/api/jobs/<submission_id>/resubmit-context", methods=["GET"])
+@require_auth
+def job_resubmit_context_api(submission_id):
+    """Context the resubmit modal needs to render: parent's known floor
+    names (for the scope-tag picker), schedule presence, version + cap,
+    and any prior merge_log so the UI can show revision history.
+
+    Authorization: org-scoped (any teammate in the parent's org can revise),
+    matching the resubmit route itself.
+    """
+    user_id = current_user_id()
+    with session_scope() as session:
+        user = session.get(User, user_id)
+        org_id = user.current_organization_id if user else None
+        sub = session.get(Submission, submission_id)
+        if sub is None or sub.org_id != org_id:
+            return jsonify({"error": "not found"}), 404
+        if sub.status != "completed":
+            return jsonify({"error": "not completed", "status": sub.status}), 409
+
+        version = sub.version or 1
+        json_files = [f for f in sub.files
+                      if f.kind == "result" and f.filename.lower().endswith(".json")]
+        if not json_files:
+            return jsonify({"error": "result JSON not found"}), 404
+        json_file = sorted(json_files, key=lambda f: f.id, reverse=True)[0]
+        r2_key = json_file.r2_key
+
+    try:
+        raw = storage.get_bytes(r2_key)
+        data = json.loads(raw)
+    except Exception as exc:
+        logger.error("Failed to load result JSON %s: %s", r2_key, exc)
+        return jsonify({"error": "failed to load result"}), 500
+
+    analysis = data.get("analysis") or {}
+    floors = analysis.get("floors") or []
+    floor_names = [f.get("floor_name") for f in floors if f.get("floor_name")]
+
+    return jsonify({
+        "version": version,
+        "max_versions": MAX_SUBMISSION_VERSIONS,
+        "can_resubmit": version < MAX_SUBMISSION_VERSIONS,
+        "floor_names": floor_names,
+        "has_door_schedule": bool(analysis.get("has_door_schedule")),
+        "has_window_schedule": bool(analysis.get("has_window_schedule")),
+        "subtotal": (data.get("cost_estimate") or {}).get("subtotal"),
+        "manual_review_required": bool(data.get("manual_review_required")),
+        "merge_log": data.get("merge_log") or [],
+    })
+
+
 @app.route("/api/jobs/<submission_id>/result", methods=["GET"])
 @require_auth
 def job_result_api(submission_id):
