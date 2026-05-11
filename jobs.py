@@ -264,10 +264,11 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
 
             # Pre-normalize any pages that would be too dense for the heavy
             # worker to process without triggering Render's CPU-load
-            # preemption. Pages whose single-serialized PDF size exceeds
-            # 25 MB get rasterized to JPEG-embedded PDF pages at 150 DPI.
-            # Lean pages pass through untouched so non-DD-scale jobs incur
-            # no quality penalty. See pdf_preprocess.py docstring for
+            # preemption, or that would blow Claude's 5 MB per-image cap on
+            # image-fallback. Pages whose single-serialized PDF size exceeds
+            # 5 MB get rasterized to JPEG-embedded PDF pages at 150 DPI.
+            # Lean pages pass through untouched so small files incur no
+            # quality penalty. See pdf_preprocess.py docstring for
             # background. Toggleable via NIGHTSHIFT_DISABLE_PDF_NORMALIZE=1.
             try:
                 from pdf_preprocess import normalize_oversized_pages

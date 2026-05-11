@@ -8,7 +8,9 @@ The most likely cause is shared-CPU throttling on sustained high CPU load
 during PyMuPDF rendering.
 
 This module rasterizes any page whose single-page-serialized size exceeds a
-threshold (default 25 MB) to a JPEG-embedded PDF page at a low DPI.
+threshold (default 5 MB — matches Claude's per-image cap, which is the
+actual failure surface for the image-fallback path) to a JPEG-embedded
+PDF page at a low DPI.
 Pages under threshold are preserved as-is. The result: a normalized PDF
 where every page is small and lightweight, eliminating the dense-vector
 CPU spike that triggers Render's preemption.
@@ -131,7 +133,7 @@ def _build_searchable_page(out_doc, src_page, jpeg_bytes: bytes) -> None:
 def normalize_oversized_pages(
     src_path: str,
     dst_path: Optional[str] = None,
-    threshold_mb: float = 25.0,
+    threshold_mb: float = 5.0,
     dpi: int = 150,
     quality: int = 85,
     max_dim: int = 7800,
