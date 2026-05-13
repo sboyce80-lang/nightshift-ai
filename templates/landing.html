@@ -1,120 +1,1322 @@
+{# Public marketing landing page. Replaces the previous CTA-only stub.
+   Layout mirrors the kn­ight-shift-ai.replit.app design: dark navy theme
+   with cyan accents, full narrative + ROI slider + waitlist/demo CTAs.
+
+   Auth-bearing CTAs (Log In / Request Access / Book Demo) all bootstrap
+   Clerk client-side, identical to the previous landing flow.            #}
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Knight Shift &mdash; Forged by Willpower</title>
-    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <title>KnightShift &mdash; Automated commercial painting estimates</title>
+    <meta name="description" content="Upload architectural PDFs. KnightShift reads the plans, parses the specs, and generates a commercial-grade painting estimate in minutes. No more midnight takeoffs.">
+    <link rel="icon" type="image/png" href="{{ url_for('static', filename='logo_helm_sm.png') }}">
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800;900&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
     <style>
-        .landing-shell {
-            min-height: 80vh;
+        :root {
+            --bg: #0B1622;
+            --bg-darker: #050A10;
+            --bg-card: #0F172A;
+            --border: #1E293B;
+            --cyan: #22d3ee;
+            --cyan-dark: #06b6d4;
+            --cyan-glow: rgba(34, 211, 238, 0.4);
+            --green: #22C55E;
+            --red: #ef4444;
+            --red-dark: #dc2626;
+            --text: #ffffff;
+            --text-muted: rgba(255, 255, 255, 0.6);
+            --text-faint: rgba(255, 255, 255, 0.4);
+            --text-dim: rgba(255, 255, 255, 0.3);
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+        html { scroll-behavior: smooth; }
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, system-ui, sans-serif;
+            background: var(--bg);
+            color: var(--text);
+            line-height: 1.5;
+            -webkit-font-smoothing: antialiased;
+            overflow-x: hidden;
+        }
+        body::selection, body *::selection {
+            background: rgba(34, 211, 238, 0.3);
+            color: #a5f3fc;
+        }
+        a { color: inherit; text-decoration: none; }
+        img { max-width: 100%; display: block; }
+        button { font-family: inherit; cursor: pointer; }
+
+        .mono { font-family: 'JetBrains Mono', 'Courier New', monospace; }
+        .container { max-width: 1400px; margin: 0 auto; padding: 0 24px; }
+        @media (min-width: 768px) { .container { padding: 0 48px; } }
+
+        /* ============ NAV ============ */
+        .nav {
+            position: fixed;
+            top: 0; left: 0; right: 0;
+            z-index: 50;
+            background: rgba(11, 22, 34, 0.9);
+            backdrop-filter: blur(12px);
+            border-bottom: 2px solid rgba(34, 211, 238, 0.2);
+        }
+        .nav-inner {
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 0 24px;
+            height: 80px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+        @media (min-width: 768px) { .nav-inner { padding: 0 48px; height: 96px; } }
+        .nav-brand {
+            display: flex; align-items: center; gap: 12px;
+            font-weight: 900; font-size: 1.25rem; letter-spacing: 0.02em;
+        }
+        .nav-brand img { height: 44px; width: auto; }
+        .nav-brand-text { color: var(--text); }
+        .nav-brand-text span { color: var(--cyan); }
+        .nav-links {
+            display: none;
+            gap: 32px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+            letter-spacing: 0.15em;
+            text-transform: uppercase;
+            color: var(--text-muted);
+        }
+        @media (min-width: 1024px) { .nav-links { display: flex; } }
+        .nav-links a { transition: color 0.2s; }
+        .nav-links a:hover { color: var(--cyan); }
+        .nav-cta { display: flex; align-items: center; gap: 12px; }
+        .btn {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            gap: 8px;
+            padding: 12px 24px;
+            font-weight: 700;
+            font-size: 0.85rem;
+            letter-spacing: 0.08em;
+            text-transform: uppercase;
+            border: 2px solid transparent;
+            background: transparent;
+            color: var(--text);
+            cursor: pointer;
+            transition: all 0.15s ease;
+            white-space: nowrap;
+        }
+        .btn:disabled { opacity: 0.5; cursor: not-allowed; }
+        .btn-primary {
+            background: var(--cyan);
+            color: var(--bg-darker);
+            box-shadow: 6px 6px 0 0 var(--border);
+        }
+        .btn-primary:hover:not(:disabled) {
+            transform: translate(-2px, -2px);
+            box-shadow: 8px 8px 0 0 var(--green);
+        }
+        .btn-primary:active:not(:disabled) {
+            transform: translate(2px, 2px);
+            box-shadow: 2px 2px 0 0 var(--border);
+        }
+        .btn-ghost {
+            border-color: var(--border);
+            color: var(--text);
+        }
+        .btn-ghost:hover:not(:disabled) {
+            border-color: var(--cyan);
+            color: var(--cyan);
+        }
+        .btn-lg {
+            padding: 18px 36px;
+            font-size: 1rem;
+        }
+        .btn-link-inline {
+            background: none; border: none; padding: 0; color: var(--cyan);
+            font: inherit; cursor: pointer; text-transform: none; letter-spacing: 0;
+        }
+
+        /* ============ HERO ============ */
+        .hero {
+            position: relative;
+            min-height: 100dvh;
+            padding: 144px 0 80px;
+            overflow: hidden;
+            background:
+                radial-gradient(ellipse at top right, rgba(34, 211, 238, 0.1), transparent 60%),
+                radial-gradient(ellipse at bottom left, rgba(34, 197, 94, 0.05), transparent 60%),
+                var(--bg);
+        }
+        .hero::before {
+            content: '';
+            position: absolute; inset: 0;
+            background-image:
+                linear-gradient(rgba(34, 211, 238, 0.04) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(34, 211, 238, 0.04) 1px, transparent 1px);
+            background-size: 60px 60px;
+            pointer-events: none;
+        }
+        .hero-grid {
+            position: relative; z-index: 1;
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 64px;
+            align-items: center;
+        }
+        @media (min-width: 1024px) { .hero-grid { grid-template-columns: 7fr 5fr; gap: 32px; } }
+        .badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 12px;
+            padding: 8px 16px;
+            border: 2px solid rgba(34, 211, 238, 0.4);
+            background: rgba(34, 211, 238, 0.05);
+            color: var(--cyan);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75rem;
+            letter-spacing: 0.2em;
+            text-transform: uppercase;
+            margin-bottom: 24px;
+        }
+        .badge .dot {
+            width: 8px; height: 8px; border-radius: 50%;
+            background: var(--green);
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.6; transform: scale(0.85); }
+        }
+        .hero h1 {
+            font-size: clamp(2.5rem, 7vw, 6rem);
+            font-weight: 900;
+            line-height: 0.95;
+            letter-spacing: -0.03em;
+            text-transform: uppercase;
+            margin-bottom: 32px;
+        }
+        .hero h1 .accent {
+            display: block;
+            background: linear-gradient(135deg, var(--cyan) 0%, #3b82f6 100%);
+            -webkit-background-clip: text;
+            background-clip: text;
+            color: transparent;
+        }
+        .hero-sub {
+            font-size: 1.125rem;
+            color: var(--text-muted);
+            font-weight: 500;
+            line-height: 1.5;
+            margin-bottom: 32px;
+            max-width: 560px;
+            border-left: 4px solid var(--cyan);
+            padding-left: 24px;
+        }
+        @media (min-width: 768px) { .hero-sub { font-size: 1.25rem; } }
+        .hero-ctas {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 16px;
+            margin-bottom: 48px;
+        }
+        .hero-supported {
+            padding-top: 24px;
+            border-top: 1px solid var(--border);
+        }
+        .hero-supported-label {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.7rem;
+            letter-spacing: 0.2em;
+            text-transform: uppercase;
+            color: var(--text-faint);
+            margin-bottom: 16px;
+        }
+        .hero-supported-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 12px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+            letter-spacing: 0.1em;
+            color: var(--text-muted);
+        }
+        @media (min-width: 768px) { .hero-supported-grid { grid-template-columns: repeat(3, 1fr); } }
+        .hero-supported-grid div::before {
+            content: '> ';
+            color: var(--cyan);
+            font-weight: 700;
+        }
+
+        /* Hero mockup card */
+        .hero-mock {
+            position: relative;
+            border: 2px solid var(--border);
+            background: var(--bg-card);
+            padding: 24px;
+            box-shadow: 16px 16px 0 0 var(--border);
+        }
+        .hero-mock::before,
+        .hero-mock::after {
+            content: '';
+            position: absolute;
+            width: 32px; height: 32px;
+            border-color: var(--cyan);
+        }
+        .hero-mock::before {
+            top: -2px; left: -2px;
+            border-top: 4px solid;
+            border-left: 4px solid;
+        }
+        .hero-mock::after {
+            bottom: -2px; right: -2px;
+            border-bottom: 4px solid;
+            border-right: 4px solid;
+        }
+        .hero-mock-head {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding-bottom: 16px;
+            border-bottom: 1px solid var(--border);
+            margin-bottom: 16px;
+        }
+        .hero-mock-dot { width: 10px; height: 10px; border-radius: 50%; }
+        .hero-mock-dot.red { background: rgba(239, 68, 68, 0.5); }
+        .hero-mock-dot.yellow { background: rgba(234, 179, 8, 0.5); }
+        .hero-mock-dot.green { background: rgba(34, 197, 94, 0.5); }
+        .hero-mock-title {
+            margin-left: 12px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75rem;
+            letter-spacing: 0.15em;
+            color: var(--text-faint);
+            text-transform: uppercase;
+        }
+        .hero-mock-row {
+            display: flex;
+            justify-content: space-between;
+            padding: 12px 0;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+            border-bottom: 1px dashed rgba(255, 255, 255, 0.06);
+        }
+        .hero-mock-row span:first-child { color: var(--text-muted); }
+        .hero-mock-row span:last-child { color: var(--cyan); font-weight: 700; }
+        .hero-mock-row.done span:last-child { color: var(--green); }
+        .hero-mock-status {
+            margin-top: 16px;
+            padding-top: 16px;
+            border-top: 1px solid var(--border);
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75rem;
+            letter-spacing: 0.15em;
+            text-transform: uppercase;
+        }
+        .hero-mock-status .left {
+            color: var(--green);
+            display: flex; align-items: center; gap: 8px;
+        }
+        .hero-mock-status .left::before {
+            content: ''; width: 8px; height: 8px; border-radius: 50%;
+            background: var(--green); animation: pulse 2s infinite;
+        }
+        .hero-mock-status .right { color: var(--text-faint); }
+
+        /* ============ SECTIONS ============ */
+        section {
+            position: relative;
+            padding: 96px 0;
+            scroll-margin-top: 96px;
+        }
+        .section-title-bar {
+            display: inline-flex;
+            align-items: center;
+            gap: 12px;
+            padding: 8px 16px;
+            border: 2px solid rgba(34, 211, 238, 0.4);
+            background: rgba(34, 211, 238, 0.05);
+            color: var(--cyan);
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75rem;
+            letter-spacing: 0.2em;
+            text-transform: uppercase;
+            margin-bottom: 24px;
+        }
+        .section-title-bar.warn {
+            border-color: rgba(239, 68, 68, 0.4);
+            background: rgba(239, 68, 68, 0.05);
+            color: var(--red);
+        }
+        .section-title {
+            font-size: clamp(2.25rem, 5vw, 4.5rem);
+            font-weight: 900;
+            line-height: 1;
+            letter-spacing: -0.02em;
+            text-transform: uppercase;
+            margin-bottom: 24px;
+        }
+        .section-lead {
+            font-size: 1.125rem;
+            color: var(--text-muted);
+            font-weight: 500;
+            line-height: 1.6;
+            max-width: 720px;
+            margin-bottom: 64px;
+            border-left: 4px solid var(--cyan);
+            padding-left: 24px;
+        }
+        @media (min-width: 768px) { .section-lead { font-size: 1.25rem; } }
+
+        /* Bottleneck section */
+        #problem { background: var(--bg-darker); border-top: 8px solid var(--red-dark); }
+        .bottleneck-grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 24px;
+        }
+        @media (min-width: 768px) { .bottleneck-grid { grid-template-columns: repeat(2, 1fr); } }
+        .bottleneck-card {
+            position: relative;
+            background: var(--bg-card);
+            border: 2px solid var(--border);
+            padding: 32px;
+            transition: border-color 0.3s ease;
+        }
+        .bottleneck-card:hover { border-color: rgba(239, 68, 68, 0.5); }
+        .bottleneck-num {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75rem;
+            letter-spacing: 0.2em;
+            color: var(--red);
+            margin-bottom: 12px;
+        }
+        .bottleneck-title {
+            font-size: 1.25rem;
+            font-weight: 700;
+            line-height: 1.3;
+            color: var(--text);
+        }
+
+        /* How It Works section */
+        #how { background: var(--bg); border-top: 4px solid rgba(34, 211, 238, 0.2); }
+        .steps {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 24px;
+        }
+        @media (min-width: 768px) { .steps { grid-template-columns: repeat(3, 1fr); } }
+        .step {
+            position: relative;
+            background: var(--bg-card);
+            border: 2px solid var(--border);
+            padding: 40px 32px;
+            overflow: hidden;
+        }
+        .step-number {
+            position: absolute;
+            top: 16px; right: 24px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 4rem;
+            font-weight: 900;
+            color: rgba(34, 211, 238, 0.15);
+            line-height: 1;
+        }
+        .step-tag {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.7rem;
+            letter-spacing: 0.2em;
+            color: var(--cyan);
+            text-transform: uppercase;
+            margin-bottom: 16px;
+        }
+        .step-title {
+            font-size: 1.5rem;
+            font-weight: 800;
+            line-height: 1.2;
+            margin-bottom: 16px;
+        }
+        .step-body {
+            color: var(--text-muted);
+            line-height: 1.6;
+            font-size: 0.95rem;
+        }
+
+        /* Features section */
+        #features { background: var(--bg-darker); border-top: 4px solid rgba(34, 211, 238, 0.2); }
+        .features-grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 24px;
+        }
+        @media (min-width: 768px) { .features-grid { grid-template-columns: repeat(2, 1fr); } }
+        @media (min-width: 1024px) { .features-grid { grid-template-columns: repeat(3, 1fr); } }
+        .feature {
+            background: var(--bg-card);
+            border: 2px solid var(--border);
+            padding: 40px 32px;
+            transition: border-color 0.2s, transform 0.2s;
+        }
+        .feature:hover {
+            border-color: rgba(34, 211, 238, 0.5);
+            transform: translateY(-4px);
+        }
+        .feature-icon {
+            width: 48px; height: 48px;
+            background: rgba(34, 211, 238, 0.1);
+            border: 1px solid rgba(34, 211, 238, 0.3);
+            color: var(--cyan);
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 24px;
+        }
+        .feature-title {
+            font-size: 1.25rem;
+            font-weight: 800;
+            margin-bottom: 12px;
+            line-height: 1.3;
+        }
+        .feature-body {
+            color: var(--text-muted);
+            line-height: 1.6;
+            font-size: 0.95rem;
+        }
+
+        /* Personas section */
+        #personas { background: var(--bg); border-top: 4px solid rgba(34, 211, 238, 0.2); }
+        .personas-grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 24px;
+        }
+        @media (min-width: 1024px) { .personas-grid { grid-template-columns: repeat(2, 1fr); } }
+        .persona {
+            background: var(--bg-darker);
+            border-left: 4px solid var(--cyan);
+            padding: 32px;
+        }
+        .persona-tag {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75rem;
+            letter-spacing: 0.2em;
+            color: var(--cyan);
+            text-transform: uppercase;
+            margin-bottom: 12px;
+        }
+        .persona-name {
+            font-size: 1.5rem;
+            font-weight: 800;
+            margin-bottom: 16px;
+            line-height: 1.2;
+        }
+        .persona-body {
+            color: var(--text-muted);
+            font-size: 0.95rem;
+            line-height: 1.65;
+        }
+
+        /* Math section */
+        #math { background: var(--bg-darker); border-top: 4px solid rgba(34, 211, 238, 0.2); }
+        .math-grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 32px;
+            align-items: start;
+        }
+        @media (min-width: 1024px) { .math-grid { grid-template-columns: 5fr 7fr; } }
+        .math-input {
+            background: var(--bg);
+            border: 2px solid var(--border);
+            padding: 32px;
+        }
+        .math-input-label {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.7rem;
+            letter-spacing: 0.2em;
+            text-transform: uppercase;
+            color: var(--cyan);
+            margin-bottom: 8px;
+        }
+        .math-slider-group { margin-bottom: 32px; }
+        .math-slider-row {
+            display: flex;
+            justify-content: space-between;
+            align-items: baseline;
+            margin-bottom: 12px;
+        }
+        .math-slider-row .name {
+            font-weight: 600;
+            color: var(--text);
+            font-size: 0.95rem;
+        }
+        .math-slider-row .val {
+            font-family: 'JetBrains Mono', monospace;
+            font-weight: 700;
+            color: var(--cyan);
+            font-size: 1.1rem;
+        }
+        .math-slider {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 100%;
+            height: 4px;
+            background: var(--border);
+            outline: none;
+            cursor: pointer;
+        }
+        .math-slider::-webkit-slider-thumb {
+            -webkit-appearance: none;
+            appearance: none;
+            width: 18px; height: 18px;
+            background: var(--cyan);
+            border: 2px solid var(--bg-darker);
+            cursor: pointer;
+            box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.2);
+        }
+        .math-slider::-moz-range-thumb {
+            width: 18px; height: 18px;
+            background: var(--cyan);
+            border: 2px solid var(--bg-darker);
+            cursor: pointer;
+            box-shadow: 0 0 0 3px rgba(34, 211, 238, 0.2);
+        }
+        .math-slider-meta {
+            display: flex;
+            justify-content: space-between;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.7rem;
+            letter-spacing: 0.15em;
+            color: var(--text-dim);
+            margin-top: 8px;
+        }
+        .math-output {
+            background: var(--bg);
+            border: 2px solid var(--cyan);
+            padding: 32px;
+            box-shadow: 8px 8px 0 0 var(--border);
+        }
+        .math-output-block { margin-bottom: 32px; }
+        .math-output-block:last-child { margin-bottom: 0; }
+        .math-output-label {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.7rem;
+            letter-spacing: 0.2em;
+            color: var(--text-faint);
+            text-transform: uppercase;
+            margin-bottom: 8px;
+        }
+        .math-output-value {
+            font-size: clamp(2.5rem, 6vw, 4.5rem);
+            font-weight: 900;
+            color: var(--text);
+            line-height: 1;
+            font-variant-numeric: tabular-nums;
+        }
+        .math-output-value.cyan { color: var(--cyan); }
+        .math-output-value.green { color: var(--green); }
+        .math-output-sub {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.8rem;
+            color: var(--text-faint);
+            margin-top: 8px;
+            letter-spacing: 0.05em;
+        }
+        .math-note {
+            margin-top: 32px;
+            padding: 16px;
+            background: rgba(34, 211, 238, 0.05);
+            border-left: 4px solid var(--cyan);
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            line-height: 1.6;
+        }
+
+        /* Testimonials */
+        #testimonials { background: var(--bg); border-top: 4px solid rgba(34, 211, 238, 0.2); }
+        .testimonials-grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 24px;
+        }
+        @media (min-width: 1024px) { .testimonials-grid { grid-template-columns: repeat(3, 1fr); } }
+        .testimonial {
+            position: relative;
+            background: var(--bg-card);
+            border: 2px solid var(--border);
+            padding: 40px 32px;
+        }
+        .testimonial::before {
+            content: '\201C';
+            position: absolute;
+            top: 8px; left: 24px;
+            font-family: Georgia, serif;
+            font-size: 5rem;
+            color: rgba(34, 211, 238, 0.2);
+            line-height: 1;
+            pointer-events: none;
+        }
+        .testimonial-body {
+            position: relative;
+            z-index: 1;
+            color: rgba(255, 255, 255, 0.8);
+            font-size: 1.0625rem;
+            line-height: 1.6;
+            font-weight: 500;
+            margin-bottom: 32px;
+            min-height: 140px;
+        }
+        .testimonial-author {
+            padding-top: 24px;
+            border-top: 1px solid var(--border);
+        }
+        .testimonial-name {
+            font-weight: 800;
+            font-size: 0.9rem;
+            letter-spacing: 0.05em;
+            color: var(--text);
+            margin-bottom: 4px;
+        }
+        .testimonial-role {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.7rem;
+            letter-spacing: 0.15em;
+            color: var(--text-faint);
+            text-transform: uppercase;
+        }
+
+        /* CTA / waitlist */
+        #demo { background: var(--bg-darker); border-top: 4px solid rgba(34, 211, 238, 0.2); }
+        .demo-grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 32px;
+            align-items: start;
+        }
+        @media (min-width: 1024px) { .demo-grid { grid-template-columns: 5fr 7fr; } }
+        .demo-card {
+            background: var(--bg-card);
+            border: 4px solid var(--cyan);
+            padding: 40px;
+            box-shadow: 16px 16px 0 0 var(--green);
+            height: 100%;
+        }
+        .demo-card .step-tag { color: var(--green); margin-bottom: 12px; }
+        .demo-card h3 {
+            font-size: 2rem;
+            font-weight: 900;
+            line-height: 1.05;
+            text-transform: uppercase;
+            margin-bottom: 16px;
+        }
+        .demo-card p {
+            color: var(--text-muted);
+            font-size: 1rem;
+            line-height: 1.65;
+            margin-bottom: 16px;
+        }
+        .demo-card ul {
+            list-style: none;
+            margin: 24px 0;
+            padding: 0;
+        }
+        .demo-card ul li {
+            position: relative;
+            padding: 10px 0 10px 28px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.85rem;
+            letter-spacing: 0.08em;
+            color: rgba(255, 255, 255, 0.7);
+            text-transform: uppercase;
+            border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+        }
+        .demo-card ul li:last-child { border-bottom: none; }
+        .demo-card ul li::before {
+            content: '+';
+            position: absolute;
+            left: 0; top: 50%;
+            transform: translateY(-50%);
+            color: var(--green);
+            font-weight: 900;
+            font-size: 1.1rem;
+        }
+        .demo-waitlist {
+            background: var(--bg-card);
+            border: 2px solid var(--border);
+            padding: 40px;
+        }
+        .demo-waitlist h3 {
+            font-size: 1.75rem;
+            font-weight: 900;
+            text-transform: uppercase;
+            letter-spacing: -0.01em;
+            margin-bottom: 12px;
+        }
+        .demo-waitlist .lead {
+            color: var(--text-muted);
+            margin-bottom: 32px;
+            line-height: 1.6;
+        }
+        .demo-options {
+            display: grid;
+            gap: 16px;
+            grid-template-columns: 1fr;
+        }
+        @media (min-width: 640px) { .demo-options { grid-template-columns: 1fr 1fr; } }
+        .demo-option {
+            background: var(--bg-darker);
+            border: 2px solid var(--border);
+            padding: 24px;
             display: flex;
             flex-direction: column;
-            align-items: center;
-            justify-content: center;
-            padding: 2rem;
+            gap: 12px;
+        }
+        .demo-option .tag {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.7rem;
+            letter-spacing: 0.2em;
+            color: var(--cyan);
+            text-transform: uppercase;
+        }
+        .demo-option h4 {
+            font-size: 1.15rem;
+            font-weight: 800;
+            line-height: 1.25;
+        }
+        .demo-option p {
+            color: var(--text-muted);
+            font-size: 0.9rem;
+            line-height: 1.55;
+            flex: 1;
+        }
+
+        /* ============ FOOTER ============ */
+        footer {
+            background: var(--bg-darker);
+            border-top: 4px solid var(--border);
+            padding: 80px 0 48px;
+        }
+        .footer-grid {
+            display: grid;
+            grid-template-columns: 1fr;
+            gap: 48px;
+            margin-bottom: 64px;
+        }
+        @media (min-width: 768px) { .footer-grid { grid-template-columns: 2fr 1fr 1fr; gap: 64px; } }
+        .footer-brand-text {
+            color: var(--text-muted);
+            font-size: 0.9rem;
+            line-height: 1.6;
+            max-width: 360px;
+            margin-top: 16px;
+        }
+        .footer-col-title {
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.7rem;
+            letter-spacing: 0.2em;
+            text-transform: uppercase;
+            color: var(--cyan);
+            margin-bottom: 16px;
+        }
+        .footer-col a, .footer-col span {
+            display: block;
+            color: var(--text-muted);
+            padding: 6px 0;
+            font-size: 0.9rem;
+            transition: color 0.2s;
+        }
+        .footer-col a:hover { color: var(--cyan); cursor: pointer; }
+        .footer-bottom {
+            padding-top: 32px;
+            border-top: 1px solid var(--border);
+            display: flex;
+            flex-direction: column;
+            gap: 16px;
+            font-family: 'JetBrains Mono', monospace;
+            font-size: 0.75rem;
+            letter-spacing: 0.1em;
+            color: var(--text-faint);
+            text-transform: uppercase;
+        }
+        @media (min-width: 768px) {
+            .footer-bottom { flex-direction: row; justify-content: space-between; align-items: center; }
+        }
+
+        /* Continue link for re-auth bounce */
+        .continue-bar {
+            position: fixed;
+            top: 0; left: 0; right: 0;
+            z-index: 60;
+            padding: 12px 24px;
+            background: var(--green);
+            color: var(--bg-darker);
             text-align: center;
+            font-weight: 700;
+            font-size: 0.9rem;
+            letter-spacing: 0.05em;
         }
-        .landing-hero {
-            display: flex;
-            align-items: center;
-            gap: 1.5rem;
-            margin-bottom: 1.5rem;
+        .continue-bar a {
+            text-decoration: underline;
+            font-weight: 800;
         }
-        .landing-hero img { width: 84px; height: auto; }
-        .landing-title {
-            font-size: 2.4rem;
-            margin: 0;
-            color: #fff;
-        }
-        .landing-tagline {
-            color: rgba(203,213,225,0.75);
-            margin-top: 0.25rem;
-            font-size: 1rem;
-            letter-spacing: 0.04em;
-        }
-        .landing-blurb {
-            max-width: 560px;
-            color: rgba(203,213,225,0.85);
-            font-size: 1.05rem;
-            line-height: 1.5;
-            margin: 1rem 0 2rem;
-        }
-        .landing-actions {
-            display: flex;
-            gap: 1rem;
-            flex-wrap: wrap;
-            justify-content: center;
-        }
-        .landing-btn {
-            min-width: 200px;
-            padding: 14px 26px;
-            font-size: 1rem;
-            font-weight: 600;
-            border-radius: 8px;
-            border: 0;
-            cursor: pointer;
-            transition: transform 0.05s ease, box-shadow 0.15s ease;
-        }
-        .landing-btn:active { transform: translateY(1px); }
-        .landing-btn-primary {
-            background: linear-gradient(180deg,#2563eb,#1d4ed8);
-            color: #fff;
-            box-shadow: 0 6px 18px rgba(37,99,235,0.35);
-        }
-        .landing-btn-secondary {
-            background: rgba(255,255,255,0.06);
-            color: #f1f5f9;
-            border: 1px solid rgba(255,255,255,0.18);
-        }
-        .landing-foot {
-            margin-top: 2.5rem;
-            color: rgba(203,213,225,0.5);
-            font-size: 0.85rem;
-        }
-        .landing-foot a { color: #93c5fd; text-decoration: none; }
+
+        .scroll-mt { scroll-margin-top: 96px; }
     </style>
 </head>
-<body class="dark-theme">
-    <main class="landing-shell">
-        <div class="landing-hero">
-            <img src="{{ url_for('static', filename='logo_helm.png') }}" alt="Knight Shift helm">
-            <div>
-                <h1 class="landing-title">
-                    <span class="brand-name-light">Knight</span>
-                    <span class="brand-name-white">Shift</span>
-                </h1>
-                <div class="landing-tagline">Forged by Willpower</div>
+<body>
+    <p id="reauth-bar" class="continue-bar" style="display:none;">
+        Already signed in? <a href="#" id="continue-link">Continue to your account &rarr;</a>
+    </p>
+
+    <header class="nav">
+        <div class="nav-inner">
+            <a href="#" class="nav-brand" aria-label="KnightShift home">
+                <img src="{{ url_for('static', filename='logo_helm_sm.png') }}" alt="">
+                <span class="nav-brand-text">Knight<span>Shift</span></span>
+            </a>
+            <nav class="nav-links" aria-label="Primary">
+                <a href="#problem">Problem</a>
+                <a href="#how">How&nbsp;It&nbsp;Works</a>
+                <a href="#features">Features</a>
+                <a href="#math">ROI</a>
+                <a href="#demo">Demo</a>
+            </nav>
+            <div class="nav-cta">
+                <button type="button" class="btn btn-ghost" id="btn-login" disabled>Log&nbsp;in</button>
+                <button type="button" class="btn btn-primary" id="btn-signup" disabled>Request&nbsp;Access</button>
             </div>
         </div>
+    </header>
 
-        <p class="landing-blurb">
-            Automated painting estimates from your construction documents.
-            Sign in to your account or request access if you're new.
-        </p>
-
-        <div class="landing-actions">
-            <button type="button" class="landing-btn landing-btn-primary"
-                    id="btn-login" disabled>
-                Log in
-            </button>
-            <button type="button" class="landing-btn landing-btn-secondary"
-                    id="btn-signup" disabled>
-                Request access
-            </button>
+    <!-- HERO -->
+    <section class="hero">
+        <div class="container">
+            <div class="hero-grid">
+                <div>
+                    <div class="badge">
+                        <span class="dot"></span>
+                        <span>System Active // Beta</span>
+                    </div>
+                    <h1>
+                        On the lift by day.
+                        <span class="accent">Bidding by midnight.</span>
+                    </h1>
+                    <p class="hero-sub">
+                        Automated commercial-grade painting estimates from your construction documents.
+                        Upload the PDFs, our engine reads the plans, parses the Division&nbsp;09 spec book,
+                        and gives you a real takeoff in minutes. No more midnight bidding.
+                    </p>
+                    <div class="hero-ctas">
+                        <button type="button" class="btn btn-primary btn-lg" id="hero-cta-signup" disabled>Get on the Waitlist</button>
+                        <a href="#demo" class="btn btn-ghost btn-lg">Book a Live Demo &rarr;</a>
+                    </div>
+                    <div class="hero-supported">
+                        <div class="hero-supported-label">[ Built for these commercial applications ]</div>
+                        <div class="hero-supported-grid">
+                            <div>Healthcare</div>
+                            <div>K-12 / Higher Ed</div>
+                            <div>Multifamily</div>
+                            <div>Office Build-outs</div>
+                            <div>Warehouses</div>
+                            <div>Commercial New Build</div>
+                        </div>
+                    </div>
+                </div>
+                <div class="hero-mock" role="img" aria-label="KnightShift estimate processing preview">
+                    <div class="hero-mock-head">
+                        <span class="hero-mock-dot red"></span>
+                        <span class="hero-mock-dot yellow"></span>
+                        <span class="hero-mock-dot green"></span>
+                        <span class="hero-mock-title">Processing&nbsp;Blueprint</span>
+                    </div>
+                    <div class="hero-mock-row"><span>[+] PLAN SHEETS PARSED</span><span>184</span></div>
+                    <div class="hero-mock-row"><span>[+] SPEC SECTIONS READ</span><span>09 90 00</span></div>
+                    <div class="hero-mock-row"><span>[+] PAINTABLE WALL AREA</span><span>42,000 sf</span></div>
+                    <div class="hero-mock-row"><span>[+] CEILINGS &amp; SOFFITS</span><span>18,400 sf</span></div>
+                    <div class="hero-mock-row"><span>[+] DOOR / FRAME COUNT</span><span>312</span></div>
+                    <div class="hero-mock-row"><span>[+] CROSSOVER SUBMITTALS</span><span>PPG&nbsp;&rarr;&nbsp;SW</span></div>
+                    <div class="hero-mock-row done"><span>[+] ESTIMATE COMPILED</span><span>READY</span></div>
+                    <div class="hero-mock-status">
+                        <span class="left">System Operational</span>
+                        <span class="right">v.&nbsp;Live&nbsp;Build&nbsp;2026</span>
+                    </div>
+                </div>
+            </div>
         </div>
+    </section>
 
-        <p class="landing-foot" id="landing-foot" style="display:none;">
-            Already signed in? <a href="#" id="continue-link">Continue to your account &rarr;</a>
-        </p>
-    </main>
+    <!-- THE BOTTLENECK -->
+    <section id="problem">
+        <div class="container">
+            <div class="section-title-bar warn">
+                <span>!</span><span>Warning: Not a Residential Tool</span>
+            </div>
+            <h2 class="section-title">The Bottleneck</h2>
+            <p class="section-lead">
+                The painting industry runs on precision, but the way we estimate is broken. Manual takeoffs
+                are a massive bottleneck for commercial contractors. Every hour spent counting doors is an
+                hour not spent reviewing scope or winning jobs.
+            </p>
+            <div class="bottleneck-grid">
+                <div class="bottleneck-card">
+                    <div class="bottleneck-num">01 // Plan Reading</div>
+                    <div class="bottleneck-title">Clicking through hundreds of pages, manually scaling and measuring walls, ceilings, and trim.</div>
+                </div>
+                <div class="bottleneck-card">
+                    <div class="bottleneck-num">02 // Spec Cross-Reference</div>
+                    <div class="bottleneck-title">Flipping between drawing notes and the Division&nbsp;09 spec book to figure out the right system.</div>
+                </div>
+                <div class="bottleneck-card">
+                    <div class="bottleneck-num">03 // Spreadsheet Gymnastics</div>
+                    <div class="bottleneck-title">Reconciling counts across drawings, rolling up areas by system, padding for waste, and hoping the formulas didn&rsquo;t drift.</div>
+                </div>
+                <div class="bottleneck-card">
+                    <div class="bottleneck-num">04 // Bid Package Assembly</div>
+                    <div class="bottleneck-title">Formatting proposals and assembling submittals at 11&nbsp;PM the night before the bid is due.</div>
+                </div>
+            </div>
+        </div>
+    </section>
 
-    {% if clerk_publishable_key and clerk_frontend_api_host %}
+    <!-- HOW IT WORKS -->
+    <section id="how">
+        <div class="container">
+            <div class="section-title-bar"><span>&middot;</span><span>How It Works</span></div>
+            <h2 class="section-title">Three Steps. Real PDF. Live Results.</h2>
+            <p class="section-lead">
+                Upload architectural PDFs. Our AI reads the plans, parses the specs, and generates a
+                commercial-grade painting estimate instantly. No more midnight takeoffs.
+            </p>
+            <div class="steps">
+                <div class="step">
+                    <div class="step-number">01</div>
+                    <div class="step-tag">Step 01 // Input</div>
+                    <h3 class="step-title">Upload Bid Set</h3>
+                    <p class="step-body">Drag and drop your architectural drawings and the Division&nbsp;09 spec book directly into KnightShift.</p>
+                </div>
+                <div class="step">
+                    <div class="step-number">02</div>
+                    <div class="step-tag">Step 02 // AI Analysis</div>
+                    <h3 class="step-title">Engine Runs Live</h3>
+                    <p class="step-body">Our engine reads the PDFs, measures all paintable surfaces, identifies openings, and extracts the specified paint systems.</p>
+                </div>
+                <div class="step">
+                    <div class="step-number">03</div>
+                    <div class="step-tag">Step 03 // Output</div>
+                    <h3 class="step-title">Get Proposal</h3>
+                    <p class="step-body">Review your detailed takeoff, make final adjustments, and generate a client-ready proposal and finish schedule.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- FEATURES -->
+    <section id="features">
+        <div class="container">
+            <div class="section-title-bar"><span>&middot;</span><span>Capabilities</span></div>
+            <h2 class="section-title">Built for Commercial. Built Tough.</h2>
+            <p class="section-lead">
+                A comprehensive toolset designed explicitly for commercial painting contractors.
+                Built tough. Built accurate.
+            </p>
+            <div class="features-grid">
+                <div class="feature">
+                    <div class="feature-icon">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></svg>
+                    </div>
+                    <h3 class="feature-title">Plan Reading That Doesn&rsquo;t Hallucinate</h3>
+                    <p class="feature-body">Reads PDFs like an experienced estimator. Identifies paintable surfaces, calculates square footage from drawings, reads the spec book for product requirements.</p>
+                </div>
+                <div class="feature">
+                    <div class="feature-icon">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M11 4.562v16.157a1 1 0 0 0 1.242.97L19 20V5.562a2 2 0 0 0-1.515-1.94l-4-1A2 2 0 0 0 11 4.561z"/><path d="M3 6v14"/><path d="M21 6v14"/></svg>
+                    </div>
+                    <h3 class="feature-title">Commercial Paint Knowledge Built-In</h3>
+                    <p class="feature-body">Built around products commercial painters actually use: SW ProMar 200/400, Pro Industrial, Loxon, Macropoxy, ArmorSeal &mdash; not residential.</p>
+                </div>
+                <div class="feature">
+                    <div class="feature-icon">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M16 13H8"/><path d="M16 17H8"/><path d="M10 9H8"/><rect width="14" height="20" x="5" y="2" rx="2"/></svg>
+                    </div>
+                    <h3 class="feature-title">CSI-Formatted Finish Schedule</h3>
+                    <p class="feature-body">CSI 09&nbsp;90&nbsp;00 finish schedule with rendered color swatches, product specs by room/space, sheen levels, and application notes.</p>
+                </div>
+                <div class="feature">
+                    <div class="feature-icon">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/></svg>
+                    </div>
+                    <h3 class="feature-title">Crossover Submittals, Auto-Generated</h3>
+                    <p class="feature-body">Auto-generate Sherwin-Williams crossover substitution requests with technical data comparison and VOC compliance when other brands are specified.</p>
+                </div>
+                <div class="feature">
+                    <div class="feature-icon">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 10H4a2 2 0 0 0-2 2v7a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-7a2 2 0 0 0-2-2h-2"/><path d="M10 10V5a1 1 0 0 1 1-1h2a1 1 0 0 1 1 1v5"/></svg>
+                    </div>
+                    <h3 class="feature-title">Production-Ready Bid Package</h3>
+                    <p class="feature-body">Combines estimate, finish schedule, crossover submittal, and cover letter into one deliverable that goes straight to the GC.</p>
+                </div>
+                <div class="feature">
+                    <div class="feature-icon">
+                        <svg width="24" height="24" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="10"/><path d="M2 12h20"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
+                    </div>
+                    <h3 class="feature-title">Calibrated to Real Job Data</h3>
+                    <p class="feature-body">Built on real historical job data. Knows labor rates, crew productivity by surface type, material coverage rates, and regional pricing.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- PERSONAS -->
+    <section id="personas">
+        <div class="container">
+            <div class="section-title-bar"><span>&middot;</span><span>Who It&rsquo;s For</span></div>
+            <h2 class="section-title">Same Engine. Different Scale.</h2>
+            <p class="section-lead">
+                One-truck owner-op chasing your first commercial job. ENR Top 400 contractor with six
+                estimators on staff. KnightShift is the same compounding leverage &mdash; it just looks
+                different at scale.
+            </p>
+            <div class="personas-grid">
+                <div class="persona">
+                    <div class="persona-tag">01 // The Owner-Operator</div>
+                    <h3 class="persona-name">On the lift by day. Bidding by midnight.</h3>
+                    <p class="persona-body">You&rsquo;re a working painter. You&rsquo;re running the crew, cutting in trim, and chasing punch lists until 5&nbsp;PM. Then bid sets stack up. KnightShift turns the 8-hour midnight takeoff into a 15-minute job you can do from your truck.</p>
+                </div>
+                <div class="persona">
+                    <div class="persona-tag">02 // Residential Going Commercial</div>
+                    <h3 class="persona-name">Commercial work is locked behind plan reading.</h3>
+                    <p class="persona-body">Residential painters need to measure a living room. You need to estimate 200,000&nbsp;sq&nbsp;ft of high-performance epoxy and dryfall. KnightShift is built strictly for commercial applications with the product data you actually specify.</p>
+                </div>
+                <div class="persona">
+                    <div class="persona-tag">03 // The Small Shop Ready To Scale</div>
+                    <h3 class="persona-name">You&rsquo;d bid more if you had the hours.</h3>
+                    <p class="persona-body">You&rsquo;re winning the work you bid on. The problem is you can only bid 6 jobs a month before your one estimator is buried. KnightShift is the leverage that lets a 4-person shop bid like a 20-person shop &mdash; without hiring another estimator.</p>
+                </div>
+                <div class="persona">
+                    <div class="persona-tag">04 // The Enterprise Estimating Department</div>
+                    <h3 class="persona-name">Six estimators. Still missing bids.</h3>
+                    <p class="persona-body">Your team is buried. Quality bid sets hit the desk Wednesday and are due Friday &mdash; and they slip. KnightShift turns a 6-estimator team into a 12-estimator team without the headcount, the recruiting, or the overhead.</p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- THE MATH -->
+    <section id="math">
+        <div class="container">
+            <div class="section-title-bar"><span>&middot;</span><span>The Math You&rsquo;re Avoiding</span></div>
+            <h2 class="section-title">That&rsquo;s What Your Takeoff Costs You.</h2>
+            <p class="section-lead">
+                Drag the sliders. Watch the numbers move. Plug in your real estimator rate, your real
+                bid volume, your real takeoff hours. The math doesn&rsquo;t lie.
+            </p>
+            <div class="math-grid">
+                <div class="math-input">
+                    <div class="math-input-label">[ Input ] Your Operation</div>
+                    <div class="math-slider-group">
+                        <div class="math-slider-row"><span class="name">Estimator Hourly Rate</span><span class="val mono" id="m-rate-val">$95</span></div>
+                        <input class="math-slider" type="range" min="40" max="200" step="5" value="95" id="m-rate" aria-label="Estimator hourly rate">
+                        <div class="math-slider-meta"><span>$40</span><span>$200</span></div>
+                    </div>
+                    <div class="math-slider-group">
+                        <div class="math-slider-row"><span class="name">Hours per Manual Takeoff</span><span class="val mono" id="m-hours-val">8&nbsp;hrs</span></div>
+                        <input class="math-slider" type="range" min="2" max="40" step="1" value="8" id="m-hours" aria-label="Hours per manual takeoff">
+                        <div class="math-slider-meta"><span>2&nbsp;hrs</span><span>40&nbsp;hrs</span></div>
+                    </div>
+                    <div class="math-slider-group">
+                        <div class="math-slider-row"><span class="name">Bid Sets per Month</span><span class="val mono" id="m-bids-val">12</span></div>
+                        <input class="math-slider" type="range" min="2" max="60" step="1" value="12" id="m-bids" aria-label="Bid sets per month">
+                        <div class="math-slider-meta"><span>2</span><span>60</span></div>
+                    </div>
+                    <div class="math-slider-group">
+                        <div class="math-slider-row"><span class="name">Win Rate</span><span class="val mono" id="m-win-val">25%</span></div>
+                        <input class="math-slider" type="range" min="5" max="60" step="1" value="25" id="m-win" aria-label="Win rate percent">
+                        <div class="math-slider-meta"><span>5%</span><span>60%</span></div>
+                    </div>
+                </div>
+                <div class="math-output">
+                    <div class="math-output-block">
+                        <div class="math-output-label">What You&rsquo;re Spending Today</div>
+                        <div class="math-output-value" id="m-cost">$109,440</div>
+                        <div class="math-output-sub mono">/&nbsp;year on takeoff labor</div>
+                    </div>
+                    <div class="math-output-block">
+                        <div class="math-output-label">KnightShift Baseline</div>
+                        <div class="math-output-value cyan" id="m-ksbase">15&nbsp;min</div>
+                        <div class="math-output-sub mono">per takeoff &mdash; no shortcuts, real numbers</div>
+                    </div>
+                    <div class="math-output-block">
+                        <div class="math-output-label">Additional Pipeline You Could Capture</div>
+                        <div class="math-output-value green" id="m-upside">$1.8M</div>
+                        <div class="math-output-sub mono">/&nbsp;year if you doubled your bid output (<span id="m-win-out">25</span>% win rate)</div>
+                    </div>
+                    <div class="math-note">
+                        Capped at 2&times; current volume &mdash; the realistic growth ceiling. Assumes a
+                        $300K avg commercial project at your stated win rate. Stop paying $80K/yr to do
+                        data entry.
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- TESTIMONIALS -->
+    <section id="testimonials">
+        <div class="container">
+            <div class="section-title-bar"><span>&middot;</span><span>Trusted by Trades Who Spot BS Instantly</span></div>
+            <h2 class="section-title">From the Field.</h2>
+            <div class="testimonials-grid">
+                <div class="testimonial">
+                    <p class="testimonial-body">We were spending a full day per bid set just doing the takeoff. KnightShift gives us the quantities in 20 minutes. It&rsquo;s the first AI tool that actually understands a spec book.</p>
+                    <div class="testimonial-author">
+                        <div class="testimonial-name">Sarah&nbsp;L.</div>
+                        <div class="testimonial-role">VP of Precon &middot; Northeast Commercial Painters</div>
+                    </div>
+                </div>
+                <div class="testimonial">
+                    <p class="testimonial-body">I&rsquo;ve tried generic estimating software, but they don&rsquo;t get the nuances of Division&nbsp;09. KnightShift knows what a cutback is and how to calculate waste for dryfall vs block filler.</p>
+                    <div class="testimonial-author">
+                        <div class="testimonial-name">David&nbsp;R.</div>
+                        <div class="testimonial-role">Apex Coatings Group</div>
+                    </div>
+                </div>
+                <div class="testimonial">
+                    <p class="testimonial-body">The crossover submittal engine alone pays for the software. Taking a PPG spec and automatically mapping it to Sherwin equivalents with all the documentation ready for the GC is incredible.</p>
+                    <div class="testimonial-author">
+                        <div class="testimonial-name">R&amp;R Industrial Painting</div>
+                        <div class="testimonial-role">Estimating Lead</div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <!-- DEMO / WAITLIST -->
+    <section id="demo">
+        <div class="container">
+            <div class="section-title-bar"><span>&middot;</span><span>See It On Your Bid Set</span></div>
+            <h2 class="section-title">No Slideshow. No Sales Deck. Just Your PDF and Our Engine.</h2>
+            <p class="section-lead">
+                30 minutes. We walk you through the platform, process your bid set live on the call,
+                and you leave with a real estimate in hand.
+            </p>
+            <div class="demo-grid">
+                <div class="demo-card">
+                    <div class="step-tag">Highest&nbsp;Conviction</div>
+                    <h3>Book a Live Demo</h3>
+                    <p>Lock in a 30-minute window. Have your bid set ready &mdash; we&rsquo;re going to run it live, on the call.</p>
+                    <ul>
+                        <li>Bring a real bid set</li>
+                        <li>Live PDF &rarr; estimate</li>
+                        <li>Concierge onboarding when called up</li>
+                        <li>First-look at new specs &amp; features</li>
+                        <li>Founder pricing locked in</li>
+                    </ul>
+                    <a href="mailto:hello@knightshiftai.com?subject=Book%20a%20KnightShift%20demo&amp;body=Hi%20%E2%80%94%20I%27d%20like%20to%20book%20a%20live%20demo.%20My%20bid%20set%20is%20attached%20or%20I%20can%20bring%20one%20to%20the%20call." class="btn btn-primary btn-lg" style="margin-top: 8px;">Book Demo &rarr;</a>
+                </div>
+                <div class="demo-waitlist">
+                    <h3>Or Get on the Early Access Waitlist</h3>
+                    <p class="lead">No commitment. We&rsquo;ll ping you when your seat in the beta opens. Want to wait? Get in line. Want to see it crush a bid on a live call? Book the demo.</p>
+                    <div class="demo-options">
+                        <div class="demo-option">
+                            <span class="tag">Track 01 // Get in Line</span>
+                            <h4>Request Beta Access</h4>
+                            <p>Tell us about your shop. We&rsquo;ll reach out the moment your slot opens.</p>
+                            <button type="button" class="btn btn-primary" id="waitlist-cta" disabled>Request Access</button>
+                        </div>
+                        <div class="demo-option">
+                            <span class="tag">Track 02 // Already a Member</span>
+                            <h4>Log In to Your Account</h4>
+                            <p>Existing customer? Jump straight to your estimator dashboard.</p>
+                            <button type="button" class="btn btn-ghost" id="login-cta" disabled>Log In</button>
+                        </div>
+                    </div>
+                    <p class="mono" style="margin-top: 24px; font-size: 0.75rem; letter-spacing: 0.15em; color: var(--text-faint); text-transform: uppercase;">
+                        Questions? <a href="mailto:hello@knightshiftai.com" style="color: var(--cyan);">hello@knightshiftai.com</a>
+                    </p>
+                </div>
+            </div>
+        </div>
+    </section>
+
+    <footer>
+        <div class="container">
+            <div class="footer-grid">
+                <div class="footer-col">
+                    <a href="#" class="nav-brand" style="font-size: 1.5rem;">
+                        <img src="{{ url_for('static', filename='logo_helm_sm.png') }}" alt="">
+                        <span class="nav-brand-text">Knight<span>Shift</span></span>
+                    </a>
+                    <p class="footer-brand-text">
+                        Automated commercial painting estimates from architectural PDFs.
+                        Forged by willpower. Built for the trades.
+                    </p>
+                </div>
+                <div class="footer-col">
+                    <div class="footer-col-title">Product</div>
+                    <a href="#features">Features</a>
+                    <a href="#how">How It Works</a>
+                    <a href="#math">ROI Calculator</a>
+                    <a href="#demo">Book a Demo</a>
+                </div>
+                <div class="footer-col">
+                    <div class="footer-col-title">Account</div>
+                    <a href="#" id="footer-login">Log In</a>
+                    <a href="#" id="footer-signup">Request Access</a>
+                    <a href="mailto:hello@knightshiftai.com">Contact</a>
+                </div>
+            </div>
+            <div class="footer-bottom">
+                <div>A Knight Shift / Get Trades AI product &middot; System build {{ "now"|default("2026") }}</div>
+                <div>&copy; <span id="year">2026</span> Knight Shift AI</div>
+            </div>
+        </div>
+    </footer>
+
     <script>
+    // ---- ROI calculator ----
     (function() {
-        // If we just got bounced here from a failed reload-after-signin,
-        // skip the auto-redirect to avoid a loop. The user can still click
-        // a CTA manually.
+        const fmtMoney = (n) => '$' + Math.round(n).toLocaleString();
+        const fmtMoneyShort = (n) => {
+            if (n >= 1e6) return '$' + (n / 1e6).toFixed(n >= 10e6 ? 0 : 1) + 'M';
+            if (n >= 1e3) return '$' + Math.round(n / 1e3) + 'K';
+            return '$' + Math.round(n);
+        };
+        const $ = (id) => document.getElementById(id);
+        const rate = $('m-rate'), hours = $('m-hours'), bids = $('m-bids'), win = $('m-win');
+        const cost = $('m-cost'), upside = $('m-upside'), winOut = $('m-win-out');
+        const avgProject = 300000; // assumed avg commercial job size, $300K
+
+        function update() {
+            const r = +rate.value, h = +hours.value, b = +bids.value, w = +win.value;
+            $('m-rate-val').textContent = fmtMoney(r);
+            $('m-hours-val').textContent = h + ' hrs';
+            $('m-bids-val').textContent = b;
+            $('m-win-val').textContent = w + '%';
+            winOut.textContent = w;
+            const annualCost = r * h * b * 12;
+            cost.textContent = fmtMoney(annualCost);
+            // Upside: doubling bid output → extra (b * 12) bids/yr → wins = bids * win% → $ = wins * avgProject
+            const extraBids = b * 12;
+            const extraWins = extraBids * (w / 100);
+            const extraRev = extraWins * avgProject;
+            upside.textContent = fmtMoneyShort(extraRev);
+        }
+        [rate, hours, bids, win].forEach((el) => el.addEventListener('input', update));
+        update();
+        $('year').textContent = new Date().getFullYear();
+    })();
+
+    // ---- Clerk bootstrap (same pattern as previous landing) ----
+    (function() {
         const params = new URLSearchParams(window.location.search);
         const skipAutoRedirect = params.get('reauth') === '1';
 
@@ -122,52 +1324,56 @@
             const Clerk = window.Clerk;
             await Clerk.load();
 
-            // Already signed in (Clerk has a session client-side, but the
-            // server-side cookie may not have been set on the previous
-            // request). Reload so the server can route us to the right page.
+            // Cold-cookie case: server didn't see a session on first hit,
+            // but Clerk has one client-side. Reload so the server can route
+            // us to the right page.
             if (Clerk.user && !skipAutoRedirect) {
                 window.location.replace('/?reauth=1');
                 return;
             }
 
-            // Reauth bounce: just show a "continue" link and disable the
-            // auto-redirect. User can click through manually.
+            // Re-auth bounce: server still doesn't see a session even after
+            // a reload. Surface a manual "continue" link rather than looping.
             if (Clerk.user && skipAutoRedirect) {
-                const foot = document.getElementById('landing-foot');
+                const bar = document.getElementById('reauth-bar');
                 const link = document.getElementById('continue-link');
-                if (foot) foot.style.display = '';
+                if (bar) bar.style.display = '';
                 if (link) link.addEventListener('click', (e) => {
                     e.preventDefault();
                     window.location.replace('/');
                 });
             }
 
-            const login = document.getElementById('btn-login');
-            const signup = document.getElementById('btn-signup');
-            login.disabled = false;
-            signup.disabled = false;
+            const signInOpts = { afterSignInUrl: '/', afterSignUpUrl: '/onboarding' };
+            const signUpOpts = { afterSignUpUrl: '/onboarding', afterSignInUrl: '/' };
+            const openSignIn = (e) => { e && e.preventDefault(); Clerk.openSignIn(signInOpts); };
+            const openSignUp = (e) => { e && e.preventDefault(); Clerk.openSignUp(signUpOpts); };
 
-            login.addEventListener('click', () => {
-                Clerk.openSignIn({
-                    afterSignInUrl: '/',
-                    afterSignUpUrl: '/onboarding',
-                });
+            const loginIds = ['btn-login', 'login-cta', 'footer-login'];
+            const signupIds = ['btn-signup', 'hero-cta-signup', 'waitlist-cta', 'footer-signup'];
+            loginIds.forEach((id) => {
+                const el = document.getElementById(id);
+                if (!el) return;
+                el.disabled = false;
+                el.addEventListener('click', openSignIn);
             });
-            signup.addEventListener('click', () => {
-                Clerk.openSignUp({
-                    afterSignUpUrl: '/onboarding',
-                    afterSignInUrl: '/',
-                });
+            signupIds.forEach((id) => {
+                const el = document.getElementById(id);
+                if (!el) return;
+                el.disabled = false;
+                el.addEventListener('click', openSignUp);
             });
         };
     })();
     </script>
+
+    {% if clerk_publishable_key and clerk_frontend_api_host %}
     <script async crossorigin="anonymous"
         data-clerk-publishable-key="{{ clerk_publishable_key }}"
         src="https://{{ clerk_frontend_api_host }}/npm/@clerk/clerk-js@5/dist/clerk.browser.js"
         onload="window.__bootClerk()"></script>
     {% else %}
-    <noscript><p style="color:#fff;text-align:center;">JavaScript is required.</p></noscript>
+    <noscript><p style="color:#fff;text-align:center;padding:24px;">JavaScript is required.</p></noscript>
     {% endif %}
 </body>
 </html>
