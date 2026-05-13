@@ -368,17 +368,20 @@ def index():
         → waitlist.html.
       - Authenticated, approved → existing estimate form (index.html).
 
-    Phones are redirected to /mobile unless ?desktop=1 is passed.
+    Phones get the streamlined /mobile submission form once signed in.
+    Anonymous phone visitors still see the full marketing landing.
+    ?desktop=1 opts a phone into the desktop layout regardless of auth.
     """
-    if _is_mobile_ua() and request.args.get("desktop") != "1":
-        return redirect(url_for("mobile"))
-
     _uid, snap = _try_signed_in_user_snapshot()
     if snap is None:
         # Cold-cookie path: render landing. Its JS detects an existing Clerk
         # session and reloads (now with the cookie set) — that lands here
-        # again with `snap` populated.
+        # again with `snap` populated. Anon phones get the same marketing
+        # page (now mobile-responsive); /mobile is only useful post-login.
         return render_template("landing.html")
+
+    if _is_mobile_ua() and request.args.get("desktop") != "1":
+        return redirect(url_for("mobile"))
 
     if snap["org_id"] is None:
         return redirect(url_for("onboarding"))
