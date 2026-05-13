@@ -42,9 +42,9 @@ OVERHEAD_PERCENTAGE = 0.15
 PROFIT_MARGIN = 0.20
 
 # Company Info - UPDATE THESE!
-COMPANY_NAME = "Your Painting Company"
-COMPANY_EMAIL = "proposals@yourcompany.com"
-COMPANY_PHONE = "(555) 123-4567"
+COMPANY_NAME = "Knight Shift"
+COMPANY_EMAIL = "admin@knightshiftai.com"
+COMPANY_PHONE = "978-618-4071"
 
 # Coverage rates
 COVERAGE_RATES = {

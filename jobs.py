@@ -29,6 +29,7 @@ from config import (
     EMAIL_ADDRESS, EMAIL_APP_PASSWORD,
     EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT,
     COMPANY_NAME, COMPANY_EMAIL, COMPANY_PHONE,
+    ADMIN_EMAILS,
 )
 import storage
 from db import session_scope
@@ -530,6 +531,10 @@ Best regards,
     msg = MIMEMultipart()
     msg["From"] = f"{COMPANY_NAME} <{EMAIL_ADDRESS}>"
     msg["To"] = f"{contact_info['name']} <{contact_info['email']}>"
+    cc_addrs = sorted(a for a in ADMIN_EMAILS
+                      if a != (contact_info.get("email") or "").lower())
+    if cc_addrs:
+        msg["Cc"] = ", ".join(cc_addrs)
     msg["Subject"] = "Knight Shift - Your Painting Estimate is Ready"
     msg.attach(MIMEText(body, "plain"))
 
@@ -589,6 +594,8 @@ Best regards,
     msg = MIMEMultipart()
     msg["From"] = f"{COMPANY_NAME} <{EMAIL_ADDRESS}>"
     msg["To"] = f"{contact_info['name']} <{contact_info['email']}>"
+    if (contact_info.get("email") or "").lower() != "admin@knightshiftai.com":
+        msg["Cc"] = "admin@knightshiftai.com"
     msg["Subject"] = "Knight Shift - Issue Processing Your Documents"
     msg.attach(MIMEText(body, "plain"))
 
