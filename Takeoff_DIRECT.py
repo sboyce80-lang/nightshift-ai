@@ -1102,11 +1102,19 @@ def _summarize_excluded(excluded):
     return ", ".join(parts)
 
 
-def _render_pages_to_images(pdf_path, page_numbers, dpi=250):
+def _render_pages_to_images(pdf_path, page_numbers, dpi=250,
+                             output_format="png", jpeg_quality=85):
     """
-    Render specific PDF pages to PNG images at the given DPI using PyMuPDF.
-    Returns list of (page_num_0based, base64_png_string) tuples.
-    At 250 DPI a letter page is ~2080×2690 px (~300-500 KB PNG).
+    Render specific PDF pages to images at the given DPI using PyMuPDF.
+    Returns list of (page_num_0based, base64_string) tuples.
+
+    output_format: "png" (default, lossless) or "jpeg". JPEG at q=85 is
+    visually equivalent to PNG for Claude's vision input (which downscales
+    everything to 1568px anyway) but compresses ~5-10× better on dense
+    architectural raster content — critical for staying under Claude's
+    5 MB per-image base64 cap on DD-scale pages.
+
+    At 250 DPI a letter page is ~2080×2690 px (~300-500 KB PNG, ~80-150 KB JPEG).
     """
     import fitz  # PyMuPDF
 
@@ -1120,11 +1128,16 @@ def _render_pages_to_images(pdf_path, page_numbers, dpi=250):
             continue
         page = doc[page_num]
         pix = page.get_pixmap(matrix=matrix)
-        png_bytes = pix.tobytes("png")
-        b64 = base64.standard_b64encode(png_bytes).decode("utf-8")
+        if output_format == "jpeg":
+            img_bytes = pix.tobytes("jpeg", jpg_quality=jpeg_quality)
+            label = "JPEG"
+        else:
+            img_bytes = pix.tobytes("png")
+            label = "PNG"
+        b64 = base64.standard_b64encode(img_bytes).decode("utf-8")
         images.append((page_num, b64))
         print(f"      📸 Rendered page {page_num + 1} → "
-              f"{pix.width}×{pix.height} px ({len(png_bytes)/1024:.0f} KB)")
+              f"{pix.width}×{pix.height} px ({len(img_bytes)/1024:.0f} KB {label})")
 
     doc.close()
     return images
@@ -1298,23 +1311,28 @@ def _parse_floor_plan_text(text_layer):
     }
 
 
-def _enhance_image_for_extraction(png_bytes):
+def _enhance_image_for_extraction(image_bytes, output_format="PNG",
+                                   jpeg_quality=85):
     """
     Apply contrast enhancement and sharpening to a rendered PDF page image.
     Architectural drawings benefit from increased contrast (thin lines on white)
     and slight sharpening to make text/dimensions more legible.
 
     Args:
-        png_bytes: raw PNG bytes
+        image_bytes: raw image bytes (PNG or JPEG — PIL auto-detects)
+        output_format: "PNG" (default, lossless) or "JPEG". Use JPEG when
+            the caller will send the result to Claude's vision API on a
+            dense page that would otherwise exceed the 5 MB base64 cap.
+        jpeg_quality: q for JPEG output (ignored for PNG)
     Returns:
-        enhanced PNG bytes
+        enhanced image bytes in the requested format
     """
     try:
         from PIL import Image, ImageEnhance
         import io
 
         Image.MAX_IMAGE_PIXELS = None  # architectural sheets are large
-        img = Image.open(io.BytesIO(png_bytes))
+        img = Image.open(io.BytesIO(image_bytes))
 
         # Increase contrast by 1.3x — makes thin architectural lines pop
         enhancer = ImageEnhance.Contrast(img)
@@ -1324,13 +1342,18 @@ def _enhance_image_for_extraction(png_bytes):
         enhancer = ImageEnhance.Sharpness(img)
         img = enhancer.enhance(1.5)
 
-        # Save back to PNG bytes
         buf = io.BytesIO()
-        img.save(buf, format="PNG", optimize=True)
+        if output_format.upper() == "JPEG":
+            # JPEG can't encode alpha; flatten if needed
+            if img.mode in ("RGBA", "LA", "P"):
+                img = img.convert("RGB")
+            img.save(buf, format="JPEG", quality=jpeg_quality, optimize=True)
+        else:
+            img.save(buf, format="PNG", optimize=True)
         return buf.getvalue()
     except (ImportError, Exception):
         # PIL not available or image processing failed — return original
-        return png_bytes
+        return image_bytes
 
 
 def _tile_page(pdf_path, page_index, grid=(2, 2), dpi=300, overlap_pct=0.05):
@@ -1793,19 +1816,23 @@ def _analyze_floor_plan_as_images(client, pdf_path, scope_notes="",
     total_pages = len(doc)
     doc.close()
 
-    # Render all pages as images
+    # Render all pages as JPEG (q=85). PNG of DD-scale pages routinely
+    # exceeded Claude's 5 MB per-image cap; JPEG q=85 is visually equivalent
+    # for Claude's downscaled-to-1568px vision input but ~5-10× smaller.
     page_numbers = list(range(total_pages))
     print(f"\n   🖼️  IMAGE FALLBACK: Rendering {total_pages} page(s) "
-          f"at {IMAGE_FALLBACK_DPI} DPI...")
+          f"at {IMAGE_FALLBACK_DPI} DPI (JPEG q=85)...")
     images = _render_pages_to_images(pdf_path, page_numbers,
-                                      dpi=IMAGE_FALLBACK_DPI)
+                                      dpi=IMAGE_FALLBACK_DPI,
+                                      output_format="jpeg", jpeg_quality=85)
 
     if not images:
         print(f"   ❌ Image fallback: no pages rendered")
         return None
 
-    # Safety check: auto-reduce DPI if any page exceeds Claude's 8000px limit
+    # Safety check 1: auto-reduce DPI if any page exceeds Claude's 8000px limit
     MAX_DIMENSION = 7999
+    current_dpi = IMAGE_FALLBACK_DPI
     for page_num, b64_data in images:
         raw_bytes = base64.standard_b64decode(b64_data)
         try:
@@ -1817,21 +1844,43 @@ def _analyze_floor_plan_as_images(client, pdf_path, scope_notes="",
             if max(w, h) > MAX_DIMENSION:
                 # Re-render at reduced DPI
                 scale = MAX_DIMENSION / max(w, h)
-                reduced_dpi = int(IMAGE_FALLBACK_DPI * scale)
+                current_dpi = int(IMAGE_FALLBACK_DPI * scale)
                 print(f"      ⚠️  Page {page_num + 1} is {w}×{h}px — "
-                      f"re-rendering at {reduced_dpi} DPI")
+                      f"re-rendering at {current_dpi} DPI")
                 images = _render_pages_to_images(pdf_path, page_numbers,
-                                                  dpi=reduced_dpi)
+                                                  dpi=current_dpi,
+                                                  output_format="jpeg",
+                                                  jpeg_quality=85)
                 break  # re-rendered all pages at lower DPI
         except ImportError:
             pass  # can't check dimensions without PIL, proceed anyway
 
-    # Optional image enhancement
+    # Safety check 2: ensure no image exceeds Claude's 5 MB base64 cap.
+    # JPEG q=85 should keep us under, but on very dense pages a step-down
+    # to q=70 + lower DPI may still be needed. Iterate up to 3 reductions.
+    MAX_B64_BYTES = 5 * 1024 * 1024
+    for _attempt in range(3):
+        oversized = [(p, len(b64)) for p, b64 in images
+                     if len(b64.encode("ascii")) > MAX_B64_BYTES]
+        if not oversized:
+            break
+        # Reduce DPI by 25% and quality to 70, re-render everything
+        current_dpi = max(120, int(current_dpi * 0.75))
+        print(f"      ⚠️  {len(oversized)} page(s) exceed 5 MB cap — "
+              f"re-rendering all at {current_dpi} DPI, JPEG q=70")
+        images = _render_pages_to_images(pdf_path, page_numbers,
+                                          dpi=current_dpi,
+                                          output_format="jpeg",
+                                          jpeg_quality=70)
+
+    # Optional image enhancement — preserve JPEG format (we render JPEG
+    # to stay under Claude's 5 MB cap; PNG output here would re-inflate).
     if IMAGE_FALLBACK_ENHANCE:
         enhanced_images = []
         for page_num, b64_data in images:
             raw_bytes = base64.standard_b64decode(b64_data)
-            enhanced_bytes = _enhance_image_for_extraction(raw_bytes)
+            enhanced_bytes = _enhance_image_for_extraction(
+                raw_bytes, output_format="JPEG", jpeg_quality=85)
             enhanced_b64 = base64.standard_b64encode(
                 enhanced_bytes).decode("utf-8")
             enhanced_images.append((page_num, enhanced_b64))
@@ -1866,7 +1915,7 @@ def _analyze_floor_plan_as_images(client, pdf_path, scope_notes="",
                 "type": "image",
                 "source": {
                     "type": "base64",
-                    "media_type": "image/png",
+                    "media_type": "image/jpeg",
                     "data": b64_data
                 }
             })
