@@ -886,13 +886,19 @@
         @media (max-width: 640px) {
             .container { padding: 0 16px; }
 
-            /* NAV: tighter bar, primary CTA only — Log In lives in body */
+            /* NAV: keep both Log In + Request Access; drop wordmark for room */
             .nav-inner { height: 64px; padding: 0 16px; }
-            .nav-brand { gap: 10px; font-size: 1rem; }
-            .nav-brand img { height: 36px; }
-            #btn-login { display: none; }
-            .nav-cta .btn { padding: 8px 14px; font-size: 0.7rem; letter-spacing: 0.05em; }
+            .nav-brand-text { display: none; }   /* logo-only brand on phone */
+            .nav-brand img { height: 40px; }
+            .nav-cta { gap: 8px; }
+            .nav-cta .btn {
+                padding: 8px 12px;
+                font-size: 0.7rem;
+                letter-spacing: 0.04em;
+                min-width: 0;
+            }
             .nav-cta .btn-primary { box-shadow: 3px 3px 0 0 var(--border); }
+            .nav-cta .btn-ghost { padding: 8px 10px; }
 
             /* HERO: tighter padding, full-width stacked CTAs */
             .hero { padding: 96px 0 56px; }
@@ -947,7 +953,8 @@
 
         /* ============ EXTRA-NARROW ≤ 380px (iPhone SE etc.) ============ */
         @media (max-width: 380px) {
-            .nav-brand-text { display: none; }   /* logo-only brand */
+            .nav-brand img { height: 36px; }
+            .nav-cta .btn { font-size: 0.65rem; padding: 7px 10px; }
             .hero h1 { font-size: 2.25rem; }
             .section-title { font-size: 1.875rem; }
             .math-output-value { font-size: 2rem; }
