@@ -3052,7 +3052,14 @@ def _merge_chunk_responses(texts, page_offsets=None):
             cext = combined.setdefault("exterior", {})
             for key, val in ext.items():
                 if isinstance(val, (int, float)):
-                    cext[key] = max(cext.get(key, 0), val)
+                    existing = cext.get(key, 0)
+                    # Prior chunk may have stringified the same field (LLM
+                    # type drift across chunks) — replace rather than crash
+                    # on max(str, int).
+                    if not isinstance(existing, (int, float)):
+                        cext[key] = val
+                    else:
+                        cext[key] = max(existing, val)
                 elif not cext.get(key):
                     cext[key] = val
 

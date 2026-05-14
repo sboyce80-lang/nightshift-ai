@@ -190,8 +190,8 @@ def _pick_timeout(total_pages, max_size_bytes):
         # Medium (30-100 MB or 10+ pages): 1h
         if max_mb >= 30 or total_pages >= 10:
             return 3600
-        # Small everything else: 30 min
-        return 1800
+        # Small everything else: 60 min
+        return 3600
     except Exception:
         return RQ_JOB_TIMEOUT
 
