@@ -17,7 +17,9 @@ module (kept as a single self-contained file so the worker doesn't need a
 Jinja loader for one template).
 """
 
+import base64
 import logging
+import mimetypes
 import os
 import re
 from datetime import datetime, timezone
@@ -168,8 +170,8 @@ _HTML_TEMPLATE = Template("""<!DOCTYPE html>
 
     <div class="header">
         <div class="left">
-            {% if org.logo_url %}
-            <img class="logo" src="{{ org.logo_url }}" alt="{{ org.name }}">
+            {% if logo_src %}
+            <img class="logo" src="{{ logo_src }}" alt="{{ org.name }}">
             {% endif %}
             <div class="org-name">{{ org.name }}</div>
             {% if org.street_address %}<div class="org-line">{{ org.street_address }}</div>{% endif %}
@@ -245,6 +247,39 @@ _HTML_TEMPLATE = Template("""<!DOCTYPE html>
 </body>
 </html>
 """)
+
+
+def _resolve_logo_src(organization) -> Optional[str]:
+    """Return the value the HTML template should set as the logo <img src>.
+
+    Preference order:
+        1. R2-hosted upload (logo_r2_key): fetch bytes and inline as a
+           data: URI. Keeps the PDF self-contained — no expiring presigned
+           URLs, no external dependencies at render time.
+        2. External URL (logo_url): pass straight through (Clerk CDN or
+           a user-pasted public URL). WeasyPrint fetches it during render.
+        3. None: skip the <img> tag.
+
+    Failures during R2 fetch fall back to logo_url so an outage on the
+    storage backend never breaks PDF generation entirely.
+    """
+    r2_key = getattr(organization, "logo_r2_key", None)
+    if r2_key:
+        try:
+            # Local import — keeps generate_estimate_pdf importable in
+            # environments without R2 credentials (e.g. unit tests).
+            import storage  # type: ignore
+            data = storage.get_bytes(r2_key)
+            mime, _ = mimetypes.guess_type(r2_key)
+            if not mime:
+                # Fall back to PNG — works for any standard browser/PDF
+                # renderer even if the extension was lost.
+                mime = "image/png"
+            return f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}"
+        except Exception as exc:
+            logger.warning("Could not inline R2 logo %s, falling back to logo_url: %s",
+                           r2_key, exc)
+    return getattr(organization, "logo_url", None) or None
 
 
 def _slugify(text: str) -> str:
@@ -411,6 +446,7 @@ def generate_estimate_pdf(submission, organization, result: dict, out_dir: str,
 
     html_str = _HTML_TEMPLATE.render(
         org=organization,
+        logo_src=_resolve_logo_src(organization),
         org_city_line=_city_line(organization.city, organization.state, organization.postal_code),
         client_name=client_name,
         client_address=client_address,

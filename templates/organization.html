@@ -43,20 +43,45 @@
                     </p>
 
                     <div class="form-group">
-                        <label for="logo_url">Logo image URL</label>
-                        <input type="url" id="logo_url" name="logo_url" maxlength="1024"
-                               placeholder="https://…"
-                               value="{{ org.logo_url or '' }}"
-                               {% if not is_owner %}disabled{% endif %}>
-                        <small class="panel-subtle">
-                            Defaults to your Clerk profile image on sign-in. Paste any public image URL to override.
-                        </small>
-                        {% if org.logo_url %}
-                        <div style="margin-top:8px;">
-                            <img src="{{ org.logo_url }}" alt="Current logo"
-                                 style="max-height:48px;background:#fff;padding:4px;border-radius:4px;">
+                        <label>Logo</label>
+                        <p class="panel-subtle" style="margin-top:0;margin-bottom:8px;font-size:0.85rem;">
+                            Drag &amp; drop an image, or click to choose a file. PNG, JPEG, GIF, or WebP up to 5&nbsp;MB.
+                        </p>
+
+                        <div id="logo-dropzone"
+                             {% if not is_owner %}data-disabled="1"{% endif %}
+                             style="position:relative;display:flex;flex-direction:column;align-items:center;justify-content:center;
+                                    padding:18px;border:2px dashed rgba(255,255,255,0.18);
+                                    border-radius:8px;background:rgba(8,18,32,0.4);
+                                    color:#cbd5e1;text-align:center;cursor:pointer;
+                                    transition:border-color .15s, background .15s;">
+                            <img id="logo-preview"
+                                 src="{{ uploaded_logo_preview or org.logo_url or '' }}"
+                                 alt=""
+                                 style="max-height:72px;max-width:200px;background:#fff;padding:4px;border-radius:4px;
+                                        {% if not (uploaded_logo_preview or org.logo_url) %}display:none;{% endif %}">
+                            <div id="logo-placeholder" style="{% if uploaded_logo_preview or org.logo_url %}display:none;{% endif %}">
+                                <div style="font-size:1.6rem;line-height:1;margin-bottom:6px;">&#128206;</div>
+                                <div>Drop logo here or click to browse</div>
+                            </div>
+                            <div id="logo-feedback" style="margin-top:10px;font-size:0.85rem;display:none;"></div>
+                            <input id="logo-file-input" type="file" accept="image/png,image/jpeg,image/gif,image/webp"
+                                   style="position:absolute;inset:0;opacity:0;cursor:pointer;{% if not is_owner %}pointer-events:none;{% endif %}">
                         </div>
-                        {% endif %}
+
+                        <details style="margin-top:10px;">
+                            <summary class="panel-subtle" style="cursor:pointer;font-size:0.85rem;">
+                                Advanced: use an external image URL instead
+                            </summary>
+                            <input type="url" id="logo_url" name="logo_url" maxlength="1024"
+                                   placeholder="https://…"
+                                   value="{{ org.logo_url or '' }}"
+                                   style="margin-top:8px;"
+                                   {% if not is_owner %}disabled{% endif %}>
+                            <small class="panel-subtle">
+                                Defaults to your Clerk profile image. Used only when no logo file is uploaded above.
+                            </small>
+                        </details>
                     </div>
 
                     <div class="form-group">
@@ -212,6 +237,93 @@
     <footer style="text-align:center;padding:20px;color:rgba(203,213,225,0.5);font-size:0.85rem;">
         &copy; 2026 Knight Shift &mdash; Forged by Willpower
     </footer>
+
+    <script>
+    (function() {
+        const dz = document.getElementById('logo-dropzone');
+        if (!dz || dz.dataset.disabled) return;
+        const input = document.getElementById('logo-file-input');
+        const preview = document.getElementById('logo-preview');
+        const placeholder = document.getElementById('logo-placeholder');
+        const feedback = document.getElementById('logo-feedback');
+
+        const ALLOWED = ['image/png', 'image/jpeg', 'image/gif', 'image/webp'];
+        const MAX_BYTES = 5 * 1024 * 1024;
+
+        function setFeedback(text, color) {
+            feedback.textContent = text;
+            feedback.style.color = color || '#cbd5e1';
+            feedback.style.display = text ? '' : 'none';
+        }
+
+        function showPreview(url) {
+            preview.src = url;
+            preview.style.display = '';
+            placeholder.style.display = 'none';
+        }
+
+        async function upload(file) {
+            if (!ALLOWED.includes(file.type)) {
+                setFeedback('Unsupported file type — use PNG, JPEG, GIF, or WebP.', '#f87171');
+                return;
+            }
+            if (file.size > MAX_BYTES) {
+                setFeedback('File is too large (max 5 MB).', '#f87171');
+                return;
+            }
+            setFeedback('Uploading…', '#cbd5e1');
+
+            // Show a local-blob preview immediately so the UI feels responsive
+            // even before R2 returns a presigned URL.
+            const localUrl = URL.createObjectURL(file);
+            showPreview(localUrl);
+
+            const fd = new FormData();
+            fd.append('file', file);
+            try {
+                const res = await fetch('/api/org/logo', {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    body: fd,
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) throw new Error(data.error || ('HTTP ' + res.status));
+                if (data.preview_url) showPreview(data.preview_url);
+                setFeedback('✓ Logo saved — it will appear on the next estimate.', '#6ee7b7');
+            } catch (err) {
+                setFeedback('Upload failed: ' + err.message, '#f87171');
+            }
+        }
+
+        input.addEventListener('change', (e) => {
+            const file = e.target.files && e.target.files[0];
+            if (file) upload(file);
+        });
+
+        // Drag-and-drop. preventDefault on dragover is required for the
+        // drop event to fire at all.
+        ['dragenter', 'dragover'].forEach(evt => {
+            dz.addEventListener(evt, (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                dz.style.borderColor = 'rgba(110,231,183,0.65)';
+                dz.style.background = 'rgba(46,204,113,0.06)';
+            });
+        });
+        ['dragleave', 'dragend', 'drop'].forEach(evt => {
+            dz.addEventListener(evt, (e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                dz.style.borderColor = 'rgba(255,255,255,0.18)';
+                dz.style.background = 'rgba(8,18,32,0.4)';
+            });
+        });
+        dz.addEventListener('drop', (e) => {
+            const file = e.dataTransfer && e.dataTransfer.files && e.dataTransfer.files[0];
+            if (file) upload(file);
+        });
+    })();
+    </script>
 
     {% if clerk_publishable_key and clerk_frontend_api_host %}
     <script>

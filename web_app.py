@@ -2225,6 +2225,18 @@ def organization():
                               .filter(OrganizationMembership.organization_id == org.id,
                                       OrganizationMembership.role == "owner")
                               .count())
+
+        # If the owner has uploaded a logo, surface a fresh presigned URL
+        # for the in-page preview. Presigned URLs expire (R2_SIGNED_URL_EXPIRY),
+        # but this one only lives for the duration of the page view — the
+        # estimate PDF generator fetches bytes directly via logo_r2_key.
+        uploaded_logo_preview = None
+        if org.logo_r2_key:
+            try:
+                uploaded_logo_preview = storage.presigned_download_url(org.logo_r2_key)
+            except Exception as exc:
+                logger.warning("Could not presign org %d logo preview: %s", org.id, exc)
+
         return render_template(
             "organization.html",
             org=org,
@@ -2233,7 +2245,83 @@ def organization():
             member_count=member_count,
             owner_count=owner_count,
             daily_cap_effective=org.daily_submission_cap or BETA_DAILY_SUBMISSION_CAP_DEFAULT,
+            uploaded_logo_preview=uploaded_logo_preview,
         )
+
+
+# Image MIME types the logo upload accepts. SVG is excluded — embedded
+# <script> in an SVG would render in browser previews of the image URL.
+# PDF generation goes through WeasyPrint which is safe, but the same bytes
+# are also surfaced as a presigned URL for the Org Settings preview.
+_LOGO_ALLOWED_MIMES = {
+    "image/png":  "png",
+    "image/jpeg": "jpg",
+    "image/gif":  "gif",
+    "image/webp": "webp",
+}
+_LOGO_MAX_BYTES = 5 * 1024 * 1024  # 5 MB — generous for a logo, stops abuse
+
+
+@app.route("/api/org/logo", methods=["POST"])
+@require_auth
+def org_logo_upload():
+    """Upload an org logo image. Owner-only.
+
+    Accepts multipart/form-data with a single 'file' field. Streams the
+    bytes to R2 under orgs/<org_id>/logo.<ext>, updates the org row, and
+    returns a presigned URL the browser can use to display the uploaded
+    image in the settings page preview.
+    """
+    uid = current_user_id()
+    upload = request.files.get("file")
+    if upload is None or not upload.filename:
+        return jsonify({"error": "No file provided."}), 400
+
+    # Browser-supplied content type — first cheap filter. We still cap by
+    # byte count below in case a malicious client claims image/png on a
+    # giant binary.
+    mime = (upload.mimetype or "").lower()
+    if mime not in _LOGO_ALLOWED_MIMES:
+        return jsonify({"error": "Logo must be a PNG, JPEG, GIF, or WebP image."}), 415
+
+    blob = upload.read(_LOGO_MAX_BYTES + 1)
+    if len(blob) == 0:
+        return jsonify({"error": "Uploaded file is empty."}), 400
+    if len(blob) > _LOGO_MAX_BYTES:
+        return jsonify({"error": "Logo file is too large (max 5 MB)."}), 413
+
+    ext = _LOGO_ALLOWED_MIMES[mime]
+
+    with session_scope() as session:
+        user = session.get(User, uid)
+        org = user.current_organization if user else None
+        if org is None:
+            return jsonify({"error": "no organization"}), 400
+        if not _is_owner(session, uid, org.id):
+            return jsonify({"error": "Only org owners can change the logo."}), 403
+
+        key = storage.org_logo_key(org.id, ext)
+        try:
+            storage.put_bytes(blob, key, content_type=mime)
+        except Exception as exc:
+            logger.error("Logo upload failed for org %d: %s", org.id, exc, exc_info=True)
+            return jsonify({"error": "Could not save the logo to storage."}), 502
+
+        # Setting logo_r2_key tells the PDF generator to prefer the upload
+        # over logo_url. We deliberately don't null out logo_url here so
+        # the user can still see the Clerk fallback if they later "remove"
+        # the upload (a future feature).
+        org.logo_r2_key = key
+        org_id = org.id
+
+    try:
+        preview_url = storage.presigned_download_url(key)
+    except Exception as exc:
+        logger.warning("Logo upload OK but presign failed for org %d: %s", org_id, exc)
+        preview_url = None
+
+    logger.info("Org %d logo uploaded (%d bytes, %s)", org_id, len(blob), mime)
+    return jsonify({"ok": True, "preview_url": preview_url})
 
 
 @app.route("/account/members", methods=["GET"])

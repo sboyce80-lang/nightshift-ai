@@ -110,7 +110,14 @@ class Organization(Base):
     # third deliverable alongside the full job PDF + JSON). logo_url is
     # auto-populated from the first owner's Clerk image_url on sign-in;
     # the rest are owner-editable on /account/organization.
+    #
+    # Two-column logo design: external URLs (Clerk CDN, user-pasted) live
+    # in logo_url; bytes uploaded via the drag-drop zone live in R2 with
+    # the object key stored in logo_r2_key. The PDF generator prefers the
+    # R2 upload when both are set (so a fresh upload "wins" over a stale
+    # Clerk avatar) and inlines those bytes as a data URI for portability.
     logo_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    logo_r2_key: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     street_address: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     city: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
     state: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)

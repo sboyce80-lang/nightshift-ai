@@ -98,6 +98,18 @@ def metadata_key(submission_id: str) -> str:
     return f"{submission_prefix(submission_id)}metadata.json"
 
 
+def org_logo_key(org_id: int, ext: str) -> str:
+    """R2 key for an organization-uploaded logo image.
+
+    Convention: orgs/<org_id>/logo.<ext> — a single object per org. Each
+    upload overwrites the prior one so we don't accumulate orphans, and
+    the key is stable so the PDF generator can fetch by org_id without
+    keeping the key in sync separately.
+    """
+    safe_ext = (ext or "").lstrip(".").lower() or "bin"
+    return f"orgs/{org_id}/logo.{safe_ext}"
+
+
 # ---------------------------------------------------------------------------
 # Operations
 # ---------------------------------------------------------------------------
