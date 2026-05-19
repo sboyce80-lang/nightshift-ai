@@ -70,6 +70,7 @@ from notifications import (
     notify_user_of_denial,
     notifications_configured,
 )
+from generate_estimate_pdf import is_estimate_filename
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -150,13 +151,28 @@ _queue_heavy = Queue(RQ_QUEUE_HEAVY, connection=_redis)
 
 def _count_pdf_pages(path):
     """Best-effort page count. Returns 0 on failure so routing falls back
-    to size-based heuristic — never blocks a submission on a broken PDF."""
+    to size-based heuristic — never blocks a submission on a broken PDF.
+
+    Tries PyMuPDF first (much more tolerant of unusual xref/structure that
+    real-world DD-set PDFs contain) and falls back to PyPDF2. Rider
+    Painting's scanned multi-PDF DD sets routinely caused PyPDF2 alone to
+    return 0, which dropped them into the small-job timeout bucket.
+    """
+    try:
+        import fitz  # PyMuPDF
+        with fitz.open(path) as doc:
+            n = doc.page_count
+            if n > 0:
+                return n
+    except Exception as exc:
+        logger.warning("PyMuPDF page count failed for %s: %s", path, exc)
+
     try:
         from PyPDF2 import PdfReader
         reader = PdfReader(path, strict=False)
         return len(reader.pages)
     except Exception as exc:
-        logger.warning("page count failed for %s: %s", path, exc)
+        logger.warning("PyPDF2 page count failed for %s: %s", path, exc)
         return 0
 
 
@@ -1304,16 +1320,23 @@ def jobs_list():
                 .limit(100).all())
         for s in subs:
             results = []
+            estimate = None
             if s.status == "completed":
                 for f in s.files:
                     if f.kind == "result":
                         try:
-                            results.append({
+                            entry = {
                                 "filename": f.filename,
                                 "url": storage.presigned_download_url(f.r2_key),
-                            })
+                                "is_estimate": is_estimate_filename(f.filename),
+                            }
                         except Exception as exc:
                             logger.warning("Could not sign URL for %s: %s", f.r2_key, exc)
+                            continue
+                        if entry["is_estimate"]:
+                            estimate = entry
+                        else:
+                            results.append(entry)
             rows.append({
                 "id": s.id,
                 "business_name": s.business_name,
@@ -1323,6 +1346,7 @@ def jobs_list():
                 "subtotal": float(s.subtotal) if s.subtotal is not None else None,
                 "upload_count": sum(1 for f in s.files if f.kind == "upload"),
                 "results": results,
+                "estimate": estimate,
             })
     return render_template("jobs.html", submissions=rows,
                            status_filter=status_filter, is_admin=admin)
@@ -1357,6 +1381,7 @@ def job_status_api(submission_id):
             "filename": f.filename,
             "size": f.size_bytes,
             "url": storage.presigned_download_url(f.r2_key),
+            "is_estimate": is_estimate_filename(f.filename),
         } for f in result_files]
 
         payload = {
@@ -1813,6 +1838,85 @@ def job_cancel_api(submission_id):
     return jsonify({"ok": True})
 
 
+# Lightweight email regex for the send-estimate endpoint. Not RFC-perfect —
+# just rejects obviously-malformed addresses before we open an SMTP session.
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+@app.route("/api/jobs/<submission_id>/send-estimate", methods=["POST"])
+@require_auth
+def job_send_estimate_api(submission_id):
+    """Email the formal Estimate PDF to a stakeholder. Owner-only.
+
+    Body JSON: {to: "...", subject: "...", body: "..."}.
+    The estimate PDF is the one tagged by generate_estimate_pdf.is_estimate_filename
+    on the submission's result files; we download it from R2 and attach.
+    """
+    uid = current_user_id()
+    data = request.get_json(silent=True) or {}
+    to_email = (data.get("to") or "").strip()
+    subject = (data.get("subject") or "").strip()
+    body = data.get("body") or ""
+
+    if not _EMAIL_RE.match(to_email):
+        return jsonify({"error": "Enter a valid recipient email address."}), 400
+    if not subject:
+        return jsonify({"error": "Subject is required."}), 400
+    if len(subject) > 255:
+        return jsonify({"error": "Subject is too long (max 255 characters)."}), 400
+    if not body.strip():
+        return jsonify({"error": "Message body is required."}), 400
+
+    with session_scope() as session:
+        sub = session.get(Submission, submission_id)
+        if sub is None or sub.user_id != uid:
+            return jsonify({"error": "not found"}), 404
+        if sub.status != "completed":
+            return jsonify({"error": "Job must be completed before sending the estimate."}), 409
+        estimate_file = next(
+            (f for f in sub.files
+             if f.kind == "result" and is_estimate_filename(f.filename)),
+            None,
+        )
+        if estimate_file is None:
+            return jsonify({"error": "No estimate PDF found for this submission."}), 404
+        r2_key = estimate_file.r2_key
+        filename = estimate_file.filename
+
+        user = session.get(User, uid)
+        org = user.current_organization if user else None
+        from_name = (org.name if org else None) or "Knight Shift"
+
+    # Download the PDF to a temp file, then send.
+    from jobs import send_email_with_attachments
+    with tempfile.TemporaryDirectory(prefix=f"ks-send-{submission_id}-") as workdir:
+        local_path = os.path.join(workdir, filename)
+        try:
+            storage.download_file(r2_key, local_path)
+        except Exception as exc:
+            logger.error("send-estimate %s: failed to fetch %s: %s",
+                         submission_id, r2_key, exc)
+            return jsonify({"error": "Could not retrieve the estimate file."}), 500
+
+        try:
+            sent = send_email_with_attachments(
+                to_email=to_email,
+                subject=subject,
+                body=body,
+                attachment_paths=[local_path],
+                from_name=from_name,
+            )
+        except Exception as exc:
+            logger.error("send-estimate %s: SMTP error: %s", submission_id, exc, exc_info=True)
+            return jsonify({"error": "Failed to send the email. Please try again."}), 502
+
+    if not sent:
+        return jsonify({"error": "Email delivery is not configured on the server."}), 503
+
+    logger.info("Estimate for %s sent by user %d to %s", submission_id, uid, to_email)
+    return jsonify({"ok": True, "to": to_email})
+
+
 @app.route("/pricing", methods=["GET", "POST"])
 @require_auth
 def pricing_settings():
@@ -2088,6 +2192,29 @@ def organization():
                 flash("Organization name is too long (max 255 characters).", "error")
                 return redirect(url_for("organization"))
             org.name = new_name
+
+            # Branding fields surfaced on the Estimate PDF. Empty string →
+            # NULL so the template can fall back to defaults cleanly.
+            # Keys: form field → (model attr, max length)
+            branding_fields = {
+                "logo_url":       ("logo_url",       1024),
+                "street_address": ("street_address",  255),
+                "city":           ("city",            128),
+                "state":          ("state",            64),
+                "postal_code":    ("postal_code",      32),
+                "phone":          ("phone",            64),
+                "contact_email":  ("contact_email",   320),
+                "website":        ("website",         255),
+                "tax_id":         ("tax_id",           64),
+            }
+            for form_key, (attr, maxlen) in branding_fields.items():
+                raw = (request.form.get(form_key) or "").strip()
+                if len(raw) > maxlen:
+                    flash(f"{form_key.replace('_',' ').title()} is too long (max {maxlen}).",
+                          "error")
+                    return redirect(url_for("organization"))
+                setattr(org, attr, raw or None)
+
             flash("Organization updated.", "success")
             return redirect(url_for("organization"))
 

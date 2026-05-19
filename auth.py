@@ -34,7 +34,7 @@ from config import (
     CLERK_AUTHORIZED_PARTIES, ADMIN_EMAILS,
 )
 from db import session_scope
-from models import User
+from models import User, Organization
 
 logger = logging.getLogger("nightshift.auth")
 
@@ -148,8 +148,13 @@ def _clerk():
     return _clerk_sdk
 
 
-def _fetch_clerk_user_email_and_name(clerk_user_id: str) -> tuple[str, Optional[str]]:
-    """One-shot Clerk API call to retrieve a user's primary email + name."""
+def _fetch_clerk_user_email_and_name(clerk_user_id: str) -> tuple[str, Optional[str], Optional[str]]:
+    """One-shot Clerk API call to retrieve a user's primary email, name, and image URL.
+
+    Returns (email, name, image_url). image_url is the Clerk-hosted avatar
+    (user's profile picture); used as the default org logo on the Estimate
+    PDF until an owner overrides it from /account/organization.
+    """
     user = _clerk().users.get(user_id=clerk_user_id)
     primary_id = getattr(user, "primary_email_address_id", None)
     email = None
@@ -162,7 +167,8 @@ def _fetch_clerk_user_email_and_name(clerk_user_id: str) -> tuple[str, Optional[
     if not email:
         raise AuthError(f"Clerk user {clerk_user_id} has no email address")
     name = " ".join(filter(None, [user.first_name, user.last_name])) or None
-    return email, name
+    image_url = getattr(user, "image_url", None) or getattr(user, "profile_image_url", None)
+    return email, name, image_url
 
 
 def _sync_user(clerk_user_id: str) -> int:
@@ -187,7 +193,7 @@ def _sync_user(clerk_user_id: str) -> int:
 
         # Not yet linked — fetch email from Clerk and try to match an existing
         # row (someone may have submitted via email before signing in).
-        email, name = _fetch_clerk_user_email_and_name(clerk_user_id)
+        email, name, image_url = _fetch_clerk_user_email_and_name(clerk_user_id)
         user = session.query(User).filter(User.email == email.lower()).one_or_none()
         if user is None:
             user = User(email=email.lower(), name=name, clerk_user_id=clerk_user_id)
@@ -201,6 +207,14 @@ def _sync_user(clerk_user_id: str) -> int:
         if user.current_organization_id is None:
             provision_org_for_user(session, user)
             session.flush()
+
+        # Seed org.logo_url from the user's Clerk avatar on first sign-in.
+        # Owners can override on /account/organization later; we don't
+        # overwrite an already-set value here.
+        if image_url and user.current_organization_id is not None:
+            org = session.get(Organization, user.current_organization_id)
+            if org is not None and not org.logo_url:
+                org.logo_url = image_url
 
         return user.id
 

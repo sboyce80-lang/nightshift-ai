@@ -33,8 +33,9 @@ from config import (
 )
 import storage
 from db import session_scope
-from models import Submission, File
+from models import Submission, File, Organization
 from Takeoff_DIRECT import run_analysis, run_analysis_merge
+from generate_estimate_pdf import generate_estimate_pdf
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -197,6 +198,44 @@ def reconcile_abandoned_submissions(redis_conn, queue_names):
     return rows_changed
 
 
+def _build_and_upload_estimate(submission_id, result, workdir):
+    """Render the formal Estimate PDF and upload it as a third result file.
+
+    Best-effort: any failure (missing org row, WeasyPrint not installed,
+    bad logo URL, etc.) is logged but does NOT fail the submission. The
+    full job PDF + JSON are the source of truth; the Estimate is a
+    convenience deliverable.
+
+    Returns the local PDF path on success, or None.
+    """
+    try:
+        with session_scope() as session:
+            sub = session.get(Submission, submission_id)
+            if sub is None:
+                logger.warning("Estimate skipped: submission %s not found", submission_id)
+                return None
+            org = session.get(Organization, sub.org_id)
+            if org is None:
+                logger.warning("Estimate skipped: org %s not found for submission %s",
+                               sub.org_id, submission_id)
+                return None
+            # Detach so we can use the rows after the session closes.
+            session.expunge(sub)
+            session.expunge(org)
+
+        pdf_path = generate_estimate_pdf(sub, org, result, workdir)
+        filename = os.path.basename(pdf_path)
+        r2_key = storage.result_key(submission_id, filename)
+        size_bytes = os.path.getsize(pdf_path)
+        storage.upload_file(pdf_path, r2_key, content_type="application/pdf")
+        _record_result_file(submission_id, filename, r2_key, size_bytes, "application/pdf")
+        return pdf_path
+    except Exception as exc:
+        logger.error("Estimate PDF generation failed for %s: %s",
+                     submission_id, exc, exc_info=True)
+        return None
+
+
 def _record_result_file(submission_id, filename, r2_key, size_bytes, content_type):
     """Idempotently record a result file in the `files` table."""
     try:
@@ -317,6 +356,10 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
                     storage.upload_file(src, r2_key, content_type=content_type)
                     _record_result_file(submission_id, filename, r2_key,
                                         size_bytes, content_type)
+
+            # Third deliverable: formal Estimate PDF. Failure here doesn't
+            # block completion — the full PDF/JSON are the source of truth.
+            _build_and_upload_estimate(submission_id, result, workdir)
 
             send_result_email(contact_info, result)
 
@@ -449,6 +492,8 @@ def merge_submission(submission_id, parent_id, new_pdf_keys, contact_info,
                     _record_result_file(submission_id, filename, r2_key,
                                         size_bytes, content_type)
 
+            _build_and_upload_estimate(submission_id, result, workdir)
+
             send_result_email(contact_info, result)
 
             subtotal = result.get("cost_estimate", {}).get("subtotal", 0) or 0
@@ -480,6 +525,58 @@ def merge_submission(submission_id, parent_id, new_pdf_keys, contact_info,
 # ---------------------------------------------------------------------------
 # Email Notifications
 # ---------------------------------------------------------------------------
+
+def send_email_with_attachments(to_email, subject, body, attachment_paths,
+                                 from_name=None, cc=None):
+    """Send a plaintext email with PDF/JSON attachments over the same SMTP
+    relay used by send_result_email.
+
+    Args:
+        to_email:         single recipient email address (string).
+        subject:          plain text subject line.
+        body:             plain text body. UTF-8 safe.
+        attachment_paths: iterable of local file paths to attach.
+                          Extension drives the MIME subtype (pdf/json/octet).
+        from_name:        display name; defaults to COMPANY_NAME.
+        cc:               optional list of CC addresses.
+
+    Returns True on send, False if SMTP isn't configured. Raises on send failure.
+    """
+    if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD:
+        logger.warning("SMTP not configured — cannot send email to %s", to_email)
+        return False
+
+    msg = MIMEMultipart()
+    msg["From"] = f"{from_name or COMPANY_NAME} <{EMAIL_ADDRESS}>"
+    msg["To"] = to_email
+    if cc:
+        msg["Cc"] = ", ".join(cc)
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain", _charset="utf-8"))
+
+    for path in attachment_paths or []:
+        if not path or not os.path.exists(path):
+            continue
+        ext = os.path.splitext(path)[1].lower().lstrip(".")
+        subtype = {"pdf": "pdf", "json": "json"}.get(ext, "octet-stream")
+        with open(path, "rb") as f:
+            att = MIMEApplication(f.read(), _subtype=subtype)
+            att.add_header(
+                "Content-Disposition", "attachment",
+                filename=os.path.basename(path),
+            )
+            msg.attach(att)
+
+    recipients = [to_email] + (list(cc) if cc else [])
+    with smtplib.SMTP(EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT) as server:
+        server.ehlo()
+        server.starttls()
+        server.ehlo()
+        server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
+        server.sendmail(EMAIL_ADDRESS, recipients, msg.as_string())
+    logger.info("Sent email '%s' to %s", subject, to_email)
+    return True
+
 
 def send_result_email(contact_info, result):
     if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD:

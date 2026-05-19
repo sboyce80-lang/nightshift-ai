@@ -84,6 +84,25 @@
                         {% endfor %}
                     </div>
 
+                    {% if s.estimate %}
+                    <div class="estimate-row" style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;
+                                margin-top:10px;padding:10px 12px;
+                                background:rgba(46,204,113,0.08);border:1px solid rgba(46,204,113,0.25);
+                                border-radius:6px;">
+                        <span style="color:#6ee7b7;font-weight:600;">&#128196; Formal Estimate</span>
+                        <span class="panel-subtle" style="font-size:0.9rem;">{{ s.estimate.filename }}</span>
+                        <span style="flex:1;"></span>
+                        <a class="btn-link" href="{{ s.estimate.url }}" target="_blank">View Estimate &rarr;</a>
+                        <button type="button" class="btn-primary send-estimate-btn"
+                                data-submission-id="{{ s.id }}"
+                                data-business-name="{{ s.business_name or 'this project' }}"
+                                data-subtotal="{{ s.subtotal or 0 }}"
+                                data-filename="{{ s.estimate.filename }}">
+                            &#9993;&#65039; Send Estimate for Approval
+                        </button>
+                    </div>
+                    {% endif %}
+
                     {% if status_filter == 'completed' and s.status == 'completed' %}
                     <div class="breakdown-wrap" id="breakdown-{{ s.id }}">
                         <p class="panel-subtle" style="margin-bottom:10px;">
@@ -124,6 +143,50 @@
                 {% endif %}
             </section>
         </main>
+    </div>
+
+    <div id="send-estimate-modal" style="display:none;position:fixed;inset:0;background:rgba(2,8,20,0.78);z-index:1000;align-items:center;justify-content:center;padding:20px;">
+        <div style="background:#0b1626;border:1px solid rgba(255,255,255,0.08);border-radius:10px;max-width:640px;width:100%;max-height:92vh;overflow:auto;padding:24px;">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
+                <h2 style="margin:0;color:#e2e8f0;">Send Estimate for Approval</h2>
+                <button type="button" id="send-estimate-close" aria-label="Close"
+                        style="background:transparent;border:0;color:#cbd5e1;font-size:1.4rem;cursor:pointer;line-height:1;">&times;</button>
+            </div>
+            <p class="panel-subtle" style="margin-top:6px;font-size:0.92rem;">
+                We&rsquo;ll send a draft email with the formal Estimate PDF attached.
+                Edit the subject and body if you&rsquo;d like before sending.
+            </p>
+
+            <form id="send-estimate-form" style="margin-top:16px;">
+                <div class="form-group">
+                    <label for="send-to" style="color:#cbd5e1;">Send to (email)</label>
+                    <input type="email" id="send-to" name="to" required maxlength="320"
+                           placeholder="stakeholder@example.com"
+                           style="width:100%;padding:8px;background:rgba(8,18,32,0.7);border:1px solid rgba(255,255,255,0.12);border-radius:6px;color:#cbd5e1;">
+                </div>
+                <div class="form-group">
+                    <label for="send-subject" style="color:#cbd5e1;">Subject</label>
+                    <input type="text" id="send-subject" name="subject" required maxlength="255"
+                           style="width:100%;padding:8px;background:rgba(8,18,32,0.7);border:1px solid rgba(255,255,255,0.12);border-radius:6px;color:#cbd5e1;">
+                </div>
+                <div class="form-group">
+                    <label for="send-body" style="color:#cbd5e1;">Message</label>
+                    <textarea id="send-body" name="body" rows="8" required
+                              style="width:100%;padding:8px;background:rgba(8,18,32,0.7);border:1px solid rgba(255,255,255,0.12);border-radius:6px;color:#cbd5e1;font-family:inherit;font-size:0.95rem;"></textarea>
+                </div>
+                <p class="panel-subtle" id="send-attachment-note" style="margin-top:0;font-size:0.85rem;">
+                    Attachment: <span id="send-attachment-name">(estimate)</span>
+                </p>
+
+                <div style="display:flex;gap:10px;margin-top:18px;">
+                    <button type="submit" class="btn-primary" id="send-estimate-submit">
+                        &#9993;&#65039; Send Email
+                    </button>
+                    <button type="button" class="btn-secondary" id="send-estimate-cancel">Cancel</button>
+                </div>
+                <p id="send-estimate-feedback" style="display:none;margin-top:10px;font-size:0.9rem;"></p>
+            </form>
+        </div>
     </div>
 
     <footer style="text-align:center;padding:20px;color:rgba(203,213,225,0.5);font-size:0.85rem;">
@@ -340,6 +403,91 @@
                     btn.disabled = false;
                 }
             });
+        });
+
+        // ---------- Send Estimate for Approval ----------
+        const sendModal = document.getElementById("send-estimate-modal");
+        const sendForm = document.getElementById("send-estimate-form");
+        const sendTo = document.getElementById("send-to");
+        const sendSubject = document.getElementById("send-subject");
+        const sendBody = document.getElementById("send-body");
+        const sendAttachmentName = document.getElementById("send-attachment-name");
+        const sendFeedback = document.getElementById("send-estimate-feedback");
+        const sendSubmitBtn = document.getElementById("send-estimate-submit");
+        let activeSendSubmissionId = null;
+
+        function openSendModal(btn) {
+            activeSendSubmissionId = btn.dataset.submissionId;
+            const business = btn.dataset.businessName || "this project";
+            const subtotal = Number(btn.dataset.subtotal || 0);
+            const filename = btn.dataset.filename || "estimate.pdf";
+            sendTo.value = "";
+            sendSubject.value = `Estimate for ${business}`;
+            sendBody.value =
+                `Hello,\n\n` +
+                `Please find attached the formal estimate for ${business}.\n\n` +
+                `Estimate total: ${fmtMoney(subtotal)}\n\n` +
+                `Let me know if you have any questions or if you'd like to proceed.\n\n` +
+                `Thank you.`;
+            sendAttachmentName.textContent = filename;
+            sendFeedback.style.display = "none";
+            sendFeedback.textContent = "";
+            sendSubmitBtn.disabled = false;
+            sendModal.style.display = "flex";
+            setTimeout(() => sendTo.focus(), 50);
+        }
+
+        function closeSendModal() {
+            sendModal.style.display = "none";
+            activeSendSubmissionId = null;
+        }
+
+        document.querySelectorAll(".send-estimate-btn").forEach(btn => {
+            btn.addEventListener("click", () => openSendModal(btn));
+        });
+
+        document.getElementById("send-estimate-close").addEventListener("click", closeSendModal);
+        document.getElementById("send-estimate-cancel").addEventListener("click", closeSendModal);
+        sendModal.addEventListener("click", (e) => {
+            if (e.target === sendModal) closeSendModal();
+        });
+        document.addEventListener("keydown", (e) => {
+            if (e.key === "Escape" && sendModal.style.display !== "none") closeSendModal();
+        });
+
+        sendForm.addEventListener("submit", async (e) => {
+            e.preventDefault();
+            if (!activeSendSubmissionId) return;
+            sendSubmitBtn.disabled = true;
+            sendFeedback.style.display = "";
+            sendFeedback.style.color = "#cbd5e1";
+            sendFeedback.textContent = "Sending…";
+            try {
+                const res = await fetch(`/api/jobs/${activeSendSubmissionId}/send-estimate`, {
+                    method: "POST",
+                    credentials: "same-origin",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                    },
+                    body: JSON.stringify({
+                        to: sendTo.value.trim(),
+                        subject: sendSubject.value.trim(),
+                        body: sendBody.value,
+                    }),
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) {
+                    throw new Error(data.error || `HTTP ${res.status}`);
+                }
+                sendFeedback.style.color = "#6ee7b7";
+                sendFeedback.textContent = "✓ Sent to " + sendTo.value.trim();
+                setTimeout(closeSendModal, 1400);
+            } catch (err) {
+                sendFeedback.style.color = "#f87171";
+                sendFeedback.textContent = "Failed: " + err.message;
+                sendSubmitBtn.disabled = false;
+            }
         });
 
         document.querySelectorAll(".job-cancel").forEach(btn => {

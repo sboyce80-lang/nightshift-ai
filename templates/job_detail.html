@@ -32,6 +32,19 @@
                 <h2>Results</h2>
                 <p style="color:#cbd5e1;font-size:1.1rem;">Subtotal: <strong id="subtotal-display" style="color:var(--accent-green);font-size:1.6rem;">—</strong></p>
                 <ul id="result-files" style="list-style:none;padding:0;margin-top:12px;"></ul>
+
+                <div id="estimate-row" style="display:none;flex-wrap:wrap;gap:10px;align-items:center;
+                            margin-top:14px;padding:10px 12px;
+                            background:rgba(46,204,113,0.08);border:1px solid rgba(46,204,113,0.25);
+                            border-radius:6px;">
+                    <span style="color:#6ee7b7;font-weight:600;">&#128196; Formal Estimate</span>
+                    <span id="estimate-filename" class="panel-subtle" style="font-size:0.9rem;"></span>
+                    <span style="flex:1;"></span>
+                    <a id="estimate-view-link" class="btn-link" href="#" target="_blank">View Estimate &rarr;</a>
+                    <button type="button" class="btn-primary" id="estimate-send-btn">
+                        &#9993;&#65039; Send Estimate for Approval
+                    </button>
+                </div>
             </section>
 
             <section class="panel" id="resubmit-section" style="display:none;margin-top:20px;">
@@ -141,6 +154,50 @@
         }
     </style>
 
+    <div id="send-estimate-modal" style="display:none;position:fixed;inset:0;background:rgba(2,8,20,0.78);z-index:1000;align-items:center;justify-content:center;padding:20px;">
+        <div style="background:#0b1626;border:1px solid rgba(255,255,255,0.08);border-radius:10px;max-width:640px;width:100%;max-height:92vh;overflow:auto;padding:24px;">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;gap:12px;">
+                <h2 style="margin:0;color:#e2e8f0;">Send Estimate for Approval</h2>
+                <button type="button" id="send-estimate-close" aria-label="Close"
+                        style="background:transparent;border:0;color:#cbd5e1;font-size:1.4rem;cursor:pointer;line-height:1;">&times;</button>
+            </div>
+            <p class="panel-subtle" style="margin-top:6px;font-size:0.92rem;">
+                We&rsquo;ll send a draft email with the formal Estimate PDF attached.
+                Edit the subject and body if you&rsquo;d like before sending.
+            </p>
+
+            <form id="send-estimate-form" style="margin-top:16px;">
+                <div class="form-group">
+                    <label for="send-to" style="color:#cbd5e1;">Send to (email)</label>
+                    <input type="email" id="send-to" name="to" required maxlength="320"
+                           placeholder="stakeholder@example.com"
+                           style="width:100%;padding:8px;background:rgba(8,18,32,0.7);border:1px solid rgba(255,255,255,0.12);border-radius:6px;color:#cbd5e1;">
+                </div>
+                <div class="form-group">
+                    <label for="send-subject" style="color:#cbd5e1;">Subject</label>
+                    <input type="text" id="send-subject" name="subject" required maxlength="255"
+                           style="width:100%;padding:8px;background:rgba(8,18,32,0.7);border:1px solid rgba(255,255,255,0.12);border-radius:6px;color:#cbd5e1;">
+                </div>
+                <div class="form-group">
+                    <label for="send-body" style="color:#cbd5e1;">Message</label>
+                    <textarea id="send-body" name="body" rows="8" required
+                              style="width:100%;padding:8px;background:rgba(8,18,32,0.7);border:1px solid rgba(255,255,255,0.12);border-radius:6px;color:#cbd5e1;font-family:inherit;font-size:0.95rem;"></textarea>
+                </div>
+                <p class="panel-subtle" style="margin-top:0;font-size:0.85rem;">
+                    Attachment: <span id="send-attachment-name">(estimate)</span>
+                </p>
+
+                <div style="display:flex;gap:10px;margin-top:18px;">
+                    <button type="submit" class="btn-primary" id="send-estimate-submit">
+                        &#9993;&#65039; Send Email
+                    </button>
+                    <button type="button" class="btn-secondary" id="send-estimate-cancel">Cancel</button>
+                </div>
+                <p id="send-estimate-feedback" style="display:none;margin-top:10px;font-size:0.9rem;"></p>
+            </form>
+        </div>
+    </div>
+
     <footer style="text-align:center;padding:20px;color:rgba(203,213,225,0.5);font-size:0.85rem;">
         &copy; 2026 Knight Shift &mdash; Forged by Willpower
     </footer>
@@ -202,7 +259,15 @@
                 d.subtotal != null ? "$" + d.subtotal.toLocaleString(undefined, {maximumFractionDigits: 0}) : "—";
             const ul = document.getElementById("result-files");
             ul.innerHTML = "";
+            const estimateRow = document.getElementById("estimate-row");
+            const estimateName = document.getElementById("estimate-filename");
+            const estimateLink = document.getElementById("estimate-view-link");
+            let estimate = null;
             (d.results || []).forEach(f => {
+                if (f.is_estimate) {
+                    estimate = f;
+                    return;
+                }
                 const li = document.createElement("li");
                 li.style.padding = "8px 0";
                 const a = document.createElement("a");
@@ -214,6 +279,14 @@
                 li.appendChild(a);
                 ul.appendChild(li);
             });
+            if (estimate) {
+                estimateName.textContent = estimate.filename;
+                estimateLink.href = estimate.url;
+                estimateRow.dataset.filename = estimate.filename;
+                estimateRow.style.display = "flex";
+            } else {
+                estimateRow.style.display = "none";
+            }
 
             // Load the resubmit panel context once the job is completed.
             if (!resubmitContextLoaded) {
@@ -348,6 +421,86 @@
                 }
             });
         }
+    });
+
+    function fmtMoney(n) {
+        return "$" + Number(n).toLocaleString(undefined, {maximumFractionDigits: 0});
+    }
+
+    function openSendEstimateModal() {
+        const modal = document.getElementById("send-estimate-modal");
+        const row = document.getElementById("estimate-row");
+        const filename = (row && row.dataset.filename) || "estimate.pdf";
+        const subtotal = Number(
+            (document.getElementById("subtotal-display").textContent || "")
+            .replace(/[^0-9.]/g, "")) || 0;
+        document.getElementById("send-to").value = "";
+        document.getElementById("send-subject").value = `Estimate for review`;
+        document.getElementById("send-body").value =
+            "Hello,\n\n" +
+            "Please find attached the formal estimate for review.\n\n" +
+            (subtotal ? `Estimate total: ${fmtMoney(subtotal)}\n\n` : "") +
+            "Let me know if you have any questions or if you'd like to proceed.\n\n" +
+            "Thank you.";
+        document.getElementById("send-attachment-name").textContent = filename;
+        const feedback = document.getElementById("send-estimate-feedback");
+        feedback.style.display = "none";
+        feedback.textContent = "";
+        document.getElementById("send-estimate-submit").disabled = false;
+        modal.style.display = "flex";
+        setTimeout(() => document.getElementById("send-to").focus(), 50);
+    }
+
+    function closeSendEstimateModal() {
+        document.getElementById("send-estimate-modal").style.display = "none";
+    }
+
+    document.addEventListener("DOMContentLoaded", () => {
+        const sendBtn = document.getElementById("estimate-send-btn");
+        const sendModal = document.getElementById("send-estimate-modal");
+        if (sendBtn) sendBtn.addEventListener("click", openSendEstimateModal);
+        document.getElementById("send-estimate-close").addEventListener("click", closeSendEstimateModal);
+        document.getElementById("send-estimate-cancel").addEventListener("click", closeSendEstimateModal);
+        sendModal.addEventListener("click", (e) => {
+            if (e.target === sendModal) closeSendEstimateModal();
+        });
+        document.addEventListener("keydown", (e) => {
+            if (e.key === "Escape" && sendModal.style.display !== "none") closeSendEstimateModal();
+        });
+
+        document.getElementById("send-estimate-form").addEventListener("submit", async (e) => {
+            e.preventDefault();
+            const submitBtn = document.getElementById("send-estimate-submit");
+            const feedback = document.getElementById("send-estimate-feedback");
+            submitBtn.disabled = true;
+            feedback.style.display = "";
+            feedback.style.color = "#cbd5e1";
+            feedback.textContent = "Sending…";
+            try {
+                const res = await fetch(`/api/jobs/${SUB_ID}/send-estimate`, {
+                    method: "POST",
+                    credentials: "same-origin",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Accept": "application/json",
+                    },
+                    body: JSON.stringify({
+                        to: document.getElementById("send-to").value.trim(),
+                        subject: document.getElementById("send-subject").value.trim(),
+                        body: document.getElementById("send-body").value,
+                    }),
+                });
+                const data = await res.json().catch(() => ({}));
+                if (!res.ok) throw new Error(data.error || `HTTP ${res.status}`);
+                feedback.style.color = "#6ee7b7";
+                feedback.textContent = "✓ Sent to " + document.getElementById("send-to").value.trim();
+                setTimeout(closeSendEstimateModal, 1400);
+            } catch (err) {
+                feedback.style.color = "#f87171";
+                feedback.textContent = "Failed: " + err.message;
+                submitBtn.disabled = false;
+            }
+        });
     });
 
     async function poll() {

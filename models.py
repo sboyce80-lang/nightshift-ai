@@ -106,6 +106,20 @@ class Organization(Base):
         DateTime(timezone=True), nullable=True,
     )
 
+    # Branding + contact fields surfaced on the formal Estimate PDF (the
+    # third deliverable alongside the full job PDF + JSON). logo_url is
+    # auto-populated from the first owner's Clerk image_url on sign-in;
+    # the rest are owner-editable on /account/organization.
+    logo_url: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
+    street_address: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    city: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
+    state: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    postal_code: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+    phone: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    contact_email: Mapped[Optional[str]] = mapped_column(String(320), nullable=True)
+    website: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
+    tax_id: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=_utcnow, nullable=False,
     )

@@ -384,7 +384,19 @@
         ['dragleave','drop'].forEach(evt =>
             drop.addEventListener(evt, e => { e.preventDefault(); drop.classList.remove('drag-over'); }));
         drop.addEventListener('drop', e => {
-            if (e.dataTransfer.files.length > 0) { input.files = e.dataTransfer.files; render(); }
+            if (e.dataTransfer.files.length === 0) return;
+            const dt = new DataTransfer();
+            const seen = new Set();
+            const addFile = f => {
+                const key = f.name + '|' + f.size + '|' + f.lastModified;
+                if (seen.has(key)) return;
+                seen.add(key);
+                dt.items.add(f);
+            };
+            for (const f of input.files) addFile(f);
+            for (const f of e.dataTransfer.files) addFile(f);
+            input.files = dt.files;
+            render();
         });
         input.addEventListener('change', render);
 
