@@ -470,6 +470,12 @@ footer {
     text-decoration: underline;
 }
 
+.back-link-top {
+    display: block;
+    text-align: left;
+    margin: 0 0 16px;
+}
+
 /* ── Progress Tracker (Thank You page) ── */
 .progress-tracker {
     margin: 24px 0;

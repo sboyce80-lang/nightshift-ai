@@ -68,6 +68,7 @@ from notifications import (
     notify_admin_of_new_signup,
     notify_user_of_approval,
     notify_user_of_denial,
+    notify_user_of_org_invite,
     notifications_configured,
 )
 from generate_estimate_pdf import is_estimate_filename
@@ -2383,6 +2384,7 @@ def members_invite():
         flash("Enter a valid email address.", "error")
         return redirect(url_for("members"))
 
+    notify_payload = None
     with session_scope() as session:
         user = session.get(User, uid)
         org = user.current_organization if user else None
@@ -2405,6 +2407,10 @@ def members_invite():
         if invitee_domain in FREE_EMAIL_DOMAINS:
             flash("Free-email addresses cannot be added to a corporate org.", "error")
             return redirect(url_for("members"))
+
+        inviter_name = user.name or ""
+        inviter_email = user.email or ""
+        org_name = org.name
 
         existing = session.query(User).filter(User.email == raw_email).one_or_none()
         if existing is None:
@@ -2432,8 +2438,46 @@ def members_invite():
         if existing.current_organization_id is None:
             existing.current_organization_id = org.id
 
-    flash(f"Invited {raw_email}. They'll join automatically when they sign in.",
-          "success")
+        notify_payload = {
+            "email": raw_email,
+            "role": role,
+            "org_name": org_name,
+            "inviter_name": inviter_name,
+            "inviter_email": inviter_email,
+        }
+
+    # Send notification AFTER commit so a Resend hiccup doesn't roll back the
+    # membership. Mirrors the pattern in /onboarding.
+    email_sent = False
+    if notify_payload:
+        app_url = url_for("index", _external=True)
+        try:
+            email_sent = notify_user_of_org_invite(
+                notify_payload["email"],
+                notify_payload["org_name"],
+                notify_payload["role"],
+                notify_payload["inviter_name"],
+                notify_payload["inviter_email"],
+                app_url,
+            )
+        except Exception as exc:
+            logger.error("Invite notification to %s failed: %s",
+                         notify_payload["email"], exc)
+
+    if email_sent:
+        flash(f"Invited {raw_email} — notification email sent.", "success")
+    elif notifications_configured():
+        flash(
+            f"Invited {raw_email}. Email notification failed to send — "
+            "they can still join by signing in with that address.",
+            "success",
+        )
+    else:
+        flash(
+            f"Invited {raw_email}. They'll join automatically when they sign in. "
+            "(Email notifications are not configured.)",
+            "success",
+        )
     return redirect(url_for("members"))
 
 

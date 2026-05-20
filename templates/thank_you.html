@@ -24,6 +24,7 @@
     </header>
 
     <main class="thank-you-card">
+        <a href="{{ url_for('index') }}" class="back-link back-link-top">&larr; Submit another project</a>
         <div class="check-icon">&#9989;</div>
         <h2>Your Estimate Is Being Prepared</h2>
         <p>We received <strong>{{ num_files }} PDF{{ 's' if num_files != 1 else '' }}</strong> from <strong>{{ name }}</strong>.</p>
@@ -56,10 +57,6 @@
                 </div>
             </div>
             <p class="progress-status" id="progress-status">Analyzing your documents...</p>
-        </div>
-
-        <div class="estimate-time">
-            &#9200; Estimated processing time: 2&ndash;5 minutes per document
         </div>
 
         <p>Our AI is reading every room, door, window, and finish on your drawings. You'll receive a detailed painting estimate with line-item pricing in your inbox shortly.</p>

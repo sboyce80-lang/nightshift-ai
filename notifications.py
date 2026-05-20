@@ -139,6 +139,33 @@ If you have any questions, just reply to this email.
     return _send([email], "Your Knight Shift access is approved", body)
 
 
+def notify_user_of_org_invite(email: str, org_name: str, role: str,
+                              inviter_name: str, inviter_email: str,
+                              app_url: str) -> bool:
+    """Email an invitee that they've been added to an org.
+
+    Sent from the /account/members/invite handler after the membership row
+    commits. The invitee signs in with this email and is auto-joined to the
+    org via the existing _sync_user path — no token in the link.
+    """
+    role_label = "owner" if role == "owner" else "member"
+    inviter = inviter_name or inviter_email or "A teammate"
+    body = f"""Hi,
+
+{inviter} ({inviter_email}) added you to {org_name} on Knight Shift as a {role_label}.
+
+Sign in with this email address to join automatically:
+
+  {app_url}
+
+If you weren't expecting this, you can ignore this email — no account is
+created until you sign in.
+
+— Knight Shift
+"""
+    return _send([email], f"You've been added to {org_name} on Knight Shift", body)
+
+
 def notify_user_of_denial(email: str, name: str, org_name: str) -> bool:
     """Email the requester that their access request was denied."""
     body = f"""Hi {name or 'there'},
