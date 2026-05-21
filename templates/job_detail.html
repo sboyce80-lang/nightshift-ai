@@ -101,6 +101,15 @@
                 <textarea id="merge-notes" name="merge_notes" rows="2" placeholder="Revised basement plan from architect"
                           style="width:100%;padding:8px;background:rgba(8,18,32,0.7);border:1px solid rgba(255,255,255,0.12);border-radius:6px;color:#cbd5e1;font-family:inherit;font-size:0.95rem;"></textarea>
 
+                <label for="merge-sheet-hint" style="display:block;color:#cbd5e1;font-weight:500;margin-top:18px;margin-bottom:6px;">
+                    Limit to sheets <span style="color:rgba(203,213,225,0.6);font-weight:400;">(optional)</span>
+                </label>
+                <input id="merge-sheet-hint" type="text" name="merge_sheet_hint" placeholder="e.g. A-201, A-202"
+                       style="width:100%;padding:8px;background:rgba(8,18,32,0.7);border:1px solid rgba(255,255,255,0.12);border-radius:6px;color:#cbd5e1;font-family:inherit;font-size:0.95rem;" />
+                <p style="color:rgba(203,213,225,0.6);font-size:0.82rem;margin:6px 0 0 0;">
+                    Leave blank to analyze the whole file. Enter sheet numbers to point the re-run at just those sheets.
+                </p>
+
                 <div style="margin-top:18px;">
                     <p style="color:#cbd5e1;font-weight:500;margin-bottom:4px;">Scope of revision</p>
                     <p style="color:rgba(203,213,225,0.65);font-size:0.85rem;margin:0 0 10px 0;">

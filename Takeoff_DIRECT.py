@@ -1198,6 +1198,60 @@ def _sheets_in_text(text, upload_sheets):
     return referenced, present, missing
 
 
+def _filter_pdfs_to_sheets(pdf_paths, sheet_hint):
+    """Re-run targeting: return pdf paths narrowed to only the pages whose
+    sheet number matches `sheet_hint`.
+
+    `sheet_hint` may be a raw string ("A-101, A-201") or a list of tokens. A
+    file with no matching sheet is passed through UNCHANGED — an unmatched or
+    mistyped hint can never blank a job. Returns (paths, summary_str).
+    """
+    if not sheet_hint:
+        return list(pdf_paths), ""
+    raw = re.split(r"[,;]+", sheet_hint) if isinstance(sheet_hint, str) else list(sheet_hint)
+    want = {_normalize_sheet_token(t) for t in raw if str(t).strip()}
+    want.discard("")
+    if not want:
+        return list(pdf_paths), ""
+
+    out = []
+    matched_pages = 0
+    filtered_files = 0
+    for p in pdf_paths:
+        try:
+            cls = _classify_pdf_pages(p)
+        except Exception:
+            cls = []
+        match_idx = sorted(
+            c["page_index"] for c in cls
+            if c.get("sheet_number")
+            and _normalize_sheet_token(c["sheet_number"]) in want
+        )
+        if match_idx:
+            try:
+                data = _create_filtered_pdf(p, match_idx)
+                tf = tempfile.NamedTemporaryFile(
+                    suffix=".pdf", delete=False, prefix="nsai_sheethint_")
+                tf.write(data)
+                tf.close()
+                out.append(tf.name)
+                matched_pages += len(match_idx)
+                filtered_files += 1
+                continue
+            except Exception:
+                pass  # fall through to the whole file
+        out.append(p)  # no match (or filter failed) → analyze the file whole
+
+    if matched_pages:
+        summary = (f"sheet hint {sorted(want)} → {matched_pages} matching "
+                   f"page(s) across {filtered_files} file(s)")
+    else:
+        summary = (f"sheet hint {sorted(want)} matched no sheets — "
+                   f"analyzing the uploaded file(s) in full")
+    print(f"   🎯 Re-run targeting: {summary}")
+    return out, summary
+
+
 def _create_filtered_pdf(pdf_path, page_indices):
     """Create a new PDF containing only the specified pages.  Returns bytes.
 
@@ -3227,7 +3281,7 @@ def _build_extraction_prompt(scope_notes="", schedule_hints=None,
         si = schedule_hints.get("stair_info", {})
         hint_parts = [
             "\n═══════════════════════════════════════════════════════════",
-            "KNOWN SCHEDULE DATA (pre-extracted from door/window schedule images):",
+            "KNOWN SCHEDULE DATA (pre-extracted from schedule pages):",
             "═══════════════════════════════════════════════════════════",
         ]
         d_fp = ds.get("total_doors_full_paint", 0) or 0
@@ -3258,6 +3312,34 @@ def _build_extraction_prompt(scope_notes="", schedule_hints=None,
             "Use these totals as REFERENCE when assigning doors/windows to rooms.")
         hint_parts.append(
             "Your per-room counts should approximately SUM to these schedule totals.")
+        rfs = schedule_hints.get("room_finish_schedule") or []
+        if rfs:
+            hint_parts.append("")
+            hint_parts.append(
+                "ROOM FINISH SCHEDULE (pre-extracted — authoritative per-room "
+                "finishes). Match each room below to its floor-plan room by "
+                "number/name and set that room's finishes from this data:")
+            hint_parts.append(
+                "- A wall finish of WC-x / 'wallcovering' / 'vinyl wallcovering' "
+                "means those walls get wallcovering_sqft, NOT paint — reduce "
+                "wall_area_sqft accordingly (see the Wallcovering instructions below).")
+            hint_parts.append(
+                "- Use the ceiling and base finishes here as positive evidence for "
+                "ceiling_painted / ceiling material and base_trim_lf.")
+            for r in rfs[:200]:
+                num = str(r.get("room_number", "") or "").strip()
+                nm = str(r.get("room_name", "") or "").strip()
+                wf = str(r.get("wall_finish", "") or "?").strip()
+                cf = str(r.get("ceiling_finish", "") or "?").strip()
+                bf = str(r.get("base_finish", "") or "?").strip()
+                ut = str(r.get("unit_type", "") or "").strip()
+                lbl = " ".join(x for x in (num, nm) if x) or "(unnamed room)"
+                ut_s = f" [{ut}]" if ut else ""
+                hint_parts.append(
+                    f"  - {lbl}{ut_s}: wall={wf}; ceiling={cf}; base={bf}")
+            if len(rfs) > 200:
+                hint_parts.append(
+                    f"  - ...and {len(rfs) - 200} more rooms in the schedule")
         hint_parts.append(
             "═══════════════════════════════════════════════════════════\n")
         schedule_hint_text = "\n".join(hint_parts)
@@ -7322,19 +7404,24 @@ def _deduplicate_rooms(rooms):
         sheet_room_names.setdefault(sheet, set()).add(
             room.get("room_name", "").lower().strip())
 
-    # Detect detail/enlarged sheets: ≤4 rooms AND all room names appear on a larger sheet
+    # Detect detail/enlarged sheets. A GENUINE enlarged-detail sheet is tiny
+    # (1-2 rooms — an enlarged restroom, an enlarged stair) and every one of
+    # its rooms also appears on a SUBSTANTIALLY larger main-plan sheet.
+    # Kept deliberately strict: over-flagging here drops real floor-plan rooms
+    # — multi-file runs were losing ~half their rooms when 3-4 room real floor
+    # plans got misread as "details" of a coincidentally larger sheet.
     detail_sheets = set()
     for sheet, names in sheet_room_names.items():
         count = sheet_room_counts.get(sheet, 0)
-        if count > 4:
-            continue  # Not a detail sheet
-        # Check if all names from this sheet appear on a bigger sheet
+        if count > 2:
+            continue  # 3+ rooms → treat as a real floor plan, not a detail
+        # Check if all names from this sheet appear on a much bigger sheet
         for other_sheet, other_names in sheet_room_names.items():
             if other_sheet == sheet:
                 continue
-            if sheet_room_counts.get(other_sheet, 0) <= count:
-                continue  # Other sheet is not larger
-            if names.issubset(other_names):
+            if sheet_room_counts.get(other_sheet, 0) < count + 4:
+                continue  # Other sheet is not a substantially larger main plan
+            if names and names.issubset(other_names):
                 detail_sheets.add(sheet)
                 break
     if detail_sheets:
@@ -12431,6 +12518,7 @@ def _max_merge_exterior(prior_ext, delta_ext):
 
 def run_analysis_merge(prior_json, new_pdf_paths, scope_tags=None,
                         contact_name="", contact_email="", scope_notes="",
+                        sheet_hint=None,
                         rate_overrides=None, version=None, parent_id=None):
     """Re-run analysis using a prior result JSON as the baseline, merging
     in extraction from `new_pdf_paths` only.
@@ -12466,6 +12554,10 @@ def run_analysis_merge(prior_json, new_pdf_paths, scope_tags=None,
     #    per-PDF extraction + post-extraction passes; the result's analysis
     #    dict is what we merge with the prior. cost_estimate and will_synthesis
     #    on the delta are discarded — we'll recompute on the merged whole.
+    # Re-run targeting: narrow the new PDFs to specific sheets if requested.
+    if sheet_hint:
+        new_pdf_paths, _ = _filter_pdfs_to_sheets(new_pdf_paths, sheet_hint)
+
     delta_result = run_analysis(
         new_pdf_paths,
         contact_name=contact_name,
@@ -12990,6 +13082,29 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         print(f"   ⚠️  Schedule pre-scan failed: {e}")
         image_schedule_data = None
 
+    # --- Pre-extract the Room Finish Schedule ---
+    # Drives wallcovering + per-room wall/ceiling/base finishes. Gated by a
+    # zero-cost text scan so the LLM call only runs when a finish schedule is
+    # actually present; the result is injected into the extraction prompt.
+    room_finish_schedule = None
+    try:
+        for pdf_path_scan in pdf_paths:
+            if _detect_finish_schedule(pdf_path_scan):
+                rfs_pre = _extract_room_finish_schedule(client, pdf_path_scan)
+                if rfs_pre and rfs_pre.get("room_finish_schedule"):
+                    room_finish_schedule = rfs_pre["room_finish_schedule"]
+                    print(f"   📋 Room finish schedule pre-extracted: "
+                          f"{len(room_finish_schedule)} rooms — injecting into extraction")
+                    break
+    except Exception as e:
+        print(f"   ⚠️  Finish schedule pre-extraction failed: {e}")
+        room_finish_schedule = None
+
+    if room_finish_schedule:
+        if image_schedule_data is None:
+            image_schedule_data = {}
+        image_schedule_data["room_finish_schedule"] = room_finish_schedule
+
     # --- Pre-scan for building inventory from index pages ---
     _update_progress(2, TOTAL_STEPS, "Building Inventory", "Scanning index pages for building data...")
     building_inventory = None
@@ -13481,7 +13596,11 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     _update_progress(5, TOTAL_STEPS, "Validating & Recalculating", "Applying guardrails and schedule overrides...")
     analysis = _normalize_scope_fields(analysis)
 
-    # --- Finish schedule + upload sheet inventory (zero-cost PDF scans) ---
+    # --- Finish schedule + upload sheet inventory ---
+    # Carry the pre-extracted Room Finish Schedule onto the result so the
+    # has_finish_schedule flag and downstream RFIs see it.
+    if room_finish_schedule and not analysis.get("room_finish_schedule"):
+        analysis["room_finish_schedule"] = room_finish_schedule
     _set_finish_schedule_flag(analysis, pdf_paths)
     analysis["_upload_sheet_numbers"] = sorted(_collect_upload_sheet_numbers(pdf_paths))
 

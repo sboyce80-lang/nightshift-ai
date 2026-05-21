@@ -415,7 +415,8 @@ def _find_parent_result_json_key(parent_id):
 
 
 def merge_submission(submission_id, parent_id, new_pdf_keys, contact_info,
-                      scope_notes=None, scope_tags=None, rate_overrides=None):
+                      scope_notes=None, scope_tags=None, rate_overrides=None,
+                      sheet_hint=None):
     """Incremental re-run for a v2+ child submission.
 
     Loads the parent's stored result JSON from R2, runs extraction on ONLY
@@ -476,6 +477,7 @@ def merge_submission(submission_id, parent_id, new_pdf_keys, contact_info,
                 contact_name=contact_info.get("name", ""),
                 contact_email=contact_info.get("email", ""),
                 scope_notes=scope_notes or "",
+                sheet_hint=sheet_hint,
                 rate_overrides=rate_overrides,
             )
 

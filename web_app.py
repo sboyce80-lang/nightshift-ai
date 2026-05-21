@@ -1173,6 +1173,7 @@ def resubmit(parent_id):
 
     # Form fields specific to a re-run.
     merge_notes_text = (request.form.get("merge_notes") or "").strip() or None
+    merge_sheet_hint = (request.form.get("merge_sheet_hint") or "").strip() or None
     raw_tags = request.form.getlist("merge_scope_tags")
     if not raw_tags:
         # Allow comma-separated single field as well as repeated form fields.
@@ -1238,6 +1239,7 @@ def resubmit(parent_id):
                 },
                 "scope_notes": merge_notes_text,
                 "scope_tags": merge_scope_tags,
+                "sheet_hint": merge_sheet_hint,
                 "rate_overrides": None,
             },
             job_id=submission_id,

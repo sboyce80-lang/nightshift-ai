@@ -784,6 +784,7 @@ def json_to_pdf(json_path, pdf_path):
         # New fields with backward compat fallbacks
         doors_fp = _safe_num(agg.get('total_doors_full_paint', agg.get('total_doors', 0)))
         doors_hm = _safe_num(agg.get('total_doors_hm_panel', 0))
+        doors_frame = _safe_num(agg.get('total_doors_frame_only', 0))
         win_ptd = _safe_num(agg.get('total_windows_painted_interior', agg.get('total_windows', 0)))
         win_all = _safe_num(agg.get('total_windows_all', 0))
         stairs = _safe_num(agg.get('total_stair_sections', 0))
@@ -792,14 +793,21 @@ def json_to_pdf(json_path, pdf_path):
             ['Paintable Walls', f"{_safe_num(agg.get('total_paintable_wall_sqft')):,.0f} sqft"],
             ['Paintable Ceilings', f"{_safe_num(agg.get('total_paintable_ceiling_sqft')):,.0f} sqft"],
             ['Base Trim', f"{_safe_num(agg.get('total_base_trim_lf')):,.0f} LF"],
-            ['Doors (Full Paint)', f"{int(doors_fp)}"],
-            ['Doors (HM Panel)', f"{int(doors_hm)}"],
+            ['Doors — Full Paint', f"{int(doors_fp)}"],
+            ['Doors — HM Panel', f"{int(doors_hm)}"],
+            ['Doors — Frame Only', f"{int(doors_frame)}"],
+            ['Doors — Total', f"{int(doors_fp + doors_hm + doors_frame)}"],
             ['Windows (Painted Interior)', f"{int(win_ptd)}"],
             ['Windows (All)', f"{int(win_all)}"],
             ['Stair Sections', f"{int(stairs)}"],
         ]
         story.append(Spacer(1, 4))
         story.append(_kv_table(agg_rows))
+        story.append(Paragraph(
+            '<i>Door types — Full Paint: panel + frame both field-painted. '
+            'HM Panel: hollow-metal panel painted, frame factory-finished. '
+            'Frame Only: frame field-painted, panel not painted.</i>',
+            styles['Note']))
 
     # ── Traceability Summary ──
     # Shows which rooms contribute to each key metric for audit trail
@@ -836,6 +844,7 @@ def json_to_pdf(json_path, pdf_path):
                     'trim': _safe_num(elems.get('base_trim_lf', 0)) * multiplier,
                     'doors_fp': _safe_num(elems.get('doors_full_paint', 0)) * multiplier,
                     'doors_hm': _safe_num(elems.get('doors_hm_panel', 0)) * multiplier,
+                    'doors_frame': _safe_num(elems.get('doors_frame_only', 0)) * multiplier,
                     'windows': _safe_num(elems.get('windows_painted_interior', 0)) * multiplier,
                 })
 
@@ -845,6 +854,7 @@ def json_to_pdf(json_path, pdf_path):
             ('Base Trim (LF)', 'trim'),
             ('Doors Full Paint', 'doors_fp'),
             ('Doors HM Panel', 'doors_hm'),
+            ('Doors Frame Only', 'doors_frame'),
             ('Windows Painted', 'windows'),
         ]
         MAX_TRACE_ROWS = 10
@@ -1219,6 +1229,37 @@ def json_to_pdf(json_path, pdf_path):
         t.setStyle(TableStyle([('ALIGN', (2, 0), (2, -1), 'CENTER')]))
         story.append(Spacer(1, 4))
         story.append(t)
+
+    # ── Glossary ──
+    story.append(Spacer(1, 8))
+    story.append(Paragraph("Glossary", styles['SectionHead']))
+    story.append(HRFlowable(width="100%", thickness=0.5, color=BORDER_GRAY))
+    story.append(Spacer(1, 4))
+    _glossary = [
+        ("Doors — Full Paint",
+         "Door panel and frame both field-painted (typically a wood door in a wood frame)."),
+        ("Doors — HM Panel",
+         "Hollow-metal door panel field-painted; the frame is factory-finished and not repainted."),
+        ("Doors — Frame Only",
+         "Only the door frame is field-painted; the panel (glass or prefinished) is not."),
+        ("Base Trim",
+         "Painted wall base / baseboard, measured in linear feet (LF)."),
+        ("Gyp. Between Stairs",
+         "Gypsum-board wall area in and around stair runs — the stepped drywall flanking the stairs."),
+        ("Dryfall Ceiling",
+         "Spray-applied coating for exposed structure / open ceilings; overspray dries to powder before it reaches the floor."),
+        ("Level 5 Finish",
+         "The smoothest drywall finish — a full skim coat over the surface — priced per square foot."),
+        ("Wallcovering",
+         "Vinyl wallcovering / wallpaper. Priced as install labor, not as paint."),
+        ("CMU Walls",
+         "Concrete masonry unit (block) walls — painted with a block-filler system; priced separately from gypsum."),
+        ("Perimeter Wall Boost",
+         "A pipeline adjustment that raises extracted wall area toward the perimeter-derived total when per-room extraction came in low."),
+    ]
+    for _term, _definition in _glossary:
+        story.append(Paragraph(f"<b>{_term}</b> — {_definition}", styles['BodyText2']))
+        story.append(Spacer(1, 2))
 
     # ── Missing Items for Painting Estimate ──
     missing = analysis.get('missing_for_painting_estimate', [])
