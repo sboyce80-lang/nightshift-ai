@@ -213,6 +213,7 @@
         onload="window.__bootClerk()"></script>
     {% endif %}
 
+    <script src="{{ url_for('static', filename='file-merge.js') }}"></script>
     <script src="{{ url_for('static', filename='upload.js') }}"></script>
     <script>
     // Drag-drop, file list, and pricing-table change tracking
@@ -223,40 +224,9 @@
         const submitBtn = document.getElementById('submit-btn');
         const form = document.getElementById('rfp-form');
 
-        ['dragenter','dragover'].forEach(evt =>
-            dropZone.addEventListener(evt, e => { e.preventDefault(); dropZone.classList.add('drag-over'); }));
-        ['dragleave','drop'].forEach(evt =>
-            dropZone.addEventListener(evt, e => { e.preventDefault(); dropZone.classList.remove('drag-over'); }));
-        dropZone.addEventListener('drop', e => {
-            if (e.dataTransfer.files.length === 0) return;
-            const dt = new DataTransfer();
-            const seen = new Set();
-            const addFile = f => {
-                const key = f.name + '|' + f.size + '|' + f.lastModified;
-                if (seen.has(key)) return;
-                seen.add(key);
-                dt.items.add(f);
-            };
-            for (const f of fileInput.files) addFile(f);
-            for (const f of e.dataTransfer.files) addFile(f);
-            fileInput.files = dt.files;
-            updateFileList();
-        });
-        fileInput.addEventListener('change', updateFileList);
-
-        function updateFileList() {
-            fileList.innerHTML = '';
-            for (const f of fileInput.files) {
-                const sizeMB = (f.size / 1048576).toFixed(1);
-                const isPDF = f.type === 'application/pdf' || f.name.toLowerCase().endsWith('.pdf');
-                const item = document.createElement('div');
-                item.className = 'file-item';
-                item.innerHTML = '<span class="file-name">' + (isPDF ? '' : '&#9888; ') + f.name + '</span>' +
-                                 '<span class="file-size">' + sizeMB + ' MB</span>';
-                if (!isPDF) item.style.borderLeft = '3px solid #dc2626';
-                fileList.appendChild(item);
-            }
-        }
+        // Browse and drag-drop both MERGE into the current selection instead
+        // of replacing it (native <input type=file> clobbers on every pick).
+        wireFileMerge(fileInput, { dropZone: dropZone, listEl: fileList });
 
         // Pricing override sync — only post values that differ from default.
         function syncOverrides() {

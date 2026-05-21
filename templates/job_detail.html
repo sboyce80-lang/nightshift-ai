@@ -93,6 +93,7 @@
                 </label>
                 <input id="resubmit-files" type="file" name="attachments" multiple accept="application/pdf" required
                        style="width:100%;padding:8px;background:rgba(8,18,32,0.7);border:1px solid rgba(255,255,255,0.12);border-radius:6px;color:#cbd5e1;" />
+                <div id="resubmit-file-list" style="margin-top:8px;"></div>
 
                 <label for="merge-notes" style="display:block;color:#cbd5e1;font-weight:500;margin-top:18px;margin-bottom:6px;">
                     What changed? <span style="color:rgba(203,213,225,0.6);font-weight:400;">(optional)</span>
@@ -232,6 +233,7 @@
     });</script>
     {% endif %}
 
+    <script src="{{ url_for('static', filename='file-merge.js') }}"></script>
     <script>
     const SUB_ID = {{ submission_id|tojson }};
     const TERMINAL = new Set(["completed", "failed"]);
@@ -245,6 +247,7 @@
     let pollTimer = null;
 
     let resubmitContextLoaded = false;
+    let resubmitMerge = null;
 
     function render(d) {
         const pill = document.getElementById("status-pill");
@@ -381,6 +384,7 @@
         const form = document.getElementById("resubmit-form");
         form.action = `/submit/${SUB_ID}/resubmit`;
         form.reset();
+        if (resubmitMerge) resubmitMerge.reset();
         document.getElementById("resubmit-form-error").style.display = "none";
     }
 
@@ -408,6 +412,13 @@
                 closeResubmitModal();
             }
         });
+        // Browse merges into the current selection instead of replacing it.
+        const resubmitFiles = document.getElementById("resubmit-files");
+        const resubmitFileList = document.getElementById("resubmit-file-list");
+        if (resubmitFiles) {
+            resubmitMerge = wireFileMerge(resubmitFiles, { listEl: resubmitFileList });
+        }
+
         // Light client-side validation for the form (must have at least 1 file).
         const form = document.getElementById("resubmit-form");
         if (form) {

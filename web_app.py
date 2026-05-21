@@ -1555,12 +1555,16 @@ def job_chat_api(submission_id):
 
     try:
         from chat import chat_about_job
-        reply = chat_about_job(data, messages)
+        result = chat_about_job(data, messages)
     except Exception as exc:
         logger.error("Chat failed for submission %s: %s", submission_id, exc, exc_info=True)
         return jsonify({"error": "chat failed"}), 500
 
-    return jsonify({"role": "assistant", "content": reply})
+    return jsonify({
+        "role": "assistant",
+        "content": result.get("reply", ""),
+        "proposed_corrections": result.get("proposed_corrections") or [],
+    })
 
 
 @app.route("/api/help/chat", methods=["POST"])
@@ -1760,6 +1764,161 @@ def job_regenerate_api(submission_id):
                 submission_id, uid, new_subtotal)
     return jsonify({"ok": True, "subtotal": new_subtotal,
                     "items_updated": matched})
+
+
+@app.route("/api/jobs/<submission_id>/adjust-quantities", methods=["POST"])
+@require_auth
+def job_adjust_quantities_api(submission_id):
+    """Apply user quantity corrections to a completed estimate and re-price it.
+
+    Body: {"adjustments": [{"label": "<leading line-item label>",
+                            "qty": <float>}, ...]}
+
+    Loads the saved result JSON, sets the new quantity on each matching
+    cost-estimate line item (keeping its unit rate and markup %), recomputes
+    line totals + subtotal, re-renders the PDF, and re-uploads both to R2.
+    The DB subtotal and a manual_corrections audit log are updated too.
+    No LLM calls — this is a pure pricing recompute.
+    """
+    import re
+    import tempfile
+    from datetime import datetime, timezone
+    from json_to_pdf import json_to_pdf
+
+    uid = current_user_id()
+    payload = request.get_json(silent=True) or {}
+    adjustments = payload.get("adjustments") or []
+    by_label = {}
+    for adj in adjustments:
+        label = (adj.get("label") or "").strip()
+        if not label:
+            continue
+        try:
+            qty = float(adj.get("qty"))
+        except (TypeError, ValueError):
+            return jsonify({"error": "invalid qty"}), 400
+        if qty < 0 or qty > 10_000_000:
+            return jsonify({"error": "qty out of range"}), 400
+        by_label[label] = qty
+
+    if not by_label:
+        return jsonify({"error": "no adjustments provided"}), 400
+
+    with session_scope() as session:
+        sub = session.get(Submission, submission_id)
+        if sub is None or sub.user_id != uid:
+            return jsonify({"error": "not found"}), 404
+        if sub.status != "completed":
+            return jsonify({"error": "not completed"}), 409
+
+        json_files = [f for f in sub.files
+                      if f.kind == "result"
+                      and f.filename.lower().endswith(".json")]
+        pdf_files = [f for f in sub.files
+                     if f.kind == "result"
+                     and f.filename.lower().endswith(".pdf")]
+        if not json_files:
+            return jsonify({"error": "result JSON not found"}), 404
+
+        json_file = sorted(json_files, key=lambda f: f.id, reverse=True)[0]
+        json_key = json_file.r2_key
+        json_filename = json_file.filename
+        pdf_key = pdf_files[0].r2_key if pdf_files else None
+        pdf_filename = (pdf_files[0].filename if pdf_files
+                        else json_filename.replace(".json", ".pdf"))
+
+    try:
+        raw = storage.get_bytes(json_key)
+        data = json.loads(raw)
+    except Exception as exc:
+        logger.error("Adjust-qty: failed to load %s: %s", json_key, exc)
+        return jsonify({"error": "failed to load result"}), 500
+
+    cost_estimate = data.get("cost_estimate") or {}
+    line_items = cost_estimate.get("line_items") or []
+    # Replace the qty shown right after the first " - " in the item label.
+    qty_label_re = re.compile(r"( - )([\d,]+(?:\.\d+)?)")
+
+    applied = []
+    for li in line_items:
+        label = (li.get("item") or "").split(" - ")[0]
+        if label not in by_label:
+            continue
+        old_qty = float(li.get("qty") or 0)
+        if old_qty <= 0:
+            continue
+        new_qty = by_label[label]
+        old_cost = float(li.get("cost") or 0)
+        old_markup = float(li.get("markup") or 0)
+        rate = old_cost / old_qty
+        markup_pct = (old_markup / old_cost) if old_cost else 0.0
+        cost = new_qty * rate
+        markup = cost * markup_pct
+        li["qty"] = new_qty
+        li["cost"] = round(cost, 2)
+        li["markup"] = round(markup, 2)
+        li["total"] = round(cost + markup, 2)
+        li["item"] = qty_label_re.sub(
+            lambda m: m.group(1) + format(new_qty, ",.0f"),
+            li.get("item") or "", count=1)
+        applied.append({"label": label, "from_qty": old_qty, "to_qty": new_qty})
+
+    if not applied:
+        return jsonify({"error": "no matching line items"}), 400
+
+    new_subtotal = round(sum(float(li.get("total") or 0) for li in line_items), 2)
+    cost_estimate["subtotal"] = new_subtotal
+    data["cost_estimate"] = cost_estimate
+
+    # Audit trail — the result JSON previously had no user-correction field.
+    corrections_log = data.get("manual_corrections") or []
+    corrections_log.append({
+        "applied_at": datetime.now(timezone.utc).isoformat(),
+        "kind": "quantity",
+        "changes": applied,
+    })
+    data["manual_corrections"] = corrections_log
+
+    # Re-render PDF + re-upload both files.
+    with tempfile.TemporaryDirectory(prefix=f"ns-adjqty-{submission_id}-") as workdir:
+        json_path = os.path.join(workdir, json_filename)
+        pdf_path = os.path.join(workdir, pdf_filename)
+        try:
+            with open(json_path, "w") as f:
+                json.dump(data, f, indent=2)
+            json_to_pdf(json_path, pdf_path)
+            storage.upload_file(json_path, json_key,
+                                content_type="application/json")
+            if pdf_key:
+                storage.upload_file(pdf_path, pdf_key,
+                                    content_type="application/pdf")
+            else:
+                new_pdf_key = storage.result_key(submission_id, pdf_filename)
+                storage.upload_file(pdf_path, new_pdf_key,
+                                    content_type="application/pdf")
+                with session_scope() as session:
+                    session.add(File(
+                        submission_id=submission_id,
+                        kind="result",
+                        filename=pdf_filename,
+                        r2_key=new_pdf_key,
+                        size_bytes=os.path.getsize(pdf_path),
+                        content_type="application/pdf",
+                    ))
+        except Exception as exc:
+            logger.error("Adjust-qty: render/upload failed for %s: %s",
+                         submission_id, exc, exc_info=True)
+            return jsonify({"error": "failed to regenerate"}), 500
+
+    with session_scope() as session:
+        sub = session.get(Submission, submission_id)
+        if sub is not None:
+            sub.subtotal = new_subtotal
+
+    logger.info("Submission %s quantities adjusted by user %d — new subtotal $%.2f",
+                submission_id, uid, new_subtotal)
+    return jsonify({"ok": True, "subtotal": new_subtotal,
+                    "items_updated": len(applied)})
 
 
 @app.route("/api/jobs/<submission_id>/prioritize", methods=["POST"])

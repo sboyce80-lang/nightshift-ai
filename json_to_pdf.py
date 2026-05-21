@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Convert construction analysis JSON to formatted PDF"""
 import json
+import re
 import sys
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.units import inch
@@ -907,6 +908,56 @@ def json_to_pdf(json_path, pdf_path):
                 ('ROWBACKGROUNDS', (0, 1), (-1, -1), [WHITE, LIGHT_GRAY]),
             ]))
             story.append(tt)
+
+            # ── Pipeline reconciliation (walls / trim) ──
+            # The per-room sum above is the EXTRACTED total. The Cost Estimate
+            # prices a figure derived from it through pipeline adjustments
+            # (perimeter boost, sanity caps, senior-estimator review). Show
+            # both, and name the adjustments that left a trace, so this table
+            # does not look like it contradicts the priced number.
+            _li_kw = {
+                'walls': ('gyp. wall', 'gyp wall'),
+                'trim': ('base trim',),
+            }.get(metric_key)
+            if _li_kw:
+                extracted = total_val
+                priced = None
+                will_pct = None
+                for li in (cost_est.get('line_items') or []):
+                    _label = str(li.get('item', ''))
+                    if any(kw in _label.lower() for kw in _li_kw):
+                        priced = _safe_num(li.get('qty', 0))
+                        _m = re.search(r'\[Will:\s*([+-]?\d+(?:\.\d+)?)\s*%\]', _label)
+                        will_pct = float(_m.group(1)) if _m else None
+                        break
+                # Only explain a materially different priced number — small
+                # gaps are routine door-opening deductions, not worth a note.
+                if (priced is not None and extracted > 0
+                        and abs(priced - extracted) > extracted * 0.04):
+                    _notes_blob = " ".join(str(n) for n in (analysis.get('notes') or []))
+                    _adj = []
+                    if ('Perimeter Wall Boost' in _notes_blob
+                            or '[Wall Boost]' in _notes_blob):
+                        _adj.append('a perimeter boost')
+                    if priced < extracted * 0.96:
+                        # Priced dropped below the extracted total — an upstream
+                        # sanity cap / manual-review reduction shrank it.
+                        _adj.append('a sanity cap')
+                    if will_pct:
+                        _adj.append(f'a senior-estimator adjustment (Will {will_pct:+.0f}%)')
+                    if len(_adj) > 1:
+                        _adj_txt = ', '.join(_adj[:-1]) + ' and ' + _adj[-1]
+                    elif _adj:
+                        _adj_txt = _adj[0]
+                    else:
+                        _adj_txt = 'pipeline adjustments'
+                    story.append(Paragraph(
+                        f"<i>Reconciliation: per-room extraction sums to "
+                        f"{extracted:,.0f}; the Cost Estimate prices {priced:,.0f} "
+                        f"after {_adj_txt}. See the job notes for the adjustment "
+                        f"trail.</i>",
+                        styles['Note']
+                    ))
 
     # ── Exterior Scope ──
     ext = analysis.get('exterior', {})

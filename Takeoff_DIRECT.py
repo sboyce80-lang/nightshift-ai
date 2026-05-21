@@ -1076,6 +1076,128 @@ def _classify_pdf_pages(pdf_path):
     return classifications
 
 
+def _detect_finish_schedule(pdf_path):
+    """Zero-API-cost detector: scan a PDF's page text for a Room Finish
+    Schedule table.
+
+    Returns True if one is found, False if the PDF was scanned and none was
+    found, or None if the PDF could not be scanned (PyMuPDF unavailable or a
+    read error). Mirrors the door/window-schedule flags so a project that
+    actually includes a finish schedule is not RFI'd as if one is missing.
+    """
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        return None
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception:
+        return None
+    try:
+        # A page that NAMES a finish schedule/legend...
+        TITLE_PHRASES = ("room finish schedule", "finish schedule",
+                         "interior finish schedule", "finish legend",
+                         "room finish legend")
+        # ...AND carries finish-table column headers is the schedule itself.
+        # Requiring 2+ strong headers keeps a stray "see finish schedule"
+        # callout on a floor plan from tripping the detector.
+        TABLE_TOKENS = ("wall finish", "ceiling finish", "base finish",
+                        "floor finish", "room finish", "room name",
+                        "room no", "room number")
+        for page in doc:
+            t = page.get_text().lower()
+            if not any(p in t for p in TITLE_PHRASES):
+                continue
+            if sum(1 for tok in TABLE_TOKENS if tok in t) >= 2:
+                return True
+        return False
+    finally:
+        doc.close()
+
+
+def _set_finish_schedule_flag(analysis, pdf_paths):
+    """Set analysis['has_finish_schedule'] from a zero-cost PDF text scan.
+
+    Honors a finish schedule already detected/extracted upstream (the
+    schedule-estimation path populates room_finish_schedule). Leaves the flag
+    unset if no PDF could be scanned, so the RFI's `is False` check does not
+    fire on an inconclusive scan.
+    """
+    if analysis.get("has_finish_schedule") is True or analysis.get("room_finish_schedule"):
+        analysis["has_finish_schedule"] = True
+        return
+    found = False
+    scanned = False
+    for p in pdf_paths or []:
+        d = _detect_finish_schedule(p)
+        if d is None:
+            continue
+        scanned = True
+        if d:
+            found = True
+            break
+    if scanned:
+        analysis["has_finish_schedule"] = found
+        print(f"   📋 Finish schedule detection: "
+              f"{'found in upload' if found else 'none found'}")
+
+
+def _normalize_sheet_token(s):
+    """Normalize a sheet number for comparison: uppercase, drop separators.
+    'A-101' / 'A 101' / 'A1.01' all normalize to 'A101'."""
+    return re.sub(r'[^A-Z0-9]', '', str(s).upper())
+
+
+def _collect_upload_sheet_numbers(pdf_paths):
+    """Zero-API-cost scan: collect every sheet number physically present
+    across the uploaded PDFs (normalized).
+
+    Reads only the title-block / bottom-strip regions so a cross-reference
+    ("see A-101") on a floor plan is not mistaken for sheet A-101 being in
+    the set. Used so RFIs don't request sheets that are already uploaded.
+    Returns a set; empty if PyMuPDF is unavailable.
+    """
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        return set()
+    sheets = set()
+    known_prefixes = tuple(dp for dp, _, _ in _DISCIPLINE_MAP)
+    for path in pdf_paths or []:
+        try:
+            doc = fitz.open(path)
+        except Exception:
+            continue
+        try:
+            for page in doc:
+                r = page.rect
+                for clip in (fitz.Rect(r.width * 0.60, r.height * 0.80, r.width, r.height),
+                             fitz.Rect(0, r.height * 0.70, r.width, r.height)):
+                    for m in _SHEET_NUMBER_RE.finditer(page.get_text(clip=clip)):
+                        prefix = m.group(1).upper()
+                        if any(prefix == p or prefix.startswith(p) for p in known_prefixes):
+                            sheets.add(_normalize_sheet_token(prefix + m.group(2)))
+        finally:
+            doc.close()
+    return sheets
+
+
+def _sheets_in_text(text, upload_sheets):
+    """Find sheet numbers named in `text` and split them by whether each is
+    present in `upload_sheets`. Returns (referenced, present, missing)."""
+    referenced, present, missing = [], [], []
+    for m in _SHEET_NUMBER_RE.finditer(str(text)):
+        prefix = m.group(1).upper()
+        if not any(prefix == p or prefix.startswith(p) for p, _, _ in _DISCIPLINE_MAP):
+            continue
+        norm = _normalize_sheet_token(prefix + m.group(2))
+        if norm in referenced:
+            continue
+        referenced.append(norm)
+        (present if norm in upload_sheets else missing).append(norm)
+    return referenced, present, missing
+
+
 def _create_filtered_pdf(pdf_path, page_indices):
     """Create a new PDF containing only the specified pages.  Returns bytes.
 
@@ -2401,6 +2523,9 @@ Go through the door schedule table ROW BY ROW.  For EACH door mark:
      - Any door whose panel material is NOT explicitly "HM"
    • "hm_panel"  — Hollow Metal (HM) panel with ANY frame type (HM, AL, ALUM)
      The panel gets painted regardless of frame material.
+   • EXCLUDE — do NOT count as full_paint or hm_panel: any door whose schedule
+     entry marks it prefinished, pre-finished, factory-finished, "PF", stained,
+     clear-coat, anodized, or clad. These are factory-finished, not field-painted.
    CRITICAL: Blank/-- material is VERY COMMON for residential apartment doors.
    A 20-unit building typically has 150+ doors with blank material columns.
    These are ALL full_paint.  Do NOT skip or ignore doors with blank materials.
@@ -3324,7 +3449,7 @@ For each room:
   * Final calc chain (all three numbers must come from the plans, NEVER estimated):
       sum of linear paths  =  WALL PERIMETER (LF)
       WALL PERIMETER × Wall Height  =  Wall Area (sqft)
-    Record the LF total as "perimeter_lf" and use the SAME LF for base_trim_lf.
+    Record the LF total as "perimeter_lf" and use the same LF for base_trim_lf (see the base trim rule below — flag the room if the base material is resilient or unconfirmed).
 - SHARED INTERIOR WALLS — COUNT IN BOTH ROOMS' WALL PERIMETERS:
   An interior partition wall has TWO painted faces, one in each adjoining room.
   Each room's WALL PERIMETER must include the full length of every wall that bounds
@@ -3338,7 +3463,12 @@ For each room:
   * Exception: exterior walls and walls bounding non-paintable space (mech shafts,
     elevator shafts) only contribute to the one interior room they bound.
 - Calculate: Ceiling Area = Length × Width (only if ceiling_painted = true)
-- Base trim LF = room perimeter (assume base trim in ALL rooms with gyp walls)
+- Base trim LF: record base_trim_lf = room perimeter (this is the measured base
+  length). If the base material is resilient / vinyl / rubber / cove base, tile, or
+  cannot be confirmed from the drawings or finish schedule, ALSO add to the room's
+  "notes": "Base material unverified — confirm paintable vs. resilient cove base".
+  Do NOT silently treat the base as paintable just because the room has gyp walls —
+  vinyl and resilient cove base are common and are not field-painted.
 - Level 5 finish: Check the FINISH SCHEDULE, wall type legends, and room notes for "Level 5",
   "Level 5 skim coat", "L5", "smooth finish", or "skim coat" specifications on any wall or ceiling.
   Common locations: entryways, foyers, hallways, great rooms, formal dining rooms (especially in
@@ -3516,6 +3646,10 @@ CRITICAL: If a door schedule exists, COUNT EVERY SINGLE DOOR listed in it.
 - Doors with NO material listed (just width/height) → classify as "doors_full_paint"
   (these are typically interior residential doors with wood frames)
 - If type is unclear → classify as "doors_full_paint"
+- EXCLUDE prefinished doors: if a door's schedule entry, finish column, or notes
+  mark it prefinished / pre-finished / factory-finished / "PF" / stained /
+  clear-coat / anodized / clad, do NOT count it in any doors_* field — it is
+  factory-finished, not field-painted.
 - DOUBLE DOOR entries count as 1 door opening for painting purposes
 Assign door counts BY FLOOR based on door mark numbers:
   - 000-099 = basement/common, 100-series = 1st floor, 200-series = 2nd floor, 300-series = 3rd floor
@@ -3764,12 +3898,12 @@ CRITICAL RULES:
 - Commercial jobs: assume window sashes are NOT painted (factory-finished)
 - Door schedules override floor plan counts
 - Include ALL hallways, corridors, lobbies, and common areas
-- Base trim in EVERY room with gyp walls, even if not explicitly called out
+- Base trim: record base_trim_lf (= perimeter) for every room; flag rooms whose base is resilient/vinyl or unconfirmed in the room notes (see the base trim rule above) so the estimator can confirm paint scope
 - Break EVERY apartment into individual rooms — never list just "Living/Dining/Kitchen"
 - Extract ALL closets as separate rooms: linen closets, coat closets, pantry closets,
   utility closets, walk-in closets, storage closets. These are commonly missed but
   contribute meaningful ceiling and wall area. Each closet needs its own dimensions,
-  ceiling_painted=true, and base_trim_lf.
+  with ceiling_painted and base_trim_lf set per the ceiling and base trim rules above.
 - For repeated unit types, create ONE template set per type with "unit_multiplier" set to total count
 - Count stairs across the ENTIRE building, not just per-enclosure
 - If you find NO floor plans, return:
@@ -4210,7 +4344,9 @@ Look for these specific items and extract counts:
    - EXCLUDE these door types — they are NOT field-painted:
      * Storefront doors (AD1, AL1, SD-1) — aluminum, factory-finished
      * Overhead/rolling doors (OHD1, OHD2, OHD3, RD-1) — factory-finished
-     * Wood doors (WD1, WD2) — typically pre-finished per manufacturer
+     * Wood doors (WD types) — typically factory pre-finished; also exclude any
+       door the schedule's finish/remarks column marks prefinished, factory-
+       finished, "PF", stained, clear-coat, anodized, or clad
      * Glass doors (GL1, GL-1) — not painted
      * Doors marked "NOT USED" or "NIC" — skip entirely
    - Count ALL qualifying doors in the schedule across ALL floors
@@ -5767,9 +5903,10 @@ def _estimate_from_room_finish_schedule(room_schedule_data, schedule_data=None):
         return "GYP"
 
     def _is_painted_ceiling(ceiling_finish):
-        """Determine if ceiling gets paint."""
+        """Determine if ceiling gets paint. Requires positive evidence — a
+        blank/unknown ceiling finish is NOT assumed to be painted gypsum."""
         if not ceiling_finish:
-            return True
+            return False
         cf = ceiling_finish.lower()
         # ACT (acoustic ceiling tile) is NOT painted
         if any(kw in cf for kw in ("act", "acoustic", "exposed", "none", "n/a")):
@@ -5777,9 +5914,10 @@ def _estimate_from_room_finish_schedule(room_schedule_data, schedule_data=None):
         return True
 
     def _get_ceiling_material(ceiling_finish):
-        """Determine ceiling material type."""
+        """Determine ceiling material type. Blank/unknown is reported as
+        UNKNOWN rather than assumed gypsum — see _is_painted_ceiling."""
         if not ceiling_finish:
-            return "GYP"
+            return "UNKNOWN"
         cf = ceiling_finish.lower()
         if "dryfall" in cf:
             return "DRYFALL"
@@ -5794,7 +5932,7 @@ def _estimate_from_room_finish_schedule(room_schedule_data, schedule_data=None):
             return True
         if any(kw in bf for kw in ("rubber", "vinyl", "tile", "none", "n/a", "carpet")):
             return False
-        return True  # Default to having base trim
+        return True  # Base finish present but unrecognized — assume paintable
 
     def _is_concrete_floor(floor_finish):
         """Determine if floor needs concrete sealer.
@@ -5894,7 +6032,7 @@ def _estimate_from_room_finish_schedule(room_schedule_data, schedule_data=None):
             floor_area = length * width
 
             wall_finish = room.get("wall_finish", "Paint")
-            ceiling_finish = room.get("ceiling_finish", "GWB - Paint")
+            ceiling_finish = room.get("ceiling_finish", "")
             base_finish = room.get("base_finish", "")
             floor_finish = room.get("floor_finish", "")
 
@@ -5944,7 +6082,7 @@ def _estimate_from_room_finish_schedule(room_schedule_data, schedule_data=None):
                     "painted_railing_lf": 0,
                 },
                 "notes": f"Schedule-estimated room ({total_multiplier}x: {units_per_building} units/bldg × {n_buildings} buildings). "
-                         f"Wall finish: {wall_finish}. Ceiling: {ceiling_finish}. Base: {base_finish}.",
+                         f"Wall finish: {wall_finish}. Ceiling: {ceiling_finish or 'UNVERIFIED — not in finish schedule'}. Base: {base_finish or 'UNVERIFIED — not in finish schedule'}.",
                 "source": "schedule_estimate",
                 "estimated_dimensions": True,
                 "in_scope": True,
@@ -5967,7 +6105,7 @@ def _estimate_from_room_finish_schedule(room_schedule_data, schedule_data=None):
         floor_area = length * width
 
         wall_finish = room.get("wall_finish", "Paint")
-        ceiling_finish = room.get("ceiling_finish", "GWB - Paint")
+        ceiling_finish = room.get("ceiling_finish", "")
         base_finish = room.get("base_finish", "")
         floor_finish = room.get("floor_finish", "")
 
@@ -6020,7 +6158,7 @@ def _estimate_from_room_finish_schedule(room_schedule_data, schedule_data=None):
                 "painted_railing_lf": 0,
             },
             "notes": f"Schedule-estimated common area ({common_multiplier}x: {floors_per_building} floors × {n_buildings} buildings). "
-                     f"Wall: {wall_finish}. Ceiling: {ceiling_finish}. Base: {base_finish}.",
+                     f"Wall: {wall_finish}. Ceiling: {ceiling_finish or 'UNVERIFIED — not in finish schedule'}. Base: {base_finish or 'UNVERIFIED — not in finish schedule'}.",
             "source": "schedule_estimate",
             "estimated_dimensions": True,
             "in_scope": True,
@@ -6125,6 +6263,67 @@ def _apply_building_multiplier(combined, building_info):
     )
 
     return combined
+
+
+def _purge_stale_schedule_notes(combined, *, doors=False, windows=False):
+    """Drop free-text notes that claim a schedule is missing once that schedule
+    has actually been detected and applied.
+
+    The extraction LLM emits "no door schedule provided" style notes per chunk
+    when a schedule isn't visible in that chunk. When the schedule later turns
+    up in another chunk — or via targeted re-analysis — those notes become
+    false, but they are plain LLM notes, not [bracketed] pipeline markers, so
+    the normal dedup keeps them and they end up contradicting the estimate.
+    """
+    notes = combined.get("notes")
+    if not notes or not (doors or windows):
+        return
+
+    # Phrases that, sitting just after a schedule term, mean the note is
+    # asserting that schedule does not exist. Kept narrow on purpose so a note
+    # like "door schedule lists 49 doors, not all HM" is not caught.
+    _ABSENCE_AFTER = (
+        "not provided", "not found", "not included", "not present",
+        "not available", "not located", "not shown", "not detected",
+        "not in the set", "not in the drawing", "not part of",
+        "was not", "were not", "wasn't", "weren't", "is missing",
+        "missing", "unavailable", "absent", "none provided", "none found",
+    )
+
+    terms = []
+    if doors:
+        terms += ["door schedule", "door/frame schedule", "door and frame schedule"]
+    if windows:
+        terms += ["window schedule"]
+
+    def _denies_schedule(text_lower):
+        for term in terms:
+            idx = text_lower.find(term)
+            while idx != -1:
+                before = text_lower[max(0, idx - 14):idx]
+                if "no " in before or "without" in before or "lack" in before:
+                    return True
+                after = text_lower[idx + len(term):idx + len(term) + 45]
+                if any(a in after for a in _ABSENCE_AFTER):
+                    return True
+                idx = text_lower.find(term, idx + 1)
+        return False
+
+    kept = []
+    removed = 0
+    for n in notes:
+        s = str(n)
+        stripped = s.strip()
+        is_bracketed = stripped.startswith("[") and "]" in stripped
+        if not is_bracketed and _denies_schedule(s.lower()):
+            removed += 1
+            continue
+        kept.append(n)
+
+    if removed:
+        combined["notes"] = kept
+        print(f"   🧹 Purged {removed} stale 'schedule missing' note(s) "
+              f"that contradict a detected schedule")
 
 
 def _apply_schedule_overrides(combined):
@@ -6500,6 +6699,14 @@ def _apply_schedule_overrides(combined):
                     "RFI recommended to confirm exterior painting scope.")
     combined["exterior"] = exterior
 
+    # A detected schedule makes any earlier "no <X> schedule" LLM note false.
+    # Purge those before emitting override notes so the two don't contradict.
+    _purge_stale_schedule_notes(
+        combined,
+        doors=bool(ds) or bool(combined.get("has_door_schedule")),
+        windows=bool(ws) or bool(combined.get("has_window_schedule")),
+    )
+
     if overrides_applied:
         combined.setdefault("notes", [])
         for note in overrides_applied:
@@ -6772,13 +6979,10 @@ def _validate_and_boost_walls(analysis):
 
             if boost_factor > 1.05:
                 boosted_wall = round(current_wall * boost_factor)
-                current_ceil = _num(agg.get("total_paintable_ceiling_sqft", 0))
-                boosted_ceil = round(current_ceil * boost_factor) if current_ceil > 0 else current_ceil
                 current_trim = _num(agg.get("total_base_trim_lf", 0))
                 boosted_trim = round(current_trim * boost_factor) if current_trim > 0 else current_trim
 
                 agg["total_paintable_wall_sqft"] = boosted_wall
-                agg["total_paintable_ceiling_sqft"] = boosted_ceil
                 agg["total_base_trim_lf"] = boosted_trim
                 analysis["aggregated_totals"] = agg
 
@@ -6786,8 +6990,8 @@ def _validate_and_boost_walls(analysis):
                     f"[Perimeter Wall Boost] Aggregated walls ({current_wall:,} sqft) "
                     f"< perimeter-derived ({perimeter_wall:,} sqft). "
                     f"Boosted to {boosted_wall:,} sqft ({boost_factor:.2f}x). "
-                    f"Ceilings {current_ceil:,}->{boosted_ceil:,}, "
-                    f"Trim {current_trim:,}->{boosted_trim:,} LF."
+                    f"Trim {current_trim:,}->{boosted_trim:,} LF. "
+                    f"Ceilings not boosted (no measurement basis)."
                 )
                 print(f"   📐 Perimeter wall boost: {current_wall:,} -> {boosted_wall:,} sqft "
                       f"({boost_factor:.2f}x, from perimeter data)")
@@ -6866,15 +7070,11 @@ def _validate_and_boost_walls(analysis):
 
         if boost_factor > 1.05:  # Only boost if meaningfully under (>5%)
             boosted_wall = round(current_wall * boost_factor)
-            # Also boost ceilings proportionally (they track with rooms)
-            current_ceil = _num(agg.get("total_paintable_ceiling_sqft", 0))
-            boosted_ceil = round(current_ceil * boost_factor) if current_ceil > 0 else current_ceil
-            # And trim (perimeter-based, tracks with wall extraction completeness)
+            # Trim is perimeter-based — tracks with wall extraction completeness.
             current_trim = _num(agg.get("total_base_trim_lf", 0))
             boosted_trim = round(current_trim * boost_factor) if current_trim > 0 else current_trim
 
             agg["total_paintable_wall_sqft"] = boosted_wall
-            agg["total_paintable_ceiling_sqft"] = boosted_ceil
             agg["total_base_trim_lf"] = boosted_trim
             analysis["aggregated_totals"] = agg
 
@@ -6882,7 +7082,7 @@ def _validate_and_boost_walls(analysis):
                 f"[Wall Boost] Extracted wall area ({current_wall:,} sqft) was {actual_ratio:.2f}x "
                 f"floor area — expected ~{expected_wall_ratio}x for residential multi-family. "
                 f"Boosted to {boosted_wall:,} sqft (factor {boost_factor:.2f}x). "
-                f"Ceilings {current_ceil:,}->{boosted_ceil:,}, Trim {current_trim:,}->{boosted_trim:,} LF."
+                f"Trim {current_trim:,}->{boosted_trim:,} LF. Ceilings not boosted (no measurement basis)."
             )
             print(f"   📐 Wall boost: {current_wall:,} -> {boosted_wall:,} sqft "
                   f"({boost_factor:.2f}x factor, was {actual_ratio:.2f}x floor area)")
@@ -9632,18 +9832,35 @@ def generate_rfi_items(analysis):
     """
     items = []
 
+    # Sheet numbers physically present in the upload — used so RFIs don't
+    # request drawings the client already provided.
+    upload_sheets = set(analysis.get("_upload_sheet_numbers") or [])
+
     # --- 1. No floor plans found ---
     if analysis.get("no_floor_plans_found") or analysis.get("no_detailed_floor_plans_found"):
-        items.append({
-            "category": "Missing Drawings",
-            "question": (
-                "The provided drawing set does not include architectural floor plans with "
-                "dimensions. Can you provide the complete architectural plan sheets "
-                "(A1.x, A2.x series) so we can measure wall areas, ceiling areas, and "
-                "perimeter lengths for all rooms?"
-            ),
-            "action_required": "Provide architectural floor plan sheets with dimension callouts."
-        })
+        # Contradiction guard: dimensioned, non-synthetic rooms can only be
+        # measured off floor plans — if we have them, the plans were uploaded.
+        _measured_rooms = 0
+        for _fl in analysis.get("floors", []):
+            for _rm in _fl.get("rooms", []):
+                if not _rm.get("in_scope", True) or _rm.get("source") == "schedule_estimate":
+                    continue
+                if _num(_rm.get("dimensions", {}).get("wall_area_sqft", 0)) > 0:
+                    _measured_rooms += 1
+        if _measured_rooms >= 3:
+            print(f"   📋 RFI: suppressed 'no floor plans' — {_measured_rooms} "
+                  f"dimensioned rooms were extracted (floor plans were present)")
+        else:
+            items.append({
+                "category": "Missing Drawings",
+                "question": (
+                    "The provided drawing set does not include architectural floor plans with "
+                    "dimensions. Can you provide the complete architectural plan sheets "
+                    "(A1.x, A2.x series) so we can measure wall areas, ceiling areas, and "
+                    "perimeter lengths for all rooms?"
+                ),
+                "action_required": "Provide architectural floor plan sheets with dimension callouts."
+            })
 
     # --- 2. No door schedule ---
     if analysis.get("has_door_schedule") is False:
@@ -9652,7 +9869,11 @@ def generate_rfi_items(analysis):
             "question": (
                 "No door schedule was found in the provided documents. Door type "
                 "(hollow metal vs. wood) determines our painting scope and pricing "
-                "per unit. Can you provide the door schedule sheets (typically A-501/A-502)?"
+                "per unit. Without the schedule, door counts are estimated from the "
+                "floor plans and commonly over-count field-painted doors — every "
+                "room shows its doors, and prefinished doors cannot be ruled out. "
+                "Treat the door quantities in this estimate as preliminary. Can you "
+                "provide the door schedule sheets (typically A-501/A-502)?"
             ),
             "action_required": "Provide door schedule sheet(s) showing door types, materials, and frame specifications."
         })
@@ -9674,6 +9895,32 @@ def generate_rfi_items(analysis):
                 "Provide window schedule with TYPE details showing frame material, "
                 "casing, apron, stool/sill, wood return, drywall return, and "
                 "field-paint specifications."
+            )
+        })
+
+    # --- 3b. No finish schedule ---
+    if analysis.get("has_finish_schedule") is False:
+        _agg_fs = analysis.get("aggregated_totals", {})
+        _bt_fs = _num(_agg_fs.get("total_base_trim_lf", 0))
+        _bt_clause = (
+            f" In particular, all {_bt_fs:,.0f} LF of base trim is priced as "
+            f"paintable — if any rooms have resilient/vinyl/rubber cove base, that "
+            f"footage is not field-painted and should be deducted."
+            if _bt_fs > 0 else ""
+        )
+        items.append({
+            "category": "Missing Schedules",
+            "question": (
+                "No room finish schedule was found in the provided documents. The "
+                "finish schedule determines wall, ceiling, and base materials per "
+                "room — which surfaces are paintable gypsum versus CMU, ACT, or "
+                "resilient cove base. Without it the estimate relies on typical "
+                f"assumptions.{_bt_clause} Can you provide the room finish schedule "
+                "and finish legend sheets?"
+            ),
+            "action_required": (
+                "Provide the room finish schedule / finish legend sheets showing "
+                "wall, ceiling, and base finishes per room."
             )
         })
 
@@ -9727,6 +9974,12 @@ def generate_rfi_items(analysis):
 
     # --- 6. missing_for_painting_estimate list ---
     for item_text in analysis.get("missing_for_painting_estimate", []):
+        # Don't echo a request for sheets the client already uploaded.
+        referenced, present, missing = _sheets_in_text(item_text, upload_sheets)
+        if referenced and not missing:
+            print(f"   📋 RFI: skipped \"{str(item_text)[:55]}\" — referenced "
+                  f"sheet(s) {', '.join(present)} are in the upload")
+            continue
         items.append({
             "category": "Clarification Needed",
             "question": (
@@ -9738,6 +9991,10 @@ def generate_rfi_items(analysis):
 
     # --- 7. drawings_referenced_but_not_included ---
     for sheet in analysis.get("drawings_referenced_but_not_included", []):
+        # Skip if that sheet is actually in the upload (stale reference).
+        if _normalize_sheet_token(sheet) in upload_sheets:
+            print(f"   📋 RFI: skipped 'missing sheet {sheet}' — it is in the upload")
+            continue
         items.append({
             "category": "Missing Drawings",
             "question": (
@@ -12256,6 +12513,18 @@ def run_analysis_merge(prior_json, new_pdf_paths, scope_tags=None,
     # 5. Re-run validation and RFIs on merged data. RFIs regenerate from
     #    current state, so any RFI Matt resolved by uploading a new
     #    schedule simply doesn't re-fire.
+    # Carry a finish schedule the prior run already detected, then re-scan the
+    # newly uploaded files so an added finish schedule clears the RFI.
+    _prior_an_fs = prior_json.get("analysis") or {}
+    if _prior_an_fs.get("has_finish_schedule") or _prior_an_fs.get("room_finish_schedule"):
+        merged_analysis["has_finish_schedule"] = True
+    _set_finish_schedule_flag(merged_analysis, new_pdf_paths)
+
+    # Upload sheet inventory: prior run's sheets plus the newly uploaded files.
+    _prior_sheets = set(_prior_an_fs.get("_upload_sheet_numbers") or [])
+    merged_analysis["_upload_sheet_numbers"] = sorted(
+        _prior_sheets | _collect_upload_sheet_numbers(new_pdf_paths))
+
     validation = _validate_cost_estimate(merged_analysis, costs)
     rfi_items = generate_rfi_items(merged_analysis) or []
 
@@ -13211,6 +13480,10 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     # Normalize scope fields after merge (ensures every room has in_scope)
     _update_progress(5, TOTAL_STEPS, "Validating & Recalculating", "Applying guardrails and schedule overrides...")
     analysis = _normalize_scope_fields(analysis)
+
+    # --- Finish schedule + upload sheet inventory (zero-cost PDF scans) ---
+    _set_finish_schedule_flag(analysis, pdf_paths)
+    analysis["_upload_sheet_numbers"] = sorted(_collect_upload_sheet_numbers(pdf_paths))
 
     # --- Whitebox / Prime Only exclusion (before validation) ---
     analysis = _apply_whitebox_exclusion(analysis)

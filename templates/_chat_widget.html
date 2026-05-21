@@ -97,6 +97,25 @@
     border: none; border-radius: 6px; font-weight: 500; cursor: pointer; }
 #ks-chat-send:disabled, #ks-chat-input:disabled { opacity: 0.5; cursor: not-allowed; }
 
+.ks-chat-correction { margin: 8px 30px 8px 0; padding: 10px 12px; border-radius: 6px;
+    background: rgba(46,204,113,0.08); border: 1px solid rgba(46,204,113,0.35); }
+.ks-chat-correction-title { color: #6ee7b7; font-weight: 600; font-size: 0.78rem;
+    text-transform: uppercase; letter-spacing: 0.03em; margin-bottom: 6px; }
+.ks-chat-correction-row { color: #e2e8f0; font-size: 0.9rem; font-weight: 600; }
+.ks-chat-correction-reason { color: #94a3b8; font-size: 0.8rem; margin-top: 2px; }
+.ks-chat-correction-actions { display: flex; gap: 8px; margin-top: 8px; }
+.ks-chat-correction-apply { padding: 6px 12px; color: white; border: none;
+    background: linear-gradient(90deg,#1a6fb5,#2ecc71); border-radius: 5px;
+    font-weight: 600; cursor: pointer; font-size: 0.82rem; }
+.ks-chat-correction-dismiss { padding: 6px 12px; background: transparent;
+    color: #cbd5e1; border: 1px solid rgba(148,163,184,0.3); border-radius: 5px;
+    cursor: pointer; font-size: 0.82rem; }
+.ks-chat-correction-apply:disabled, .ks-chat-correction-dismiss:disabled {
+    opacity: 0.5; cursor: not-allowed; }
+.ks-chat-correction-status { font-size: 0.82rem; margin-top: 6px; color: #cbd5e1; }
+.ks-chat-correction-status.ok { color: #6ee7b7; }
+.ks-chat-correction-status.err { color: #fca5a5; }
+
 @media (max-width: 480px) {
     #ks-chat-drawer { width: calc(100vw - 20px); height: calc(100vh - 80px);
         bottom: 10px; right: 10px; }
@@ -275,6 +294,94 @@
         return div;
     }
 
+    // Render a proposed quantity correction with an Apply button. Nothing is
+    // saved until the user clicks Apply — that click is the explicit confirm.
+    function renderCorrectionCard(corrections, jobId) {
+        const card = document.createElement('div');
+        card.className = 'ks-chat-correction';
+
+        const title = document.createElement('div');
+        title.className = 'ks-chat-correction-title';
+        title.textContent = 'Proposed correction';
+        card.appendChild(title);
+
+        corrections.forEach(c => {
+            const row = document.createElement('div');
+            row.className = 'ks-chat-correction-row';
+            const from = (c.current_qty != null)
+                ? Number(c.current_qty).toLocaleString() + ' → ' : '';
+            row.textContent = c.label + ': ' + from
+                + Number(c.corrected_qty).toLocaleString();
+            card.appendChild(row);
+            if (c.reason) {
+                const reason = document.createElement('div');
+                reason.className = 'ks-chat-correction-reason';
+                reason.textContent = c.reason;
+                card.appendChild(reason);
+            }
+        });
+
+        const note = document.createElement('div');
+        note.className = 'ks-chat-correction-reason';
+        note.textContent = 'Applying updates the line item, re-prices the '
+            + 'estimate, and regenerates the PDF.';
+        card.appendChild(note);
+
+        const actions = document.createElement('div');
+        actions.className = 'ks-chat-correction-actions';
+        const applyBtn = document.createElement('button');
+        applyBtn.type = 'button';
+        applyBtn.className = 'ks-chat-correction-apply';
+        applyBtn.textContent = 'Apply & re-price';
+        const dismissBtn = document.createElement('button');
+        dismissBtn.type = 'button';
+        dismissBtn.className = 'ks-chat-correction-dismiss';
+        dismissBtn.textContent = 'Dismiss';
+        actions.appendChild(applyBtn);
+        actions.appendChild(dismissBtn);
+        card.appendChild(actions);
+
+        const status = document.createElement('div');
+        status.className = 'ks-chat-correction-status';
+        card.appendChild(status);
+
+        dismissBtn.addEventListener('click', () => card.remove());
+
+        applyBtn.addEventListener('click', async () => {
+            applyBtn.disabled = true;
+            dismissBtn.disabled = true;
+            status.className = 'ks-chat-correction-status';
+            status.textContent = 'Applying…';
+            try {
+                const res = await fetch(`/api/jobs/${jobId}/adjust-quantities`, {
+                    method: 'POST',
+                    credentials: 'same-origin',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        adjustments: corrections.map(c => ({
+                            label: c.label, qty: c.corrected_qty,
+                        })),
+                    }),
+                });
+                const d = await res.json();
+                if (!res.ok) throw new Error(d.error || 'HTTP ' + res.status);
+                actions.remove();
+                status.className = 'ks-chat-correction-status ok';
+                status.textContent = '✓ Applied — new subtotal $'
+                    + Math.round(d.subtotal).toLocaleString()
+                    + '. Refresh the page to see the updated estimate PDF.';
+            } catch (err) {
+                applyBtn.disabled = false;
+                dismissBtn.disabled = false;
+                status.className = 'ks-chat-correction-status err';
+                status.textContent = 'Failed: ' + err.message;
+            }
+        });
+
+        log.appendChild(card);
+        log.scrollTop = log.scrollHeight;
+    }
+
     form.addEventListener('submit', async (e) => {
         e.preventDefault();
         const text = input.value.trim();
@@ -311,6 +418,11 @@
             if (!res.ok) throw new Error(data.error || 'HTTP ' + res.status);
             pending.textContent = data.content;
             history.push({ role: 'assistant', content: data.content });
+            if (state.mode === 'estimate' && state.currentJobId
+                    && Array.isArray(data.proposed_corrections)
+                    && data.proposed_corrections.length) {
+                renderCorrectionCard(data.proposed_corrections, state.currentJobId);
+            }
         } catch (err) {
             pending.textContent = 'Error: ' + err.message;
             pending.classList.add('error');

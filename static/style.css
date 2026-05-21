@@ -330,6 +330,22 @@ body {
 .file-item .file-size {
     color: var(--text-muted);
     font-size: 0.82rem;
+    margin-left: auto;
+}
+
+.file-item .file-remove {
+    margin-left: 10px;
+    background: transparent;
+    border: 0;
+    color: var(--text-muted);
+    font-size: 1.1rem;
+    line-height: 1;
+    cursor: pointer;
+    padding: 0 4px;
+}
+
+.file-item .file-remove:hover {
+    color: #dc2626;
 }
 
 /* ── Checkbox / Radio Rows ── */

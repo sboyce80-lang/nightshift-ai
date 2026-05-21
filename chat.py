@@ -31,11 +31,57 @@ SYSTEM_PROMPT_HEADER = (
     "there, say so plainly — never estimate, infer from outside knowledge, or "
     "fabricate numbers. Reference rooms by name and floor when relevant. "
     "Money in dollars; areas in sqft or LF.\n\n"
+    "You cannot edit the estimate yourself. When the user states that a "
+    "specific cost-estimate line-item quantity is wrong and gives a corrected "
+    "number, call the propose_quantity_correction tool so they can review and "
+    "apply it, then tell them to click Apply below your message. NEVER claim "
+    "you have saved, applied, updated, or changed anything — nothing is saved "
+    "until the user clicks Apply. Use the exact line-item label from the "
+    "cost_estimate.line_items list.\n\n"
     "Takeoff JSON:\n"
 )
 
+# Tool the model calls to surface a quantity correction the user asked for.
+# It only PROPOSES — the web app applies it after the user clicks Apply.
+QUANTITY_CORRECTION_TOOL = {
+    "name": "propose_quantity_correction",
+    "description": (
+        "Propose a correction to a cost-estimate line-item quantity. Call this "
+        "only when the user explicitly states a specific quantity is wrong and "
+        "gives a corrected value. This does NOT save anything — it surfaces the "
+        "correction for the user to review and apply. Never invent a correction "
+        "the user did not ask for."
+    ),
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "line_item_label": {
+                "type": "string",
+                "description": (
+                    "The leading label of the cost-estimate line item, i.e. the "
+                    "text before the first ' - ' in the item string "
+                    "(e.g. 'Gyp. Walls', 'Doors - Full Paint')."
+                ),
+            },
+            "current_qty": {
+                "type": "number",
+                "description": "The current quantity shown in the estimate.",
+            },
+            "corrected_qty": {
+                "type": "number",
+                "description": "The corrected quantity the user gave.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Brief reason the user gave for the correction.",
+            },
+        },
+        "required": ["line_item_label", "corrected_qty"],
+    },
+}
 
-def chat_about_job(result_json: Dict[str, Any], history: List[Dict[str, str]]) -> str:
+
+def chat_about_job(result_json: Dict[str, Any], history: List[Dict[str, str]]) -> Dict[str, Any]:
     """Answer a follow-up question about a completed takeoff job.
 
     Args:
@@ -44,7 +90,10 @@ def chat_about_job(result_json: Dict[str, Any], history: List[Dict[str, str]]) -
                  must be 'user'; roles must alternate user/assistant.
 
     Returns:
-        The assistant's reply text.
+        {"reply": str, "proposed_corrections": [{"label", "current_qty",
+        "corrected_qty", "reason"}, ...]}. proposed_corrections is non-empty
+        only when the user asked for a quantity correction; it is never
+        applied here — the web app applies it after the user confirms.
     """
     if not history or history[0].get("role") != "user":
         raise ValueError("history must start with a user message")
@@ -70,6 +119,7 @@ def chat_about_job(result_json: Dict[str, Any], history: List[Dict[str, str]]) -
         max_tokens=MAX_TOKENS,
         system=system,
         messages=history,
+        tools=[QUANTITY_CORRECTION_TOOL],
     )
 
     usage = getattr(response, "usage", None)
@@ -82,7 +132,37 @@ def chat_about_job(result_json: Dict[str, Any], history: List[Dict[str, str]]) -
             usage.output_tokens,
         )
 
-    return next((b.text for b in response.content if b.type == "text"), "")
+    reply_parts = [b.text for b in response.content if b.type == "text"]
+    corrections: List[Dict[str, Any]] = []
+    for b in response.content:
+        if getattr(b, "type", None) != "tool_use" or b.name != "propose_quantity_correction":
+            continue
+        inp = b.input or {}
+        label = str(inp.get("line_item_label") or "").strip()
+        try:
+            corrected = float(inp.get("corrected_qty"))
+        except (TypeError, ValueError):
+            continue
+        if not label or corrected < 0:
+            continue
+        try:
+            current = float(inp.get("current_qty")) if inp.get("current_qty") is not None else None
+        except (TypeError, ValueError):
+            current = None
+        corrections.append({
+            "label": label,
+            "current_qty": current,
+            "corrected_qty": corrected,
+            "reason": str(inp.get("reason") or "").strip(),
+        })
+
+    reply = "\n\n".join(p for p in reply_parts if p).strip()
+    if not reply and corrections:
+        c = corrections[0]
+        reply = (f"Got it — you're saying {c['label']} should be "
+                 f"{c['corrected_qty']:,.0f}. Review the proposed correction "
+                 f"below and click Apply to update and re-price the estimate.")
+    return {"reply": reply, "proposed_corrections": corrections}
 
 
 def _trim_for_chat(result: Dict[str, Any]) -> Dict[str, Any]:
