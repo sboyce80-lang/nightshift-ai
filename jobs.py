@@ -442,11 +442,12 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
             # rendered with room bboxes drawn on top, so the contractor (and
             # we) can visually confirm what was measured and spot missed
             # sheets at a glance. Best-effort.
-            _build_and_upload_annotated_drawings(
+            annotated_pdf_paths = _build_and_upload_annotated_drawings(
                 submission_id, result, local_pdfs, workdir,
             )
 
-            send_result_email(contact_info, result)
+            send_result_email(contact_info, result,
+                              extra_attachment_paths=annotated_pdf_paths)
 
             subtotal = result.get("cost_estimate", {}).get("subtotal", 0) or 0
             update_status(submission_id, "completed", subtotal=subtotal)
@@ -665,7 +666,7 @@ def send_email_with_attachments(to_email, subject, body, attachment_paths,
     return True
 
 
-def send_result_email(contact_info, result):
+def send_result_email(contact_info, result, extra_attachment_paths=None):
     if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD:
         logger.warning("SMTP not configured — skipping email notification")
         return
@@ -739,6 +740,17 @@ Best regards,
             att.add_header(
                 "Content-Disposition", "attachment",
                 filename=os.path.basename(json_path),
+            )
+            msg.attach(att)
+
+    for extra_path in extra_attachment_paths or []:
+        if not extra_path or not os.path.exists(extra_path):
+            continue
+        with open(extra_path, "rb") as f:
+            att = MIMEApplication(f.read(), _subtype="pdf")
+            att.add_header(
+                "Content-Disposition", "attachment",
+                filename=os.path.basename(extra_path),
             )
             msg.attach(att)
 
