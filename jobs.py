@@ -405,12 +405,20 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
                     submission_id, norm_exc, exc_info=True
                 )
 
+            # Multi-pass extraction (always-on as of 2026-05-26): re-extract
+            # floor-plan PDFs and keep whichever pass found more rooms. Adds
+            # ~30s + 1× API cost per FP file, eliminates the LLM-variance
+            # downside we saw on the 397Fishkill twin-run regression
+            # ($100K → $88K on identical input, same code). Toggle off via
+            # NIGHTSHIFT_MULTI_PASS=0 if rate-limit cost becomes an issue.
+            _multi_pass = os.environ.get("NIGHTSHIFT_MULTI_PASS", "1").strip() != "0"
             result = run_analysis(
                 local_pdfs,
                 contact_name=contact_info["name"],
                 contact_email=contact_info["email"],
                 scope_notes=scope_notes,
                 rate_overrides=rate_overrides,
+                multi_pass=_multi_pass,
             )
 
             for key_name, content_type in (
