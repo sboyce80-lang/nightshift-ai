@@ -3747,7 +3747,26 @@ SOURCE TRACKING — for each room, also provide:
 
 STEP 3B: TYPICAL / REPEATED UNIT TYPES
 Multi-unit residential buildings often have IDENTICAL floor plans repeated across units and floors.
-- FIRST: Identify all unique unit TYPES (e.g., "1BR Type A = 876 SF", "Studio Type B = 456 SF")
+- FIRST: Identify all unique unit TYPES. Architects use many naming conventions — recognize all of them:
+  * "1BR Type A", "Studio Type B", "2BR Type C" — explicit type lettering
+  * "Unit 101 / 201 / 301" — same suffix across floors = same TYPE (the floor digit changes)
+  * "Unit x01 / x02 / x03 / x04 / x05 / x06" — the "x" is a floor-digit wildcard;
+    each different number suffix (x01 vs x02 vs x03) is a DIFFERENT unit type
+  * "Apt Type 1 / 2 / 3" or "Plan A / Plan B / Plan C"
+  * Sometimes types are implicit — count distinct floor-plan layouts shown
+- CRITICAL — APARTMENT PLAN SHEETS USUALLY SHOW MULTIPLE DISTINCT UNIT TYPES:
+  When the drawing index lists MULTIPLE apartment plan sheets (e.g. A-105, A-106, A-107
+  all titled "Apartment Plans" or "Unit Plans"), each sheet typically shows DIFFERENT
+  unit types — they are NOT duplicates of each other.
+  * If A-105 shows "Units x01 & x02", A-106 shows "Units x03 & x04", A-107 shows "Units x05 & x06"
+    → that is SIX distinct unit types total, not one. Extract a template for EACH.
+  * Read each sheet's drawing title (usually bottom-right title block) to see which units it covers.
+  * DO NOT assume A-106 and A-107 are redundant with A-105. Open them and extract their units.
+  * If you only extract from one apartment plan sheet when the index lists several, you are
+    UNDER-COUNTING the building's unit-type variety by 50-80%.
+- IF A SINGLE SHEET TITLE LISTS MULTIPLE UNITS (e.g. "Units x01 & x02 Floor Plans"):
+  That sheet shows TWO unit types side-by-side. Extract BOTH as separate templates, not one.
+  Same rule applies to "Units A & B", "Units 101 & 102", etc.
 - Determine the TOTAL COUNT of each unit type from the drawings, schedules, or unit mix tables.
 - Look for unit counts in: Light & Ventilation schedules, unit mix tables, apartment number series
   (e.g., units 201-208 on 2nd floor = 8 units), door schedule unit groups, or key plans.
