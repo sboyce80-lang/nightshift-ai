@@ -2258,6 +2258,7 @@ def _analyze_floor_plan_as_images(client, pdf_path, scope_notes="",
 
     rooms = final.get('project_info', {}).get('total_rooms_found', 0)
     print(f"   🖼️  Image fallback extracted {rooms} rooms total")
+    _attach_bbox_anchors(final, pdf_path)
     return (pdf_path, final)
 
 
@@ -2645,6 +2646,7 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
 
     total_rooms = final_analysis.get('project_info', {}).get('total_rooms_found', 0)
     print(f"   🔬 Enhanced extraction found {total_rooms} rooms total")
+    _attach_bbox_anchors(final_analysis, pdf_path)
     return (pdf_path, final_analysis)
 
 
@@ -12232,6 +12234,30 @@ def interactive_adjustments(analysis, costs, pricing_model_used=None):
     return analysis, costs, pricing_model_used, adjustments_log, False
 
 
+def _attach_bbox_anchors(analysis, pdf_path):
+    """Run Tier-1 bbox anchoring on an analysis dict. Called by every path
+    that produces a (pdf_path, analysis) result so heavy/light/main workers
+    all stamp bbox info regardless of which extraction code path was used.
+
+    Failure is non-fatal — rooms get bbox=None entries and a summary records
+    the error, but the takeoff result is unchanged.
+    """
+    if not analysis or not pdf_path:
+        return
+    try:
+        from bbox_spike import attach_label_bboxes
+        attach_label_bboxes(analysis, pdf_path)
+        _bs = analysis.get("bbox_spike_summary") or {}
+        if _bs.get("total_rooms"):
+            print(f"   📍 Bbox anchoring: {_bs.get('anchored', 0)}/"
+                  f"{_bs.get('total_rooms', 0)} rooms "
+                  f"({_bs.get('coverage_pct', 0)}%)", flush=True)
+    except Exception as _bbox_err:
+        print(f"   ⚠️  Bbox anchoring failed (non-fatal): "
+              f"{type(_bbox_err).__name__}: {str(_bbox_err)[:160]}",
+              flush=True)
+
+
 def analyze_and_parse(client, pdf_path, scope_notes="", schedule_hints=None,
                       building_inventory=None):
     """Analyze a single PDF and return parsed JSON. Returns (path, analysis_dict) or None on failure."""
@@ -12243,21 +12269,7 @@ def analyze_and_parse(client, pdf_path, scope_notes="", schedule_hints=None,
         json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
         if json_match:
             analysis = json.loads(json_match.group())
-            # Tier-1 bbox anchoring: attach label_bbox_norm to every room by
-            # matching room_name against the PyMuPDF text layer of source_page.
-            # Failure is non-fatal — rooms get bbox=None entries and a summary
-            # records the error, but the takeoff result is unchanged.
-            try:
-                from bbox_spike import attach_label_bboxes
-                attach_label_bboxes(analysis, pdf_path)
-                _bs = analysis.get("bbox_spike_summary") or {}
-                if _bs.get("total_rooms"):
-                    print(f"   📍 Bbox anchoring: {_bs.get('anchored', 0)}/"
-                          f"{_bs.get('total_rooms', 0)} rooms "
-                          f"({_bs.get('coverage_pct', 0)}%)")
-            except Exception as _bbox_err:
-                print(f"   ⚠️  Bbox anchoring failed (non-fatal): "
-                      f"{type(_bbox_err).__name__}: {str(_bbox_err)[:160]}")
+            _attach_bbox_anchors(analysis, pdf_path)
             return (pdf_path, analysis)
         else:
             print(f"\n⚠️  Could not parse response for {filename}")
