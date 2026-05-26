@@ -42,3 +42,4 @@ submissions/
 # Local DB backup dumps
 nightshift_pre_*.sql
 *.sql.bak
+spike_samples/

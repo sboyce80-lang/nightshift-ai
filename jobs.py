@@ -198,6 +198,75 @@ def reconcile_abandoned_submissions(redis_conn, queue_names):
     return rows_changed
 
 
+def _build_and_upload_annotated_drawings(submission_id, result, local_pdfs, workdir):
+    """Render an annotated copy of each source PDF with room bboxes drawn on
+    each referenced page, and upload as additional result file(s).
+
+    One annotated PDF per source PDF, named `<original_basename>.annotated.pdf`.
+    Skipped silently if no rooms have bbox info (e.g. bbox attachment failed
+    upstream, or the result is from a code path that doesn't run it).
+
+    Best-effort — failures are logged but do NOT fail the submission.
+    """
+    try:
+        from bbox_spike import render_annotated_pdf, annotated_drawings_filename
+
+        analysis = (result or {}).get("analysis") or {}
+        rooms_iter = (r for f in analysis.get("floors", []) or []
+                      for r in f.get("rooms", []) or [])
+
+        # Group rooms by the source_pdf path recorded at attach_label_bboxes time.
+        # Fall back to basename lookup against local_pdfs if the absolute path
+        # doesn't survive (e.g. workdir reused across runs).
+        by_source: dict[str, int] = {}
+        for r in rooms_iter:
+            b = r.get("bbox") or {}
+            src = b.get("source_pdf")
+            if src:
+                by_source[src] = by_source.get(src, 0) + 1
+
+        if not by_source:
+            logger.info("Annotated drawings: no bbox info present, skipping for %s",
+                        submission_id)
+            return []
+
+        # Build a basename → local-path map for fallback resolution
+        local_by_basename = {os.path.basename(p): p for p in (local_pdfs or [])}
+
+        uploaded = []
+        for src_path, room_count in by_source.items():
+            resolved = src_path if os.path.exists(src_path) \
+                else local_by_basename.get(os.path.basename(src_path))
+            if not resolved or not os.path.exists(resolved):
+                logger.warning("Annotated drawings: source PDF not found for %s "
+                               "(tried %s, basename %s); skipping",
+                               submission_id, src_path, os.path.basename(src_path))
+                continue
+
+            out_filename = annotated_drawings_filename(os.path.basename(resolved))
+            out_path = os.path.join(workdir, out_filename)
+
+            summary = render_annotated_pdf(resolved, result, out_path)
+            logger.info("Annotated drawings for %s/%s: %d/%d pages referenced, "
+                        "%d rooms drawn, %d misses, %.1f MB",
+                        submission_id, out_filename,
+                        summary["referenced_pages"], summary["pages"],
+                        summary["rooms_drawn"], summary["misses_marked"],
+                        summary["output_size_bytes"] / 1024 / 1024)
+
+            r2_key = storage.result_key(submission_id, out_filename)
+            storage.upload_file(out_path, r2_key, content_type="application/pdf")
+            _record_result_file(submission_id, out_filename, r2_key,
+                                os.path.getsize(out_path), "application/pdf")
+            uploaded.append(out_path)
+
+        return uploaded
+    except Exception as exc:
+        logger.error("Annotated drawings generation failed for %s: %s",
+                     submission_id, exc, exc_info=True)
+        return []
+
+
 def _build_and_upload_estimate(submission_id, result, workdir):
     """Render the formal Estimate PDF and upload it as a third result file.
 
@@ -360,6 +429,14 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
             # Third deliverable: formal Estimate PDF. Failure here doesn't
             # block completion — the full PDF/JSON are the source of truth.
             _build_and_upload_estimate(submission_id, result, workdir)
+
+            # Fourth deliverable: Annotated Drawings PDF — each source page
+            # rendered with room bboxes drawn on top, so the contractor (and
+            # we) can visually confirm what was measured and spot missed
+            # sheets at a glance. Best-effort.
+            _build_and_upload_annotated_drawings(
+                submission_id, result, local_pdfs, workdir,
+            )
 
             send_result_email(contact_info, result)
 

@@ -45,6 +45,8 @@
                         &#9993;&#65039; Send Estimate for Approval
                     </button>
                 </div>
+
+                <div id="annotated-drawings-list" style="margin-top:10px;"></div>
             </section>
 
             <section class="panel" id="resubmit-section" style="display:none;margin-top:20px;">
@@ -274,10 +276,31 @@
             const estimateRow = document.getElementById("estimate-row");
             const estimateName = document.getElementById("estimate-filename");
             const estimateLink = document.getElementById("estimate-view-link");
+            const adList = document.getElementById("annotated-drawings-list");
+            adList.innerHTML = "";
             let estimate = null;
             (d.results || []).forEach(f => {
                 if (f.is_estimate) {
                     estimate = f;
+                    return;
+                }
+                if (f.is_annotated_drawings) {
+                    const row = document.createElement("div");
+                    row.style.cssText =
+                        "display:flex;flex-wrap:wrap;gap:10px;align-items:center;" +
+                        "margin-top:10px;padding:10px 12px;" +
+                        "background:rgba(56,131,189,0.08);" +
+                        "border:1px solid rgba(56,131,189,0.25);border-radius:6px;";
+                    row.innerHTML =
+                        '<span style="color:#93c5fd;font-weight:600;">📄 Annotated Drawings</span>' +
+                        '<span class="panel-subtle" style="font-size:0.9rem;"></span>' +
+                        '<span class="panel-subtle" style="font-size:0.8rem;">' +
+                        '— Source plans with each measured room boxed for verification</span>' +
+                        '<span style="flex:1;"></span>' +
+                        '<a class="btn-link" target="_blank">View Annotated PDF →</a>';
+                    row.children[1].textContent = f.filename;
+                    row.children[4].href = f.url;
+                    adList.appendChild(row);
                     return;
                 }
                 const li = document.createElement("li");

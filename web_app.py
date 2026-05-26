@@ -72,6 +72,7 @@ from notifications import (
     notifications_configured,
 )
 from generate_estimate_pdf import is_estimate_filename
+from bbox_spike import is_annotated_drawings_filename
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -1324,6 +1325,7 @@ def jobs_list():
         for s in subs:
             results = []
             estimate = None
+            annotated_drawings = []
             if s.status == "completed":
                 for f in s.files:
                     if f.kind == "result":
@@ -1332,12 +1334,15 @@ def jobs_list():
                                 "filename": f.filename,
                                 "url": storage.presigned_download_url(f.r2_key),
                                 "is_estimate": is_estimate_filename(f.filename),
+                                "is_annotated_drawings": is_annotated_drawings_filename(f.filename),
                             }
                         except Exception as exc:
                             logger.warning("Could not sign URL for %s: %s", f.r2_key, exc)
                             continue
                         if entry["is_estimate"]:
                             estimate = entry
+                        elif entry["is_annotated_drawings"]:
+                            annotated_drawings.append(entry)
                         else:
                             results.append(entry)
             rows.append({
@@ -1350,6 +1355,7 @@ def jobs_list():
                 "upload_count": sum(1 for f in s.files if f.kind == "upload"),
                 "results": results,
                 "estimate": estimate,
+                "annotated_drawings": annotated_drawings,
             })
     return render_template("jobs.html", submissions=rows,
                            status_filter=status_filter, is_admin=admin)
@@ -1385,6 +1391,7 @@ def job_status_api(submission_id):
             "size": f.size_bytes,
             "url": storage.presigned_download_url(f.r2_key),
             "is_estimate": is_estimate_filename(f.filename),
+            "is_annotated_drawings": is_annotated_drawings_filename(f.filename),
         } for f in result_files]
 
         payload = {

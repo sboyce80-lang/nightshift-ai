@@ -103,6 +103,19 @@
                     </div>
                     {% endif %}
 
+                    {% for ad in s.annotated_drawings %}
+                    <div class="annotated-drawings-row" style="display:flex;flex-wrap:wrap;gap:10px;align-items:center;
+                                margin-top:10px;padding:10px 12px;
+                                background:rgba(56,131,189,0.08);border:1px solid rgba(56,131,189,0.25);
+                                border-radius:6px;">
+                        <span style="color:#93c5fd;font-weight:600;">&#128196; Annotated Drawings</span>
+                        <span class="panel-subtle" style="font-size:0.9rem;">{{ ad.filename }}</span>
+                        <span class="panel-subtle" style="font-size:0.8rem;">— Source plans with each measured room boxed for verification</span>
+                        <span style="flex:1;"></span>
+                        <a class="btn-link" href="{{ ad.url }}" target="_blank">View Annotated PDF &rarr;</a>
+                    </div>
+                    {% endfor %}
+
                     {% if status_filter == 'completed' and s.status == 'completed' %}
                     <div class="breakdown-wrap" id="breakdown-{{ s.id }}">
                         <p class="panel-subtle" style="margin-bottom:10px;">

@@ -965,6 +965,72 @@ def _is_floor_plan_file(filename):
     return False
 
 
+def _extract_known_sheet_ids_from_index(pdf_path):
+    """Pre-scan the index pages for sheet-ID patterns to build an
+    authoritative set of sheet IDs that exist on THIS project.
+
+    Used by `_classify_pdf_pages` to validate per-page sheet-ID detection
+    against the drawing index. Without this, the classifier can be fooled by
+    equipment callouts like "EQ2" or "FA-201" on an architectural sheet —
+    those get parsed as the page's own ID and the page is wrongly excluded as
+    Electrical / Fire Alarm.
+
+    Strategy:
+      1. Use _detect_index_pages() to find the project's drawing-index page(s).
+      2. From the index_text, extract every disciplinary sheet ID — these are
+         authoritative because the drawing index lists every sheet exactly once.
+      3. Fallback: if no index found, scan the first 3 pages and accept
+         whatever disciplinary IDs appear there (one of them is almost
+         always the cover page / index).
+
+    Returns a set of normalized sheet IDs (e.g. {"A100", "A101", "A105", ...}).
+    Empty set on failure — caller treats as "no validation available".
+    """
+    candidates = set()
+
+    # Try the proper index detector first
+    try:
+        idx = _detect_index_pages(pdf_path)
+    except Exception:
+        idx = None
+
+    if idx and idx.get("index_text"):
+        for m in _SHEET_NUMBER_RE.finditer(idx["index_text"]):
+            prefix = m.group(1).upper()
+            number = m.group(2)
+            if any(prefix == dp or prefix.startswith(dp)
+                   for dp, _, _ in _DISCIPLINE_MAP):
+                candidates.add(f"{prefix}{number}")
+
+    if candidates:
+        return candidates
+
+    # Fallback: scan first few pages directly
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+    except Exception:
+        return set()
+
+    try:
+        scan_limit = min(len(doc), 3)
+        for pg_0 in range(scan_limit):
+            try:
+                txt = doc[pg_0].get_text() or ""
+            except Exception:
+                continue
+            for m in _SHEET_NUMBER_RE.finditer(txt):
+                prefix = m.group(1).upper()
+                number = m.group(2)
+                if any(prefix == dp or prefix.startswith(dp)
+                       for dp, _, _ in _DISCIPLINE_MAP):
+                    candidates.add(f"{prefix}{number}")
+    finally:
+        doc.close()
+
+    return candidates
+
+
 def _classify_pdf_pages(pdf_path):
     """
     Pre-scan all pages using PyMuPDF (zero API cost) to classify each page
@@ -983,6 +1049,10 @@ def _classify_pdf_pages(pdf_path):
         print("   ⚠️  PyMuPDF not installed — skipping page classification")
         return []  # Empty = no filtering, send all pages
 
+    # Build the set of sheet IDs that actually exist on this project — used
+    # to filter out equipment-callout false positives below.
+    known_sheet_ids = _extract_known_sheet_ids_from_index(pdf_path)
+
     doc = fitz.open(pdf_path)
     classifications = []
     g_t_count = 0  # Track how many General/Title pages we've included
@@ -993,40 +1063,61 @@ def _classify_pdf_pages(pdf_path):
         page_w = page_rect.width
         page_h = page_rect.height
 
-        # --- Strategy: extract text from title block region first ---
-        # Title blocks are typically in the bottom-right ~40% width × 20% height
-        title_block_rect = fitz.Rect(
-            page_w * 0.60, page_h * 0.80,
-            page_w, page_h
-        )
-        title_text = page.get_text(clip=title_block_rect).strip()
-
-        # Also get bottom 30% for fallback
-        bottom_rect = fitz.Rect(0, page_h * 0.70, page_w, page_h)
-        bottom_text = page.get_text(clip=bottom_rect).strip()
-
-        # Full page text (for Division 9 keyword scan)
+        # --- Find sheet number ---
+        # Empirically (validated across multiple architect templates):
+        # the actual title-block sheet ID is reliably the LARGEST-font text
+        # on the page that matches the sheet-number pattern. It's typically
+        # 25-35pt, while incidental callouts ("see A-300/2") are 6-8pt and
+        # grid line labels are 5pt. Position-based clipping is fragile
+        # (architects place title blocks anywhere; some PDF coordinate systems
+        # put the title block at negative or off-page positions due to
+        # rotation metadata), but font size is consistent.
+        #
+        # Strategy: scan the WHOLE page for sheet-ID candidates with their
+        # font sizes. Prefer the largest-font candidate that's confirmed
+        # present in the drawing index. Fall back to the absolute largest if
+        # none are index-confirmed.
         full_text = page.get_text().strip()
         full_text_lower = full_text.lower()
 
-        # --- Find sheet number ---
         sheet_number = None
         discipline_prefix = None
 
-        # Search in priority order: title block → bottom 30% → full page
-        for search_text in [title_text, bottom_text, full_text]:
-            if sheet_number:
-                break
-            for m in _SHEET_NUMBER_RE.finditer(search_text):
-                prefix = m.group(1).upper()
-                number = m.group(2)
-                # Validate: prefix must be a known discipline letter
-                known = any(prefix == dp or prefix.startswith(dp)
-                            for dp, _, _ in _DISCIPLINE_MAP)
-                if known:
-                    sheet_number = f"{prefix}{number}"
+        candidates_with_size = []
+        try:
+            td = page.get_text("dict", flags=fitz.TEXT_PRESERVE_WHITESPACE)
+        except Exception:
+            td = {"blocks": []}
+        for block in td.get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    t = (span.get("text") or "").strip()
+                    if not t:
+                        continue
+                    sz = float(span.get("size", 0))
+                    for m in _SHEET_NUMBER_RE.finditer(t):
+                        prefix = m.group(1).upper()
+                        number = m.group(2)
+                        if any(prefix == dp or prefix.startswith(dp)
+                               for dp, _, _ in _DISCIPLINE_MAP):
+                            candidates_with_size.append(
+                                (f"{prefix}{number}", prefix, sz)
+                            )
+        candidates_with_size.sort(key=lambda x: -x[2])  # largest font first
+
+        # Prefer largest-font candidate that's in the drawing index
+        if known_sheet_ids:
+            for sid, prefix, sz in candidates_with_size:
+                if sid in known_sheet_ids:
+                    sheet_number = sid
                     discipline_prefix = prefix
                     break
+
+        # Fallback: absolute largest-font candidate (any disciplinary ID)
+        if not sheet_number and candidates_with_size:
+            sheet_number, discipline_prefix, _ = candidates_with_size[0]
 
         # --- Classify by discipline ---
         include = True
@@ -12152,6 +12243,21 @@ def analyze_and_parse(client, pdf_path, scope_notes="", schedule_hints=None,
         json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
         if json_match:
             analysis = json.loads(json_match.group())
+            # Tier-1 bbox anchoring: attach label_bbox_norm to every room by
+            # matching room_name against the PyMuPDF text layer of source_page.
+            # Failure is non-fatal — rooms get bbox=None entries and a summary
+            # records the error, but the takeoff result is unchanged.
+            try:
+                from bbox_spike import attach_label_bboxes
+                attach_label_bboxes(analysis, pdf_path)
+                _bs = analysis.get("bbox_spike_summary") or {}
+                if _bs.get("total_rooms"):
+                    print(f"   📍 Bbox anchoring: {_bs.get('anchored', 0)}/"
+                          f"{_bs.get('total_rooms', 0)} rooms "
+                          f"({_bs.get('coverage_pct', 0)}%)")
+            except Exception as _bbox_err:
+                print(f"   ⚠️  Bbox anchoring failed (non-fatal): "
+                      f"{type(_bbox_err).__name__}: {str(_bbox_err)[:160]}")
             return (pdf_path, analysis)
         else:
             print(f"\n⚠️  Could not parse response for {filename}")
@@ -14016,7 +14122,14 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             "— the API call likely failed silently during pre-scan."
         )
 
-    # Trigger 2: architectural-sheet coverage from extracted rooms vs. drawing index
+    # Trigger 2: architectural-sheet coverage from extracted rooms vs. drawing index.
+    #
+    # IMPORTANT: The denominator must only include sheets that ACTUALLY produce
+    # rooms (floor plans, foundation plans, roof plans, apartment plans, RCPs).
+    # The drawing index also lists elevations, sections, schedules, and
+    # details — these are reference material and don't contain room
+    # measurements. If they're in the denominator the metric is unhittable
+    # (a typical 17-sheet set has only 4-7 rooms-expected sheets).
     _extracted_arch_sheets = set()
     for _floor in analysis.get("floors", []) or []:
         for _room in _floor.get("rooms", []) or []:
@@ -14024,24 +14137,74 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             if re.match(r'^A[D]?\d', _sheet) or re.match(r'^A[D]?-\d', _sheet):
                 _extracted_arch_sheets.add(_sheet)
 
-    _detected_arch_sheets = set()
-    for _info in _index_info_per_pdf:
-        _txt = (_info.get("index_text") or "").upper()
-        # Match A-101, AD-100, A101, etc. Trailing letter for sub-sheets (A-300A).
-        for _m in re.finditer(r'\bA[D]?\s*-?\s*\d{2,3}[A-Z]?\b', _txt):
-            _detected_arch_sheets.add(re.sub(r'\s+', '', _m.group()))
+    # Parse (sheet_id, title) pairs from the index_text. Architects render
+    # the index as a table; in text-layer extraction it often becomes:
+    #   "A-101 1st Floor Plan"
+    #   "A-101\n1st Floor Plan"
+    # or with various separators. Pair each A-xxx mention with the next ~80
+    # chars of context, then classify by keyword.
+    _ROOMS_EXPECTED_KW = (
+        "floor plan", "foundation plan", "roof plan",
+        "apartment plan", "ceiling plan", "rcp",
+    )
+    _REFERENCE_ONLY_KW = (
+        "elevation", "section", "schedule", "detail",
+        "wall section", "stair section", "canopy", "key plan",
+    )
 
-    if (len(_detected_arch_sheets) >= 6
-            and _extracted_arch_sheets
-            and len(_extracted_arch_sheets) / len(_detected_arch_sheets) < 0.30):
-        _coverage_pct = (len(_extracted_arch_sheets)
-                         / len(_detected_arch_sheets)) * 100
+    def _classify_sheet_from_index(sheet_id, index_text):
+        """Return 'rooms_expected', 'reference_only', or 'ambiguous' based on
+        the title that appears near the sheet ID in the drawing index."""
+        sid_re = re.compile(re.escape(sheet_id), re.IGNORECASE)
+        for m in sid_re.finditer(index_text):
+            # Look at up to 80 chars AFTER the sheet ID (the title)
+            context = index_text[m.end():m.end() + 80].lower()
+            if any(kw in context for kw in _ROOMS_EXPECTED_KW):
+                return "rooms_expected"
+            if any(kw in context for kw in _REFERENCE_ONLY_KW):
+                return "reference_only"
+        return "ambiguous"
+
+    _all_arch_sheets = set()
+    _rooms_expected_sheets = set()
+    _full_index_text = ""
+    for _info in _index_info_per_pdf:
+        _txt = _info.get("index_text") or ""
+        _full_index_text += "\n" + _txt
+        for _m in re.finditer(r'\bA[D]?\s*-?\s*\d{2,3}[A-Z]?\b', _txt.upper()):
+            _all_arch_sheets.add(re.sub(r'\s+', '', _m.group()))
+
+    for _sid in _all_arch_sheets:
+        if _classify_sheet_from_index(_sid, _full_index_text) == "rooms_expected":
+            _rooms_expected_sheets.add(_sid)
+
+    # Denominator: rooms-expected sheets only. If classification yielded
+    # nothing (very short index, no recognizable plan-type titles), fall back
+    # to the full set so we don't suppress legitimate alarms — but require a
+    # higher absolute miss count before flagging.
+    _denominator = _rooms_expected_sheets if _rooms_expected_sheets else _all_arch_sheets
+    _extracted_in_denom = _extracted_arch_sheets & _denominator if _rooms_expected_sheets else _extracted_arch_sheets
+
+    if (len(_denominator) >= 4
+            and _extracted_in_denom
+            and len(_extracted_in_denom) / len(_denominator) < 0.60):
+        _coverage_pct = (len(_extracted_in_denom)
+                         / len(_denominator)) * 100
+        _missed_sheets = sorted(_denominator - _extracted_in_denom)
+        _classification_note = (
+            "(rooms-expected sheets only; reference sheets like elevations / "
+            "sections / schedules / details excluded from denominator)"
+            if _rooms_expected_sheets else
+            "(could not classify sheets by type; denominator is all architectural sheets)"
+        )
         _flag_partial_extraction(
-            f"Extracted rooms came from only {len(_extracted_arch_sheets)} of "
-            f"{len(_detected_arch_sheets)} architectural sheets detected in the "
-            f"drawing index ({_coverage_pct:.0f}% coverage; ≥30% expected). "
-            f"Extracted: {sorted(_extracted_arch_sheets)[:8]}"
-            f"{'...' if len(_extracted_arch_sheets) > 8 else ''}."
+            f"Extracted rooms came from only {len(_extracted_in_denom)} of "
+            f"{len(_denominator)} architectural sheets that should contain rooms "
+            f"({_coverage_pct:.0f}% coverage; ≥60% expected). "
+            f"{_classification_note} "
+            f"Missed sheets: {_missed_sheets[:8]}"
+            f"{'...' if len(_missed_sheets) > 8 else ''}. "
+            f"Extracted: {sorted(_extracted_in_denom)[:8]}."
         )
 
     # Trigger 3: chunk_tracking shows ≥50% of PDF chunks failed
