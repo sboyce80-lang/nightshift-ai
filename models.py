@@ -80,6 +80,19 @@ class Organization(Base):
     # NULL → fall back to industry-average defaults in the UI.
     usage_settings: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
+    # Defaults for the "Send Estimate for Approval" modal on the Completed
+    # tab. Shape:
+    #   {
+    #     "subject_template": "Estimate for {business_name}",
+    #     "body_template":    "Hello, ... {subtotal} ...",
+    #     "cc":  ["pm@example.com", ...],
+    #     "bcc": ["billing@example.com", ...]
+    #   }
+    # Templates accept {business_name}, {subtotal}, {filename} placeholders.
+    # NULL → fall back to the built-in defaults the JS shipped before this
+    # column existed.
+    message_settings: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+
     # Beta gate. New orgs land with is_beta_approved=False and must be
     # approved (manual SQL flip for now). Migration 0004 grandfathers
     # all pre-existing orgs to True so current users aren't locked out.

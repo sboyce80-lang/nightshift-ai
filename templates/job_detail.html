@@ -195,6 +195,16 @@
                     <textarea id="send-body" name="body" rows="8" required
                               style="width:100%;padding:8px;background:rgba(8,18,32,0.7);border:1px solid rgba(255,255,255,0.12);border-radius:6px;color:#cbd5e1;font-family:inherit;font-size:0.95rem;"></textarea>
                 </div>
+                <div class="form-group">
+                    <label for="send-cc" style="color:#cbd5e1;">CC <span class="panel-subtle" style="font-size:0.8rem;">(comma-separated)</span></label>
+                    <input type="text" id="send-cc" name="cc"
+                           style="width:100%;padding:8px;background:rgba(8,18,32,0.7);border:1px solid rgba(255,255,255,0.12);border-radius:6px;color:#cbd5e1;">
+                </div>
+                <div class="form-group">
+                    <label for="send-bcc" style="color:#cbd5e1;">BCC <span class="panel-subtle" style="font-size:0.8rem;">(comma-separated)</span></label>
+                    <input type="text" id="send-bcc" name="bcc"
+                           style="width:100%;padding:8px;background:rgba(8,18,32,0.7);border:1px solid rgba(255,255,255,0.12);border-radius:6px;color:#cbd5e1;">
+                </div>
                 <p class="panel-subtle" style="margin-top:0;font-size:0.85rem;">
                     Attachment: <span id="send-attachment-name">(estimate)</span>
                 </p>
@@ -470,21 +480,62 @@
         return "$" + Number(n).toLocaleString(undefined, {maximumFractionDigits: 0});
     }
 
-    function openSendEstimateModal() {
+    // Org-level message defaults — cached after the first fetch. The
+    // modal falls back to a sensible built-in if /api/messages/defaults
+    // can't be reached (offline preview, etc.) so the page never breaks.
+    let _msgDefaults = null;
+    const _BUILTIN_MSG_DEFAULTS = {
+        subject_template: "Estimate for {business_name}",
+        body_template:
+            "Hello,\n\n" +
+            "Please find attached the formal estimate for {business_name}.\n\n" +
+            "Estimate total: {subtotal}\n\n" +
+            "Let me know if you have any questions or if you'd like to proceed.\n\n" +
+            "Thank you.",
+        cc: [],
+        bcc: [],
+    };
+    async function _loadMessageDefaults() {
+        if (_msgDefaults) return _msgDefaults;
+        try {
+            const res = await fetch("/api/messages/defaults",
+                                     { credentials: "same-origin" });
+            _msgDefaults = res.ok ? await res.json() : _BUILTIN_MSG_DEFAULTS;
+        } catch (_) {
+            _msgDefaults = _BUILTIN_MSG_DEFAULTS;
+        }
+        return _msgDefaults;
+    }
+    _loadMessageDefaults();
+
+    function _applyTemplate(tmpl, vars) {
+        return String(tmpl || "").replace(/\{(\w+)\}/g, (m, k) =>
+            Object.prototype.hasOwnProperty.call(vars, k) ? vars[k] : m
+        );
+    }
+
+    async function openSendEstimateModal() {
         const modal = document.getElementById("send-estimate-modal");
         const row = document.getElementById("estimate-row");
         const filename = (row && row.dataset.filename) || "estimate.pdf";
         const subtotal = Number(
             (document.getElementById("subtotal-display").textContent || "")
             .replace(/[^0-9.]/g, "")) || 0;
+        const defaults = await _loadMessageDefaults();
+        const vars = {
+            business_name: "this project",
+            subtotal: subtotal ? fmtMoney(subtotal) : "",
+            filename: filename,
+        };
         document.getElementById("send-to").value = "";
-        document.getElementById("send-subject").value = `Estimate for review`;
+        document.getElementById("send-subject").value =
+            _applyTemplate(defaults.subject_template, vars);
         document.getElementById("send-body").value =
-            "Hello,\n\n" +
-            "Please find attached the formal estimate for review.\n\n" +
-            (subtotal ? `Estimate total: ${fmtMoney(subtotal)}\n\n` : "") +
-            "Let me know if you have any questions or if you'd like to proceed.\n\n" +
-            "Thank you.";
+            _applyTemplate(defaults.body_template, vars);
+        const cc = document.getElementById("send-cc");
+        const bcc = document.getElementById("send-bcc");
+        if (cc) cc.value = (defaults.cc || []).join(", ");
+        if (bcc) bcc.value = (defaults.bcc || []).join(", ");
         document.getElementById("send-attachment-name").textContent = filename;
         const feedback = document.getElementById("send-estimate-feedback");
         feedback.style.display = "none";
@@ -531,6 +582,8 @@
                         to: document.getElementById("send-to").value.trim(),
                         subject: document.getElementById("send-subject").value.trim(),
                         body: document.getElementById("send-body").value,
+                        cc: (document.getElementById("send-cc") || {}).value || "",
+                        bcc: (document.getElementById("send-bcc") || {}).value || "",
                     }),
                 });
                 const data = await res.json().catch(() => ({}));

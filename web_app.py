@@ -141,6 +141,70 @@ def _flatten_overrides(po):
         flat["markup"] = po["markup"]
     return flat or None
 
+
+# ---------------------------------------------------------------------------
+# "Send Estimate" message defaults — used by /messages (Message Settings tab)
+# and the send-estimate modal on the Completed tab. Stored per-org in
+# organizations.message_settings JSON. NULL → use these built-in defaults.
+# Templates accept {business_name}, {subtotal}, {filename} placeholders.
+# ---------------------------------------------------------------------------
+DEFAULT_SEND_ESTIMATE_SUBJECT = "Estimate for {business_name}"
+DEFAULT_SEND_ESTIMATE_BODY = (
+    "Hello,\n\n"
+    "Please find attached the formal estimate for {business_name}.\n\n"
+    "Estimate total: {subtotal}\n\n"
+    "Let me know if you have any questions or if you'd like to proceed.\n\n"
+    "Thank you."
+)
+
+# Outer cap on saved templates. Long enough for a proper cover note, short
+# enough to keep the form predictable in the DB and on email relays.
+MESSAGE_SUBJECT_MAX = 255
+MESSAGE_BODY_MAX = 8000
+MESSAGE_RECIPIENT_MAX = 320  # SMTP path-length limit
+MESSAGE_CC_BCC_MAX = 10      # combined, per field
+
+
+def _parse_address_list(raw):
+    """Split a comma/newline-separated address string into a cleaned list.
+
+    Returns (addresses, errors). Empty input → ([], []).
+    """
+    addrs = []
+    errors = []
+    if not raw:
+        return addrs, errors
+    seen = set()
+    for piece in re.split(r"[,;\n]+", raw):
+        piece = piece.strip()
+        if not piece:
+            continue
+        low = piece.lower()
+        if low in seen:
+            continue
+        if len(piece) > MESSAGE_RECIPIENT_MAX or not _EMAIL_RE.match(piece):
+            errors.append(f"Not a valid email address: {piece}")
+            continue
+        seen.add(low)
+        addrs.append(piece)
+    return addrs, errors
+
+
+def _resolve_message_settings(org):
+    """Return the org's effective message settings, merged with defaults."""
+    ms = (org.message_settings if org is not None else None) or {}
+    return {
+        "subject_template": ms.get("subject_template") or DEFAULT_SEND_ESTIMATE_SUBJECT,
+        "body_template": ms.get("body_template") or DEFAULT_SEND_ESTIMATE_BODY,
+        "cc": list(ms.get("cc") or []),
+        "bcc": list(ms.get("bcc") or []),
+    }
+
+
+# Single-source-of-truth regex for address validation. Defined up here so
+# /messages can use it before the send-estimate route's module position.
+_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
 # ---------------------------------------------------------------------------
 # Job Queue
 # ---------------------------------------------------------------------------
@@ -1329,6 +1393,11 @@ def jobs_list():
             if s.status == "completed":
                 for f in s.files:
                     if f.kind == "result":
+                        # End users don't know what to do with the raw result
+                        # JSON — hide it from the UI. The file still lives in
+                        # R2 and is mailed to admins separately for archive.
+                        if f.filename.lower().endswith(".json"):
+                            continue
                         try:
                             entry = {
                                 "filename": f.filename,
@@ -1385,7 +1454,14 @@ def job_status_api(submission_id):
         if sub is None or sub.user_id != current_user_id():
             return jsonify({"error": "not found"}), 404
 
-        result_files = [f for f in sub.files if f.kind == "result"]
+        # Strip raw result JSON from the user-facing payload — it's an
+        # engineering artifact, not something the contractor would open.
+        # The file is still in R2 and is sent to admins separately.
+        result_files = [
+            f for f in sub.files
+            if f.kind == "result"
+            and not f.filename.lower().endswith(".json")
+        ]
         results = [{
             "filename": f.filename,
             "size": f.size_bytes,
@@ -2007,9 +2083,8 @@ def job_cancel_api(submission_id):
     return jsonify({"ok": True})
 
 
-# Lightweight email regex for the send-estimate endpoint. Not RFC-perfect —
-# just rejects obviously-malformed addresses before we open an SMTP session.
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+# Email-address regex for the send-estimate endpoint is _EMAIL_RE, defined
+# alongside the message-settings helpers at the top of this module.
 
 
 @app.route("/api/jobs/<submission_id>/send-estimate", methods=["POST"])
@@ -2031,10 +2106,22 @@ def job_send_estimate_api(submission_id):
         return jsonify({"error": "Enter a valid recipient email address."}), 400
     if not subject:
         return jsonify({"error": "Subject is required."}), 400
-    if len(subject) > 255:
-        return jsonify({"error": "Subject is too long (max 255 characters)."}), 400
+    if len(subject) > MESSAGE_SUBJECT_MAX:
+        return jsonify({
+            "error": f"Subject is too long (max {MESSAGE_SUBJECT_MAX} characters)."
+        }), 400
     if not body.strip():
         return jsonify({"error": "Message body is required."}), 400
+
+    # CC/BCC: accept either a list or a free-form string from the modal,
+    # validate, and fall back to the org defaults when the client doesn't
+    # send anything (the typical case — the modal pre-fills from defaults).
+    def _coerce_list(v):
+        if v is None:
+            return None
+        if isinstance(v, list):
+            return ", ".join(str(x) for x in v if x)
+        return str(v)
 
     with session_scope() as session:
         sub = session.get(Submission, submission_id)
@@ -2055,6 +2142,32 @@ def job_send_estimate_api(submission_id):
         user = session.get(User, uid)
         org = user.current_organization if user else None
         from_name = (org.name if org else None) or "Knight Shift"
+        defaults = _resolve_message_settings(org)
+
+    raw_cc = _coerce_list(data.get("cc"))
+    raw_bcc = _coerce_list(data.get("bcc"))
+    if raw_cc is None:
+        cc_list = list(defaults["cc"])
+    else:
+        cc_list, cc_errors = _parse_address_list(raw_cc)
+        if cc_errors:
+            return jsonify({"error": cc_errors[0]}), 400
+    if raw_bcc is None:
+        bcc_list = list(defaults["bcc"])
+    else:
+        bcc_list, bcc_errors = _parse_address_list(raw_bcc)
+        if bcc_errors:
+            return jsonify({"error": bcc_errors[0]}), 400
+
+    # Drop the primary recipient from CC/BCC to avoid sending it twice.
+    to_low = to_email.lower()
+    cc_list = [a for a in cc_list if a.lower() != to_low]
+    bcc_list = [a for a in bcc_list if a.lower() != to_low and a.lower() not in {c.lower() for c in cc_list}]
+
+    if len(cc_list) > MESSAGE_CC_BCC_MAX or len(bcc_list) > MESSAGE_CC_BCC_MAX:
+        return jsonify({
+            "error": f"Too many CC/BCC recipients (max {MESSAGE_CC_BCC_MAX} each).",
+        }), 400
 
     # Download the PDF to a temp file, then send.
     from jobs import send_email_with_attachments
@@ -2074,6 +2187,8 @@ def job_send_estimate_api(submission_id):
                 body=body,
                 attachment_paths=[local_path],
                 from_name=from_name,
+                cc=cc_list or None,
+                bcc=bcc_list or None,
             )
         except Exception as exc:
             logger.error("send-estimate %s: SMTP error: %s", submission_id, exc, exc_info=True)
@@ -2082,7 +2197,8 @@ def job_send_estimate_api(submission_id):
     if not sent:
         return jsonify({"error": "Email delivery is not configured on the server."}), 503
 
-    logger.info("Estimate for %s sent by user %d to %s", submission_id, uid, to_email)
+    logger.info("Estimate for %s sent by user %d to %s (cc=%d, bcc=%d)",
+                submission_id, uid, to_email, len(cc_list), len(bcc_list))
     return jsonify({"ok": True, "to": to_email})
 
 
@@ -2179,6 +2295,116 @@ def pricing_settings():
         rate_fields=RATE_FIELDS,
         advanced_rate_fields=ADVANCED_RATE_FIELDS,
     )
+
+
+@app.route("/messages", methods=["GET", "POST"])
+@require_auth
+def message_settings():
+    """View / edit per-org defaults for the Send-Estimate email.
+
+    Pairs with the modal on the Completed jobs tab — that modal pre-fills
+    the subject + body from these templates, and the API merges in the
+    saved CC/BCC lists if the request doesn't override them.
+
+    Org-scoped, same shape as /pricing — any member of the org sees the
+    same saved settings.
+    """
+    uid = current_user_id()
+    with session_scope() as session:
+        user = session.get(User, uid)
+        org = user.current_organization if user else None
+        if org is None:
+            flash("Your account is not yet fully set up. Please contact support.",
+                  "error")
+            return redirect(url_for("index"))
+
+        if request.method == "POST":
+            if request.form.get("reset"):
+                org.message_settings = None
+                flash("Message settings reset to system defaults.", "success")
+                return redirect(url_for("message_settings"))
+
+            subject_tmpl = (request.form.get("subject_template") or "").strip()
+            body_tmpl = (request.form.get("body_template") or "").strip()
+            cc_raw = request.form.get("cc") or ""
+            bcc_raw = request.form.get("bcc") or ""
+
+            errors = []
+            if subject_tmpl and len(subject_tmpl) > MESSAGE_SUBJECT_MAX:
+                errors.append(
+                    f"Subject template is too long "
+                    f"(max {MESSAGE_SUBJECT_MAX} characters)."
+                )
+            if body_tmpl and len(body_tmpl) > MESSAGE_BODY_MAX:
+                errors.append(
+                    f"Body template is too long "
+                    f"(max {MESSAGE_BODY_MAX} characters)."
+                )
+
+            cc_list, cc_errors = _parse_address_list(cc_raw)
+            bcc_list, bcc_errors = _parse_address_list(bcc_raw)
+            errors.extend(cc_errors)
+            errors.extend(bcc_errors)
+            if len(cc_list) > MESSAGE_CC_BCC_MAX:
+                errors.append(
+                    f"Too many CC addresses (max {MESSAGE_CC_BCC_MAX})."
+                )
+            if len(bcc_list) > MESSAGE_CC_BCC_MAX:
+                errors.append(
+                    f"Too many BCC addresses (max {MESSAGE_CC_BCC_MAX})."
+                )
+
+            if errors:
+                for e in errors:
+                    flash(e, "error")
+                return redirect(url_for("message_settings"))
+
+            saved = {}
+            # Persist only fields that differ from the system default, so a
+            # user clearing a field reverts to the built-in template.
+            if subject_tmpl and subject_tmpl != DEFAULT_SEND_ESTIMATE_SUBJECT:
+                saved["subject_template"] = subject_tmpl
+            if body_tmpl and body_tmpl != DEFAULT_SEND_ESTIMATE_BODY:
+                saved["body_template"] = body_tmpl
+            if cc_list:
+                saved["cc"] = cc_list
+            if bcc_list:
+                saved["bcc"] = bcc_list
+            org.message_settings = saved or None
+            flash("Message settings saved.", "success")
+            return redirect(url_for("message_settings"))
+
+        defaults = _resolve_message_settings(org)
+
+    return render_template(
+        "messages.html",
+        settings=defaults,
+        cc_text="\n".join(defaults["cc"]),
+        bcc_text="\n".join(defaults["bcc"]),
+        default_subject=DEFAULT_SEND_ESTIMATE_SUBJECT,
+        default_body=DEFAULT_SEND_ESTIMATE_BODY,
+        subject_max=MESSAGE_SUBJECT_MAX,
+        body_max=MESSAGE_BODY_MAX,
+        cc_bcc_max=MESSAGE_CC_BCC_MAX,
+    )
+
+
+@app.route("/api/messages/defaults", methods=["GET"])
+@require_auth
+def message_defaults_api():
+    """Return the caller's org message defaults — used by the Completed
+    tab modal to pre-fill subject/body and seed the CC/BCC inputs."""
+    uid = current_user_id()
+    with session_scope() as session:
+        user = session.get(User, uid)
+        org = user.current_organization if user else None
+        defaults = _resolve_message_settings(org)
+    return jsonify({
+        "subject_template": defaults["subject_template"],
+        "body_template": defaults["body_template"],
+        "cc": defaults["cc"],
+        "bcc": defaults["bcc"],
+    })
 
 
 # ---------------------------------------------------------------------------

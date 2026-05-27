@@ -1,6 +1,6 @@
 {# Shared header: brand bar with auth status + tab strip. Included in all
    authenticated pages. Caller passes `active_tab` as one of:
-       new | active | completed | usage | pricing | members | detail
+       new | active | completed | usage | pricing | messages | members | detail
 #}
 <div class="brand-bar">
     <div class="brand-bar-inner">
@@ -44,6 +44,9 @@
                 <a href="{{ url_for('pricing_settings') }}" class="account-dropdown-item" role="menuitem">
                     <span class="account-item-icon">&#128176;</span> Pricing defaults
                 </a>
+                <a href="{{ url_for('message_settings') }}" class="account-dropdown-item" role="menuitem">
+                    <span class="account-item-icon">&#9993;&#65039;</span> Message settings
+                </a>
                 <div class="account-dropdown-divider"></div>
                 <a href="#" class="account-dropdown-item account-dropdown-signout" id="sign-out-link" role="menuitem">
                     <span class="account-item-icon">&#128682;</span> Sign out
@@ -66,6 +69,9 @@
         </a>
         <a href="{{ url_for('pricing_settings') }}" class="tab {% if active_tab == 'pricing' %}tab-active{% endif %}">
             <span class="tab-icon">&#128176;</span> Pricing Defaults
+        </a>
+        <a href="{{ url_for('message_settings') }}" class="tab {% if active_tab == 'messages' %}tab-active{% endif %}">
+            <span class="tab-icon">&#9993;&#65039;</span> Message Settings
         </a>
     </nav>
 </div>

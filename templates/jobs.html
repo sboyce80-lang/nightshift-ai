@@ -187,6 +187,16 @@
                     <textarea id="send-body" name="body" rows="8" required
                               style="width:100%;padding:8px;background:rgba(8,18,32,0.7);border:1px solid rgba(255,255,255,0.12);border-radius:6px;color:#cbd5e1;font-family:inherit;font-size:0.95rem;"></textarea>
                 </div>
+                <div class="form-group">
+                    <label for="send-cc" style="color:#cbd5e1;">CC <span class="panel-subtle" style="font-size:0.8rem;">(comma-separated)</span></label>
+                    <input type="text" id="send-cc" name="cc"
+                           style="width:100%;padding:8px;background:rgba(8,18,32,0.7);border:1px solid rgba(255,255,255,0.12);border-radius:6px;color:#cbd5e1;">
+                </div>
+                <div class="form-group">
+                    <label for="send-bcc" style="color:#cbd5e1;">BCC <span class="panel-subtle" style="font-size:0.8rem;">(comma-separated)</span></label>
+                    <input type="text" id="send-bcc" name="bcc"
+                           style="width:100%;padding:8px;background:rgba(8,18,32,0.7);border:1px solid rgba(255,255,255,0.12);border-radius:6px;color:#cbd5e1;">
+                </div>
                 <p class="panel-subtle" id="send-attachment-note" style="margin-top:0;font-size:0.85rem;">
                     Attachment: <span id="send-attachment-name">(estimate)</span>
                 </p>
@@ -424,24 +434,67 @@
         const sendTo = document.getElementById("send-to");
         const sendSubject = document.getElementById("send-subject");
         const sendBody = document.getElementById("send-body");
+        const sendCc = document.getElementById("send-cc");
+        const sendBcc = document.getElementById("send-bcc");
         const sendAttachmentName = document.getElementById("send-attachment-name");
         const sendFeedback = document.getElementById("send-estimate-feedback");
         const sendSubmitBtn = document.getElementById("send-estimate-submit");
         let activeSendSubmissionId = null;
 
-        function openSendModal(btn) {
+        // Org defaults for subject/body/CC/BCC — loaded once per page from
+        // /api/messages/defaults. Falls back to built-in defaults on error
+        // so the modal still works if the user hasn't saved anything yet.
+        let messageDefaults = null;
+        const BUILTIN_DEFAULTS = {
+            subject_template: "Estimate for {business_name}",
+            body_template:
+                "Hello,\n\n" +
+                "Please find attached the formal estimate for {business_name}.\n\n" +
+                "Estimate total: {subtotal}\n\n" +
+                "Let me know if you have any questions or if you'd like to proceed.\n\n" +
+                "Thank you.",
+            cc: [],
+            bcc: [],
+        };
+        async function ensureMessageDefaults() {
+            if (messageDefaults) return messageDefaults;
+            try {
+                const res = await fetch("/api/messages/defaults",
+                                        { credentials: "same-origin" });
+                if (res.ok) {
+                    messageDefaults = await res.json();
+                } else {
+                    messageDefaults = BUILTIN_DEFAULTS;
+                }
+            } catch (_) {
+                messageDefaults = BUILTIN_DEFAULTS;
+            }
+            return messageDefaults;
+        }
+        ensureMessageDefaults();
+
+        function applyTemplate(tmpl, vars) {
+            return String(tmpl || "").replace(/\{(\w+)\}/g, (m, k) =>
+                Object.prototype.hasOwnProperty.call(vars, k) ? vars[k] : m
+            );
+        }
+
+        async function openSendModal(btn) {
             activeSendSubmissionId = btn.dataset.submissionId;
             const business = btn.dataset.businessName || "this project";
             const subtotal = Number(btn.dataset.subtotal || 0);
             const filename = btn.dataset.filename || "estimate.pdf";
+            const defaults = await ensureMessageDefaults();
+            const vars = {
+                business_name: business,
+                subtotal: fmtMoney(subtotal),
+                filename: filename,
+            };
             sendTo.value = "";
-            sendSubject.value = `Estimate for ${business}`;
-            sendBody.value =
-                `Hello,\n\n` +
-                `Please find attached the formal estimate for ${business}.\n\n` +
-                `Estimate total: ${fmtMoney(subtotal)}\n\n` +
-                `Let me know if you have any questions or if you'd like to proceed.\n\n` +
-                `Thank you.`;
+            sendSubject.value = applyTemplate(defaults.subject_template, vars);
+            sendBody.value = applyTemplate(defaults.body_template, vars);
+            if (sendCc) sendCc.value = (defaults.cc || []).join(", ");
+            if (sendBcc) sendBcc.value = (defaults.bcc || []).join(", ");
             sendAttachmentName.textContent = filename;
             sendFeedback.style.display = "none";
             sendFeedback.textContent = "";
@@ -487,6 +540,8 @@
                         to: sendTo.value.trim(),
                         subject: sendSubject.value.trim(),
                         body: sendBody.value,
+                        cc: sendCc ? sendCc.value : "",
+                        bcc: sendBcc ? sendBcc.value : "",
                     }),
                 });
                 const data = await res.json().catch(() => ({}));

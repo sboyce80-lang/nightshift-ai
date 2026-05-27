@@ -434,9 +434,14 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
                     _record_result_file(submission_id, filename, r2_key,
                                         size_bytes, content_type)
 
-            # Third deliverable: formal Estimate PDF. Failure here doesn't
-            # block completion — the full PDF/JSON are the source of truth.
-            _build_and_upload_estimate(submission_id, result, workdir)
+            # Third deliverable: formal Estimate PDF (with the org's logo).
+            # Failure here doesn't block completion — the full PDF/JSON are
+            # the source of truth. We hand the path to send_result_email so
+            # the contractor receives the branded estimate alongside the
+            # analysis PDF.
+            estimate_pdf_path = _build_and_upload_estimate(
+                submission_id, result, workdir,
+            )
 
             # Fourth deliverable: Annotated Drawings PDF — each source page
             # rendered with room bboxes drawn on top, so the contractor (and
@@ -446,8 +451,15 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
                 submission_id, result, local_pdfs, workdir,
             )
 
-            send_result_email(contact_info, result,
-                              extra_attachment_paths=annotated_pdf_paths)
+            send_result_email(
+                contact_info, result,
+                extra_attachment_paths=annotated_pdf_paths,
+                estimate_pdf_path=estimate_pdf_path,
+            )
+            # Internal-only archive: ship the raw result JSON to admins so
+            # we keep a deliverability copy even though end users no longer
+            # see it in their inbox.
+            send_result_json_to_admin(contact_info, result, submission_id)
 
             subtotal = result.get("cost_estimate", {}).get("subtotal", 0) or 0
             update_status(submission_id, "completed", subtotal=subtotal)
@@ -615,7 +627,7 @@ def merge_submission(submission_id, parent_id, new_pdf_keys, contact_info,
 # ---------------------------------------------------------------------------
 
 def send_email_with_attachments(to_email, subject, body, attachment_paths,
-                                 from_name=None, cc=None):
+                                 from_name=None, cc=None, bcc=None):
     """Send a plaintext email with PDF/JSON attachments over the same SMTP
     relay used by send_result_email.
 
@@ -627,6 +639,9 @@ def send_email_with_attachments(to_email, subject, body, attachment_paths,
                           Extension drives the MIME subtype (pdf/json/octet).
         from_name:        display name; defaults to COMPANY_NAME.
         cc:               optional list of CC addresses.
+        bcc:              optional list of BCC addresses. Never written into
+                          the message headers — appended to the SMTP envelope
+                          only, so other recipients can't see them.
 
     Returns True on send, False if SMTP isn't configured. Raises on send failure.
     """
@@ -655,7 +670,9 @@ def send_email_with_attachments(to_email, subject, body, attachment_paths,
             )
             msg.attach(att)
 
-    recipients = [to_email] + (list(cc) if cc else [])
+    recipients = ([to_email]
+                  + (list(cc) if cc else [])
+                  + (list(bcc) if bcc else []))
     with smtplib.SMTP(EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT) as server:
         server.ehlo()
         server.starttls()
@@ -666,7 +683,16 @@ def send_email_with_attachments(to_email, subject, body, attachment_paths,
     return True
 
 
-def send_result_email(contact_info, result, extra_attachment_paths=None):
+def send_result_email(contact_info, result, extra_attachment_paths=None,
+                      estimate_pdf_path=None):
+    """Email the contractor that their estimate is ready.
+
+    Attaches the analysis PDF, the formal branded Estimate PDF (with the
+    org's logo), and any extra attachments (annotated drawings, etc.).
+    The raw result JSON is intentionally *not* attached — end users don't
+    know what to do with it. `send_result_json_to_admin` ships that
+    separately to admin@knightshiftai.com so we still keep a copy.
+    """
     if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD:
         logger.warning("SMTP not configured — skipping email notification")
         return
@@ -705,7 +731,8 @@ COST ESTIMATE
 IMPORTANT: This is a preliminary estimate generated automatically from your
 drawings. A formal proposal will follow after review.
 
-The detailed analysis is attached as a PDF report.
+Attached: the detailed analysis PDF and a formal Estimate (PDF) you can
+forward directly to your client.
 
 Best regards,
 {COMPANY_NAME}
@@ -733,13 +760,15 @@ Best regards,
             )
             msg.attach(att)
 
-    json_path = result.get("output_json_path")
-    if json_path and os.path.exists(json_path):
-        with open(json_path, "rb") as f:
-            att = MIMEApplication(f.read(), _subtype="json")
+    # Formal Estimate PDF (carries the org logo). Best-effort — if the
+    # estimate render failed earlier the path will be None and we just
+    # ship the analysis PDF + annotated drawings.
+    if estimate_pdf_path and os.path.exists(estimate_pdf_path):
+        with open(estimate_pdf_path, "rb") as f:
+            att = MIMEApplication(f.read(), _subtype="pdf")
             att.add_header(
                 "Content-Disposition", "attachment",
-                filename=os.path.basename(json_path),
+                filename=os.path.basename(estimate_pdf_path),
             )
             msg.attach(att)
 
@@ -764,6 +793,78 @@ Best regards,
         logger.info("Result email sent to %s", contact_info["email"])
     except Exception as exc:
         logger.error("Failed to send result email: %s", exc)
+
+
+# Internal archive recipient. The raw result JSON is engineering-grade
+# data — the customer doesn't see it in their email or the UI, but we
+# keep a copy for debugging and future re-ingest. Falls back to whatever
+# is in ADMIN_EMAILS if the canonical address is missing for any reason.
+_ADMIN_JSON_INBOX = "admin@knightshiftai.com"
+
+
+def send_result_json_to_admin(contact_info, result, submission_id):
+    """Ship the raw result JSON to the admin archive inbox.
+
+    Customers no longer receive the JSON file (it's not actionable for
+    them), but it remains useful internally — for QA, regression checks,
+    and re-ingest. The file is already in R2 under the submission's
+    results/ prefix; this is the email mirror of that copy.
+
+    Best-effort: SMTP misconfig or missing JSON path is logged at WARNING
+    and the function returns silently — the customer email path is the
+    one that must not fail.
+    """
+    json_path = result.get("output_json_path")
+    if not json_path or not os.path.exists(json_path):
+        logger.warning("Admin JSON archive skipped for %s: no JSON on disk",
+                       submission_id)
+        return
+    if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD:
+        logger.warning("SMTP not configured — skipping admin JSON archive for %s",
+                       submission_id)
+        return
+
+    recipients = sorted(set(ADMIN_EMAILS) | {_ADMIN_JSON_INBOX})
+    customer_email = (contact_info.get("email") or "").strip()
+    business = (contact_info.get("business_name") or "").strip()
+    subject = (f"[KnightShift archive] Result JSON — {business or submission_id}"
+               .strip())
+    body = (
+        f"Internal copy of the raw result JSON for submission {submission_id}.\n\n"
+        f"  Customer:      {contact_info.get('name') or '(unknown)'}"
+        f" <{customer_email or 'no-email'}>\n"
+        f"  Business:      {business or '(not provided)'}\n"
+        f"  Submission ID: {submission_id}\n\n"
+        "This message is sent only to KnightShift admins. The customer-facing\n"
+        "email does not include the JSON file."
+    )
+
+    msg = MIMEMultipart()
+    msg["From"] = f"{COMPANY_NAME} <{EMAIL_ADDRESS}>"
+    msg["To"] = ", ".join(recipients)
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+
+    with open(json_path, "rb") as f:
+        att = MIMEApplication(f.read(), _subtype="json")
+        att.add_header(
+            "Content-Disposition", "attachment",
+            filename=os.path.basename(json_path),
+        )
+        msg.attach(att)
+
+    try:
+        with smtplib.SMTP(EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
+            server.sendmail(EMAIL_ADDRESS, recipients, msg.as_string())
+        logger.info("Admin JSON archive sent for %s → %s",
+                    submission_id, recipients)
+    except Exception as exc:
+        logger.error("Failed to send admin JSON archive for %s: %s",
+                     submission_id, exc)
 
 
 def send_error_email(contact_info, error_msg):
