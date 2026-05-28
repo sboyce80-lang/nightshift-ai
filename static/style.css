@@ -16,10 +16,6 @@
     --text-muted: #4a5568;
     --error-red: #dc2626;
     --success-green: #2ecc71;
-    /* Light "blueprint paper" surfaces — near-white with a faint cool tint */
-    --surface-base: #f5f8fc;
-    --surface-tint: #eef3fa;
-    --surface-border: #d8e3f0;
 }
 
 * {
@@ -38,11 +34,10 @@ body {
 
 /* ── Hero Header ── */
 .hero {
-    background: linear-gradient(135deg, var(--surface-tint) 0%, var(--surface-base) 100%);
-    color: var(--text-dark);
+    background: linear-gradient(135deg, var(--dark-blue) 0%, var(--darker-blue) 100%);
+    color: var(--white);
     padding: 36px 20px 60px;
     text-align: center;
-    border-bottom: 1px solid var(--surface-border);
 }
 
 .hero.hero-compact {
@@ -59,9 +54,9 @@ body {
 .hero-logo {
     height: 180px;
     width: auto;
-    opacity: 0.18;
-    mix-blend-mode: multiply;
-    filter: saturate(1.1);
+    opacity: 0.20;
+    mix-blend-mode: screen;
+    filter: saturate(1.4);
     pointer-events: none;
     user-select: none;
 }
@@ -81,28 +76,29 @@ body {
     font-weight: 700;
     margin-bottom: 4px;
     letter-spacing: -0.5px;
-    color: var(--text-dark);
+    text-shadow: 0 2px 12px rgba(0, 0, 0, 0.5);
     white-space: nowrap;
 }
 
 .tagline {
     font-size: 1.15rem;
-    color: var(--accent-green-hover);
+    color: var(--accent-green);
     font-style: italic;
     margin-bottom: 0;
     font-weight: 500;
+    text-shadow: 0 1px 6px rgba(0, 0, 0, 0.4);
 }
 
 .subtitle {
     font-size: 1.05rem;
-    color: var(--text-muted);
+    color: rgba(255, 255, 255, 0.85);
     max-width: 540px;
     margin: 8px auto 0;
 }
 
 .trust-line {
     font-size: 0.82rem;
-    color: rgba(26, 42, 58, 0.55);
+    color: rgba(255, 255, 255, 0.45);
     margin-top: 10px;
     letter-spacing: 0.02em;
 }
@@ -573,15 +569,15 @@ footer {
 /* ─────────────────────────────────────────────────────────────────────── */
 
 body.dark-theme {
-    background: linear-gradient(180deg, var(--surface-base) 0%, var(--surface-tint) 100%);
-    color: var(--text-dark);
+    background: linear-gradient(180deg, var(--darker-blue) 0%, #051322 100%);
+    color: #e2e8f0;
     min-height: 100vh;
 }
 
 /* ── Brand Bar (replaces auth-bar on dark pages) ── */
 .brand-bar {
-    background: linear-gradient(180deg, var(--surface-base) 0%, var(--surface-tint) 100%);
-    border-bottom: 1px solid var(--surface-border);
+    background: linear-gradient(180deg, #0a1628 0%, #061121 100%);
+    border-bottom: 1px solid rgba(148, 163, 184, 0.12);
     padding: 0 24px;
 }
 .brand-bar-inner {
@@ -603,8 +599,8 @@ body.dark-theme {
     width: 38px;
     height: 38px;
     border-radius: 50%;
-    border: 1.5px solid rgba(26, 111, 181, 0.35);
-    background: rgba(255, 255, 255, 0.6);
+    border: 1.5px solid rgba(46, 204, 113, 0.45);
+    background: rgba(255, 255, 255, 0.04);
     padding: 3px;
     object-fit: contain;
 }
@@ -615,18 +611,18 @@ body.dark-theme {
 }
 .brand-text strong {
     font-size: 1.05rem;
-    color: var(--text-dark);
+    color: #ffffff;
     letter-spacing: -0.2px;
 }
 .brand-tagline {
     font-size: 0.72rem;
-    color: var(--accent-green-hover);
+    color: var(--accent-green);
     font-style: italic;
     letter-spacing: 0.02em;
 }
 .brand-spacer { flex: 1; }
 .brand-auth {
-    color: var(--text-muted);
+    color: #cbd5e1;
     font-size: 0.85rem;
 }
 
@@ -637,17 +633,17 @@ body.dark-theme {
     align-items: center;
     gap: 10px;
     padding: 6px 12px 6px 6px;
-    background: rgba(255, 255, 255, 0.7);
-    border: 1px solid var(--surface-border);
+    background: rgba(15, 28, 50, 0.6);
+    border: 1px solid rgba(148, 163, 184, 0.18);
     border-radius: 999px;
-    color: var(--text-dark);
+    color: #cbd5e1;
     font-size: 0.85rem;
     cursor: pointer;
     transition: background 0.15s, border-color 0.15s;
 }
 .account-trigger:hover {
-    background: rgba(255, 255, 255, 0.95);
-    border-color: rgba(26, 111, 181, 0.35);
+    background: rgba(30, 50, 84, 0.7);
+    border-color: rgba(148, 163, 184, 0.32);
 }
 .account-avatar {
     display: inline-flex;
@@ -669,7 +665,7 @@ body.dark-theme {
     white-space: nowrap;
 }
 .account-caret {
-    color: rgba(26, 42, 58, 0.55);
+    color: rgba(203, 213, 225, 0.65);
     font-size: 0.75rem;
 }
 .account-dropdown {
@@ -677,10 +673,10 @@ body.dark-theme {
     top: calc(100% + 8px);
     right: 0;
     min-width: 260px;
-    background: var(--white);
-    border: 1px solid var(--surface-border);
+    background: #0d1c33;
+    border: 1px solid rgba(148, 163, 184, 0.22);
     border-radius: 12px;
-    box-shadow: 0 12px 32px rgba(10, 37, 64, 0.18);
+    box-shadow: 0 12px 32px rgba(0, 0, 0, 0.45);
     padding: 8px 0;
     opacity: 0;
     transform: translateY(-4px);
@@ -697,7 +693,7 @@ body.dark-theme {
     padding: 10px 16px 12px;
 }
 .account-dropdown-name {
-    color: var(--text-dark);
+    color: #ffffff;
     font-weight: 600;
     font-size: 0.92rem;
     overflow: hidden;
@@ -705,7 +701,7 @@ body.dark-theme {
     white-space: nowrap;
 }
 .account-dropdown-email {
-    color: var(--text-muted);
+    color: rgba(203, 213, 225, 0.7);
     font-size: 0.8rem;
     overflow: hidden;
     text-overflow: ellipsis;
@@ -713,7 +709,7 @@ body.dark-theme {
 }
 .account-dropdown-org {
     margin-top: 8px;
-    color: var(--text-muted);
+    color: #cbd5e1;
     font-size: 0.82rem;
     display: flex;
     align-items: center;
@@ -722,8 +718,8 @@ body.dark-theme {
 .account-role-badge {
     display: inline-block;
     padding: 1px 8px;
-    background: rgba(46, 204, 113, 0.18);
-    color: var(--accent-green-hover);
+    background: rgba(46, 204, 113, 0.15);
+    color: #6ee7b7;
     border-radius: 999px;
     font-size: 0.7rem;
     font-weight: 600;
@@ -732,7 +728,7 @@ body.dark-theme {
 }
 .account-dropdown-divider {
     height: 1px;
-    background: var(--surface-border);
+    background: rgba(148, 163, 184, 0.14);
     margin: 4px 0;
 }
 .account-dropdown-item {
@@ -740,14 +736,14 @@ body.dark-theme {
     align-items: center;
     gap: 10px;
     padding: 9px 16px;
-    color: var(--text-dark);
+    color: #cbd5e1;
     text-decoration: none;
     font-size: 0.88rem;
     transition: background 0.1s, color 0.1s;
 }
 .account-dropdown-item:hover {
-    background: var(--surface-tint);
-    color: var(--medium-blue);
+    background: rgba(46, 88, 148, 0.22);
+    color: #ffffff;
 }
 .account-item-icon {
     font-size: 0.95rem;
@@ -772,7 +768,7 @@ body.dark-theme {
     align-items: center;
     gap: 8px;
     padding: 12px 18px;
-    color: var(--text-muted);
+    color: rgba(203, 213, 225, 0.7);
     text-decoration: none;
     font-size: 0.92rem;
     font-weight: 500;
@@ -780,19 +776,19 @@ body.dark-theme {
     transition: color 0.15s, border-color 0.15s;
     white-space: nowrap;
 }
-.tab:hover { color: var(--text-dark); }
+.tab:hover { color: #fff; }
 .tab-active {
-    color: var(--text-dark);
-    border-bottom-color: var(--medium-blue);
+    color: #ffffff;
+    border-bottom-color: var(--accent-green);
 }
 .tab-icon { font-size: 1rem; opacity: 0.9; }
 
 /* ── Hero Banner (Streamlit-style gradient panel) ── */
 .hero-banner {
-    background: linear-gradient(135deg, var(--surface-tint) 0%, var(--surface-base) 100%);
-    border: 1px solid var(--surface-border);
+    background: linear-gradient(135deg, #0d3a6f 0%, #0a2540 60%, #051a2e 100%);
+    border: 1px solid rgba(96, 165, 250, 0.18);
     border-radius: 14px;
-    box-shadow: 0 4px 16px rgba(10, 37, 64, 0.06);
+    box-shadow: 0 8px 32px rgba(0, 0, 0, 0.35);
     margin: 24px auto 28px;
     max-width: 1340px;
     padding: 28px 40px;
@@ -804,8 +800,8 @@ body.dark-theme {
     width: 92px;
     height: 92px;
     border-radius: 50%;
-    background: rgba(255, 255, 255, 0.7);
-    border: 2px solid rgba(26, 111, 181, 0.35);
+    background: rgba(255, 255, 255, 0.06);
+    border: 2px solid rgba(46, 204, 113, 0.5);
     padding: 8px;
     object-fit: contain;
     flex-shrink: 0;
@@ -815,12 +811,11 @@ body.dark-theme {
     font-weight: 700;
     margin: 0 0 4px;
     letter-spacing: -0.5px;
-    color: var(--text-dark);
 }
-.hero-banner h1 .brand-name-light { color: var(--medium-blue); }
-.hero-banner h1 .brand-name-white { color: var(--text-dark); }
+.hero-banner h1 .brand-name-light { color: #60a5fa; }
+.hero-banner h1 .brand-name-white { color: #ffffff; }
 .hero-banner .banner-tagline {
-    color: var(--accent-green-hover);
+    color: var(--accent-green);
     font-style: italic;
     font-size: 1rem;
     margin: 0;
