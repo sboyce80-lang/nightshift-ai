@@ -3764,12 +3764,39 @@ Multi-unit residential buildings often have IDENTICAL floor plans repeated acros
   * DO NOT assume A-106 and A-107 are redundant with A-105. Open them and extract their units.
   * If you only extract from one apartment plan sheet when the index lists several, you are
     UNDER-COUNTING the building's unit-type variety by 50-80%.
+- COUNTER-RULE — DO NOT OVER-SEGMENT WHEN THE BUILDING IS GENUINELY TYPICAL:
+  The multi-sheet rule above applies when each sheet shows DIFFERENT unit layouts. It does
+  NOT mean "always split into Studio + 1BR + 2BR." Many buildings have a single typical
+  apartment plan repeated across floors. Over-segmenting causes per-unit dimensions to shrink
+  and undercounts total painted area by 15-25%.
+  * If only ONE apartment plan sheet exists (or multiple sheets show the SAME layout with only
+    unit-number prefix changes 101→201→301), treat as ONE unit type with a single template.
+  * If the unit-mix table shows "20 typical residential units" without breaking into
+    sub-typologies, use ONE "Typical Apartment" template with unit_multiplier = 20.
+  * Only emit Studio/1BR/2BR as separate templates when the drawings or unit-mix table
+    EXPLICITLY show distinct floor plans with different room counts, sizes, or layouts.
+    Mere unit-number variation (201 vs 202 vs 203 on the same floor) is NOT evidence of
+    different typologies — same-floor consecutive numbers are usually the same plan mirrored.
+  * Sanity check: if your residential templates emit fewer than ~3 painted rooms per unit type
+    on average (Living + Bed + Bath minimum, often + Kitchen/Closet/Entry), you are likely
+    missing rooms inside each template — revisit before finalizing.
 - IF A SINGLE SHEET TITLE LISTS MULTIPLE UNITS (e.g. "Units x01 & x02 Floor Plans"):
-  That sheet shows TWO unit types side-by-side. Extract BOTH as separate templates, not one.
+  That sheet shows TWO unit types side-by-side ONLY IF the two units have DIFFERENT layouts.
+  If "Unit x01" and "Unit x02" are mirror-image copies of the same plan, they are ONE type.
   Same rule applies to "Units A & B", "Units 101 & 102", etc.
 - Determine the TOTAL COUNT of each unit type from the drawings, schedules, or unit mix tables.
 - Look for unit counts in: Light & Ventilation schedules, unit mix tables, apartment number series
   (e.g., units 201-208 on 2nd floor = 8 units), door schedule unit groups, or key plans.
+- CROSS-FLOOR MULTIPLICATION — explicit formula:
+  unit_multiplier(type T) = (count of T on a typical floor) × (number of typical residential floors)
+  * Example: 364 Main has unit numbers 201-210 (2nd floor) AND 301-310 (3rd floor) = 10 units/floor
+    × 2 typical residential floors = 20 total residential units. If all 20 are the same type,
+    one template with unit_multiplier=20.
+  * Example: building has 4 studios + 3 1BR + 3 2BR per floor across 2 typical floors → multipliers
+    are Studio=8, 1BR=6, 2BR=6, summing to 20 (= total_units).
+  * Verification: sum(unit_multipliers across all residential templates) MUST equal
+    total_units_in_project_info. If your sum is LESS than total_units, you forgot to multiply
+    by the number of typical floors — fix before emitting.
 - Extract ONE TEMPLATE unit of each type with FULL room-by-room detail (living, ALL bedrooms,
   ALL baths, closets).
 - For each template room, add a "unit_multiplier" field set to the TOTAL number of identical
@@ -3934,6 +3961,12 @@ Look at building elevations (A-201, A-202) and exterior detail sheets:
   * Set "exterior_siding_type" to primary cladding name (e.g. "hardie", "vinyl", "wood", "stucco")
   * When material-specific siding is identified, do NOT also include that area in exterior_paint_sqft
     (exterior_paint_sqft is ONLY for generic painted surfaces not covered by a specific material item)
+  * If the drawings, finish schedule, or material callouts indicate any extracted siding/trim
+    material is FACTORY-FINISHED, PRE-FINISHED, or otherwise NOT field-painted (e.g. vinyl siding,
+    metal panels, factory-pre-finished Hardie ColorPlus), ADD an explicit note to "notes" using
+    one of these phrases: "factory finish", "pre-finish", or "does not require paint". The cost
+    engine assumes extracted siding IS in paint scope by default; without these keywords it will
+    price them at the standard rates. Only suppress with these explicit phrases when warranted.
 - Note if a lift/scaffold is required (3+ story buildings typically need a lift)
 - Set lift_required = 1 if the building is 3+ stories and has ANY exterior paint scope
 
@@ -10827,35 +10860,30 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     if azek_lf > 0 and window_trim_lf > 0:
         window_trim_lf = 0
 
-    # --- Hardie/Azek/Lintel: only price if extraction explicitly found siding TYPE ---
-    # The LLM may detect Hardie on elevations, but new construction Hardie comes
-    # factory-primed and doesn't need field painting. Only price siding materials
-    # when the exterior notes explicitly say "paint" or "field finish" for siding.
-    # Check exterior_siding_type and notes for painting indicators.
+    # --- Hardie/Azek/Lintel: price by default when extraction found them ---
+    # If Claude measured Hardie sqft, Azek LF, corner boards, or steel lintels
+    # from the elevation drawings, the painter is almost certainly bidding to
+    # paint them. The Fishkill PDF round-tripped extracted Hardie + Azek + lintel
+    # quantities that were suppressed because the notes didn't contain the
+    # specific phrase "field paint" — a $35k swing on a single bid. Invert the
+    # default: assume painting is in scope unless notes EXPLICITLY say otherwise.
     _ext_siding_type = str(exterior.get('exterior_siding_type', '')).lower()
     _ext_notes = str(exterior.get('notes', '')).lower()
-    _siding_needs_paint = any(kw in _ext_notes for kw in (
-        'paint siding', 'field paint', 'field finish', 'prime and paint',
-        'finish coat', 'two coat', '2 coat', 'topcoat'))
-    # Also check if scope_notes from user mention exterior siding painting
-    _scope_ext = str(project_info.get('_scope_notes', '')).lower()
-    _siding_needs_paint = _siding_needs_paint or any(kw in _scope_ext for kw in (
-        'paint siding', 'hardie paint', 'exterior siding', 'siding painting'))
-    # Negative check: if exterior notes explicitly say siding is factory-finished or
-    # non-paintable material (cork, vinyl, metal, aluminum), suppress siding even if
-    # the LLM extracted Hardie/Azek quantities.
+    # Explicit factory-finish / non-paint signals — these still suppress.
     _siding_factory_finished = any(kw in _ext_notes for kw in (
         'cork siding', 'vinyl siding', 'metal siding', 'metal roofing',
         'aluminum siding', 'composite siding', 'factory finish',
         'pre-finish', 'prefinish', 'not require painting',
         'do not require paint', 'does not require paint',
         'no painting required', 'no paint required'))
-    if _siding_factory_finished:
-        _siding_needs_paint = False
+    # Scope-notes override (user can force one way or the other)
+    _scope_ext = str(project_info.get('_scope_notes', '')).lower()
+    _scope_says_no_paint = any(kw in _scope_ext for kw in (
+        'no exterior paint', 'no siding paint', 'exterior excluded',
+        'siding excluded', 'do not paint siding'))
+    _suppress_siding = _siding_factory_finished or _scope_says_no_paint
 
-    if not _siding_needs_paint:
-        # New construction: siding/trim comes factory-finished. Zero out material-specific
-        # exterior items. Keep generic ext_paint_sqft and cornice (those are always painted).
+    if _suppress_siding:
         if hardie_sqft > 0:
             hardie_sqft = 0
         if azek_lf > 0:
@@ -13924,11 +13952,17 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
 
     # Check for basement/cellar floor in extracted data
     # total_stories typically counts above-grade floors only (1st, 2nd, 3rd)
-    # Basement adds an extra level transition for stair calculations
+    # Basement adds an extra level transition for stair calculations.
+    # Require >=2 rooms on the basement floor — Fishkill labels a single
+    # foundation slab as "Foundation/Basement" but has no usable basement
+    # space, so it should not contribute a stair transition.
     floors_list = analysis.get("floors", [])
-    has_basement = any("base" in f.get("floor_name", "").lower() or
-                       "cellar" in f.get("floor_name", "").lower()
-                       for f in floors_list)
+    has_basement = any(
+        ("base" in (f.get("floor_name", "") or "").lower() or
+         "cellar" in (f.get("floor_name", "") or "").lower())
+        and len(f.get("rooms", []) or []) >= 2
+        for f in floors_list
+    )
     effective_levels = int(total_stories) + (1 if has_basement else 0)
 
     # Calculate expected minimum stair count based on building size
@@ -14002,23 +14036,27 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     # --- Stair section cap for multi-story buildings ---
     # When LLM-extracted stairs significantly exceed the building heuristic,
     # the LLM likely counted landings as separate sections. Cap to heuristic.
-    # Use above-grade stories only for cap (basement stairs are fewer/simpler).
+    # Use effective_levels (includes basement) to stay symmetric with the boost
+    # formula above — otherwise a 3-story + basement building gets boosted to
+    # 12 then capped back to 8, losing the basement stair flight. Rider's
+    # 364 Main takeoff has 11 sections for this exact shape.
     final_stair_count = _num(agg.get("total_stair_sections", 0))
-    above_grade_expected = 2 * max(1, int(total_stories) - 1) * 2  # no basement
-    if total_stories >= 2 and above_grade_expected > 0:
-        stair_cap = round(above_grade_expected * 1.25)
+    cap_expected = 2 * max(1, effective_levels - 1) * 2
+    if total_stories >= 2 and cap_expected > 0:
+        stair_cap = round(cap_expected * 1.25)
         if final_stair_count > stair_cap:
-            agg["total_stair_sections"] = above_grade_expected
+            agg["total_stair_sections"] = cap_expected
             analysis["aggregated_totals"] = agg
+            basement_note = " (incl. basement)" if has_basement else ""
             analysis.setdefault("notes", []).append(
                 f"[Stair Cap] Capped stairs from {final_stair_count} to "
-                f"{above_grade_expected} sections (heuristic: 2 stairwells x "
-                f"{max(1, int(total_stories) - 1)} transitions x 2 flights = "
-                f"{above_grade_expected}). Extraction likely counted landings "
-                f"as separate sections."
+                f"{cap_expected} sections (heuristic: 2 stairwells x "
+                f"{max(1, effective_levels - 1)} transitions x 2 flights = "
+                f"{cap_expected}{basement_note}). Extraction likely counted "
+                f"landings as separate sections."
             )
-            print(f"   🪜 Stair cap: {final_stair_count} -> {above_grade_expected} sections "
-                  f"(capped to above-grade heuristic for {int(total_stories)}-story building)")
+            print(f"   🪜 Stair cap: {final_stair_count} -> {cap_expected} sections "
+                  f"(capped to {effective_levels}-level heuristic{basement_note})")
 
     # --- Gyp between stairs auto-estimate ---
     # If stairs exist but gyp_between_stairs is missing or too low, estimate from stair count.
