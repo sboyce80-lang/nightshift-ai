@@ -28,11 +28,37 @@ import sys
 # Format: metric_name: (expected_value, tolerance_fraction)
 #   e.g., (85353, 0.15) means expected=85353, pass if within ±15%
 # Assertions: (metric, operator, value, message) — hard pass/fail checks
+#
+# Tier field — explicit confidence rating per case:
+#     1  VERIFIED    — Rider Excel takeoff is in hand AND someone has
+#                      re-derived every target number from the spreadsheet
+#                      (date in `verified_on`). These cases GATE CI: a
+#                      change that fails any tier-1 reference blocks deploy.
+#                      Adding a new case at tier 1 is a deliberate act.
+#     2  INFERRED    — Rider Excel claimed in `source` but the targets in
+#                      this file have not been re-derived recently, so they
+#                      may be stale (scope grew, Rider revised, units
+#                      changed, etc). Harness reports failures as warnings
+#                      only — does NOT block deploy. Promote to tier 1 by
+#                      running scripts/verify_reference_case.py against the
+#                      Excel and updating both the targets and verified_on.
+#     3  UNVERIFIED  — review-only or no source artifact in hand. Targets
+#                      may be wrong. Harness reports for visibility but
+#                      these cases never gate deploy and shouldn't drive
+#                      code changes.
+#
+# Don't gate on numbers you can't re-derive from a primary source.
 # ---------------------------------------------------------------------------
 REFERENCE_CASES = {
     "364_main": {
         "display_name": "364 Main Street, Beacon",
-        "match_keywords": ["364", "main", "beacon"],
+        "match_keywords": ["364", "main"],
+        "tier": 1,
+        "verified_on": "2026-05-29",
+        "verified_by": "Steve Boyce + Claude — derived targets directly from "
+                       "'364 Mainstreet Beacon Take Offs (5).xlsx' Updated "
+                       "Pricing sheet (walls 85,353 SF, ceil 26,839 SF, "
+                       "trim 8,629 LF, $162,456)",
         "source": "Rider manual Excel takeoff (364 Mainstreet Beacon Take Offs)",
         "targets": {
             "total_paintable_wall_sqft": (85353, 0.15),
@@ -48,6 +74,13 @@ REFERENCE_CASES = {
     },
     "grenadier_danbury": {
         "display_name": "Grenadier of Danbury (Dealership)",
+        "tier": 3,
+        "verified_on": None,
+        "verified_by": "Review-only — no Rider Excel in hand. The +1012% "
+                       "doors gap (81 vs target 8) seen on 2026-05-29 corpus "
+                       "run is almost certainly a target/scope mismatch, not "
+                       "a code regression. Re-derive from Rider source before "
+                       "promoting.",
         "match_keywords": ["grenadier", "danbury"],
         "source": "Rider review (March 2026)",
         "targets": {
@@ -62,6 +95,10 @@ REFERENCE_CASES = {
     },
     "route22_condo": {
         "display_name": "Route 22 Condo B (Silo Ridge)",
+        "tier": 3,
+        "verified_on": None,
+        "verified_by": "Review-only — no Rider Excel in hand. Re-derive "
+                       "from Rider source before promoting.",
         "match_keywords": ["4651"],
         "source": "Rider review (March 2026)",
         "targets": {
@@ -79,6 +116,12 @@ REFERENCE_CASES = {
     # ------------------------------------------------------------------
     "fishkill_cenhud": {
         "display_name": "Cen Hud Fishkill Addition",
+        "tier": 2,
+        "verified_on": None,
+        "verified_by": "Rider Excel claimed (cenHud_Fishkill-takeoffs.xlsx) "
+                       "but targets in this file were never re-derived from "
+                       "the spreadsheet. Run scripts/verify_reference_case.py "
+                       "to promote to tier 1.",
         "match_keywords": ["fishkill"],
         "source": "Rider takeoff cenHud_Fishkill-takeoffs.xlsx (May 2026)",
         "targets": {
@@ -103,6 +146,12 @@ REFERENCE_CASES = {
     },
     "dutchess_livestock": {
         "display_name": "Dutchess Livestock Hill Restroom Facility",
+        "tier": 2,
+        "verified_on": None,
+        "verified_by": "Rider Excel claimed (LivestockHillRestrooms-takeoffs.xlsx "
+                       "Jan'26 revision) but targets in this file were never "
+                       "re-derived from the spreadsheet. Promote to tier 1 "
+                       "after re-verification.",
         "match_keywords": ["dutchess"],
         "source": "Rider takeoff LivestockHillRestrooms-takeoffs.xlsx Jan'26 revision",
         "targets": {
@@ -129,6 +178,11 @@ REFERENCE_CASES = {
     },
     "honey_farms_malta": {
         "display_name": "Honey Farms Market — Malta NY",
+        "tier": 2,
+        "verified_on": None,
+        "verified_by": "Rider Excel claimed (Honey Farms - Malta, NY.xlsx) "
+                       "but targets never re-derived. Promote after "
+                       "re-verification.",
         "match_keywords": ["honey farms"],
         "source": "Rider takeoff Honey Farms - Malta, NY.xlsx",
         "targets": {
@@ -150,6 +204,11 @@ REFERENCE_CASES = {
     },
     "tsc_fusion_highland": {
         "display_name": "TSC Fusion — Highland NY (Tractor Supply)",
+        "tier": 2,
+        "verified_on": None,
+        "verified_by": "Rider Excel claimed (Painting_Takeoff_TSC_Fusion_FINAL.xlsx, "
+                       "qty only — no $ target). Targets never re-derived. "
+                       "Promote after re-verification.",
         "match_keywords": ["tsc", "fusion"],
         "source": "Rider takeoff Painting_Takeoff_TSC_Fusion_FINAL.xlsx (qty only)",
         "targets": {

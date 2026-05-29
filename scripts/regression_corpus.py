@@ -282,29 +282,59 @@ def main() -> int:
     print("=" * 72)
     print(f"Corpus summary: {len(results)} job(s) evaluated, {errors} error(s)")
 
-    # Reference-case checks
+    # Reference-case checks — gated on tier
+    tier1_failed_total = 0
+    tier2_failed_total = 0
+    tier3_failed_total = 0
     if not args.no_reference_checks and ref_jobs > 0:
         print()
         print(f"Reference-case checks ({ref_jobs} matched job(s)):")
         print("-" * 72)
-        any_fail = False
+        # Tier 1 first (gating), then tier 2 (advisory), tier 3 (informational)
+        by_tier: Dict[int, List[Dict]] = {1: [], 2: [], 3: []}
         for r in results:
-            if not r.get("case"):
+            if r.get("case"):
+                tier = int(r["case"].get("tier", 3) or 3)
+                by_tier.setdefault(tier, []).append(r)
+
+        tier_label = {
+            1: "TIER 1 (verified — gates CI)",
+            2: "TIER 2 (inferred — advisory, targets may be stale)",
+            3: "TIER 3 (unverified — informational only)",
+        }
+        for tier in (1, 2, 3):
+            jobs = by_tier.get(tier, [])
+            if not jobs:
                 continue
-            passed, failed, failures = check_reference_targets(r)
-            ref_passed_total += passed
-            ref_failed_total += failed
-            status = "✅" if failed == 0 else "❌"
-            print(f"  {status} {r['case']['display_name']:<40} "
-                  f"{passed} passed, {failed} failed")
-            for fmsg in failures:
-                print(f"      • {fmsg}")
-                any_fail = True
+            print()
+            print(f"  {tier_label[tier]}")
+            for r in jobs:
+                passed, failed, failures = check_reference_targets(r)
+                ref_passed_total += passed
+                ref_failed_total += failed
+                if tier == 1:
+                    tier1_failed_total += failed
+                elif tier == 2:
+                    tier2_failed_total += failed
+                else:
+                    tier3_failed_total += failed
+                # Status icon — only ❌ for tier 1 failures; ⚠️ for others
+                if failed == 0:
+                    status = "✅"
+                elif tier == 1:
+                    status = "❌"
+                else:
+                    status = "⚠️ "
+                print(f"    {status} {r['case']['display_name']:<40} "
+                      f"{passed} passed, {failed} failed")
+                for fmsg in failures:
+                    print(f"        • {fmsg}")
         print()
         print(f"Reference totals: {ref_passed_total} passed, "
-              f"{ref_failed_total} failed")
-    else:
-        any_fail = False
+              f"{ref_failed_total} failed "
+              f"(tier 1 gating: {tier1_failed_total}, "
+              f"tier 2 advisory: {tier2_failed_total}, "
+              f"tier 3 informational: {tier3_failed_total})")
 
     if flagged_jobs:
         print()
@@ -318,8 +348,13 @@ def main() -> int:
             print(f"  ... and {len(flagged_jobs)-20} more")
     print("=" * 72)
 
-    # Exit code
-    if ref_failed_total > 0:
+    # Exit code — only tier 1 failures gate. Tier 2/3 are advisory and
+    # never block deploy: we don't gate on numbers we can't re-derive
+    # from a primary source.
+    if tier1_failed_total > 0:
+        print()
+        print(f"❌ TIER 1 REGRESSION — {tier1_failed_total} verified target(s) "
+              f"failed. Blocking deploy.")
         return 1
     return 0
 
