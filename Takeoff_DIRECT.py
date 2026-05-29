@@ -7849,21 +7849,30 @@ def _audit_room_provenance(analysis, project_overview=None):
     """
     audit = {
         "wrong_discipline": [],
+        "wrong_discipline_softfailed": False,
+        "wrong_discipline_softfail_reason": "",
         "outliers": [],
         "count_reconciliation": {},
         "hallucination_suspects": [],
     }
     suspect_ids = set()
+    # Collect wrong-discipline matches before mutating any room. If they would
+    # exclude 100% of extracted rooms (typical of small-TI permit sets that
+    # use non-standard sheet naming like S01 for the architectural floor plan)
+    # we soft-fail the filter instead of zeroing the estimate.
+    wrong_discipline_candidates = []
+    total_rooms_seen = 0
 
     # ---- Check 1 + 2: walk every room ----
     for floor in analysis.get("floors", []):
         floor_name = floor.get("floor_name", "?")
         for room in floor.get("rooms", []):
+            total_rooms_seen += 1
             rid = room.get("room_id") or room.get("room_name", "?")
             sheet = (room.get("source_sheet") or "").strip()
             sheet_lower = sheet.lower()
 
-            # 1. Wrong-discipline check
+            # 1. Wrong-discipline check (candidates collected; applied after triage)
             is_synthetic = any(syn in sheet_lower for syn in _SYNTHETIC_PROVENANCE)
             if sheet and not is_synthetic:
                 m = _PROVENANCE_SHEET_RE.match(sheet)
@@ -7878,7 +7887,7 @@ def _audit_room_provenance(analysis, project_overview=None):
                             matched_excl = sub
                             break
                     if matched_excl:
-                        audit["wrong_discipline"].append({
+                        wrong_discipline_candidates.append((room, rid, {
                             "room_id": rid,
                             "room_name": room.get("room_name", "?"),
                             "floor": floor_name,
@@ -7888,16 +7897,7 @@ def _audit_room_provenance(analysis, project_overview=None):
                                 f"Sheet {sheet} parses to discipline '{matched_excl}' "
                                 f"which is excluded from painting scope"
                             ),
-                        })
-                        suspect_ids.add(rid)
-                        room["_provenance_flag"] = "wrong_discipline"
-                        # Wrong-discipline rooms must be excluded from aggregated_totals.
-                        # _recalculate_totals() filters on in_scope, so set it here.
-                        room["in_scope"] = False
-                        room["scope_exclusion_reason"] = (
-                            f"Wrong-discipline source sheet ({sheet}, "
-                            f"discipline '{matched_excl}' excluded from painting scope)"
-                        )
+                        }))
 
             # 2. Outlier wall area
             wall_area = _num(room.get("wall_area_sqft", 0))
@@ -7928,6 +7928,52 @@ def _audit_room_provenance(analysis, project_overview=None):
                 })
                 suspect_ids.add(rid)
                 room["_provenance_flag"] = room.get("_provenance_flag") or "outlier_low"
+
+    # ---- Apply wrong-discipline triage (Check 1, deferred) ----
+    # If every extracted room maps to an excluded discipline, the sheet-prefix
+    # filter is almost certainly wrong (e.g. a small-TI permit set that puts
+    # the architectural floor plan on "S01"). Excluding 100% of rooms zeroes
+    # the entire estimate, which is worse than leaving them in scope and
+    # flagging for human review. Soft-fail in that case: still record the
+    # candidates in the audit, but do not mutate in_scope; emit a HIGH note
+    # so a reviewer verifies the sheet labeling.
+    n_candidates = len(wrong_discipline_candidates)
+    softfail = (
+        n_candidates > 0
+        and total_rooms_seen > 0
+        and n_candidates == total_rooms_seen
+    )
+    if softfail:
+        disc_prefixes = sorted({e["discipline_prefix"] for _, _, e in wrong_discipline_candidates})
+        sheets_seen = sorted({e["source_sheet"] for _, _, e in wrong_discipline_candidates})
+        audit["wrong_discipline_softfailed"] = True
+        audit["wrong_discipline_softfail_reason"] = (
+            f"All {total_rooms_seen} extracted room(s) source to sheet(s) "
+            f"{sheets_seen} which parse to excluded discipline(s) "
+            f"{disc_prefixes}. Soft-failing the filter to avoid a "
+            f"false-positive $0 estimate — likely non-standard sheet naming "
+            f"(e.g. 'S01' used as the architectural floor plan). Verify the "
+            f"sheet labels and discipline mapping manually."
+        )
+        for _, _, entry in wrong_discipline_candidates:
+            audit["wrong_discipline"].append(entry)
+        print(
+            f"   ⚠️  Discipline filter SOFT-FAIL: would have excluded all "
+            f"{total_rooms_seen} rooms (sheets={sheets_seen}, "
+            f"disc={disc_prefixes}); keeping rooms in scope — verify sheet labels."
+        )
+    else:
+        for room, rid, entry in wrong_discipline_candidates:
+            audit["wrong_discipline"].append(entry)
+            suspect_ids.add(rid)
+            room["_provenance_flag"] = "wrong_discipline"
+            # Wrong-discipline rooms must be excluded from aggregated_totals.
+            # _recalculate_totals() filters on in_scope, so set it here.
+            room["in_scope"] = False
+            room["scope_exclusion_reason"] = (
+                f"Wrong-discipline source sheet ({entry['source_sheet']}, "
+                f"discipline '{entry['discipline_prefix']}' excluded from painting scope)"
+            )
 
     # ---- Check 3: count reconciliation against project overview ----
     pi = analysis.get("project_info", {})
@@ -8028,6 +8074,11 @@ def _audit_room_provenance(analysis, project_overview=None):
         notes.append(
             f"[Provenance Audit] {n_wrong} wrong-discipline source(s), "
             f"{n_out} outlier(s), count status: {cr.get('status', 'ok')}"
+        )
+    if audit.get("wrong_discipline_softfailed"):
+        notes.append(
+            f"[HIGH] Discipline filter soft-failed — "
+            f"{audit.get('wrong_discipline_softfail_reason', '')}"
         )
 
     return analysis
@@ -11729,15 +11780,21 @@ def _validate_cost_estimate(analysis, cost_estimate):
             })
 
     # 3. Line-item concentration check (any single item > 40% of total)
-    for item in cost_estimate.get('line_items', []):
-        item_total = item.get('total', 0)
-        if subtotal > 0 and item_total > 0 and item_total / subtotal > 0.40:
-            warnings.append({
-                "severity": "medium",
-                "item": item.get('item', ''),
-                "message": f"Single line item is {item_total/subtotal:.0%} of total estimate. "
-                           f"Review for accuracy."
-            })
+    # Skip on small jobs: when subtotal < $15k or ≤4 line items, one item
+    # dominating is structural to the scope (e.g. walls naturally are ~55% of
+    # a small-TI estimate that only has walls/ceilings/trim/doors), not a
+    # signal that the takeoff is wrong.
+    _line_items = cost_estimate.get('line_items', [])
+    if subtotal >= 15000 and len(_line_items) > 4:
+        for item in _line_items:
+            item_total = item.get('total', 0)
+            if subtotal > 0 and item_total > 0 and item_total / subtotal > 0.40:
+                warnings.append({
+                    "severity": "medium",
+                    "item": item.get('item', ''),
+                    "message": f"Single line item is {item_total/subtotal:.0%} of total estimate. "
+                               f"Review for accuracy."
+                })
 
     # 4. Zero walls check
     wall_sqft = _num(agg.get('total_paintable_wall_sqft', 0))
@@ -11791,6 +11848,9 @@ def _validate_cost_estimate(analysis, cost_estimate):
 
     # 5. PCA cross-checks using industry multipliers
     # Door SF cross-check: total door paintable SF should be ~3-12% of wall area
+    # on average-sized rooms, but small-TI suites (avg room < 250 SF) pack many
+    # doors into small rooms — for those, the expected band is 10-25%. Pick the
+    # threshold by avg room size to avoid false-positive over-count flags.
     if door_total > 0 and wall_sqft > 0:
         _pca_door_sf = PCA_CONSTANTS.get("door_flush_sf", 42)
         _pca_frame_sf = PCA_CONSTANTS.get("door_frame_sf", 34)
@@ -11800,12 +11860,18 @@ def _validate_cost_estimate(analysis, cost_estimate):
             _num(agg.get('total_doors_frame_only', 0)) * _pca_frame_sf
         )
         _door_wall_ratio = _total_door_sf / wall_sqft if wall_sqft > 0 else 0
-        if _door_wall_ratio > 0.15:
+        _total_rooms = sum(len(f.get("rooms", [])) for f in analysis.get("floors", []))
+        _footprint = _num(pi.get("footprint_sqft", 0))
+        _avg_room_sf = (_footprint / _total_rooms) if _total_rooms > 0 else 0
+        _small_room_mode = 0 < _avg_room_sf < 250
+        _door_ratio_threshold = 0.28 if _small_room_mode else 0.15
+        _door_ratio_expected = "10-25%" if _small_room_mode else "3-12%"
+        if _door_wall_ratio > _door_ratio_threshold:
             warnings.append({
                 "severity": "medium",
                 "item": "Door Count (PCA)",
                 "message": f"Door surface area ({_total_door_sf:,.0f} SF at PCA multipliers) is "
-                           f"{_door_wall_ratio:.0%} of wall area. Typical range is 3-12%. "
+                           f"{_door_wall_ratio:.0%} of wall area. Typical range is {_door_ratio_expected}. "
                            f"Possible over-count of doors."
             })
 
@@ -13767,7 +13833,34 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         #
         # Default N=3. Set NIGHTSHIFT_MULTI_PASS_N=5 for tighter convergence
         # at higher API cost; set to 1 to effectively disable.
-        if multi_pass and not use_cache and is_fp and result and best_rooms > 0:
+        #
+        # Gate: fires when pass 1 returned at least
+        # NIGHTSHIFT_MULTI_PASS_MIN_ROOMS (default 20) rooms — that's the
+        # signal "this PDF has substantive floor-plan content and the
+        # variance fix should apply." Previous gate used the filename-only
+        # _is_floor_plan_file() heuristic, which never matched real-world
+        # filenames customers actually upload ("Combined_Files.pdf",
+        # "Bid_Set_*.pdf", "Ridgeview_Arch_Drawings_*.pdf"), so multi-pass
+        # shipped but never fired in production — confirmed by zero
+        # [Multi-Pass Median] notes across three Ridgeview runs on the
+        # same PDF that produced 561 / 459 / 338 rooms and
+        # $360K / $342K / $249K. Don't gate on filenames you can't trust.
+        try:
+            mp_min_rooms = int(os.environ.get(
+                "NIGHTSHIFT_MULTI_PASS_MIN_ROOMS", "20"))
+        except (ValueError, TypeError):
+            mp_min_rooms = 20
+        should_multi_pass = (multi_pass and not use_cache
+                              and result and best_rooms >= mp_min_rooms)
+
+        if (multi_pass and not use_cache and result
+                and not should_multi_pass):
+            # Surface the skip reason so worker logs are honest about
+            # whether the variance fix actually fired on this job.
+            print(f"   ⏭  Multi-pass median skipped: pass 1 returned "
+                  f"{best_rooms} rooms < threshold {mp_min_rooms}")
+
+        if should_multi_pass:
             try:
                 n_passes = int(os.environ.get("NIGHTSHIFT_MULTI_PASS_N", "3"))
             except (ValueError, TypeError):
