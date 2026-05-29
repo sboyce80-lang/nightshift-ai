@@ -8821,6 +8821,259 @@ def _dedupe_overlapping_template_floors(analysis):
     return analysis
 
 
+_ROOM_NAME_NORMALIZE_RE = re.compile(r"[^a-z0-9]+")
+
+
+def _normalize_room_name(name):
+    """Normalize a room name for cross-room comparison.
+    'Commercial Space 1' / 'COMMERCIAL SPACE 1' / 'commercial-space-1' all
+    normalize to 'commercialspace1'. Strips punctuation, whitespace, case.
+    """
+    return _ROOM_NAME_NORMALIZE_RE.sub("", str(name or "").lower())
+
+
+# Keywords used for fuzzy same-sheet dedup. A pair of rooms on the same
+# sheet with the same unit_multiplier that BOTH contain one of these
+# keywords (and have no other distinguishing semantic keyword) are likely
+# the LLM emitting one physical room twice with slight name variations.
+#
+# Important — keywords NOT in this list because their pairings are legit:
+#   'bedroom'  — "Primary Bedroom" + "Second Bedroom" are real distinct rooms
+#   'bathroom' — "Master Bath" + "Second Bath" likewise
+#   'kitchen'  — Kitchen + Living/Kitchen can be a legit "combo plan" call
+# Only keywords representing a single-room-per-unit concept go here.
+_SAME_SHEET_DEDUP_KEYWORDS = (
+    "living",        # "Living Room" / "Living/Dining/Kitchen" / "Living Area"
+    "commercial",    # "Commercial Space" emitted multiple times on A-101
+    "retail",        # "Retail Space" vs "Commercial Space" on the same sheet
+    "lobby",         # "Residential Lobby" emitted twice on the same sheet
+    "vault",
+    "elevator",
+    "package",       # "Package Room" duplicates
+)
+
+
+def _dedupe_same_sheet_room_names(analysis):
+    """Two-pass dedup of rooms the LLM emitted multiple times on the same sheet.
+
+    Pass A — exact normalized-name dedup. Catches cases like A-101 emitting
+        "Commercial Space 1" three times (F1-COMM1, F1-COMM001, F1-RETAIL001)
+        on the same sheet, "Residential Lobby" twice, etc. Strict identity
+        on the normalized room name; safe.
+
+    Pass B — same sheet + same unit_multiplier + shared single-instance
+        keyword (Living / Commercial / Retail / Lobby / Vault / Elevator /
+        Package). Catches the 364 Main A-102 case where the LLM emitted
+        BOTH "Living Room" × 20 and "Living/Dining/Kitchen" × 20 as
+        "Typical Apartment" rooms — same physical room, two slightly
+        different name variants. The keyword list is restricted to room
+        concepts that appear at most ONCE per unit so we don't collapse
+        legitimate "Primary Bedroom" + "Second Bedroom" pairs.
+
+    Both passes keep the room with the largest wall_area_sqft × multiplier
+    (most measurement "evidence"), and append a dedup note to the keeper.
+
+    Idempotent via analysis['_same_sheet_room_names_deduped'].
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if analysis.get("_same_sheet_room_names_deduped"):
+        return analysis
+
+    def _score(r):
+        w = float(r.get("dimensions", {}).get("wall_area_sqft", 0) or 0)
+        m = float(r.get("unit_multiplier", 1) or 1)
+        return w * m
+
+    total_exact = 0
+    total_keyword = 0
+
+    for floor in analysis.get("floors", []) or []:
+        # Pass A: exact normalized-name dedup
+        groups = {}
+        for room in floor.get("rooms", []) or []:
+            sheet = str(room.get("source_sheet") or "").strip().upper()
+            name = _normalize_room_name(room.get("room_name"))
+            if not sheet or not name:
+                continue
+            groups.setdefault((sheet, name), []).append(room)
+
+        drop_ids = set()
+        for key, rooms in groups.items():
+            if len(rooms) < 2:
+                continue
+            rooms_sorted = sorted(rooms, key=_score, reverse=True)
+            keeper = rooms_sorted[0]
+            for d in rooms_sorted[1:]:
+                drop_ids.add(id(d))
+            keeper["notes"] = ((keeper.get("notes") or "") +
+                f" [Same-Sheet Dedup: collapsed {len(rooms_sorted)-1} "
+                f"identically-named room(s) on sheet {key[0]}]").strip()
+            total_exact += len(rooms_sorted) - 1
+        if drop_ids:
+            floor["rooms"] = [r for r in floor["rooms"]
+                              if id(r) not in drop_ids]
+
+        # Pass B: keyword-overlap dedup, partitioned by trailing-number
+        # suffix so "Commercial Space 1" / "Commercial Space 2" /
+        # "Commercial Space 3" never collide (different physical rooms).
+        # Only rooms sharing the SAME keyword AND SAME number suffix on
+        # the same sheet + multiplier are candidates for collapse — e.g.
+        # "Living Room" + "Living/Dining/Kitchen" (both "living", both no
+        # number) on A-102 × 20 mult.
+        kw_groups = {}
+        _trailing_num_re = re.compile(r"(\d+)\s*$")
+        for room in floor.get("rooms", []) or []:
+            sheet = str(room.get("source_sheet") or "").strip().upper()
+            mult = int(_num(room.get("unit_multiplier", 1)) or 1)
+            name_lower = str(room.get("room_name") or "").lower()
+            if not sheet:
+                continue
+            tn = _trailing_num_re.search(name_lower)
+            num_suffix = tn.group(1) if tn else ""
+            for kw in _SAME_SHEET_DEDUP_KEYWORDS:
+                if kw in name_lower:
+                    kw_groups.setdefault(
+                        (sheet, mult, kw, num_suffix), []).append(room)
+                    break
+
+        drop_ids = set()
+        for key, rooms in kw_groups.items():
+            if len(rooms) < 2:
+                continue
+            rooms_sorted = sorted(rooms, key=_score, reverse=True)
+            keeper = rooms_sorted[0]
+            for d in rooms_sorted[1:]:
+                drop_ids.add(id(d))
+            dropped_names = [d.get("room_name") for d in rooms_sorted[1:]]
+            keeper["notes"] = ((keeper.get("notes") or "") +
+                f" [Keyword Dedup: collapsed {len(rooms_sorted)-1} room(s) "
+                f"sharing '{key[2]}' on sheet {key[0]} × {key[1]} mult "
+                f"({dropped_names})]").strip()
+            total_keyword += len(rooms_sorted) - 1
+        if drop_ids:
+            floor["rooms"] = [r for r in floor["rooms"]
+                              if id(r) not in drop_ids]
+
+    if total_exact or total_keyword:
+        note = (f"[Same-Sheet Dedup] Pass A (exact name): "
+                f"{total_exact} room(s) collapsed. "
+                f"Pass B (keyword overlap): {total_keyword} room(s) collapsed.")
+        analysis.setdefault("notes", []).append(note)
+        print(f"   🧹 Same-sheet dedup: {total_exact} exact-name + "
+              f"{total_keyword} keyword-overlap room(s) collapsed")
+
+    analysis["_same_sheet_room_names_deduped"] = True
+    return analysis
+
+
+# Sheet-prefix patterns whose rooms are dropped IF and only if a similar
+# room already exists on a primary floor-plan sheet (A-1xx). Detecting
+# substring overlap on the room_name is the safety check — it protects
+# legitimate distinct rooms tagged with a non-authoritative sheet number
+# (e.g. some architects place apartment unit details on A-301 sheets and
+# the LLM correctly extracts them; we should keep those when no A-1xx
+# version exists, and only drop when a duplicate IS on A-1xx).
+_NON_AUTHORITATIVE_SHEET_PATTERNS = (
+    re.compile(r"^A-?3\d{2}", re.I),   # Building Sections
+    re.compile(r"^A-?4\d{2}", re.I),   # Typical Details
+    re.compile(r"^A-?5\d{2}", re.I),   # Schedules
+    re.compile(r"^D-?\d{2,3}", re.I),  # Demolition Plans
+)
+_AUTHORITATIVE_SHEET_PATTERN = re.compile(r"^A-?1\d{2}", re.I)
+
+
+def _drop_non_authoritative_duplicates(analysis):
+    """Drop rooms emitted from Section / Detail / Schedule / Demolition
+    sheets ONLY when an A-1xx (floor plan) sheet on the same floor has a
+    room whose normalized name overlaps theirs (substring match either way).
+
+    Why the substring overlap gate — observed against 5/19 baseline:
+        5/19's LLM placed legitimate residential rooms on A-301 with names
+        like "Apartment Bedroom" / "Apartment Bathroom" / "Apartment Entry".
+        Those names are NOT substrings of (and don't contain as substring)
+        any A-102 room name ("Primary Bedroom" / "Bathroom" / "Bedroom
+        Closet"). So they survive — correct, they're not duplicates.
+
+    Why the rule still drops the 5/29 leak:
+        5/29's LLM placed a generic "Bedroom" × 20 on A-301. The string
+        "bedroom" IS a substring of "Primary Bedroom" already extracted
+        from A-102, so it's dropped — correct, it's a cross-sheet duplicate.
+
+    The check is per-floor so we don't drop a basement section room because
+    a residential floor has a similarly named room.
+
+    Idempotent via analysis['_non_authoritative_duplicates_dropped'].
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if analysis.get("_non_authoritative_duplicates_dropped"):
+        return analysis
+
+    dropped = []
+    for floor in analysis.get("floors", []) or []:
+        # Build a set of normalized names on authoritative sheets on this floor.
+        auth_names = set()
+        for room in floor.get("rooms", []) or []:
+            sheet = str(room.get("source_sheet") or "").strip()
+            if _AUTHORITATIVE_SHEET_PATTERN.match(sheet):
+                auth_names.add(_normalize_room_name(room.get("room_name")))
+
+        if not auth_names:
+            continue
+
+        kept_rooms = []
+        for room in floor.get("rooms", []) or []:
+            sheet = str(room.get("source_sheet") or "").strip()
+            is_non_auth = any(p.match(sheet)
+                              for p in _NON_AUTHORITATIVE_SHEET_PATTERNS)
+            if not is_non_auth:
+                kept_rooms.append(room)
+                continue
+            room_name_norm = _normalize_room_name(room.get("room_name"))
+            if not room_name_norm:
+                kept_rooms.append(room)
+                continue
+            # Drop only when the non-auth room's normalized name is in the
+            # 6–9 character "generic single-word" window AND is a strict
+            # substring of an auth room's longer name.
+            #   "bedroom" (7) → "primarybedroom" (14): DROP (5/29 leak case)
+            #   "entry"   (5) → "entrycloset"   (11): KEEP (too short to
+            #     be confidently generic; "Entry" is often a real foyer)
+            #   "masterbathroom" (14) → "bathroom" (8): KEEP (non-auth is
+            #     the SPECIFIC version; auth is the generic)
+            #   "apartmentbedroom" (16) → any auth: KEEP (too specific)
+            n = len(room_name_norm)
+            overlaps = (
+                6 <= n <= 9 and any(
+                    room_name_norm != auth
+                    and room_name_norm in auth
+                    and n < len(auth)
+                    for auth in auth_names if auth
+                )
+            )
+            if overlaps:
+                dropped.append((sheet, room.get("room_id"),
+                                room.get("room_name")))
+            else:
+                kept_rooms.append(room)
+        floor["rooms"] = kept_rooms
+
+    if dropped:
+        sample = ", ".join(f"{rid or rn} on {s}" for s, rid, rn in dropped[:5])
+        note = (f"[Non-Auth Sheet Dedup] Dropped {len(dropped)} room(s) "
+                f"from Section / Detail / Schedule / Demolition sheets whose "
+                f"names duplicate rooms already extracted from A-1xx floor "
+                f"plans on the same floor: {sample}"
+                f"{'...' if len(dropped) > 5 else ''}")
+        analysis.setdefault("notes", []).append(note)
+        print(f"   🧹 Non-auth sheet dedup: dropped {len(dropped)} "
+              f"cross-sheet duplicate room(s)")
+
+    analysis["_non_authoritative_duplicates_dropped"] = True
+    return analysis
+
+
 def _recalculate_totals(analysis):
     """
     Recalculate aggregated_totals from individual room data.
@@ -8828,6 +9081,33 @@ def _recalculate_totals(analysis):
     and unit_multiplier for repeated/typical unit types.
     Works for both single-file and merged multi-file analyses.
     """
+    # Two dedup passes BEFORE aggregation. Together they correct the
+    # cross-sheet / intra-sheet over-extraction observed on 364 Main
+    # (2026-05-29) where wall SF was inflated by ~30% over Rider truth
+    # even after the prompt + multi-pass reverts:
+    #
+    #   1. Same-sheet dedup: two passes — exact normalized-name match,
+    #      and same-sheet+same-multiplier+shared-single-instance-keyword.
+    #      Catches LLM emitting "Commercial Space 1" three times on A-101
+    #      and "Living Room" + "Living/Dining/Kitchen" both × 20 on A-102.
+    #   2. Non-authoritative-sheet dedup: drops Section / Detail / Schedule
+    #      / Demolition rooms ONLY when a substring-matching room already
+    #      exists on an A-1xx floor plan on the same floor. The substring
+    #      gate protects against LLM mis-tags (e.g. 5/19 baseline's
+    #      "Apartment Bedroom" on A-301 survives because no A-1xx room
+    #      contains "apartment bedroom"; 5/29's generic "Bedroom" on A-301
+    #      gets dropped because A-102 has "Primary Bedroom").
+    #
+    # A third intended fix (inventory cap on apartment-template multipliers)
+    # was prototyped and rejected — it over-corrects on the 5/19 baseline,
+    # where two competing typologies ("Typical Apartment" × 20 and "1BR
+    # Apartment" × 20) describe DIFFERENT room subsets of the same 20-unit
+    # building and the partial-split duplication produces an accurate
+    # total. Detecting that pattern reliably needs typology-overlap
+    # analysis at the room-name level — deferred to a follow-up.
+    _dedupe_same_sheet_room_names(analysis)
+    _drop_non_authoritative_duplicates(analysis)
+
     # Dedupe template floors with overlapping ranges before any totals are
     # computed. Cross-chunk extraction can produce 'Levels 1-7' AND
     # 'Floors 2-9' AND 'Levels 1-10' for the same residential block;
