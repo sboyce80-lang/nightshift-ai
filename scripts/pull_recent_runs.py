@@ -45,7 +45,7 @@ sys.path.insert(0, str(REPO))
 import sqlalchemy as sa
 from sqlalchemy.orm import Session
 
-from db import get_engine
+from db import engine
 from models import File, Submission
 from storage import download_file
 
@@ -83,7 +83,6 @@ def main() -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     manifest_path = out_dir / "manifest.csv"
 
-    engine = get_engine()
     with Session(engine) as s:
         q = sa.select(Submission).order_by(Submission.submitted_at.desc())
         if args.status != "any":
