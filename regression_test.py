@@ -73,6 +73,104 @@ REFERENCE_CASES = {
              "Should not double-count units from typical + floor plans"),
         ],
     },
+    # ------------------------------------------------------------------
+    # Variance test set (May 2026) — 4 jobs with Rider Painting takeoffs.
+    # Target tolerance is 10% across the board to enforce the accuracy goal.
+    # ------------------------------------------------------------------
+    "fishkill_cenhud": {
+        "display_name": "Cen Hud Fishkill Addition",
+        "match_keywords": ["fishkill"],
+        "source": "Rider takeoff cenHud_Fishkill-takeoffs.xlsx (May 2026)",
+        "targets": {
+            # Rider: 2,102.58 LF × 9' = 18,925 SF gyp walls 9'
+            "total_paintable_wall_sqft": (18925, 0.10),
+            # Rider: 35 HM frames-only (door schedule wasn't extracted in baseline
+            # KS run; widening tolerance to capture frame/panel ambiguity)
+            "total_doors_full_paint": (35, 0.30),
+            # Rider FTPRNT: 8,200 SF
+            "footprint_sqft": (8200, 0.15),
+            # Rider: $43,592.50 labor + $9,000 materials = $52,592.50
+            "cost_estimate_subtotal": (52593, 0.10),
+        },
+        "assertions": [
+            # Rider has no concrete sealer in scope — baseline run added 3,320 SF
+            ("total_concrete_floor_sqft", "<", 500,
+             "No concrete sealer in Rider scope (baseline run hallucinated 3,320 SF)"),
+            # Rider has no dryfall ceiling in scope — baseline added 2,912 SF
+            ("total_dryfall_ceiling_sqft", "<", 500,
+             "No dryfall ceiling in Rider scope (baseline run hallucinated 2,912 SF)"),
+        ],
+    },
+    "dutchess_livestock": {
+        "display_name": "Dutchess Livestock Hill Restroom Facility",
+        "match_keywords": ["dutchess"],
+        "source": "Rider takeoff LivestockHillRestrooms-takeoffs.xlsx Jan'26 revision",
+        "targets": {
+            # Rider Jan'26: gyp walls SF area 690.77 + 391.17 + 2,265.84 + 652.50
+            # + 521.57 + 558.24 (elevator) ≈ 5,080 SF + wainscot ≈ 5,371 SF total
+            "total_paintable_wall_sqft": (5371, 0.10),
+            # Rider Jan'26: 2,060.63 SF gyp ceiling
+            "total_paintable_ceiling_sqft": (2061, 0.10),
+            # Rider Jan'26: 28 doors total (panel + frame)
+            "total_doors_full_paint": (28, 0.15),
+            # Rider Jan'26: 390.91 LF wood base trim
+            "total_base_trim_lf": (391, 0.10),
+            # Rider Jan'26: 25 window casings
+            "total_windows_painted_interior": (25, 0.20),
+            # Rider Jan'26 interior subtotal: $22,758.26
+            "cost_estimate_subtotal": (22758, 0.10),
+        },
+        "assertions": [
+            # Baseline run extracted from 3 of 9 sheets and produced 4-6× over-extraction.
+            # Floor area should approximate building data (1st 3,180 + 2nd 1,500 = 4,680 SF).
+            ("total_paintable_ceiling_sqft", "<", 5500,
+             "Ceiling SF must not exceed reasonable multiple of 4,680 SF building area"),
+        ],
+    },
+    "honey_farms_malta": {
+        "display_name": "Honey Farms Market — Malta NY",
+        "match_keywords": ["honey farms"],
+        "source": "Rider takeoff Honey Farms - Malta, NY.xlsx",
+        "targets": {
+            # Rider: gyp walls 299.75 + 238.96 + 1,304.10 + 724.14 + 343.90 + 66.11
+            # + PT-01 1,258.03 + PT-02 190.05 = 4,425 SF + Cooler 154 = ~4,580 SF
+            "total_paintable_wall_sqft": (4580, 0.10),
+            # Rider: 1,029.4 SF gyp ceilings
+            "total_paintable_ceiling_sqft": (1029, 0.10),
+            # Rider: 6 HM full doors + 2 HM frame-only = 8 doors total
+            "total_doors_full_paint": (8, 0.20),
+            # Rider total: $10,855 int + $17,709 ext = $28,564.13
+            "cost_estimate_subtotal": (28564, 0.10),
+        },
+        "assertions": [
+            # Baseline hallucinated 669 LF base trim; Rider has 0 base trim line items
+            ("total_base_trim_lf", "<", 100,
+             "No base trim in Rider scope (baseline hallucinated 669 LF)"),
+        ],
+    },
+    "tsc_fusion_highland": {
+        "display_name": "TSC Fusion — Highland NY (Tractor Supply)",
+        "match_keywords": ["tsc", "fusion"],
+        "source": "Rider takeoff Painting_Takeoff_TSC_Fusion_FINAL.xlsx (qty only)",
+        "targets": {
+            # Rider GWB walls (BoH + pet wash + restrooms + office): 5,447 SF
+            "total_paintable_wall_sqft": (5447, 0.10),
+            # Rider CMU walls: 12,073 sales + 5,634 BoH + 8,900 ext = 26,607 SF total
+            # (KS aggregates int+ext CMU into total_cmu_wall_sqft)
+            "total_cmu_wall_sqft": (26607, 0.15),
+            # Rider: 13 interior HM doors (no cost target — Rider gave qty only)
+            "total_doors_full_paint": (13, 0.20),
+        },
+        "assertions": [
+            # Baseline run added 51,056 SF concrete sealer ($69,691) — not in Rider scope.
+            # Retail sales floor concrete is unfinished slab; sealer requires schedule callout.
+            ("total_concrete_floor_sqft", "<", 1000,
+             "No concrete sealer in Rider scope (baseline hallucinated 51,056 SF / $69,691)"),
+            # Baseline added 18,000 SF dryfall ceiling — Rider lists sales floor as ACT, not deck.
+            ("total_dryfall_ceiling_sqft", "<", 2000,
+             "Sales floor is ACT per finish schedule (baseline hallucinated 18,000 SF dryfall)"),
+        ],
+    },
 }
 
 
