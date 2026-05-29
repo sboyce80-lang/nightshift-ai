@@ -10517,6 +10517,216 @@ def _num(val):
     return 0
 
 
+# ---------------------------------------------------------------------------
+# Multi-pass extraction with per-room median merge
+# ---------------------------------------------------------------------------
+# Claude's vision encoder is non-deterministic on complex architectural PDFs
+# even at temperature=0 — the same FP file, same prompts, can return
+# wildly different room counts (observed on 364 Main: 510 / 264 / 83 rooms
+# across three runs of identical code).
+#
+# Single-pass extraction is at the mercy of that variance: any individual
+# run can land far from truth, and we have no signal to know whether we
+# got the "good" run or the "bad" run.
+#
+# Strategy: run N extraction passes per FP file, then merge by taking the
+# MEDIAN of each room-level measurement. Median is robust to one outlier
+# in either direction (the min OR the max gets discarded), so the merged
+# answer converges toward the central tendency across passes.
+#
+# Reverted f004a50 originally tried multi-pass with a "keep whichever
+# pass found MORE rooms" combiner — that biased toward over-extraction.
+# Per-room median fixes that asymmetry. See run_analysis for the loop.
+
+_ROOM_NAME_NORMALIZE_RE_MP = re.compile(r"[^a-z0-9]+")
+
+
+def _normalize_room_name_mp(name):
+    """Strip punctuation/whitespace/case for room-name matching across passes.
+    'Commercial Space 1' / 'commercial-space-1' / 'COMMERCIAL SPACE 1' all
+    normalize to 'commercialspace1'."""
+    return _ROOM_NAME_NORMALIZE_RE_MP.sub("", str(name or "").lower())
+
+
+def _median_num(values):
+    """Median of a list of numeric values. Skips Nones; returns 0 if empty."""
+    import statistics as _stats
+    vals = [_num(v) for v in values if v is not None]
+    vals = [v for v in vals if v != 0] or [_num(v) for v in values
+                                            if v is not None]
+    if not vals:
+        return 0
+    try:
+        return _stats.median(vals)
+    except _stats.StatisticsError:
+        return 0
+
+
+# Per-room numeric fields we median across passes. Everything else
+# (room_id, room_name, materials, notes, bbox) takes the value from the
+# first pass that contributed to the merged room.
+_MEDIAN_DIM_KEYS = (
+    "length_feet", "width_feet", "ceiling_height_feet",
+    "floor_area_sqft", "perimeter_lf", "wall_area_sqft",
+    "ceiling_area_sqft",
+)
+_MEDIAN_ELEM_KEYS = (
+    "doors_full_paint", "doors_hm_panel", "doors_frame_only",
+    "windows_total", "windows_painted_interior", "base_trim_lf",
+    "stair_sections", "gyp_between_stairs_sqft", "level_5_finish_sqft",
+    "concrete_floor_sqft", "painted_columns_ea", "wallcovering_sqft",
+    "stained_wood_sqft", "soffit_sqft", "painted_railing_lf",
+)
+
+
+def _merge_passes_with_median(pass_analyses, min_pass_presence=None):
+    """Merge N extraction passes by per-room median.
+
+    Args:
+        pass_analyses: list of `analysis` dicts (the per-pass output of
+            analyze_and_parse, NOT the (path, analysis) tuples).
+        min_pass_presence: a room must appear in >= this many passes to
+            survive the merge. Default ceil(N/2) — a room that only
+            appears in 1/3 passes is treated as low-confidence and dropped.
+
+    Returns:
+        A merged analysis dict suitable for downstream aggregation.
+        Aggregated totals are recomputed inside _recalculate_totals so
+        the caller doesn't need to do it again.
+
+    Matching key: (floor_name, source_sheet_upper, normalized_room_name).
+    Rooms sharing that key across passes are considered the same physical
+    room. Their numeric dimensions and element counts are medianed; their
+    multiplier is medianed too (rounded). Categorical fields (materials,
+    name, notes) come from the first contributing pass.
+
+    Unit multipliers: medianed across passes (rounded to int). This catches
+    cases like a corridor extracted as ×2 in one pass and ×3 in another
+    — median picks the stable answer.
+    """
+    if not pass_analyses:
+        return None
+    if len(pass_analyses) == 1:
+        return pass_analyses[0]
+
+    import copy as _copy
+    import math as _math
+    N = len(pass_analyses)
+    if min_pass_presence is None:
+        min_pass_presence = max(2, _math.ceil(N / 2))  # majority
+
+    # Index every room by (floor_name_norm, sheet, name_norm). The
+    # floor_name is normalized the same way as room names (lowercase,
+    # alphanumeric-only) so that minor LLM-driven naming variations across
+    # passes — "Typical Residential Units (Floors 2&3)" vs "Typical 2BR
+    # Units (Floors 2&3)" vs "Typical Residential Floors 2-3" — still
+    # collide on the same key. The displayed floor_name is preserved
+    # separately in floor_meta_by_name below.
+    rooms_by_key = {}  # key -> list of (floor_name_display, room)
+    for analysis in pass_analyses:
+        for floor in analysis.get("floors", []) or []:
+            fname_display = str(floor.get("floor_name") or "")
+            fname_norm = _normalize_room_name_mp(fname_display)
+            for room in floor.get("rooms", []) or []:
+                sheet = str(room.get("source_sheet") or "").strip().upper()
+                name_norm = _normalize_room_name_mp(room.get("room_name"))
+                if not name_norm:
+                    continue
+                key = (fname_norm, sheet, name_norm)
+                rooms_by_key.setdefault(key, []).append(
+                    (fname_display, room))
+
+    # Build merged rooms, keyed by floor name
+    merged_rooms_per_floor = {}
+    dropped_count = 0
+    kept_count = 0
+
+    for (fname_norm, sheet, name_norm), instances in rooms_by_key.items():
+        if len(instances) < min_pass_presence:
+            dropped_count += 1
+            continue
+
+        # Base room = first instance's room dict (preserves room_id, name, materials)
+        first_fname_display, first_room = instances[0]
+        merged = _copy.deepcopy(first_room)
+        room_dicts = [inst[1] for inst in instances]
+
+        # Median dimensions
+        dims = merged.setdefault("dimensions", {})
+        for k in _MEDIAN_DIM_KEYS:
+            vals = [r.get("dimensions", {}).get(k) for r in room_dicts]
+            med = _median_num(vals)
+            # Round integer-ish keys to int
+            if k.endswith(("_sqft", "_lf")) or k == "ceiling_height_feet":
+                dims[k] = round(med, 2) if k == "ceiling_height_feet" else round(med)
+            else:
+                dims[k] = round(med, 1)
+
+        # Median element counts
+        elems = merged.setdefault("elements", {})
+        for k in _MEDIAN_ELEM_KEYS:
+            vals = [r.get("elements", {}).get(k) for r in room_dicts]
+            elems[k] = round(_median_num(vals))
+
+        # Median unit_multiplier (rounded to int, floor 1)
+        mults = [_num(r.get("unit_multiplier", 1) or 1) for r in room_dicts]
+        merged["unit_multiplier"] = max(1, round(_median_num(mults)))
+
+        # Audit annotation
+        merged["_median_from_passes"] = len(instances)
+        merged["_total_passes"] = N
+
+        merged_rooms_per_floor.setdefault(first_fname_display, []).append(merged)
+        kept_count += 1
+
+    # Build merged analysis: start from a deep copy of the first pass for
+    # all the non-floor metadata (project_info, building_inventory, etc.).
+    merged_analysis = _copy.deepcopy(pass_analyses[0])
+
+    # Replace the floors with merged rooms. Preserve floor metadata from
+    # whichever pass had each floor first.
+    floor_meta_by_name = {}
+    for analysis in pass_analyses:
+        for floor in analysis.get("floors", []) or []:
+            fname = str(floor.get("floor_name") or "")
+            if fname and fname not in floor_meta_by_name:
+                floor_meta_by_name[fname] = {
+                    k: v for k, v in floor.items() if k != "rooms"
+                }
+
+    new_floors = []
+    for fname, rooms in merged_rooms_per_floor.items():
+        meta = floor_meta_by_name.get(fname, {"floor_name": fname})
+        new_floors.append({**meta, "rooms": rooms})
+    merged_analysis["floors"] = new_floors
+
+    # Median the project_info aggregates that are scalars across passes
+    pi = merged_analysis.setdefault("project_info", {})
+    pi_keys_to_median = ("total_rooms_found", "footprint_sqft",
+                          "total_floors_analyzed", "template_rooms")
+    for k in pi_keys_to_median:
+        vals = [a.get("project_info", {}).get(k)
+                for a in pass_analyses]
+        med = _median_num(vals)
+        if med:
+            pi[k] = round(med)
+
+    # Audit note
+    note = (f"[Multi-Pass Median] Extracted via N={N} passes. Per-room "
+            f"dimensions and element counts are the median across passes "
+            f"that contained the same (floor, sheet, room_name). "
+            f"Kept {kept_count} room(s) appearing in >= {min_pass_presence} "
+            f"passes; dropped {dropped_count} low-confidence room(s) "
+            f"(appearing in fewer passes).")
+    merged_analysis.setdefault("notes", []).append(note)
+    merged_analysis["_extracted_with_median_of_passes"] = N
+
+    # Recompute aggregated totals from the merged room set
+    _recalculate_totals(merged_analysis)
+
+    return merged_analysis
+
+
 def _apply_rate_overrides(rate_overrides):
     """Build a modified copy of PRICING_MODEL with rate/markup overrides applied.
 
@@ -13542,33 +13752,77 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                 else:
                     print(f"   🖼️  Image fallback failed")
 
-        # Optional multi-pass: re-extract floor plan files for best result
-        # Only when --multi-pass is enabled, cache is off, and first pass got rooms
+        # Multi-pass extraction with per-room median merge.
+        #
+        # The previous f004a50 implementation ran 2 passes and kept "whichever
+        # found more rooms" — that biased toward over-extraction (e.g. the
+        # 364 Main 510-room inflated run was the bias's worst-case). Reverted.
+        #
+        # This version runs N total passes (configurable via env, default 3)
+        # and merges them by taking the MEDIAN of every per-room dimension
+        # and element count. Median is robust to one outlier in either
+        # direction, so the merged answer converges toward the central
+        # tendency across passes — directly addresses Claude's vision-encoder
+        # variance on complex architectural PDFs.
+        #
+        # Default N=3. Set NIGHTSHIFT_MULTI_PASS_N=5 for tighter convergence
+        # at higher API cost; set to 1 to effectively disable.
         if multi_pass and not use_cache and is_fp and result and best_rooms > 0:
-            if used_image_fb:
-                # Second pass also uses image mode for consistency
-                print(f"   🔄 Multi-pass (image mode): running second extraction...")
-                time.sleep(30)
-                pass2_result = _analyze_floor_plan_as_images(
-                    client, pdf_path, scope_notes=scope_notes,
-                    schedule_hints=image_schedule_data,
-                    building_inventory=building_inventory)
-            else:
-                print(f"   🔄 Multi-pass: running second extraction for comparison...")
-                time.sleep(30)  # brief cooldown to avoid rate limits
-                pass2_result = analyze_and_parse(client, pdf_path, scope_notes=scope_notes,
-                                                 schedule_hints=image_schedule_data,
-                                                 building_inventory=building_inventory)
-            if pass2_result:
-                _, pass2_analysis = pass2_result
-                pass2_rooms = pass2_analysis.get('project_info', {}).get(
-                    'total_rooms_found', 0)
-                if pass2_rooms > best_rooms:
-                    print(f"   📊 Multi-pass improved: {best_rooms} -> {pass2_rooms} rooms")
-                    result = pass2_result
-                    best_rooms = pass2_rooms
+            try:
+                n_passes = int(os.environ.get("NIGHTSHIFT_MULTI_PASS_N", "3"))
+            except (ValueError, TypeError):
+                n_passes = 3
+            n_passes = max(1, min(7, n_passes))
+
+            if n_passes >= 2:
+                extra_passes = n_passes - 1  # we already have pass 1 in `result`
+                pass_results = [result]
+                mode_label = "image mode" if used_image_fb else "vector mode"
+                print(f"   🔄 Multi-pass median ({mode_label}): "
+                      f"running passes 2..{n_passes} of {n_passes}")
+                for i in range(extra_passes):
+                    time.sleep(30)  # cooldown between passes
+                    try:
+                        if used_image_fb:
+                            extra = _analyze_floor_plan_as_images(
+                                client, pdf_path, scope_notes=scope_notes,
+                                schedule_hints=image_schedule_data,
+                                building_inventory=building_inventory)
+                        else:
+                            extra = analyze_and_parse(
+                                client, pdf_path, scope_notes=scope_notes,
+                                schedule_hints=image_schedule_data,
+                                building_inventory=building_inventory)
+                    except Exception as _mp_exc:
+                        print(f"   ⚠️  Multi-pass {i+2} failed: {_mp_exc}")
+                        extra = None
+                    if extra:
+                        _, extra_an = extra
+                        extra_rooms = extra_an.get('project_info', {}).get(
+                            'total_rooms_found', 0)
+                        print(f"      pass {i+2}: {extra_rooms} rooms")
+                        pass_results.append(extra)
+                    else:
+                        print(f"      pass {i+2}: failed")
+
+                if len(pass_results) >= 2:
+                    pass_analyses = [pr[1] for pr in pass_results]
+                    per_pass_rooms = [
+                        a.get('project_info', {}).get('total_rooms_found', 0)
+                        for a in pass_analyses
+                    ]
+                    merged_analysis = _merge_passes_with_median(pass_analyses)
+                    merged_rooms = (merged_analysis.get('project_info', {})
+                                    .get('total_rooms_found', 0))
+                    # Keep the path from pass 1; analysis is the median merge.
+                    result = (pass_results[0][0], merged_analysis)
+                    best_rooms = merged_rooms
+                    print(f"   📊 Multi-pass median merge: "
+                          f"per-pass rooms {per_pass_rooms} → "
+                          f"merged {merged_rooms}")
                 else:
-                    print(f"   📊 Multi-pass: kept original ({best_rooms} vs {pass2_rooms} rooms)")
+                    print(f"   📊 Multi-pass: only pass 1 succeeded, "
+                          f"using single-pass result")
 
         # Track room count for this file (for extraction validation)
         if result:

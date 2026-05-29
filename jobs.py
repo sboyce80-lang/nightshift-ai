@@ -405,12 +405,23 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
                     submission_id, norm_exc, exc_info=True
                 )
 
+            # Multi-pass extraction with per-room median merge addresses
+            # Claude vision-encoder variance on complex floor plans
+            # (observed 510/264/83 room swings on the same 364 Main PDF
+            # across single-pass runs). Replaces the reverted f004a50
+            # implementation, which combined by max-rooms and biased toward
+            # over-extraction. Default ON; gate via env var. Number of
+            # passes controlled by NIGHTSHIFT_MULTI_PASS_N (default 3).
+            _multi_pass = (
+                os.environ.get("NIGHTSHIFT_MULTI_PASS", "1").strip() != "0"
+            )
             result = run_analysis(
                 local_pdfs,
                 contact_name=contact_info["name"],
                 contact_email=contact_info["email"],
                 scope_notes=scope_notes,
                 rate_overrides=rate_overrides,
+                multi_pass=_multi_pass,
             )
 
             for key_name, content_type in (
