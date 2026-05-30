@@ -148,6 +148,28 @@ def requeue_one(sub_id_or_prefix: str, *, dry_run: bool, force: bool) -> bool:
         else:
             timeout = 30 * 60
 
+        # Multi-pass extraction inflates wall time roughly N×. When
+        # NIGHTSHIFT_MULTI_PASS is enabled, multiply the per-pass timeout
+        # by the configured N (default 3) plus a 50% safety margin so
+        # cooldowns + median-merge overhead don't push us over the limit.
+        # Observed on 2026-05-29 Ridgeview re-run: a 9.6 MB file fell into
+        # the 30-min bucket and got SIGKILL'd mid pass 2 because we forgot
+        # to account for the 3× multiplier. Don't let the runtime gate
+        # eat the very test we're paying 3× API cost to run.
+        mp_enabled = (os.environ.get("NIGHTSHIFT_MULTI_PASS", "1").strip()
+                       != "0")
+        if mp_enabled:
+            try:
+                n_passes = int(os.environ.get(
+                    "NIGHTSHIFT_MULTI_PASS_N", "3"))
+            except (ValueError, TypeError):
+                n_passes = 3
+            n_passes = max(1, min(7, n_passes))
+            if n_passes >= 2:
+                # 1.5× safety factor on top of the N× pass count.
+                # Capped at 4h — beyond that something else is wrong.
+                timeout = min(4 * 3600, int(timeout * n_passes * 1.5))
+
         logger.info("Requeue plan for %s:", sub.id)
         logger.info("  Business:    %s", contact["business_name"] or "—")
         logger.info("  Contact:     %s <%s>", contact["name"], contact["email"])

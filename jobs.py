@@ -454,6 +454,51 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
                 submission_id, result, local_pdfs, workdir,
             )
 
+            # MANUAL-REVIEW GATE
+            # The extractor sets result["manual_review_required"] = True
+            # when its own sanity checks (e.g. paintable surface < 3×
+            # footprint on a commercial job — the Urban Air pattern that
+            # produced 12 rooms / $24K from a 173 MB bid set) determine
+            # the numbers are not trustworthy. Historically we shipped
+            # those estimates to customers anyway. Stop doing that.
+            #
+            # When flagged: skip the customer-facing estimate email,
+            # notify the contact + admin that a reviewer is taking over,
+            # ship the admin the raw JSON so they can act on it, and
+            # mark the submission needs_review (not completed) so the
+            # web UI / harness can distinguish auto-shippable runs from
+            # human-needed ones.
+            manual_review = bool(result.get("manual_review_required"))
+            subtotal = result.get("cost_estimate", {}).get("subtotal", 0) or 0
+
+            if manual_review:
+                logger.warning(
+                    "Submission %s flagged for MANUAL REVIEW — skipping "
+                    "customer estimate email. Reason: %s",
+                    submission_id,
+                    result.get("manual_review_reason") or "(none provided)",
+                )
+                try:
+                    send_manual_review_email(
+                        contact_info, result, submission_id)
+                except Exception as exc:
+                    logger.error(
+                        "Failed to send manual-review email for %s: %s",
+                        submission_id, exc)
+                # Admin still receives the raw JSON archive so they can
+                # eyeball the result and decide whether to ship a
+                # corrected version or kick back to the customer.
+                send_result_json_to_admin(contact_info, result, submission_id)
+                update_status(submission_id, "needs_review", subtotal=subtotal)
+                logger.info(
+                    "Submission %s marked needs_review — subtotal $%s "
+                    "(NOT auto-sent)",
+                    submission_id, f"{subtotal:,.2f}")
+                return {"submission_id": submission_id,
+                        "subtotal": subtotal,
+                        "needs_review": True}
+
+            # Confidence checks passed — ship the customer email.
             send_result_email(
                 contact_info, result,
                 extra_attachment_paths=annotated_pdf_paths,
@@ -464,7 +509,6 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
             # see it in their inbox.
             send_result_json_to_admin(contact_info, result, submission_id)
 
-            subtotal = result.get("cost_estimate", {}).get("subtotal", 0) or 0
             update_status(submission_id, "completed", subtotal=subtotal)
             logger.info("Submission %s completed — $%s estimate",
                         submission_id, f"{subtotal:,.2f}")
@@ -597,9 +641,40 @@ def merge_submission(submission_id, parent_id, new_pdf_keys, contact_info,
 
             _build_and_upload_estimate(submission_id, result, workdir)
 
+            # Same manual-review gate as process_submission. A revision
+            # can fail confidence checks too — e.g. a customer uploading
+            # an addendum that re-introduces a Hardie scope the parent
+            # had auto-suppressed. Skip the customer-facing email when
+            # the merged result is flagged.
+            manual_review = bool(result.get("manual_review_required"))
+            subtotal = result.get("cost_estimate", {}).get("subtotal", 0) or 0
+
+            if manual_review:
+                logger.warning(
+                    "Merge submission %s flagged for MANUAL REVIEW — "
+                    "skipping customer estimate email. Reason: %s",
+                    submission_id,
+                    result.get("manual_review_reason") or "(none provided)",
+                )
+                try:
+                    send_manual_review_email(
+                        contact_info, result, submission_id)
+                except Exception as exc:
+                    logger.error(
+                        "Failed to send manual-review email for merge %s: %s",
+                        submission_id, exc)
+                update_status(submission_id, "needs_review", subtotal=subtotal)
+                logger.info(
+                    "Merge submission %s marked needs_review — subtotal "
+                    "$%s (NOT auto-sent)",
+                    submission_id, f"{subtotal:,.2f}")
+                return {"submission_id": submission_id,
+                        "parent_id": parent_id,
+                        "subtotal": subtotal,
+                        "needs_review": True}
+
             send_result_email(contact_info, result)
 
-            subtotal = result.get("cost_estimate", {}).get("subtotal", 0) or 0
             update_status(submission_id, "completed", subtotal=subtotal)
             logger.info("Merge submission %s completed — $%s estimate",
                         submission_id, f"{subtotal:,.2f}")
@@ -909,3 +984,85 @@ Best regards,
         logger.info("Error email sent to %s", contact_info["email"])
     except Exception as exc:
         logger.error("Failed to send error email: %s", exc)
+
+
+def send_manual_review_email(contact_info, result, submission_id):
+    """Notify contact + admin that a submission landed flagged for manual
+    review and IS NOT being shipped as a customer-facing estimate.
+
+    Used when the extractor itself raised manual_review_required — currently
+    set by the pre-finalize sanity check (paintable surface < 3× footprint
+    on a commercial job, the Urban Air pattern: 173 MB bid set → 12 rooms
+    → $24K subtotal flagged but historically shipped anyway).
+
+    The contact gets a clear "we caught this before sending the estimate"
+    message so they understand why no estimate landed; admin gets the full
+    JSON + reason in the admin archive email (separate path).
+    """
+    if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD:
+        logger.warning("SMTP not configured — skipping manual-review email")
+        return
+
+    reason = (result.get("manual_review_reason")
+              or "Automated confidence check failed.")
+    # Trim the leading [MANUAL REVIEW REQUIRED] marker if present —
+    # the email subject conveys that already; the body shouldn't shout.
+    if reason.startswith("[MANUAL REVIEW REQUIRED]"):
+        reason = reason[len("[MANUAL REVIEW REQUIRED]"):].strip()
+
+    contact_name = contact_info.get("name") or "there"
+    contact_email = contact_info.get("email") or ""
+    business_name = contact_info.get("business_name") or "(your project)"
+
+    body = f"""Hi {contact_name},
+
+Thank you for submitting {business_name} through Knight Shift.
+
+Our automated confidence checks flagged this submission for manual review,
+so we are NOT auto-sending an estimate based on the current extraction:
+
+  {reason}
+
+Submission ID: {submission_id}
+
+What this means: our analysis pipeline produced a result, but a built-in
+sanity check determined the numbers are unlikely to reflect the full
+painting scope. Common causes:
+
+  - A large or multi-building PDF where some sheets were missed.
+  - A finish schedule that didn't render in a format our extractor handles.
+  - Exterior or specialty scope (Hardie, lift work, exposed deck) that
+    needs to be confirmed against owner intent before pricing.
+
+What happens next: a Knight Shift reviewer will look at the run, decide
+whether the takeoff needs to be re-extracted or just patched, and reply
+to this thread with either (a) a corrected estimate or (b) targeted
+questions about scope. Please don't act on any preliminary numbers you
+may have seen before this — they have NOT been validated.
+
+If this is time-sensitive, reply directly or call {COMPANY_PHONE}.
+
+— {COMPANY_NAME}
+"""
+
+    msg = MIMEMultipart()
+    msg["From"] = f"{COMPANY_NAME} <{EMAIL_ADDRESS}>"
+    msg["To"] = f"{contact_name} <{contact_email}>" if contact_email else COMPANY_EMAIL
+    if contact_email and contact_email.lower() != "admin@knightshiftai.com":
+        msg["Cc"] = "admin@knightshiftai.com"
+    msg["Subject"] = (f"Knight Shift — {business_name} flagged for manual "
+                      f"review (estimate NOT auto-sent)")
+    msg.attach(MIMEText(body, "plain"))
+
+    try:
+        with smtplib.SMTP(EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT) as server:
+            server.ehlo()
+            server.starttls()
+            server.ehlo()
+            server.login(EMAIL_ADDRESS, EMAIL_APP_PASSWORD)
+            server.send_message(msg)
+        logger.info("Manual-review email sent for %s to %s",
+                    submission_id, contact_email or "(no contact)")
+    except Exception as exc:
+        logger.error("Failed to send manual-review email for %s: %s",
+                     submission_id, exc)

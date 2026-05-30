@@ -831,17 +831,42 @@ _DIVISION_9_KEYWORDS = [
 ]
 
 # Sheet prefix → discipline mapping (order matters: check longer prefixes first)
+#
+# 2026-05-29 expansion driven by the Urban Air Adventure Park investigation:
+# a 169.6 MB / 73-page bid set produced only 12 rooms (just sheet FS101) and
+# a $24K subtotal — flagged for manual review but historically shipped to
+# the customer anyway. Forensics on the annotated PDF showed 72 of 73 pages
+# tagged "Not referenced in takeoff (category unknown)" because the title-
+# block sheet number used prefixes (FS, MD, FE, AR, ...) that weren't in
+# this map. The exclusion default ("unknown → drop") is what caused the
+# silent under-extraction. Specialty-architectural prefixes belong here so
+# the architect's choice of sheet-naming convention doesn't decide whether
+# the painter gets a real estimate or a fragmentary one.
 _DISCIPLINE_MAP = [
     # Included disciplines (painting-relevant)
     ('AD', 'Architectural Demo', True),
     ('AI', 'Architectural Interiors', True),
+    ('AR', 'Architectural (alt prefix)', True),   # 2026-05-29 add — some firms (esp. retail/franchise)
+    ('AS', 'Architectural Site', True),           # 2026-05-29 add
+    ('FS', 'Food Service', True),                 # 2026-05-29 add — interior fit-out floor plans
+    ('FE', 'Furniture / Equipment', True),        # 2026-05-29 add — has rooms + walls
+    ('FF', 'Furniture / Fixtures', True),         # 2026-05-29 add
     ('ID', 'Interior Design', True),
+    ('IN', 'Interior', True),                     # 2026-05-29 add
+    ('LS', 'Life Safety / Egress', True),         # 2026-05-29 add — shows full floor plan
+    ('SK', 'Sketch / Field Coord', True),         # 2026-05-29 add — often the actual issued plan
+    ('WP', 'Waterproofing', True),                # 2026-05-29 add — has room boundaries
+    ('AV', 'Audio-Visual', True),                 # 2026-05-29 add — has room boundaries
     ('A',  'Architectural', True),
     ('G',  'General', True),
     ('T',  'Title', True),
     # Excluded disciplines
     ('FP', 'Fire Protection', False),
     ('FA', 'Fire Alarm', False),
+    ('MD', 'Mechanical Demo', False),             # 2026-05-29 add — engineering demo
+    ('SD', 'Structural Demo', False),             # 2026-05-29 add
+    ('ED', 'Electrical Demo', False),             # 2026-05-29 add
+    ('PD', 'Plumbing Demo', False),               # 2026-05-29 add
     ('S',  'Structural', False),
     ('M',  'Mechanical', False),
     ('E',  'Electrical', False),
@@ -1164,6 +1189,30 @@ def _classify_pdf_pages(pdf_path):
         })
 
     doc.close()
+
+    # One-line summary log per page so the next "why was this PDF only
+    # partially extracted?" investigation is a single grep instead of a
+    # forensics dig through the annotated PDF banners. Output mirrors a
+    # CSV-friendly format so it pastes cleanly into a spreadsheet.
+    #
+    # Format: PageClassify | p{idx} | sheet={s} | disc={d} | include={I}
+    # Search the worker logs for "PageClassify" to enumerate every
+    # included/excluded decision for a given submission.
+    try:
+        kept = sum(1 for c in classifications if c.get("include"))
+        total = len(classifications)
+        print(f"📋 PageClassify summary: {kept}/{total} pages included for "
+              f"room extraction; {total - kept} excluded")
+        for c in classifications:
+            inc = "Y" if c.get("include") else "N"
+            sn = c.get("sheet_number") or "?"
+            disc = (c.get("discipline") or "?")[:24]
+            print(f"   PageClassify | p{c['page_index']+1:<3} | "
+                  f"sheet={sn:<8} | disc={disc:<24} | include={inc}")
+    except Exception:
+        # Logging must never break the classifier; swallow any I/O glitch
+        pass
+
     return classifications
 
 
@@ -1962,7 +2011,7 @@ def _analyze_page_multimodal(client, pdf_path, page_index, prompt_text,
         try:
             result_parts = []
             with client.messages.stream(
-                model="claude-sonnet-4-20250514",
+                model="claude-sonnet-4-6",
                 max_tokens=64000,
                 temperature=0,
                 timeout=300.0,
@@ -2198,7 +2247,7 @@ def _analyze_floor_plan_as_images(client, pdf_path, scope_notes="",
         for attempt in range(max_retries):
             try:
                 with client.messages.stream(
-                    model="claude-sonnet-4-20250514",
+                    model="claude-sonnet-4-6",
                     max_tokens=64000,
                     temperature=0,
                     timeout=300.0,
@@ -2497,7 +2546,7 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
         for attempt in range(max_retries):
             try:
                 with client.messages.stream(
-                    model="claude-sonnet-4-20250514",
+                    model="claude-sonnet-4-6",
                     max_tokens=64000,
                     temperature=0,
                     timeout=600.0,
@@ -2539,7 +2588,7 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
             try:
                 result_parts = []
                 with client.messages.stream(
-                    model="claude-sonnet-4-20250514",
+                    model="claude-sonnet-4-6",
                     max_tokens=64000,
                     temperature=0,
                     timeout=600.0,
@@ -2598,7 +2647,7 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
             try:
                 result_parts2 = []
                 with client.messages.stream(
-                    model="claude-sonnet-4-20250514",
+                    model="claude-sonnet-4-6",
                     max_tokens=64000,
                     temperature=0,
                     timeout=600.0,
@@ -2833,7 +2882,7 @@ def analyze_schedule_images(client, pdf_path, schedule_page_nums):
     result_parts = []
     try:
         with client.messages.stream(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=8000,
             temperature=0,
             timeout=300.0,  # 5 min timeout
@@ -4185,7 +4234,7 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
             try:
                 result_parts = []
                 with client.messages.stream(
-                    model="claude-sonnet-4-20250514",
+                    model="claude-sonnet-4-6",
                     max_tokens=64000,
                     temperature=0,
                     timeout=300.0,  # 5 min per chunk — fail fast rather than hang
@@ -4612,7 +4661,7 @@ Be precise — count every entry in each schedule row by row."""
     try:
         result_parts = []
         with client.messages.stream(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=4000,
             temperature=0,
             timeout=300.0,  # 5 min timeout
@@ -4804,7 +4853,7 @@ Be precise — extract every room listed in the schedule, and capture every stru
     try:
         result_parts = []
         with client.messages.stream(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=8000,
             temperature=0,
             timeout=300.0,
@@ -5046,7 +5095,7 @@ exterior scope visible.")."""
     try:
         result_parts = []
         with client.messages.stream(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=2000,
             temperature=0,
             timeout=300.0,
@@ -5476,7 +5525,7 @@ If you cannot determine building counts from these pages, return:
 
         result_parts = []
         with client.messages.stream(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=2000,
             temperature=0,
             timeout=180.0,  # 3 min timeout (images may be large)
@@ -5500,7 +5549,7 @@ If you cannot determine building counts from these pages, return:
             try:
                 result_parts = []
                 with client.messages.stream(
-                    model="claude-sonnet-4-20250514",
+                    model="claude-sonnet-4-6",
                     max_tokens=2000,
                     temperature=0,
                     timeout=180.0,
@@ -5550,7 +5599,7 @@ If you cannot determine building counts from these pages, return:
                 try:
                     result_parts2 = []
                     with client.messages.stream(
-                        model="claude-sonnet-4-20250514",
+                        model="claude-sonnet-4-6",
                         max_tokens=2000,
                         temperature=0,
                         timeout=180.0,
@@ -5624,7 +5673,7 @@ If you cannot determine building counts from these pages, return:
                 img_blocks.append({"type": "text", "text": inventory_prompt})
                 result_parts = []
                 with client.messages.stream(
-                    model="claude-sonnet-4-20250514",
+                    model="claude-sonnet-4-6",
                     max_tokens=2000,
                     temperature=0,
                     timeout=180.0,
@@ -5931,7 +5980,7 @@ If a field is not stated on these pages, use 0 for numbers and "" for strings.""
     try:
         result_parts = []
         with client.messages.stream(
-            model="claude-sonnet-4-20250514",
+            model="claude-sonnet-4-6",
             max_tokens=2000,
             temperature=0,
             timeout=180.0,
@@ -10729,6 +10778,78 @@ def _merge_passes_with_median(pass_analyses, min_pass_presence=None):
 
         merged_rooms_per_floor.setdefault(first_fname_display, []).append(merged)
         kept_count += 1
+
+    # SAFETY FALLBACK — if the per-room match is too strict and the merge
+    # would discard most of the rooms, the downstream aggregation drops to
+    # a footprint × stories × efficiency estimate. That estimate uses the
+    # MAX-of-passes footprint, which is usually the wild-overshoot pass,
+    # and the result is silently catastrophic — we observed this on the
+    # 2026-05-29 Ridgeview re-run that triggered this fix: 3 passes
+    # produced 54 candidate rooms, none matched across >=2 passes, all
+    # got dropped, and the footprint fallback produced $335,558 / 113,400
+    # SF ceiling on a 60,000 SF footprint that the LLM emitted in only
+    # one of the three passes.
+    #
+    # When the merge keeps too few rooms relative to what each individual
+    # pass found, we instead pick the SINGLE PASS whose room count is the
+    # median of the three (or any N) and ship that pass unmodified. That's
+    # the conservative interpretation of "median": median over runs, not
+    # median over fields-within-a-broken-merge.
+    #
+    # "Too few" = kept fewer rooms than half of the minimum-non-zero
+    # per-pass count. Tunable via NIGHTSHIFT_MULTI_PASS_KEEP_RATIO
+    # (default 0.5).
+    per_pass_room_counts = [
+        sum(len(f.get("rooms", []) or [])
+            for f in (a.get("floors", []) or []))
+        for a in pass_analyses
+    ]
+    nonzero_pass_counts = [c for c in per_pass_room_counts if c > 0]
+    try:
+        keep_ratio = float(
+            os.environ.get("NIGHTSHIFT_MULTI_PASS_KEEP_RATIO", "0.5"))
+    except (ValueError, TypeError):
+        keep_ratio = 0.5
+    keep_ratio = max(0.0, min(1.0, keep_ratio))
+
+    min_required = (int(min(nonzero_pass_counts) * keep_ratio)
+                    if nonzero_pass_counts else 0)
+    if kept_count < min_required:
+        # Pick the pass whose room count is the median of all passes —
+        # closest to the "central tendency" of what the LLM saw across
+        # runs. Ties broken by returning the first such pass.
+        import statistics as _stats
+        if nonzero_pass_counts:
+            target = _stats.median(per_pass_room_counts)
+        else:
+            target = 0
+        # closest-to-median pass
+        best_idx = min(range(N),
+                        key=lambda i: abs(per_pass_room_counts[i] - target))
+        chosen = _copy.deepcopy(pass_analyses[best_idx])
+        note = (
+            f"[Multi-Pass Median: FALLBACK to median pass #{best_idx+1}] "
+            f"Per-room merge kept only {kept_count} of "
+            f"{sum(per_pass_room_counts)} candidate rooms across "
+            f"N={N} passes (per-pass counts: {per_pass_room_counts}, "
+            f"min required to ship merged: {min_required}). Room-name / "
+            f"floor-name / sheet variation across passes prevented matching. "
+            f"Shipping the pass whose room count is closest to the median "
+            f"({per_pass_room_counts[best_idx]} rooms) instead of the empty "
+            f"merge that would otherwise trigger the footprint fallback."
+        )
+        chosen.setdefault("notes", []).append(note)
+        chosen["_extracted_with_median_of_passes"] = N
+        chosen["_multi_pass_median_fallback"] = True
+        chosen["_multi_pass_per_pass_room_counts"] = per_pass_room_counts
+        chosen["_multi_pass_chosen_pass_index"] = best_idx
+        print(f"   ⚠️  Multi-pass merge kept {kept_count}/{sum(per_pass_room_counts)} rooms "
+              f"(< {min_required} required) — falling back to pass {best_idx+1} "
+              f"({per_pass_room_counts[best_idx]} rooms, closest to median)")
+        # Re-aggregate the chosen pass's totals before returning so the
+        # caller gets a consistent analysis.
+        _recalculate_totals(chosen)
+        return chosen
 
     # Build merged analysis: start from a deep copy of the first pass for
     # all the non-floor metadata (project_info, building_inventory, etc.).
