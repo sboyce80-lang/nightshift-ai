@@ -14840,13 +14840,53 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         _total_paintable = _wall + _ceil_gyp + _ceil_dry + _ext_paint + _ext_hardie
         _footprint = _num(_sanity_pi.get("footprint_sqft", 0))
 
+        # FIRST CHECK — footprint missing entirely. This is the most
+        # fundamental extraction failure: if we couldn't even determine
+        # the building's gross footprint, every downstream sanity check
+        # (which relies on footprint as the denominator) short-circuits
+        # to "fine, no comparison possible" and the result silently
+        # ships.
+        #
+        # Observed 2026-05-30 14:46 UTC on the Urban Air re-run after
+        # the discipline-map fix: extraction now saw 6 FS-series sheets
+        # (was 1) and produced 16 rooms (was 12), but `footprint_sqft`
+        # came back None because no plan view yielded enough
+        # geometry to derive it. The ratio check below short-circuited
+        # because `_footprint > 1000` was False (None is falsy), the
+        # manual_review_required flag stayed False, and a $17,302
+        # estimate shipped to DN Contracting for a 173 MB Adventure
+        # Park bid set. The extractor itself even wrote in the notes:
+        # "NEXT STEPS: (1) Obtain and review A-series architectural
+        # floor plans for room dimensions." That's a clear "extraction
+        # is incomplete, do NOT ship" signal we need to honor.
+        if not _footprint or _footprint <= 0:
+            flag_msg = (
+                f"[MANUAL REVIEW REQUIRED] Building footprint could not "
+                f"be determined from the extracted rooms (extracted "
+                f"paintable surface: {_total_paintable:,.0f} sqft). For "
+                f"a commercial building this means the architectural "
+                f"floor plans either weren't included in the extraction "
+                f"or their dimensions couldn't be parsed. Every "
+                f"downstream area/cost estimate has no anchor to verify "
+                f"against. Do NOT send this proposal without a reviewer "
+                f"confirming what's missing — and consider whether the "
+                f"customer needs to resubmit a different drawing set."
+            )
+            analysis["manual_review_required"] = True
+            analysis["manual_review_reason"] = flag_msg
+            analysis.setdefault("notes", []).append(flag_msg)
+            print(f"\n🚨 PRE-FINALIZE SANITY CHECK FAILED — NO FOOTPRINT")
+            print(f"   Extracted paintable: {_total_paintable:,.0f} sqft")
+            print(f"   Footprint:           (missing — set to None/0)")
+            print(f"   ⚠️  Flagged for manual review.")
+
         # Threshold: paintable_surface < footprint × 3 is structurally
         # implausible for a commercial building. A typical retail box:
         #   walls ≈ footprint × 0.4 (perimeter × 14ft / footprint)
         #   ceiling ≈ footprint × 0.9
         #   exterior ≈ footprint × 0.4
         # So footprint × 3 is conservative — most jobs land at 4-6×.
-        if _footprint > 1000 and _total_paintable < _footprint * 3:
+        elif _footprint > 1000 and _total_paintable < _footprint * 3:
             ratio = (_total_paintable / _footprint) if _footprint else 0
             flag_msg = (
                 f"[MANUAL REVIEW REQUIRED] Total extracted paintable surface "
