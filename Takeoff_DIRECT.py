@@ -2098,7 +2098,8 @@ def _multimodal_chunk_retry(client, chunk_path, prompt_text, chunk_label=""):
 
 
 def _analyze_floor_plan_as_images(client, pdf_path, scope_notes="",
-                                   schedule_hints=None, building_inventory=None):
+                                   schedule_hints=None, building_inventory=None,
+                                   project_overview=None):
     """
     Image-based fallback for floor plan extraction.
 
@@ -2205,7 +2206,8 @@ def _analyze_floor_plan_as_images(client, pdf_path, scope_notes="",
     # Build the same extraction prompt used by the PDF path
     effective_prompt = _build_extraction_prompt(
         scope_notes=scope_notes, schedule_hints=schedule_hints,
-        building_inventory=building_inventory)
+        building_inventory=building_inventory,
+        project_overview=project_overview)
 
     # Batch images to avoid 413 Payload Too Large errors.
     # Max ~6 full-page images per API call (each ~1-3 MB at 190 DPI).
@@ -2313,7 +2315,7 @@ def _analyze_floor_plan_as_images(client, pdf_path, scope_notes="",
 
 def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
                                        schedule_hints=None, building_inventory=None,
-                                       page_indices=None):
+                                       page_indices=None, project_overview=None):
     """
     Enhanced extraction for large-format (DD-scale) architectural PDFs.
 
@@ -2507,7 +2509,8 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
         effective_prompt = _build_extraction_prompt(
             scope_notes=scope_notes, schedule_hints=schedule_hints,
             building_inventory=building_inventory,
-            text_layer_context=text_context)
+            text_layer_context=text_context,
+            project_overview=project_overview)
 
         # Build content blocks
         content_blocks = []
@@ -3396,7 +3399,8 @@ def _merge_chunk_responses(texts, page_offsets=None):
 
 
 def _build_extraction_prompt(scope_notes="", schedule_hints=None,
-                              building_inventory=None, text_layer_context=None):
+                              building_inventory=None, text_layer_context=None,
+                              project_overview=None):
     """
     Build the full room extraction prompt with optional schedule hints,
     building inventory context, and pre-extracted text layer data.
@@ -3411,6 +3415,10 @@ def _build_extraction_prompt(scope_notes="", schedule_hints=None,
         building_inventory: Pre-extracted building inventory from index pages
         text_layer_context: Pre-extracted text layer from PyMuPDF (dimensions,
                            room labels, IDs) formatted as prompt context string
+        project_overview: Optional dict from _extract_project_overview(). When
+                          prefer_plan_state == 'proposed', a viewport-selector
+                          directive is prepended so multi-plan sheets are read
+                          from the PROPOSED viewport only.
 
     Returns:
         str: the complete prompt text (with context prepended if available)
@@ -4193,11 +4201,54 @@ Be thorough — analyze ALL pages of the PDF. Completeness is more important tha
     if text_layer_context:
         prompt = text_layer_context + "\n" + prompt
 
+    # Viewport / plan-state directive for renovation jobs. When the cover-sheet
+    # parse flagged this as a renovation (demolition + proposed-partition scope),
+    # any sheet that shows EXISTING + PROPOSED side by side must be measured
+    # from the PROPOSED viewport only. Prepended (not appended) so it is the
+    # first instruction Claude sees about how to choose between viewports.
+    if project_overview and project_overview.get("prefer_plan_state") == "proposed":
+        viewport_directive = (
+            "\n═══════════════════════════════════════════════════════════\n"
+            "VIEWPORT / PLAN-STATE SELECTION  (CRITICAL — RENOVATION JOB)\n"
+            "═══════════════════════════════════════════════════════════\n"
+            "The cover sheet on this project describes a RENOVATION scope\n"
+            "(demolition of existing partitions, installation of new partitions,\n"
+            "reconfiguration of the interior layout). Treat the proposed plan\n"
+            "as the only buildable scope.\n"
+            "\n"
+            "Many renovation sheets show TWO OR MORE viewports on a single page\n"
+            "with title strips below each viewport, for example:\n"
+            "    1  EXISTING FLOOR PLAN     |    2  PROPOSED FLOOR PLAN\n"
+            "    DEMO PLAN                  |    NEW WORK PLAN\n"
+            "    AS-BUILT                   |    PROPOSED\n"
+            "\n"
+            "When you encounter such a sheet you MUST:\n"
+            "  - Identify the viewport whose title contains PROPOSED, NEW WORK,\n"
+            "    NEW CONSTRUCTION, or RENOVATED. Extract rooms ONLY from that\n"
+            "    viewport.\n"
+            "  - Treat the EXISTING / AS-BUILT / DEMO viewport as REFERENCE\n"
+            "    ONLY. Do NOT emit any rooms from it. Walls there are about\n"
+            "    to be demolished or already exist outside the work scope.\n"
+            "  - When a room appears in both viewports (e.g. a Toilet that\n"
+            "    survives the renovation), take its measurements from the\n"
+            "    PROPOSED viewport so the bounding walls reflect the NEW\n"
+            "    partition layout.\n"
+            "  - If you cannot determine which viewport is which, set\n"
+            "    'viewport_resolution': 'ambiguous' on the floor and list the\n"
+            "    viewport titles you saw. Do NOT silently pick one.\n"
+            "\n"
+            "Viewport title strips are usually centered UNDER each plan, with a\n"
+            "leader circle (\"1\", \"2\", etc.), the title in ALL CAPS, and a scale\n"
+            "below (e.g. SCALE: 1/4\" = 1'-0\").\n"
+            "═══════════════════════════════════════════════════════════\n"
+        )
+        prompt = viewport_directive + "\n" + prompt
+
     return prompt
 
 
 def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=None,
-                             building_inventory=None):
+                             building_inventory=None, project_overview=None):
     """
     Send PDF directly to Claude for analysis.
     Claude can read PDFs natively without conversion.
@@ -4207,7 +4258,8 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
     pdf_data = _load_pdf_for_api(pdf_path, _client_for_validation=client)
 
     prompt = _build_extraction_prompt(scope_notes=scope_notes, schedule_hints=schedule_hints,
-                                      building_inventory=building_inventory)
+                                      building_inventory=building_inventory,
+                                      project_overview=project_overview)
     if schedule_hints:
         print(f"   📋 Schedule hints injected into extraction prompt")
     if building_inventory:
@@ -5999,8 +6051,34 @@ If a field is not stated on these pages, use 0 for numbers and "" for strings.""
             os.path.basename(p): [i + 1 for i in idxs]
             for p, idxs in page_picks.items()
         }
+
+        # Renovation-mode detection: scan the parsed scope text for verbs that
+        # indicate this is a renovation / tenant fit-out / demo job. When set,
+        # downstream architectural extraction must restrict measurement to the
+        # PROPOSED viewport on any sheet that shows EXISTING + PROPOSED plans
+        # side by side (see Dobbin Rd 2026-02 incident — pipeline measured the
+        # EXISTING viewport and returned ~30% short on wall area).
+        _RENO_VERBS = (
+            "demolition", "demolish", "demo ",
+            "proposed floor plan", "proposed plan",
+            "reconfigure", "renovation", "remodel",
+            "tenant fit-out", "tenant fit out", "tenant improvement",
+            "existing partition", "new partition",
+            "as-built", "new work plan",
+        )
+        scope_blob = " ".join([
+            str(overview.get("scope_of_work") or ""),
+            str(overview.get("scope_summary") or ""),
+            str(overview.get("notes") or ""),
+        ]).lower()
+        overview["is_renovation"] = any(v in scope_blob for v in _RENO_VERBS)
+        overview["prefer_plan_state"] = "proposed" if overview["is_renovation"] else None
+
         # Print summary
         print(f"   ✅ Project Overview extracted:")
+        if overview.get("is_renovation"):
+            print(f"      • 🔧 Renovation scope detected — prefer_plan_state='proposed' "
+                  f"(viewport selector will restrict to PROPOSED on multi-plan sheets)")
         if overview.get("project_name"):
             print(f"      • Project: {overview['project_name']}")
         if overview.get("scope_summary"):
@@ -12667,13 +12745,14 @@ def _attach_bbox_anchors(analysis, pdf_path):
 
 
 def analyze_and_parse(client, pdf_path, scope_notes="", schedule_hints=None,
-                      building_inventory=None):
+                      building_inventory=None, project_overview=None):
     """Analyze a single PDF and return parsed JSON. Returns (path, analysis_dict) or None on failure."""
     filename = os.path.basename(pdf_path)
     try:
         result_text = analyze_construction_pdf(client, pdf_path, scope_notes=scope_notes,
                                                 schedule_hints=schedule_hints,
-                                                building_inventory=building_inventory)
+                                                building_inventory=building_inventory,
+                                                project_overview=project_overview)
         json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
         if json_match:
             analysis = json.loads(json_match.group())
@@ -13746,7 +13825,8 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                 time.sleep(FILE_RETRY_COOLDOWN)
             result = analyze_and_parse(client, pdf_path, scope_notes=scope_notes,
                                           schedule_hints=image_schedule_data,
-                                          building_inventory=building_inventory)
+                                          building_inventory=building_inventory,
+                                          project_overview=project_overview)
             if result:
                 _, analysis_check = result
                 rooms_found_raw = analysis_check.get('project_info', {}).get('total_rooms_found', 0)
@@ -13875,7 +13955,8 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                         scope_notes=scope_notes,
                         schedule_hints=image_schedule_data,
                         building_inventory=building_inventory,
-                        page_indices=painting_page_indices
+                        page_indices=painting_page_indices,
+                        project_overview=project_overview,
                     )
                     if enhanced_result:
                         _, enh_analysis = enhanced_result
@@ -13921,7 +14002,8 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                     client, pdf_path,
                     scope_notes=scope_notes,
                     schedule_hints=image_schedule_data,
-                    building_inventory=building_inventory
+                    building_inventory=building_inventory,
+                    project_overview=project_overview,
                 )
                 if fb_result:
                     _, fb_analysis = fb_result
@@ -14001,12 +14083,14 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                             extra = _analyze_floor_plan_as_images(
                                 client, pdf_path, scope_notes=scope_notes,
                                 schedule_hints=image_schedule_data,
-                                building_inventory=building_inventory)
+                                building_inventory=building_inventory,
+                                project_overview=project_overview)
                         else:
                             extra = analyze_and_parse(
                                 client, pdf_path, scope_notes=scope_notes,
                                 schedule_hints=image_schedule_data,
-                                building_inventory=building_inventory)
+                                building_inventory=building_inventory,
+                                project_overview=project_overview)
                     except Exception as _mp_exc:
                         print(f"   ⚠️  Multi-pass {i+2} failed: {_mp_exc}")
                         extra = None
