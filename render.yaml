@@ -91,3 +91,31 @@ services:
         fromDatabase:
           name: nightshift-db
           property: connectionString
+
+  # Stuck-job watchdog — every 10 minutes, sweeps any Submission in
+  # queued / processing / running state whose updated_at is older than
+  # --threshold-min (30) and marks it 'failed' with an explanatory
+  # error. Customers get a Resend notification telling them to resubmit
+  # instead of staring at a silent UI. Catches the failure mode that
+  # took 5h 29m to notice on 2026-05-29 (submission 45c7eca6, killed
+  # mid-job by a deploy, sat in 'processing' forever).
+  #
+  # Cheap to run — single DB query + 0..N updates per tick. Idempotent
+  # (a swept job stays 'failed', won't be re-emailed). The --threshold
+  # is the longest-legitimate processing window we've observed plus
+  # margin; bump to 45 or 60 if long-running multi-PDF batches start
+  # tripping false positives.
+  - type: cron
+    name: nightshift-stuck-job-watchdog
+    runtime: python
+    region: oregon
+    plan: starter
+    schedule: "*/10 * * * *"
+    buildCommand: pip install -r requirements.txt
+    startCommand: python scripts/sweep_stuck_jobs.py --threshold-min 30
+    envVars:
+      - fromGroup: nightshift-shared
+      - key: DATABASE_URL
+        fromDatabase:
+          name: nightshift-db
+          property: connectionString
