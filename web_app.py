@@ -1182,9 +1182,29 @@ def resubmit(parent_id):
     files = request.files.getlist("attachments")
     valid_files = [f for f in files if f.filename and f.filename.strip()]
 
-    if not valid_files:
-        flash("Please upload at least one PDF file to merge.", "error")
+    # Typed re-run fields — needed by both the merge path (new files) and the
+    # no-file path (re-run the original plans with these notes as guidance).
+    merge_notes_text = (request.form.get("merge_notes") or "").strip() or None
+    merge_sheet_hint = (request.form.get("merge_sheet_hint") or "").strip() or None
+    raw_tags = request.form.getlist("merge_scope_tags")
+    if not raw_tags:
+        # Allow comma-separated single field as well as repeated form fields.
+        single = (request.form.get("merge_scope_tags") or "").strip()
+        raw_tags = [t.strip() for t in single.split(",") if t.strip()] if single else []
+    merge_scope_tags = [t for t in raw_tags if t]
+
+    # A re-run needs SOMETHING to act on: new files, or typed notes / a sheet
+    # hint / scope tags that steer a refine of the existing estimate. With no
+    # new files we skip re-extraction entirely (cheap) and re-run the
+    # downstream passes against the stored JSON — see jobs.merge_submission /
+    # run_analysis_merge. Block only a fully-empty submit so we can't silently
+    # re-bill a completed job.
+    if not valid_files and not (merge_notes_text or merge_sheet_hint
+                                or merge_scope_tags):
+        flash("Add at least one PDF, or describe what to change, to re-run.",
+              "error")
         return redirect(url_for("index"))
+
     if len(valid_files) > MAX_PDFS_PER_EMAIL:
         flash(f"Maximum {MAX_PDFS_PER_EMAIL} files allowed per re-run.", "error")
         return redirect(url_for("index"))
@@ -1236,15 +1256,8 @@ def resubmit(parent_id):
                 pass
             return redirect(url_for("index"))
 
-    # Form fields specific to a re-run.
-    merge_notes_text = (request.form.get("merge_notes") or "").strip() or None
-    merge_sheet_hint = (request.form.get("merge_sheet_hint") or "").strip() or None
-    raw_tags = request.form.getlist("merge_scope_tags")
-    if not raw_tags:
-        # Allow comma-separated single field as well as repeated form fields.
-        single = (request.form.get("merge_scope_tags") or "").strip()
-        raw_tags = [t.strip() for t in single.split(",") if t.strip()] if single else []
-    merge_scope_tags = [t for t in raw_tags if t]
+    # (Typed re-run fields — merge_notes_text, merge_sheet_hint,
+    # merge_scope_tags — were parsed above, before the no-file branch.)
 
     # Persist child submission + uploaded files.
     try:

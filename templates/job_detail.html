@@ -85,15 +85,16 @@
                         style="background:transparent;border:0;color:#cbd5e1;font-size:1.4rem;cursor:pointer;line-height:1;">&times;</button>
             </div>
             <p style="color:rgba(203,213,225,0.85);margin-top:6px;font-size:0.92rem;">
-                Upload only the new or revised files. The previous extraction is the
-                baseline; we merge new data in and re-price using the same rates.
+                Got a revised file? Upload it and we'll merge it in, re-pricing
+                with the same rates. <strong>No new file?</strong> Just describe what
+                to change below and we'll re-run the original plans with your notes.
             </p>
 
             <form id="resubmit-form" method="POST" enctype="multipart/form-data" style="margin-top:18px;">
                 <label for="resubmit-files" style="display:block;color:#cbd5e1;font-weight:500;margin-bottom:6px;">
-                    New PDFs <span style="color:rgba(203,213,225,0.6);font-weight:400;">(revised plan, RFI response, etc.)</span>
+                    New PDFs <span style="color:rgba(203,213,225,0.6);font-weight:400;">(optional — revised plan, RFI response, etc.)</span>
                 </label>
-                <input id="resubmit-files" type="file" name="attachments" multiple accept="application/pdf" required
+                <input id="resubmit-files" type="file" name="attachments" multiple accept="application/pdf"
                        style="width:100%;padding:8px;background:rgba(8,18,32,0.7);border:1px solid rgba(255,255,255,0.12);border-radius:6px;color:#cbd5e1;" />
                 <div id="resubmit-file-list" style="margin-top:8px;"></div>
 
@@ -461,16 +462,23 @@
             resubmitMerge = wireFileMerge(resubmitFiles, { listEl: resubmitFileList });
         }
 
-        // Light client-side validation for the form (must have at least 1 file).
+        // Light client-side validation: allow either a file OR typed notes.
+        // A no-file submit re-runs the original plans with the notes as
+        // guidance, so we only block a fully-empty submit.
         const form = document.getElementById("resubmit-form");
         if (form) {
             form.addEventListener("submit", (e) => {
                 const files = document.getElementById("resubmit-files");
-                if (!files || !files.files || files.files.length === 0) {
+                const hasFiles = files && files.files && files.files.length > 0;
+                const notes = (document.getElementById("merge-notes") || {}).value || "";
+                const sheetHint = (document.getElementById("merge-sheet-hint") || {}).value || "";
+                const hasText = notes.trim() !== "" || sheetHint.trim() !== "";
+                if (!hasFiles && !hasText) {
                     e.preventDefault();
                     const errEl = document.getElementById("resubmit-form-error");
                     errEl.style.display = "";
-                    errEl.textContent = "Please attach at least one PDF.";
+                    errEl.textContent =
+                        "Attach a file, or describe what to change, to re-run.";
                 }
             });
         }

@@ -25,7 +25,7 @@ import time
 import hashlib
 from pathlib import Path
 import PyPDF2
-from config import CLAUDE_API_KEY, PRICING_MODEL, SMALL_COMMERCIAL_RATES, PCA_CONSTANTS
+from config import CLAUDE_API_KEY, PRICING_MODEL, SMALL_COMMERCIAL_RATES, PCA_CONSTANTS, HARD_NUMBERS_ONLY
 from will_synthesis import run_will_synthesis
 import anthropic
 import base64
@@ -6961,7 +6961,7 @@ def _apply_schedule_overrides(combined):
     ext_paint = _num(exterior.get("exterior_paint_sqft", 0))
     is_commercial = any(kw in building_type for kw in (
         "commercial", "auto", "industrial", "warehouse", "retail", "dealership"))
-    if ext_paint == 0 and is_commercial:
+    if (not HARD_NUMBERS_ONLY) and ext_paint == 0 and is_commercial:
         all_notes = " ".join(str(n) for n in combined.get("notes", []))
         # Also scan material legend for exterior paint indicators
         for entry in combined.get("material_legend", []):
@@ -8373,7 +8373,7 @@ def _extract_multiplier_from_notes(room):
     return 1
 
 
-def _validate_extraction(analysis, file_room_counts=None):
+def _validate_extraction(analysis, file_room_counts=None, project_overview=None):
     """
     Post-extraction validation that checks for common extraction problems
     and prints warnings.  Returns the (possibly corrected) analysis dict.
@@ -8623,6 +8623,46 @@ def _validate_extraction(analysis, file_room_counts=None):
                 f"{'...' if len(suspect_pages) > 10 else ''}. "
                 f"Re-run with --image-fallback or smaller chunks for these pages."
             )
+
+    # --- Check 9: Room SF sum vs cover-sheet declared work area ---
+    # Safety net for the Dobbin Rd 2026-02 failure mode: when a renovation sheet
+    # shows EXISTING + PROPOSED side by side and the viewport selector picks the
+    # wrong one, the extracted rooms sum to a much smaller area than the cover
+    # sheet declares. Tolerance is wide (85-120%) because partition thickness,
+    # mechanical chases, and the difference between gross/net SF account for
+    # routine ~10% drift. A miss outside that band is almost always a viewport
+    # or floor-coverage problem, not a measurement-rounding problem.
+    declared_area = 0
+    declared_source = ""
+    if project_overview:
+        for key in ("total_gsf", "work_floor_area_sqft"):
+            v = _num(project_overview.get(key, 0))
+            if v > 0:
+                declared_area = v
+                declared_source = key
+                break
+    if declared_area > 0:
+        extracted_area = sum(
+            _num(r.get("dimensions", {}).get("floor_area_sqft", 0))
+            * max(1, _num(r.get("unit_multiplier", 1)))
+            for f in floors for r in f.get("rooms", [])
+        )
+        if extracted_area > 0:
+            ratio = extracted_area / declared_area
+            if ratio < 0.85 or ratio > 1.20:
+                is_reno = bool(project_overview.get("is_renovation"))
+                hint = (
+                    "On renovation jobs this usually means the EXISTING viewport "
+                    "was measured instead of the PROPOSED. Re-check viewport "
+                    "selection on sheets titled 'EXISTING & PROPOSED'."
+                    if is_reno and ratio < 0.85
+                    else "Re-check floor-plan coverage and unit multipliers."
+                )
+                warnings.append(
+                    f"[HIGH] Extracted room area ({extracted_area:,.0f} sqft) is "
+                    f"{ratio:.0%} of cover-sheet {declared_source} "
+                    f"({declared_area:,.0f} sqft). {hint}"
+                )
 
     # Print all warnings
     if warnings:
@@ -9237,7 +9277,7 @@ def _recalculate_totals(analysis):
         if room.get("in_scope", True)
     ]
 
-    if len(all_rooms_list) == 0 and total_units_val >= 4:
+    if (not HARD_NUMBERS_ONLY) and len(all_rooms_list) == 0 and total_units_val >= 4:
         # Determine unit mix from notes if possible
         all_notes_mix = " ".join(str(n) for n in analysis.get("notes", [])).lower()
         has_studio = any(kw in all_notes_mix for kw in ("studio", "efficiency"))
@@ -9351,7 +9391,7 @@ def _recalculate_totals(analysis):
     # other times as "EXPOSED" or "OPEN". In commercial buildings where specs mention
     # dryfall/spray-applied coating, EXPOSED ceilings in service/warehouse areas
     # should be reclassified as dryfall.
-    if total_dryfall_ceiling == 0:
+    if (not HARD_NUMBERS_ONLY) and total_dryfall_ceiling == 0:
         building_type = str(analysis.get("project_info", {}).get("building_type", "")).lower()
         is_commercial_bldg = any(kw in building_type for kw in (
             "commercial", "auto", "industrial", "warehouse", "retail", "dealership"))
@@ -9470,7 +9510,7 @@ def _recalculate_totals(analysis):
     # Wallcovering is typically applied to accent walls (30-50% of wall area) in
     # customer-facing spaces.
     has_wc_refs = False
-    if total_wallcovering == 0:
+    if (not HARD_NUMBERS_ONLY) and total_wallcovering == 0:
         all_notes_wc = " ".join(str(n) for n in analysis.get("notes", []))
         # Also scan room-level notes
         for floor in analysis.get("floors", []):
@@ -9534,7 +9574,7 @@ def _recalculate_totals(analysis):
     # When NO room finish schedule exists and no WC codes were found in notes,
     # residential buildings with bathrooms likely have wallcovering (above wainscot/tub).
     # Also scan for stained wood keywords in room notes.
-    if total_wallcovering == 0 and not has_wc_refs:
+    if (not HARD_NUMBERS_ONLY) and total_wallcovering == 0 and not has_wc_refs:
         has_finish_schedule = bool(analysis.get("room_finish_schedule"))
         if not has_finish_schedule:
             _pi_wc = analysis.get("project_info", {})
@@ -9575,7 +9615,7 @@ def _recalculate_totals(analysis):
                           f"wallcovering from {bath_count:.0f} bathrooms")
 
     # --- Stained wood keyword detection fallback ---
-    if total_stained_wood == 0:
+    if (not HARD_NUMBERS_ONLY) and total_stained_wood == 0:
         stain_kw_sqft = 0
         for floor in analysis.get("floors", []):
             for room in floor.get("rooms", []):
@@ -9609,7 +9649,10 @@ def _recalculate_totals(analysis):
     # If a CMU room has concrete_floor_sqft > 0 but it's much less than floor_area_sqft,
     # the LLM likely under-measured. Also, rooms with CMU walls and 0 concrete may
     # have been missed. Boost concrete to match floor area for CMU rooms.
-    if total_concrete_floor > 0:
+    # NOTE: gated by HARD_NUMBERS_ONLY — assuming a CMU room's full floor is bare
+    # sealed concrete (beyond the measured concrete_floor_sqft) is a material
+    # assumption, not a measured quantity.
+    if (not HARD_NUMBERS_ONLY) and total_concrete_floor > 0:
         building_type_conc = str(analysis.get("project_info", {}).get("building_type", "")).lower()
         is_commercial_conc = any(kw in building_type_conc for kw in (
             "commercial", "auto", "industrial", "warehouse", "retail", "dealership"))
@@ -11325,7 +11368,7 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     # missed between runs.
     _ext_footprint = _num(project_info.get('footprint_sqft', 0))
     _ext_stories = _num(project_info.get('total_stories', 0))
-    if cornice_lf == 0 and _ext_stories >= 2:
+    if (not HARD_NUMBERS_ONLY) and cornice_lf == 0 and _ext_stories >= 2:
         if _ext_footprint > 0:
             # Estimate perimeter from footprint (assume ~1.5:1 aspect ratio)
             _ext_long = math.sqrt(_ext_footprint * 1.5)
@@ -11565,7 +11608,7 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     stain_trim_lf = _num(exterior.get('stain_trim_lf', 0))
     stain_railing_lf = _num(exterior.get('stain_railing_lf', 0))
     # Also detect from exterior notes if stain items were mentioned but not quantified
-    if (stain_siding_sqft == 0 and stain_trim_lf == 0 and
+    if ((not HARD_NUMBERS_ONLY) and stain_siding_sqft == 0 and stain_trim_lf == 0 and
             any(kw in _ext_notes for kw in ('stain', 'wood shingle', 'cedar shingle',
                                              'wood siding', 'cedar siding'))):
         # Try to estimate stain siding from building envelope
@@ -11701,7 +11744,10 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     _use_footprint_pricing = False
     _footprint_interior_total = 0
 
-    if footprint_sqft > 0 and not is_commercial:
+    # HARD_NUMBERS_ONLY: never substitute a footprint × rate estimate for the
+    # measured per-room line items. Footprint pricing discards extracted scope
+    # in favor of a building-size heuristic — exactly what the policy forbids.
+    if footprint_sqft > 0 and not is_commercial and not HARD_NUMBERS_ONLY:
         if is_single_family:
             _fp_rate = 1.25
         else:
@@ -13143,67 +13189,108 @@ def run_analysis_merge(prior_json, new_pdf_paths, scope_tags=None,
     if not prior_analysis:
         raise ValueError("prior_json has no 'analysis' field — not a valid parent result")
 
+    import copy as _copy
+
     if not new_pdf_paths:
-        raise ValueError("No new PDFs provided for merge — re-submit fresh instead.")
+        # Notes-only re-run: NO architectural re-extraction (slow + burns API
+        # budget). We keep the prior takeoff as the baseline and let the cheap
+        # downstream passes (re-pricing, RFIs, Will review) re-run, with the
+        # reviewer's notes steering Will. New-file re-runs still extract the
+        # delta below.
+        print("\n" + "=" * 80)
+        print(f"🔄 NIGHTSHIFT AI — RE-RUN (notes only, no re-extraction)")
+        print("=" * 80)
+        print(f"   Parent doc:    {prior_json.get('document', '?')}")
+        print(f"   Notes:         {scope_notes or '(none)'}")
+        print(f"   Sheet hint:    {sheet_hint or '(none)'}")
+        print(f"   Pricing model: parent snapshot ({len(prior_json.get('pricing_model', {}))} items)")
+        print("=" * 80)
 
-    print("\n" + "=" * 80)
-    print(f"🔄 NIGHTSHIFT AI — INCREMENTAL RE-RUN (merge)")
-    print("=" * 80)
-    print(f"   Parent doc:    {prior_json.get('document', '?')}")
-    print(f"   New files:     {[os.path.basename(p) for p in new_pdf_paths]}")
-    print(f"   Scope tags:    {scope_tags or '(none — additive only)'}")
-    print(f"   Pricing model: parent snapshot ({len(prior_json.get('pricing_model', {}))} items)")
-    print("=" * 80)
+        delta_result = {"analysis": {}}
+        delta_analysis = {}
+        merged_analysis = _copy.deepcopy(prior_analysis)
+    else:
+        print("\n" + "=" * 80)
+        print(f"🔄 NIGHTSHIFT AI — INCREMENTAL RE-RUN (merge)")
+        print("=" * 80)
+        print(f"   Parent doc:    {prior_json.get('document', '?')}")
+        print(f"   New files:     {[os.path.basename(p) for p in new_pdf_paths]}")
+        print(f"   Scope tags:    {scope_tags or '(none — additive only)'}")
+        print(f"   Pricing model: parent snapshot ({len(prior_json.get('pricing_model', {}))} items)")
+        print("=" * 80)
 
-    # 1. Run extraction on the new PDFs only. We reuse run_analysis here for
-    #    per-PDF extraction + post-extraction passes; the result's analysis
-    #    dict is what we merge with the prior. cost_estimate and will_synthesis
-    #    on the delta are discarded — we'll recompute on the merged whole.
-    # Re-run targeting: narrow the new PDFs to specific sheets if requested.
-    if sheet_hint:
-        new_pdf_paths, _ = _filter_pdfs_to_sheets(new_pdf_paths, sheet_hint)
+        # 1. Run extraction on the new PDFs only. We reuse run_analysis here for
+        #    per-PDF extraction + post-extraction passes; the result's analysis
+        #    dict is what we merge with the prior. cost_estimate and will_synthesis
+        #    on the delta are discarded — we'll recompute on the merged whole.
+        # Re-run targeting: narrow the new PDFs to specific sheets if requested.
+        if sheet_hint:
+            new_pdf_paths, _ = _filter_pdfs_to_sheets(new_pdf_paths, sheet_hint)
 
-    delta_result = run_analysis(
-        new_pdf_paths,
-        contact_name=contact_name,
-        contact_email=contact_email,
-        scope_notes=scope_notes,
-        rate_overrides=rate_overrides,
-    )
-    delta_analysis = delta_result.get("analysis") or {}
+        delta_result = run_analysis(
+            new_pdf_paths,
+            contact_name=contact_name,
+            contact_email=contact_email,
+            scope_notes=scope_notes,
+            rate_overrides=rate_overrides,
+        )
+        delta_analysis = delta_result.get("analysis") or {}
 
-    # 2. Pure merge.
-    merged_analysis = merge_versioned_analyses(prior_analysis, delta_analysis,
-                                     scope_tags=scope_tags)
+        # 2. Pure merge.
+        merged_analysis = merge_versioned_analyses(prior_analysis, delta_analysis,
+                                         scope_tags=scope_tags)
 
     # 3. Re-run post-extraction passes on the merged whole. These mutate
     #    in place and re-derive aggregated_totals + validation notes.
-    print("\n🧮 Re-running post-extraction passes on merged data...")
-    try:
-        merged_analysis = _recalculate_totals(merged_analysis)
-        merged_analysis = _apply_schedule_overrides(merged_analysis)
-        merged_analysis = _supplement_missing_secondary_spaces(merged_analysis)
-        merged_analysis = _validate_wall_area_by_perimeter(merged_analysis)
-        merged_analysis = _validate_and_boost_walls(merged_analysis)
-        merged_analysis = _apply_commercial_window_exclusion(merged_analysis)
-        merged_analysis = _check_wall_ceiling_ratio(merged_analysis)
-    except Exception as exc:
-        print(f"⚠️  Post-extraction pass failed: {exc}")
-        raise
+    #
+    #    SKIP for a notes-only re-run: the prior analysis is already fully
+    #    processed (supplements, boosts and schedule overrides are baked into
+    #    its aggregated_totals). Re-running these passes on already-supplemented
+    #    data re-applies the supplements — observed as a ~18% phantom inflation
+    #    on a re-run that changed nothing. With no new rooms to integrate there
+    #    is nothing for them to do, so we keep the prior totals verbatim and let
+    #    pricing + Will run on top.
+    if new_pdf_paths:
+        print("\n🧮 Re-running post-extraction passes on merged data...")
+        try:
+            merged_analysis = _recalculate_totals(merged_analysis)
+            merged_analysis = _apply_schedule_overrides(merged_analysis)
+            merged_analysis = _supplement_missing_secondary_spaces(merged_analysis)
+            merged_analysis = _validate_wall_area_by_perimeter(merged_analysis)
+            merged_analysis = _validate_and_boost_walls(merged_analysis)
+            merged_analysis = _apply_commercial_window_exclusion(merged_analysis)
+            merged_analysis = _check_wall_ceiling_ratio(merged_analysis)
+        except Exception as exc:
+            print(f"⚠️  Post-extraction pass failed: {exc}")
+            raise
+    else:
+        print("\n🧮 Notes-only re-run — keeping prior takeoff totals "
+              "(skipping re-extraction passes to avoid double-counting).")
 
-    # 4. Recompute cost using parent's pricing snapshot — NOT the live
-    #    PRICING_MODEL. This is the rate-stability rule: a v2 quote uses the
-    #    same rates v1 was priced at, so deltas are pure-quantity changes.
+    # 4. Cost.
     pricing_snapshot = prior_json.get("pricing_model") or PRICING_MODEL
-    print(f"💰 Re-pricing with parent snapshot...")
-    costs = calculate_costs(
-        merged_analysis.get("aggregated_totals", {}),
-        exterior=merged_analysis.get("exterior", {}),
-        building_type=merged_analysis.get("project_info", {}).get("building_type", ""),
-        project_info=merged_analysis.get("project_info", {}),
-        analysis=merged_analysis,
-        pricing_model_override=pricing_snapshot,
-    )
+    if new_pdf_paths:
+        # Recompute cost using parent's pricing snapshot — NOT the live
+        # PRICING_MODEL. This is the rate-stability rule: a v2 quote uses the
+        # same rates v1 was priced at, so deltas are pure-quantity changes.
+        print(f"💰 Re-pricing with parent snapshot...")
+        costs = calculate_costs(
+            merged_analysis.get("aggregated_totals", {}),
+            exterior=merged_analysis.get("exterior", {}),
+            building_type=merged_analysis.get("project_info", {}).get("building_type", ""),
+            project_info=merged_analysis.get("project_info", {}),
+            analysis=merged_analysis,
+            pricing_model_override=pricing_snapshot,
+        )
+    else:
+        # Notes-only re-run: the prior cost estimate IS the baseline. Pricing
+        # from raw aggregated_totals would discard the prior run's Will/manual
+        # adjustments and hand back the pre-adjustment base (observed ~+18%).
+        # Instead we carry the prior estimate forward verbatim and let Will
+        # adjust it from there — so a note that changes nothing leaves the
+        # subtotal exactly where it was.
+        print(f"💰 Carrying prior cost estimate forward (notes-only re-run)...")
+        costs = _copy.deepcopy(prior_json.get("cost_estimate") or {})
 
     print_estimate(merged_analysis, costs)
 
@@ -13233,40 +13320,62 @@ def run_analysis_merge(prior_json, new_pdf_paths, scope_tags=None,
             next_num += 1
         rfi_items = rfi_items + pre_pricing_rfis
 
-    # 6. Fresh Will synthesis on merged data.
-    print("\n🧑‍💼 Re-running Will Synthesis on merged data...")
-    try:
-        from anthropic import Anthropic
-        will_client = Anthropic(api_key=CLAUDE_API_KEY)
-    except Exception as _exc:
-        will_client = None
-        print(f"⚠️  Could not init Anthropic client for Will: {_exc}")
-
+    # 6. Will synthesis. Will's senior-estimator pass proposes ±25% line-item
+    # adjustments whose upward edits were padding re-run quotes with unwanted
+    # "inflation," so it is DISABLED on re-runs by default — re-runs carry the
+    # prior/merged estimate forward verbatim. Fresh first-time submissions
+    # (run_analysis) still run Will. Set NIGHTSHIFT_WILL_ON_RERUN=1 to restore.
     will_result = {"will_synthesis": None, "adjustments_log": [], "rejected_log": [],
                    "new_rfis": [], "error": None}
-    if will_client is not None:
-        try:
-            will_result = run_will_synthesis(
-                analysis=merged_analysis,
-                cost_estimate=costs,
-                rfi_items=rfi_items,
-                validation=validation,
-                client=will_client,
-            )
-        except Exception as exc:
-            print(f"⚠️  Will Synthesis failed: {exc}")
-            will_result = {"will_synthesis": None, "adjustments_log": [],
-                           "rejected_log": [], "new_rfis": [], "error": str(exc)}
+    if os.environ.get("NIGHTSHIFT_WILL_ON_RERUN", "0").strip() != "1":
+        print("\n🧑‍💼 Will synthesis SKIPPED on re-run "
+              "(NIGHTSHIFT_WILL_ON_RERUN!=1) — carrying the prior estimate "
+              "forward with no senior-estimator adjustments.")
+    else:
+        # Surface the reviewer's notes to Will (reads project_info._scope_notes).
+        # Fold the sheet hint in too — without new files there's nothing to
+        # filter, so it only makes sense as guidance. Override only when given.
+        _reviewer_notes = (scope_notes or "").strip()
+        if not new_pdf_paths and sheet_hint:
+            _focus = f"Focus on sheet(s): {sheet_hint}."
+            _reviewer_notes = (f"{_reviewer_notes}\n\n{_focus}".strip()
+                               if _reviewer_notes else _focus)
+        if _reviewer_notes:
+            _pi = merged_analysis.setdefault("project_info", {})
+            if isinstance(_pi, dict):
+                _pi["_scope_notes"] = _reviewer_notes
 
-    if will_result.get("will_synthesis"):
-        will_rfis = will_result.get("new_rfis", []) or []
-        next_num = (max((r.get("number", 0) for r in rfi_items), default=0) + 1
-                    if rfi_items else 1)
-        for rfi in will_rfis:
-            rfi["number"] = next_num
-            next_num += 1
-        rfi_items = rfi_items + will_rfis
-        validation = _validate_cost_estimate(merged_analysis, costs)
+        print("\n🧑‍💼 Re-running Will Synthesis on merged data...")
+        try:
+            from anthropic import Anthropic
+            will_client = Anthropic(api_key=CLAUDE_API_KEY)
+        except Exception as _exc:
+            will_client = None
+            print(f"⚠️  Could not init Anthropic client for Will: {_exc}")
+
+        if will_client is not None:
+            try:
+                will_result = run_will_synthesis(
+                    analysis=merged_analysis,
+                    cost_estimate=costs,
+                    rfi_items=rfi_items,
+                    validation=validation,
+                    client=will_client,
+                )
+            except Exception as exc:
+                print(f"⚠️  Will Synthesis failed: {exc}")
+                will_result = {"will_synthesis": None, "adjustments_log": [],
+                               "rejected_log": [], "new_rfis": [], "error": str(exc)}
+
+        if will_result.get("will_synthesis"):
+            will_rfis = will_result.get("new_rfis", []) or []
+            next_num = (max((r.get("number", 0) for r in rfi_items), default=0) + 1
+                        if rfi_items else 1)
+            for rfi in will_rfis:
+                rfi["number"] = next_num
+                next_num += 1
+            rfi_items = rfi_items + will_rfis
+            validation = _validate_cost_estimate(merged_analysis, costs)
 
     # 7. Append to merge_log so audit history is queryable from the JSON.
     prior_log = list(prior_json.get("merge_log") or [])
@@ -14338,7 +14447,8 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             analysis = _recalculate_totals(analysis)
 
     # Run extraction validation checks
-    analysis = _validate_extraction(analysis, file_room_counts=file_room_counts)
+    analysis = _validate_extraction(analysis, file_room_counts=file_room_counts,
+                                    project_overview=project_overview)
 
     # --- Phase 4: Provenance audit (hallucination detection, count reconciliation) ---
     # Conservative — flags only, does not auto-remove. Runs AFTER dedup + recalc
@@ -14522,8 +14632,12 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             if est_stairs > max_reasonable:
                 est_stairs = 0
 
-        # If notes didn't give us a number, use building heuristic
-        if est_stairs == 0:
+        # If notes didn't give us a number, use building heuristic.
+        # Gated by HARD_NUMBERS_ONLY: a geometry-based stair estimate — and the
+        # undercount "boost" that depends on it — is a heuristic, not a measured
+        # count. With the policy on, trust the extracted count (or an explicit
+        # stair count parsed from the notes above) and surface gaps as RFIs.
+        if est_stairs == 0 and not HARD_NUMBERS_ONLY:
             est_stairwells = 2  # standard for residential
             transitions = max(1, effective_levels - 1)
             est_stairs = est_stairwells * transitions * 2

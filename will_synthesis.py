@@ -33,6 +33,11 @@ try:
 except ImportError:
     CLAUDE_API_KEY = os.environ.get("CLAUDE_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")
 
+try:
+    from config import HARD_NUMBERS_ONLY
+except ImportError:
+    HARD_NUMBERS_ONLY = True
+
 
 # ---------------------------------------------------------------------------
 # Guardrail Constants
@@ -593,7 +598,8 @@ def _apply_adjustments_to_estimate(cost_estimate, valid_adjustments, line_items_
 # ---------------------------------------------------------------------------
 
 def run_will_synthesis(analysis, cost_estimate, rfi_items=None, validation=None,
-                        client=None, model="claude-sonnet-4-20250514"):
+                        client=None, model="claude-sonnet-4-6",
+                        use_adaptive_thinking=False, effort="medium"):
     """Run the Will synthesis layer on a completed analysis + cost estimate.
 
     Args:
@@ -603,6 +609,11 @@ def run_will_synthesis(analysis, cost_estimate, rfi_items=None, validation=None,
         validation: dict with warnings and data_quality_score
         client: optional anthropic.Anthropic instance (creates one if None)
         model: Claude model to use
+        use_adaptive_thinking: enable adaptive thinking for A/B testing whether
+            deeper reasoning improves Will's adjustments and RFIs. Off by default
+            (existing behavior). Adds latency and tokens.
+        effort: thinking depth when use_adaptive_thinking is True
+            ("low" | "medium" | "high" | "max"). Default "medium".
 
     Returns:
         dict with keys:
@@ -651,19 +662,38 @@ def run_will_synthesis(analysis, cost_estimate, rfi_items=None, validation=None,
 
     print(f"   📤 Sending estimate to Will for review ({len(payload.get('line_items', []))} line items)...")
 
+    call_kwargs = {
+        "model": model,
+        "timeout": 180.0,
+        "system": WILL_SYSTEM_PROMPT,
+        "messages": [{"role": "user", "content": user_message}],
+    }
+    if use_adaptive_thinking:
+        # Thinking tokens count toward max_tokens — bump the ceiling so the JSON
+        # response isn't truncated mid-thought.
+        call_kwargs["max_tokens"] = 16000
+        call_kwargs["thinking"] = {"type": "adaptive"}
+        call_kwargs["output_config"] = {"effort": effort}
+    else:
+        call_kwargs["max_tokens"] = 8000
+        call_kwargs["temperature"] = 0
+
     try:
         result_parts = []
-        with client.messages.stream(
-            model=model,
-            max_tokens=8000,
-            temperature=0,
-            timeout=180.0,
-            system=WILL_SYSTEM_PROMPT,
-            messages=[{"role": "user", "content": user_message}],
-        ) as stream:
+        with client.messages.stream(**call_kwargs) as stream:
             for text in stream.text_stream:
                 result_parts.append(text)
+            final_message = stream.get_final_message()
         raw_response = "".join(result_parts)
+
+        if use_adaptive_thinking:
+            thinking_text = next(
+                (b.thinking for b in final_message.content if b.type == "thinking"),
+                "",
+            )
+            print(f"   🧠 Will engaged adaptive thinking (effort={effort}): "
+                  f"{final_message.usage.output_tokens} output tokens, "
+                  f"{len(thinking_text)} chars of thinking summary")
     except anthropic.RateLimitError as e:
         print(f"   ⚠️  Will synthesis rate-limited: {e}")
         return {
@@ -717,7 +747,14 @@ def run_will_synthesis(analysis, cost_estimate, rfi_items=None, validation=None,
     auto_rejected = []
 
     for adj in proposed_adjustments:
-        is_valid, reason = _validate_adjustment(adj, line_items_by_category, analysis)
+        if HARD_NUMBERS_ONLY:
+            # Hard-numbers-only policy: Will does not silently reshape measured/
+            # calculated quantities toward "typical" ranges. Every proposed
+            # quantity adjustment is converted to an RFI so the concern is
+            # surfaced for human confirmation instead of applied.
+            is_valid, reason = False, "hard_numbers_only_policy"
+        else:
+            is_valid, reason = _validate_adjustment(adj, line_items_by_category, analysis)
         if is_valid:
             valid_adjustments.append(adj)
         else:
@@ -756,6 +793,25 @@ def run_will_synthesis(analysis, cost_estimate, rfi_items=None, validation=None,
                 "action_required": f"Confirm or override the suggested {direction} for {rej['category']}.",
                 "severity": "high",
                 "source": "will_guardrail",
+            })
+        elif rej["reason_for_rejection"] == "hard_numbers_only_policy":
+            direction = "reduce" if rej["suggested_value"] < rej["current_value"] else "increase"
+            auto_rejected_rfis.append({
+                "category": "Pricing Concern",
+                "question": (
+                    f"Will (senior estimator) reviewed the {rej['category']} line item "
+                    f"and suggested adjusting it from {rej['current_value']:,.0f} to "
+                    f"{rej['suggested_value']:,.0f} ({rej['pct_change']:+.0f}%). Under the "
+                    f"hard-numbers-only policy, quantities are not auto-adjusted toward "
+                    f"typical ranges — the measured value is retained and the concern is "
+                    f"surfaced for review instead. Reason given: {rej['original_reason']}"
+                ),
+                "action_required": (
+                    f"Confirm whether to manually {direction} {rej['category']}, "
+                    f"or keep the measured quantity."
+                ),
+                "severity": "medium",
+                "source": "will_hard_numbers_policy",
             })
         elif rej["reason_for_rejection"] == "manual_review_low_scope_blocks_downward":
             auto_rejected_rfis.append({
@@ -866,6 +922,8 @@ def run_will_synthesis(analysis, cost_estimate, rfi_items=None, validation=None,
         "rejected_log": auto_rejected,
         "new_rfis": new_rfis,
         "error": None,
+        "thinking_mode": "adaptive" if use_adaptive_thinking else "off",
+        "effort": effort if use_adaptive_thinking else None,
     }
 
 

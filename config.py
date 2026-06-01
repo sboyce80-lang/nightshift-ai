@@ -438,6 +438,16 @@ ENHANCED_TILE_GRID_LARGE = (2, 2)          # Was (3, 3)=9 tiles; now (2, 2)=4 ti
 LARGE_FORMAT_THRESHOLD_PT = 2000           # Page size threshold (~28") to trigger enhanced path
 ENHANCED_TILE_OVERLAP_PCT = 0.05           # 5% overlap between tiles
 
+# Hard-Numbers-Only Policy
+# When True, the engine prices ONLY quantities measured from the drawings.
+# Paths that FABRICATE scope from heuristics (perimeter/footprint/keyword/
+# building-type assumptions when extraction found nothing) are suppressed; the
+# gap becomes an RFI instead of a guessed quantity. Compensating boosts that
+# scale an already-measured (>0) quantity upward to offset room-level under-
+# extraction are NOT affected by this flag. Set False to restore the old
+# heuristic-fill behavior.
+HARD_NUMBERS_ONLY = True
+
 # Schedule-Based Estimation (when floor plans are missing)
 ENABLE_SCHEDULE_ESTIMATION = True          # Estimate wall/ceiling from Room Finish Schedules when no floor plans
 SCHEDULE_ESTIMATION_CONFIDENCE = 0.85      # Apply 85% confidence factor to schedule-derived areas
