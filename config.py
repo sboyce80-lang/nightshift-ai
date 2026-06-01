@@ -412,7 +412,7 @@ RESEND_API_KEY    = os.environ.get("RESEND_API_KEY", "")
 RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "")
 RESEND_FROM_NAME  = os.environ.get("RESEND_FROM_NAME", "Knight Shift")
 MAX_PDF_SIZE_MB     = 600
-MAX_PDFS_PER_EMAIL  = 10
+MAX_PDFS_PER_EMAIL  = 25
 # Browser-direct R2 multipart upload — split each file into parts of this size
 # so a flaky network only retries the failed slice, not the whole upload.
 # 16 MiB is a sweet spot: 600 MB → ~38 parts (well under the 10,000 part cap),
