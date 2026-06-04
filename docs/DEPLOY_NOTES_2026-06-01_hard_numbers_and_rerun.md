@@ -137,3 +137,39 @@ disable the headline behaviors without a redeploy.
 - **Not yet run on the live stack:** a real end-to-end run with the Will API + a true
   with-file merge regression, and broad validation of `HARD_NUMBERS_ONLY` beyond the
   Ridgeview replay. Confirm before/after push as appropriate.
+
+---
+
+## 6. Five Below accuracy fixes (2026-06-03, commit `bfe5907`)
+
+Validated against Damjan / DN Contracting's manual Five Below Alameda takeoff
+(`construction_analysis_20260603_210222.json` extraction + these fixes). Engine
+now lands **walls 10,496** (Damjan 11,364), **gyp ceiling 596** (532), **dryfall
+7,887** (7,942), **base trim 0** (0), **doors 7** (7) — all principled (the prior
+11,690 wall "match" was a coincidence: cross-sheet duplication ~+21% offsetting a
+shell-perimeter under-count ~-15%).
+
+| Change | File / function | Effect |
+|---|---|---|
+| Base-trim hard-number gate | `_base_confirmed_paintable` + gate in `_recalculate_totals` | Commercial-unconfirmed base trim → 0 + RFI (retail cove base isn't field-painted). Residential/mixed keep painted-wood default. Strips the legacy "confirm paintable vs. resilient cove base" advisory before matching to avoid false-positiving real wood base. Prompt now captures `materials.base`. |
+| Plan-sheet recovery | `_analyze_with_enhanced_extraction` | Enhanced extraction picked plan pages by PDF text layer, dropping rasterized plan sheets (1 of 19 arch pages tiled). Now classifies plan sheets by title-block text (FLOOR PLAN/RCP/FIXTURE PLAN). Five Below: 1→6 sheets, 6→12 rooms. **Primary under-extraction fix.** |
+| Cross-sheet room dedup | `_dedupe_cross_sheet_rooms` | Same room tiled on multiple sheets double-counted geometry. De-dupes walls/ceiling/floor/base-trim onto the most-complete instance; doors/windows left summed. Gated to single-story commercial, no unit multipliers, >1 source page — **no-op on residential/mixed-use**. |
+| Geometric perimeter floor | `_validate_wall_area_by_perimeter` | `perimeter ≥ 4·√(floor_area)` (square = min perimeter). Lifts under-traced shells (sales floor) so the existing capped (1.30×) perimeter boost reaches geometric truth. Self-targeting: +42 SF total across all residential. |
+
+**Policy decision (2026-06-03):** suppress base trim on ALL commercial-unconfirmed
+jobs, even where painted base may exist (e.g. dutchess restroom Rider=391 LF) — the
+estimator recovers genuine painted-base commercial via the confirm-base RFI.
+
+**Validation:** module compiles; base-trim gate unit-tested (incl. advisory-note
+regression); corpus sweep (72 result JSONs) confirms base-trim gate, ceiling/room
+dedup, and geometric floor are strict no-ops on residential/mixed-use. No Tier-1
+reference target regresses (364 Main base trim 8,818 PASS; honey_farms ceiling 1,027
+PASS; fishkill has no affected target).
+
+**Rollback:** `git revert bfe5907`. The base-trim gate and room dedup are gated on
+`HARD_NUMBERS_ONLY` / building type respectively; the geometric floor is bounded by
+the existing 1.30× boost cap.
+
+**Residual (flagged, not closed):** Five Below walls still ~7.6% under Damjan after
+the capped boost — a genuine extraction-depth gap the MANUAL REVIEW flag already
+fires on. Columns still extract as 0 (separate issue).
