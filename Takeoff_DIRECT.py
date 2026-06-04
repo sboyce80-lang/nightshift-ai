@@ -2410,6 +2410,51 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
             if n_dims >= 3 or (n_dims >= 1 and (n_labels >= 1 or n_ids >= 1)):
                 floor_plan_pages.append(pg_idx)
 
+    # --- Robustness: a sparse text layer must not drop rasterized plan sheets ---
+    # Large-format architectural sheets are frequently rasterized scans whose
+    # DRAWING has no extractable text — so the dims/labels filter above scores
+    # the real plan sheets 0 and we historically tiled only the 1-2 incidental
+    # text-bearing pages. This was the primary under-extraction cause on Five
+    # Below: 1 of 19 painting-relevant pages had a parseable dims text layer, so
+    # the A1.0 floor plan, A1.1 fixture plan, and A2.0 RCP were never tiled —
+    # 6 rooms / 6,542 SF walls vs an ~11,000 SF manual takeoff.
+    #
+    # The TITLE-BLOCK text survives rasterization (it's how page classification
+    # reads the sheet number), so classify each painting-relevant page as a plan
+    # sheet by its title text and tile those. This recovers scanned plan sheets
+    # WITHOUT tiling elevations / sections / details / schedules (which waste
+    # tokens and can fabricate rooms from elevation dimensions).
+    def _is_plan_sheet(pg_idx):
+        tl = _extract_page_text_layer(pdf_path, pg_idx)
+        txt = (tl or {}).get("raw_text", "") if isinstance(tl, dict) else ""
+        txt = str(txt).lower()
+        if not txt:
+            return False
+        STRONG_PLAN = (
+            "floor plan", "reflected ceiling", "ceiling plan", "finish plan",
+            "enlarged plan", "fixture plan", "dimension plan", "partition plan",
+            "furniture plan", "equipment plan", "roof plan", "slab plan",
+            "life safety plan", "demolition plan", "overall plan",
+        )
+        NON_PLAN = ("elevation", "section", "detail", "schedule")
+        if any(k in txt for k in STRONG_PLAN):
+            return True
+        # Bare "plan" (e.g. a key/code plan) counts only when the sheet isn't
+        # dominated by elevation/section/detail/schedule content.
+        if "plan" in txt and not any(k in txt for k in NON_PLAN):
+            return True
+        return False
+
+    _plan_sheets = [pg_idx for pg_idx in page_indices if _is_plan_sheet(pg_idx)]
+    _added = sorted(set(_plan_sheets) - set(floor_plan_pages))
+    if _added:
+        print(f"   🔬 Plan-sheet recovery: text-layer dims identified "
+              f"{len(floor_plan_pages)} page(s); title-block text identifies "
+              f"{len(_plan_sheets)} plan sheet(s) — adding {len(_added)} rasterized "
+              f"plan sheet(s) {[p + 1 for p in _added]} so they get measured "
+              f"(under-extraction guard).")
+        floor_plan_pages = sorted(set(floor_plan_pages) | set(_plan_sheets))
+
     if not floor_plan_pages:
         # Fall back to all large-format pages if text layer didn't help
         for pg_idx in page_indices:
@@ -3695,12 +3740,20 @@ For each room:
   * Exception: exterior walls and walls bounding non-paintable space (mech shafts,
     elevator shafts) only contribute to the one interior room they bound.
 - Calculate: Ceiling Area = Length × Width (only if ceiling_painted = true)
-- Base trim LF: record base_trim_lf = room perimeter (this is the measured base
-  length). If the base material is resilient / vinyl / rubber / cove base, tile, or
-  cannot be confirmed from the drawings or finish schedule, ALSO add to the room's
-  "notes": "Base material unverified — confirm paintable vs. resilient cove base".
+- Base material + base trim LF: record the base/baseboard material you observe in
+  "materials"."base" (e.g. "Painted Wood Base", "Rubber Base", "Vinyl Cove Base",
+  "Tile Base", or "Unconfirmed" if the drawings/finish schedule don't say).
+  * If the base is a PAINTED base (painted wood, MDF, or the finish schedule
+    schedules the base to be painted): set base_trim_lf = room perimeter.
+  * If the base is resilient / vinyl / rubber / cove base / tile, OR cannot be
+    confirmed from the drawings or finish schedule on a COMMERCIAL / RETAIL space:
+    set base_trim_lf = 0 (resilient cove base is the retail default and is NOT
+    field-painted) and add to "notes": "Base material unverified/resilient —
+    confirm paintable vs. resilient cove base (RFI)".
   Do NOT silently treat the base as paintable just because the room has gyp walls —
-  vinyl and resilient cove base are common and are not field-painted.
+  vinyl and resilient cove base are common and are not field-painted. Pricing
+  base trim that isn't painted is a fabrication; when in doubt on a commercial
+  job, set 0 and flag rather than defaulting to perimeter.
 - Level 5 finish: Check the FINISH SCHEDULE, wall type legends, and room notes for "Level 5",
   "Level 5 skim coat", "L5", "smooth finish", or "skim coat" specifications on any wall or ceiling.
   Common locations: entryways, foyers, hallways, great rooms, formal dining rooms (especially in
@@ -4060,7 +4113,8 @@ IMPORTANT RULES:
           "materials": {
             "walls": "GYP",
             "ceiling": "GYP",
-            "ceiling_painted": true
+            "ceiling_painted": true,
+            "base": "Painted Wood Base"
           },
           "elements": {
             "doors_full_paint": 2,
@@ -4146,7 +4200,7 @@ CRITICAL RULES:
 - Commercial jobs: assume window sashes are NOT painted (factory-finished)
 - Door schedules override floor plan counts
 - Include ALL hallways, corridors, lobbies, and common areas
-- Base trim: record base_trim_lf (= perimeter) for every room; flag rooms whose base is resilient/vinyl or unconfirmed in the room notes (see the base trim rule above) so the estimator can confirm paint scope
+- Base trim: record base_trim_lf = perimeter ONLY when the base is a confirmed painted base (painted wood/MDF or scheduled-to-paint); set base_trim_lf = 0 for resilient/vinyl/cove base or unconfirmed base on commercial/retail spaces, record the base material in materials.base, and flag it in the room notes (see the base trim rule above) so the estimator can confirm paint scope
 - Break EVERY apartment into individual rooms — never list just "Living/Dining/Kitchen"
 - Extract ALL closets as separate rooms: linen closets, coat closets, pantry closets,
   utility closets, walk-in closets, storage closets. These are commonly missed but
@@ -7447,9 +7501,23 @@ def _validate_wall_area_by_perimeter(analysis):
             perimeter = _num(dims.get("perimeter_lf", 0))
             ceiling_h = _num(dims.get("ceiling_height_feet", 0))
             wall_area = _num(dims.get("wall_area_sqft", 0))
+            floor_area = _num(dims.get("floor_area_sqft", 0))
             multiplier = max(1, int(_num(room.get("unit_multiplier", 1))))
 
-            expected_wall = perimeter * ceiling_h
+            # Geometric perimeter floor: a square is the minimum-perimeter
+            # rectangle for a given area, so any enclosed room of floor_area has
+            # an enclosing perimeter of at least 4*sqrt(area). When the extracted
+            # perimeter falls below that, the shell was under-measured — e.g. a
+            # retail sales floor where only the NEW interior partitions were
+            # traced, not the full landlord-shell perimeter (Five Below: traced
+            # 308 LF vs ~355 LF geometric floor on the 7,887 SF sales floor).
+            # This is an assumption-free lower bound derived from the MEASURED
+            # floor area, so it stays within the hard-numbers policy; the boost
+            # that consumes this value is separately capped at 1.30x.
+            geom_perimeter = (4.0 * (floor_area ** 0.5)) if floor_area > 0 else 0
+            eff_perimeter = max(perimeter, geom_perimeter)
+
+            expected_wall = eff_perimeter * ceiling_h
 
             if expected_wall <= 0:
                 continue
@@ -9039,6 +9107,183 @@ def _dedupe_overlapping_template_floors(analysis):
     return analysis
 
 
+def _base_confirmed_paintable(room, building_type):
+    """Hard-numbers gate for base trim.
+
+    The floor-plan extraction path sets base_trim_lf = room perimeter for
+    EVERY room with no base-material check (the prompt's legacy default). On
+    commercial/retail fit-outs that is a fabrication: resilient/vinyl cove
+    base is the norm and is not field-painted (Five Below: we reported 590-848
+    LF; the manual takeoff had 0). This returns whether the room's base trim is
+    a CONFIRMED paintable (painted) base, so callers can zero it when it is not.
+
+    Decision order:
+      1. Explicit painted/wood base in any field/note  -> True  (keep)
+      2. Explicit resilient/vinyl/cove/tile/none base   -> False (suppress)
+      3. Unconfirmed: fall back to building-type default
+           - commercial/retail/industrial fit-out -> False (resilient default)
+           - residential / unknown                -> True  (painted-wood default)
+
+    Step 3 keeps residential wood-base jobs intact (e.g. the 364 Main Street
+    reference: 8,629 LF confirmed wood base) while excluding unconfirmed
+    commercial base, matching how Rider takeoffs treat retail boxes.
+    """
+    mats = room.get("materials", {}) or {}
+    el = room.get("elements", {}) or {}
+    base_sig = " ".join(str(x) for x in (
+        mats.get("base", ""), mats.get("base_finish", ""),
+        el.get("base_finish", ""), room.get("base_finish", ""),
+        room.get("notes", ""),
+    )).lower()
+
+    # Strip ADVISORY phrasing before keyword matching. The legacy prompt told
+    # the LLM to add "Base material unverified — confirm paintable vs. resilient
+    # cove base" to *every* room as a flag-to-confirm — that is NOT a statement
+    # that the base IS resilient. Left in, its "resilient"/"cove base" tokens
+    # would wrongly zero painted wood base in residential bedrooms/living rooms.
+    # An "unverified/confirm" note means UNCONFIRMED -> building-type default.
+    for _adv in (
+        "base material unverified/resilient — confirm paintable vs. resilient cove base (rfi)",
+        "base material unverified — confirm paintable vs. resilient cove base",
+        "base material unverified - confirm paintable vs. resilient cove base",
+        "confirm paintable vs. resilient cove base",
+        "confirm paintable vs resilient cove base",
+        "base material resilient/unconfirmed; perimeter default removed",
+        "confirm painted-base scope",
+        "base: unverified",
+        "unverified — not in finish schedule",
+        "unverified - not in finish schedule",
+    ):
+        base_sig = base_sig.replace(_adv, " ")
+
+    # 1. Explicit painted / wood base -> confirmed paintable.
+    if any(kw in base_sig for kw in (
+            "paint base", "painted base", "base: paint", "base paint",
+            "wood base", "wd base", "wd-", "mdf base", "painted wood")):
+        return True
+    # 2. Explicit resilient / non-paint base -> not paintable.
+    if any(kw in base_sig for kw in (
+            "rubber base", "vinyl base", "resilient base", "cove base",
+            "tile base", "ceramic base", "no base", "base: none",
+            "resilient", "rubber cove", "vinyl cove")):
+        return False
+    # 3. Unconfirmed -> building-type default.
+    bt = (building_type or "").lower()
+    is_commercial_box = any(kw in bt for kw in (
+        "commercial", "retail", "auto", "industrial", "warehouse",
+        "dealership", "fit-out", "fitout", "tenant"))
+    if is_commercial_box:
+        return False  # unconfirmed commercial base — hard-numbers excludes
+    return True  # residential / unknown — painted wood base is the norm
+
+
+def _dedupe_cross_sheet_rooms(analysis):
+    """Count each room ONCE when the same room is extracted from multiple sheets
+    (floor plan + fixture plan + RCP + code plan).
+
+    Enhanced extraction now tiles several plan sheets to fix under-extraction
+    (the plan-sheet-recovery guard). The same physical room then appears on 2-3
+    sheets and ALL of its quantities (walls, ceiling, doors, base trim) are
+    summed once per sheet. Five Below: the same Manager's Office / Corridor /
+    ADA Toilet / Stockroom appeared on the floor plan AND the RCP AND a code
+    plan, inflating gyp ceiling to 1,390 SF (vs a 532 SF manual takeoff) and
+    walls to 11,690 SF (vs 11,364 — a coincidental match: cross-sheet
+    duplication ~+21% offset a genuine shell-perimeter under-count ~-15%).
+
+    We keep the single most-complete instance per room (largest wall area) and
+    mark the other sheet instances out of scope, so every quantity is counted
+    once. Ceiling painted/not-painted is decided by majority vote across the
+    instances (so an open Stockroom mislabeled GYP on one low-detail sheet stays
+    open). Walls then flow through the geometric perimeter floor +
+    _validate_and_boost_walls to recover the real shell perimeter.
+
+    Tightly gated to SINGLE-STORY COMMERCIAL jobs with no unit multipliers,
+    where a repeated room NAME is a genuine cross-sheet duplicate. It must NEVER
+    run on residential / multi-unit work, where many distinct rooms legitimately
+    share a name ("Bedroom", "Bath"). Duplicates are only merged when they span
+    >1 source page, so genuinely distinct same-name rooms drawn on one sheet are
+    left alone. Idempotent via the _cross_sheet_rooms_deduped flag.
+    """
+    if analysis.get("_cross_sheet_rooms_deduped"):
+        return
+    pi = analysis.get("project_info", {}) or {}
+    bt = str(pi.get("building_type", "")).lower()
+    is_commercial = any(k in bt for k in (
+        "commercial", "retail", "auto", "industrial", "warehouse",
+        "dealership", "restaurant", "fitness", "recreational",
+        "institutional", "entertain", "fit-out", "fitout", "tenant"))
+    # Exclude anything residential/mixed — those repeat room names legitimately.
+    if not is_commercial or any(k in bt for k in (
+            "residential", "mixed", "multi", "apartment", "condo", "senior")):
+        return
+    rooms = [r for fl in analysis.get("floors", []) for r in fl.get("rooms", [])
+             if r.get("in_scope", True)]
+    if not rooms:
+        return
+    # Hard guard: a single repeated/template unit means this isn't a simple
+    # single-tenant box — bail rather than risk merging real repeats.
+    if _num(pi.get("total_units", 0)) > 1:
+        return
+    for r in rooms:
+        if _extract_multiplier_from_notes(r) > 1 or _num(r.get("unit_multiplier", 1)) > 1:
+            return
+
+    import collections
+
+    def _norm(n):
+        return re.sub(r"[^a-z0-9]", "", str(n or "").lower())
+
+    def _warea(r):
+        return _num((r.get("dimensions", {}) or {}).get("wall_area_sqft", 0))
+
+    groups = collections.defaultdict(list)
+    for r in rooms:
+        nm = _norm(r.get("room_name") or r.get("name"))
+        if nm:
+            groups[nm].append(r)
+
+    removed = 0
+    for nm, insts in groups.items():
+        if len(insts) < 2:
+            continue
+        # Only treat as cross-sheet duplicates when they appear on >1 sheet.
+        pages = {str(r.get("source_page")) for r in insts if r.get("source_page") is not None}
+        if len(pages) < 2:
+            continue
+        # Keep the most-complete instance (largest measured wall area).
+        keeper = max(insts, key=_warea)
+        # Majority vote on whether this room's ceiling is painted (tie -> painted).
+        painted = sum(1 for r in insts if (r.get("materials", {}) or {}).get("ceiling_painted", False))
+        keep_painted = painted >= (len(insts) - painted) and painted > 0
+        km = keeper.setdefault("materials", {})
+        if not keep_painted and km.get("ceiling_painted", False):
+            km["ceiling_painted"] = False
+        # Zero only the DIMENSIONAL quantities on the non-keeper instances —
+        # each sheet measures the full room geometry, so walls/ceiling/floor are
+        # true duplicates. Doors/windows are left intact: each sheet tends to
+        # enumerate DIFFERENT openings of the same room (partial counts that sum
+        # to the real total — Five Below full-paint doors sum to 7, matching the
+        # manual takeoff), so collapsing them would under-count.
+        for r in insts:
+            if r is keeper:
+                continue
+            d = r.setdefault("dimensions", {})
+            for k in ("wall_area_sqft", "perimeter_lf", "ceiling_area_sqft", "floor_area_sqft"):
+                d[k] = 0
+            r.setdefault("elements", {})["base_trim_lf"] = 0
+            r.setdefault("materials", {})["ceiling_painted"] = False
+            r["notes"] = (str(r.get("notes", "") or "") +
+                          " [Cross-sheet dedup] room geometry measured on another "
+                          "sheet; walls/ceiling counted once on the most-complete "
+                          "instance (doors/windows retained).").strip()
+            removed += 1
+
+    analysis["_cross_sheet_rooms_deduped"] = True
+    if removed:
+        print(f"   🪞 [cross-sheet room dedup] de-duplicated geometry on {removed} "
+              f"duplicate room instance(s) across sheets (single-story commercial).")
+
+
 def _recalculate_totals(analysis):
     """
     Recalculate aggregated_totals from individual room data.
@@ -9077,6 +9322,10 @@ def _recalculate_totals(analysis):
                 note = room.get("notes", "")
                 room["notes"] = (note + " [Walls/trim estimated from floor area]").strip()
 
+    # Collapse rooms extracted from multiple plan sheets so a room isn't counted
+    # once per sheet for walls/ceiling/doors (single-story commercial only).
+    _dedupe_cross_sheet_rooms(analysis)
+
     total_wall = 0
     total_ceiling = 0
     total_cmu_wall = 0
@@ -9084,6 +9333,10 @@ def _recalculate_totals(analysis):
     total_plaster_wall = 0
     total_dryfall_ceiling = 0
     total_trim = 0
+    # Hard-numbers base-trim suppression bookkeeping (see _base_confirmed_paintable)
+    _bt_building_type = str(analysis.get("project_info", {}).get("building_type", ""))
+    _bt_suppressed_lf = 0
+    _bt_suppressed_rooms = 0
     total_doors_full = 0
     total_doors_hm = 0
     total_doors_frame = 0
@@ -9174,7 +9427,24 @@ def _recalculate_totals(analysis):
                     total_ceiling += _num(dims.get("ceiling_area_sqft", 0)) * multiplier
 
             # Base trim
-            total_trim += _num(elems.get("base_trim_lf", 0)) * multiplier
+            _room_bt = _num(elems.get("base_trim_lf", 0))
+            if HARD_NUMBERS_ONLY and _room_bt > 0 and not _base_confirmed_paintable(
+                    room, _bt_building_type):
+                # Resilient/unconfirmed base on a commercial job — the perimeter
+                # default is a fabrication, not a measurement. Zero it and flag
+                # for an RFI instead of pricing trim that isn't there.
+                _bt_suppressed_lf += _room_bt * multiplier
+                _bt_suppressed_rooms += 1
+                elems["base_trim_lf"] = 0
+                _existing = str(room.get("notes", "") or "")
+                if "[Hard Numbers] base trim excluded" not in _existing:
+                    room["notes"] = (
+                        _existing + " [Hard Numbers] base trim excluded — base "
+                        "material resilient/unconfirmed; perimeter default removed "
+                        "(confirm painted-base scope via RFI)."
+                    ).strip()
+                _room_bt = 0
+            total_trim += _room_bt * multiplier
 
             # Doors — new schema: doors_full_paint / doors_hm_panel / doors_frame_only
             total_doors_full += _num(elems.get("doors_full_paint", 0)) * multiplier
@@ -9760,6 +10030,20 @@ def _recalculate_totals(analysis):
         "total_painted_railing_lf": total_painted_railing,
     }
 
+    # --- Hard-numbers base-trim suppression summary + RFI flag ---
+    if _bt_suppressed_rooms:
+        analysis["_hard_numbers_base_trim_suppressed"] = {
+            "rooms": _bt_suppressed_rooms,
+            "lf": round(_bt_suppressed_lf),
+        }
+        analysis.setdefault("notes", []).append(
+            f"[Hard Numbers] Base trim suppressed on {_bt_suppressed_rooms} room(s) "
+            f"(~{round(_bt_suppressed_lf):,} LF of perimeter-default trim removed) — "
+            f"base material is resilient/unconfirmed on a {_bt_building_type or 'commercial'} "
+            f"job and is not field-painted by default. Excluded from paint scope; "
+            f"confirm painted-base scope via RFI."
+        )
+
     # --- Small space ceiling supplement for residential ---
     # Residential units typically have small closets (linen, coat, pantry, utility)
     # that may not be extracted as separate rooms. If ceiling SF is below expected
@@ -10252,6 +10536,28 @@ def generate_rfi_items(analysis):
     # Sheet numbers physically present in the upload — used so RFIs don't
     # request drawings the client already provided.
     upload_sheets = set(analysis.get("_upload_sheet_numbers") or [])
+
+    # --- 0. Hard-numbers base-trim suppression ---
+    # When _recalculate_totals zeroed perimeter-default base trim on a
+    # commercial job (resilient/unconfirmed base), surface it as an RFI so the
+    # estimator confirms whether any base is actually painted.
+    _bt_sup = analysis.get("_hard_numbers_base_trim_suppressed")
+    if _bt_sup and _bt_sup.get("rooms"):
+        items.append({
+            "category": "Material Specifications",
+            "question": (
+                f"Base trim was excluded from the paint scope on {_bt_sup['rooms']} "
+                f"room(s) (~{_bt_sup.get('lf', 0):,} LF). The drawings/finish schedule "
+                f"do not confirm a painted base — commercial/retail spaces typically use "
+                f"resilient or vinyl cove base, which is not field-painted. Is any base "
+                f"trim painted on this project? If so, which rooms and what base material?"
+            ),
+            "action_required": (
+                "Confirm whether base trim is painted and identify the base material "
+                "(painted wood/MDF vs. resilient/vinyl cove base) per room or per the "
+                "finish schedule."
+            ),
+        })
 
     # --- 1. No floor plans found ---
     if analysis.get("no_floor_plans_found") or analysis.get("no_detailed_floor_plans_found"):
