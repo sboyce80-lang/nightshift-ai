@@ -345,6 +345,10 @@ def _detect_pca_under_extraction(analysis):
             if not room.get("in_scope", True):
                 continue
             note = room.get("notes") or ""
+            if isinstance(note, list):
+                note = " ".join(str(x) for x in note)
+            elif not isinstance(note, str):
+                note = str(note)
             m = pca_re.search(note)
             if not m:
                 continue

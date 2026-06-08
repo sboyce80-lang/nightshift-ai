@@ -233,6 +233,13 @@ PRICING_MODEL = {
         "unit": "sqft", "markup": 0.04,
         "tiers": [{"min_qty": 0, "max_qty": None, "rate": 9.00}],    # Labor-only install rate
     },
+    # ── Wallpaper / Wallcovering Removal (strip existing) ── NOT install.
+    # Used when scope says "remove/strip wallpaper". Removal labor only;
+    # any new wallcovering install or paint that follows is a separate line.
+    "wallpaper_removal": {
+        "unit": "sqft", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 2.25}],    # Strip/remove existing (typ. $1.50–$3.00/sqft)
+    },
     # ── Stained Wood / Clear-Coat Panels ── (oak panels, wood veneer, accent walls)
     "stained_wood": {
         "unit": "sqft", "markup": 0.04,

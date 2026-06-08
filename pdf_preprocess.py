@@ -34,6 +34,83 @@ from typing import Optional
 logger = logging.getLogger("nightshift.pdf_preprocess")
 
 
+class PdfPasswordLockedError(Exception):
+    """A PDF is encrypted with a user password we cannot supply.
+
+    Raised by :func:`decrypt_pdf_if_needed` when the file can't be opened with
+    an empty password — i.e. it genuinely requires a viewing password. The
+    message is customer-facing (it propagates through ``send_error_email``), so
+    keep it actionable.
+    """
+
+
+def decrypt_pdf_if_needed(src_path: str, dst_path: Optional[str] = None) -> str:
+    """Return a path to a non-encrypted version of ``src_path``.
+
+    Construction docs frequently arrive with PDF encryption applied — most
+    often *owner/permissions* protection (restricts editing/copying) that opens
+    with an empty user password. These files (typically named like
+    ``…-protected.pdf``) are the common failure: PyMuPDF auto-opens them, but
+    PyPDF2 hard-crashes (``DependencyError: PyCryptodome is required for AES``)
+    and, worse, the Claude PDF parser rejects the encrypted bytes outright — so
+    the file is silently skipped and the whole submission fails with the generic
+    "No PDFs could be analysed" error.
+
+    Strategy:
+      * Not encrypted → return ``src_path`` unchanged (zero cost).
+      * Encrypted but openable with an empty password (owner/permissions
+        lock) → re-save a decrypted copy and return its path. Downstream
+        tooling (PyPDF2 normalizer, Claude parser) then gets clean input.
+      * Encrypted with a real user password we can't supply → raise
+        :class:`PdfPasswordLockedError` with an actionable message.
+
+    Args:
+        src_path: input PDF path.
+        dst_path: output path for the decrypted copy; if None, derived from
+            ``src_path`` with a ``_decrypted`` suffix.
+
+    Returns:
+        Path to a non-encrypted PDF (``src_path`` itself when no work was
+        needed).
+    """
+    import fitz  # PyMuPDF
+
+    filename = os.path.basename(src_path)
+    doc = fitz.open(src_path)
+    try:
+        if doc.needs_pass:
+            # Try the empty password first — owner-locked files that still
+            # report needs_pass open this way. A real viewing password won't.
+            if not doc.authenticate(""):
+                raise PdfPasswordLockedError(
+                    f"'{filename}' is password-protected and cannot be opened "
+                    f"automatically. Please remove the password (or export an "
+                    f"unprotected copy) and resubmit."
+                )
+            is_encrypted = True
+        else:
+            # Owner/permission-protected files open without a password but are
+            # still encrypted on disk — detectable via the encryption metadata.
+            is_encrypted = bool((doc.metadata or {}).get("encryption"))
+
+        if not is_encrypted:
+            return src_path
+
+        if dst_path is None:
+            base, ext = os.path.splitext(src_path)
+            dst_path = f"{base}_decrypted{ext or '.pdf'}"
+
+        logger.info(
+            "Decrypting %s (encryption=%s) -> %s",
+            filename, (doc.metadata or {}).get("encryption"), os.path.basename(dst_path),
+        )
+        print(f"   🔓 Decrypting password-protected PDF: {filename}", flush=True)
+        doc.save(dst_path, encryption=fitz.PDF_ENCRYPT_NONE)
+        return dst_path
+    finally:
+        doc.close()
+
+
 def _normalize_disabled() -> bool:
     return os.environ.get("NIGHTSHIFT_DISABLE_PDF_NORMALIZE", "").strip() in ("1", "true", "True")
 

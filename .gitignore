@@ -9,6 +9,9 @@ data/
 uploads/
 jobs/
 
+# Local test-run harness — holds large customer PDFs/outputs, never deploy
+wingstop_local_run/
+
 # Python
 *.pyc
 __pycache__/

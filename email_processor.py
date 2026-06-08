@@ -291,6 +291,20 @@ def process_email(msg, uid, conn):
             return None
         logger.info("Extracted %d PDF(s) — starting analysis ...", len(pdf_paths))
 
+        # 1b) Decrypt any owner/permission-protected PDFs so the Claude parser
+        # and PyPDF2 don't choke on encrypted bytes (see decrypt_pdf_if_needed).
+        from pdf_preprocess import decrypt_pdf_if_needed, PdfPasswordLockedError
+        decrypted_paths, locked_files = [], []
+        for p in pdf_paths:
+            try:
+                decrypted_paths.append(decrypt_pdf_if_needed(p))
+            except PdfPasswordLockedError as lock_exc:
+                logger.warning("'%s': %s", subject, lock_exc)
+                locked_files.append(str(lock_exc))
+        if not decrypted_paths:
+            raise ValueError(" ".join(locked_files) or "All submitted PDFs were password-protected.")
+        pdf_paths = decrypted_paths
+
         # 2) Run analysis
         result = run_analysis(pdf_paths, sender_name, sender_email,
                             scope_notes=scope_notes)

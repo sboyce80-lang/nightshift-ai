@@ -365,11 +365,29 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
     with tempfile.TemporaryDirectory(prefix=f"ns-job-{submission_id}-") as workdir:
         local_pdfs = []
         try:
+            from pdf_preprocess import decrypt_pdf_if_needed, PdfPasswordLockedError
+            locked_files = []
             for key in pdf_keys:
                 filename = key.rsplit("/", 1)[-1]
                 local_path = os.path.join(workdir, filename)
                 storage.download_file(key, local_path)
-                local_pdfs.append(local_path)
+                # Strip PDF encryption up front. Owner/permission-protected
+                # files (named like "…-protected.pdf") open fine in PyMuPDF but
+                # crash PyPDF2 and are rejected by the Claude PDF parser, so an
+                # encrypted file would otherwise be silently skipped and sink
+                # the whole submission. Files locked with a real user password
+                # are collected and reported with an actionable message.
+                try:
+                    local_pdfs.append(decrypt_pdf_if_needed(local_path))
+                except PdfPasswordLockedError as lock_exc:
+                    logger.warning("Submission %s: %s", submission_id, lock_exc)
+                    locked_files.append(str(lock_exc))
+
+            # If every file was password-locked there is nothing to analyze —
+            # fail now with a clear, customer-facing reason instead of the
+            # generic "No PDFs could be analysed" message.
+            if not local_pdfs:
+                raise ValueError(" ".join(locked_files) or "All submitted PDFs were password-protected.")
 
             # Pre-normalize any pages that would be too dense for the heavy
             # worker to process without triggering Render's CPU-load
@@ -608,12 +626,22 @@ def merge_submission(submission_id, parent_id, new_pdf_keys, contact_info,
             with open(parent_json_local, "r") as fh:
                 prior_json = json.load(fh)
 
-            # Pull new PDFs
+            # Pull new PDFs (decrypting owner/permission-protected files so the
+            # Claude parser and PyPDF2 don't choke — see decrypt_pdf_if_needed).
+            from pdf_preprocess import decrypt_pdf_if_needed, PdfPasswordLockedError
+            locked_files = []
             for key in new_pdf_keys:
                 filename = key.rsplit("/", 1)[-1]
                 local_path = os.path.join(workdir, filename)
                 storage.download_file(key, local_path)
-                local_pdfs.append(local_path)
+                try:
+                    local_pdfs.append(decrypt_pdf_if_needed(local_path))
+                except PdfPasswordLockedError as lock_exc:
+                    logger.warning("Submission %s (merge): %s", submission_id, lock_exc)
+                    locked_files.append(str(lock_exc))
+
+            if not local_pdfs:
+                raise ValueError(" ".join(locked_files) or "All submitted PDFs were password-protected.")
 
             result = run_analysis_merge(
                 prior_json,

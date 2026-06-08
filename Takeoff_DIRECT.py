@@ -3778,21 +3778,29 @@ Columns: Count painted structural columns visible on floor plans.
   - Do NOT count columns inside walls or columns with no paint callout
   - Record as "painted_columns_ea" per room (set to 0 if none)
 
-Wallcovering: CRITICAL — Check the ROOM FINISH SCHEDULE "Wall Finish" column for EVERY room.
-  - Look at the Room Finish Schedule table (usually sheet A-601 or in the finish schedule area).
-    Each row lists a room number and its wall finish type. If the "Wall Finish" column says
-    WC-1, WC-2, WC-3, WC-5, WC-6, "wallcovering", "vinyl wallcovering", or any WC-x code,
-    those walls get wallcovering INSTEAD of paint.
-  - For rooms with wallcovering walls:
-    * Calculate: wallcovering_sqft = wallcovering wall LF × wall height
-    * If ALL walls in a room have wallcovering: wallcovering_sqft = perimeter × ceiling height,
-      and wall_area_sqft should be REDUCED by the same amount (those walls are NOT painted)
-    * If SOME walls have wallcovering and some have paint: split accordingly
-  - SUBTRACT wallcovering walls from wall_area_sqft — DO NOT double-count as both paint and WC
-  - Record wallcovering area as "wallcovering_sqft" per room (set to 0 if no wallcovering)
-  - This is a MAJOR cost item ($9/sqft) — missing wallcovering can cause 30%+ estimate error
-  - In commercial buildings, wallcovering is common in showrooms, lobbies, corridors, and
-    customer-facing areas
+Wallcovering: CRITICAL — wallcovering_sqft must come ONLY from HARD NUMBERS on the drawings.
+  - The ONLY valid sources for wallcovering area are:
+    (a) the ROOM FINISH SCHEDULE "Wall Finish" column showing WC-1/WC-2/WC-3/WC-5/WC-6,
+        "wallcovering", or "vinyl wallcovering" for that specific room, OR
+    (b) an explicit WC-x label / wallcovering callout drawn on that room in the plans or
+        interior elevations.
+  - DO NOT infer wallcovering from the free-text SCOPE NOTES. A scope note such as
+    "wallpaper removal on all corridors and guest rooms" tells you which rooms are IN SCOPE
+    (see STEP 8B) — it does NOT tell you how many square feet of wall are wallcovered, nor
+    which walls. NEVER set wallcovering_sqft = perimeter × height for a room just because the
+    scope note mentions wallpaper.
+  - If NO finish schedule and NO explicit WC label exists, you CANNOT determine the
+    wallcovering area: set wallcovering_sqft = 0 for every room and add a note like
+    "Wallcovering extent unconfirmed — no finish schedule; RFI required." This becomes an RFI.
+  - When a finish schedule / explicit WC label DOES confirm wallcovering walls:
+    * Calculate: wallcovering_sqft = confirmed wallcovering wall LF × wall height
+    * If ALL walls in that room are confirmed wallcovered: wallcovering_sqft = perimeter ×
+      ceiling height, and REDUCE wall_area_sqft by the same amount (those walls are NOT painted)
+    * If SOME walls are wallcovered and some painted: split accordingly
+  - SUBTRACT confirmed wallcovering walls from wall_area_sqft — never double-count as both paint and WC.
+  - Removal vs install: if the scope says "remove/strip wallpaper", the confirmed area is a
+    REMOVAL quantity, not new install — still record it as wallcovering_sqft (pricing applies the
+    correct removal rate); do not invent install scope.
 
 Stained Wood / Clear-Coat Panels: Check finish schedules and interior elevations for:
   - Stained wood panels, wood veneer panels, clear-coated wood
@@ -4068,6 +4076,12 @@ IMPORTANT RULES:
   * "skip mechanical rooms" → exclude mechanical/electrical/boiler rooms
   * "interior only" → set exterior values to 0 and note it
 - If ambiguous, default to in_scope: true and add a note explaining the ambiguity
+- SCOPE NOTES SET INCLUSION ONLY — NOT QUANTITIES. The scope notes determine which rooms are
+  in/out of scope. They must NEVER be used to invent or change surface quantities. In
+  particular, a note mentioning wallpaper/wallcovering does NOT make any wall wallcovered —
+  wallcovering_sqft still comes only from a finish schedule or explicit WC label (see the
+  Wallcovering instructions). Same for paint, ceilings, trim: quantities come from the drawings,
+  not the scope text.
 - Exterior elements: if scope says "interior only", set exterior values to 0
 """ if scope_notes else """
 """) + """Return this JSON structure:
@@ -4219,7 +4233,7 @@ Be thorough — analyze ALL pages of the PDF. Completeness is more important tha
         prompt = schedule_hint_text + "\n" + prompt
 
     # Inject building inventory context as a preamble
-    if building_inventory and building_inventory.get("buildings"):
+    if building_inventory and isinstance(building_inventory.get("buildings"), list) and building_inventory["buildings"]:
         inv_parts = [
             "\n═══════════════════════════════════════════════════════════",
             "BUILDING INVENTORY (pre-extracted from drawing index pages):",
@@ -4497,6 +4511,42 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
                     "floors_seen": floors_seen,
                 }
 
+            def _resend_chunk_on_transient(chunk_path, idx, total_chunks,
+                                           chunk_context, reason,
+                                           attempts=2, backoff=20):
+                """Re-send an entire chunk after a transient failure rather
+                than silently dropping its pages. The chunk file still exists
+                at this point (the loop's `finally` unlink runs after the
+                except block). Returns the response text, or None if every
+                retry fails.
+
+                Added 2026-06-08 after Aliante (Wingstop): chunk 3 (A1.1 floor
+                plan + A2.0 RCP) hit a connection reset that fell through to
+                the generic except with no retry, so the two most scope-
+                critical sheets were dropped from 2 of 3 passes. _call_api's
+                internal retries cover mid-call hiccups; this covers the case
+                where the whole call errored out and the chunk would otherwise
+                be lost.
+                """
+                for attempt in range(1, attempts + 1):
+                    wait = backoff * attempt
+                    print(f"   🔁 Chunk {idx}/{total_chunks} {reason} — "
+                          f"resend attempt {attempt}/{attempts} after {wait}s")
+                    time.sleep(wait)
+                    try:
+                        with open(chunk_path, 'rb') as _rf:
+                            _b64 = base64.standard_b64encode(
+                                _rf.read()).decode("utf-8")
+                        return _call_api(
+                            _b64,
+                            label=(f"Retry chunk {idx}/{total_chunks} "
+                                   f"({len(_b64)/1024:.0f} KB)"),
+                            extra_context=chunk_context)
+                    except Exception as _re:
+                        print(f"   ⚠️  Chunk {idx}/{total_chunks} resend "
+                              f"attempt {attempt} failed: {str(_re)[:100]}")
+                return None
+
             for idx, chunk_info in enumerate(_pending_chunks, 2):
                 chunk_path, _chunk_start = chunk_info if isinstance(chunk_info, tuple) else (chunk_info, 1)
 
@@ -4584,12 +4634,29 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
                         print(f"   ⚠️  Chunk {idx}/{total_chunks} failed: {e}")
                         chunks_failed.append(idx)
                 except anthropic.InternalServerError as chunk_err:
-                    # Overloaded or 500 after all retries exhausted — skip chunk, don't crash
-                    print(f"   ⚠️  Chunk {idx}/{total_chunks} skipped (API overloaded after retries): {str(chunk_err)[:100]}")
-                    chunks_failed.append(idx)
+                    # Overloaded or 500 after all retries exhausted — try one
+                    # more full resend before giving up, then skip (don't crash).
+                    recovered = _resend_chunk_on_transient(
+                        chunk_path, idx, total_chunks, chunk_context,
+                        reason="API overloaded")
+                    if recovered is not None:
+                        all_texts.append(recovered)
+                        chunks_succeeded.append(idx)
+                    else:
+                        print(f"   ⚠️  Chunk {idx}/{total_chunks} skipped (API overloaded after retries): {str(chunk_err)[:100]}")
+                        chunks_failed.append(idx)
                 except Exception as chunk_err:
-                    print(f"   ⚠️  Chunk {idx}/{total_chunks} failed: {chunk_err}")
-                    chunks_failed.append(idx)
+                    # Transient (connection reset, read timeout, etc.) — resend
+                    # the whole chunk before dropping its pages.
+                    recovered = _resend_chunk_on_transient(
+                        chunk_path, idx, total_chunks, chunk_context,
+                        reason="transient error")
+                    if recovered is not None:
+                        all_texts.append(recovered)
+                        chunks_succeeded.append(idx)
+                    else:
+                        print(f"   ⚠️  Chunk {idx}/{total_chunks} failed: {chunk_err}")
+                        chunks_failed.append(idx)
                 finally:
                     try:
                         os.unlink(chunk_path)
@@ -5858,7 +5925,8 @@ def _merge_building_inventories(inventories):
     buildings = list(merged.values())
     total = sum(b.get("count", 1) for b in buildings)
     total_units = sum(
-        b.get("count", 1) * b.get("units_per_building", 1) for b in buildings
+        _num(b.get("count", 1)) * _num(b.get("units_per_building", 1))
+        for b in buildings
     )
 
     result = {
@@ -8543,7 +8611,8 @@ def _validate_extraction(analysis, file_room_counts=None, project_overview=None)
         est_perimeter = 4 * est_side
         est_min_wall = est_perimeter * 9 * total_stories * 0.5  # 50% of gross shell
         total_wall = sum(
-            r.get("dimensions", {}).get("wall_area_sqft", 0) * max(1, r.get("unit_multiplier", 1))
+            _num(r.get("dimensions", {}).get("wall_area_sqft", 0))
+            * max(1, _num(r.get("unit_multiplier", 1)))
             for f in floors for r in f.get("rooms", [])
         )
         if total_wall > 0 and total_wall < est_min_wall * 0.3:
@@ -11044,6 +11113,162 @@ def _num(val):
     return 0
 
 
+# Numeric fields whose corruption materially changes the estimate. When one of
+# these arrives structurally-wrong (list/dict) or null/garbage, we don't just
+# coerce silently — we route the whole job to manual review so a degraded
+# extraction can't ship a wrong number to a customer (Wingstop Aliante,
+# 2026-06-08: a null wall_area_sqft coerced to 0 would have undercounted).
+_HIGH_IMPACT_NUMERIC = {
+    "wall_area_sqft", "floor_area_sqft", "ceiling_area_sqft", "perimeter_lf",
+    "total_stories", "total_units", "footprint_sqft",
+}
+_ROOM_DIM_NUM = ("wall_area_sqft", "floor_area_sqft", "ceiling_area_sqft",
+                 "perimeter_lf", "ceiling_height_feet")
+_ROOM_STR = ("room_name", "unit_type", "floor_name", "room_id", "source_sheet")
+
+
+def _coerce_str(val):
+    """Coerce a value to a stripped string. Joins lists — Eastern's bug was
+    Claude returning `notes` as a list, which crashed re.search()."""
+    if isinstance(val, str):
+        return val.strip()
+    if val is None:
+        return ""
+    if isinstance(val, (list, tuple)):
+        return " ".join(_coerce_str(x) for x in val).strip()
+    return str(val).strip()
+
+
+def _is_parseable_number(val):
+    """True if val is numeric or a string that parses as a number."""
+    if isinstance(val, (int, float)):
+        return True
+    if isinstance(val, str):
+        try:
+            float(val.replace(",", "").strip())
+            return True
+        except ValueError:
+            return False
+    return False
+
+
+def _normalize_analysis(analysis):
+    """Coerce a Claude-produced analysis dict to its expected schema BEFORE any
+    consumer (_validate_extraction, calculate_costs, will_synthesis, the PDF
+    builders) reads it. LLM JSON drifts off-type — null where a number is
+    expected, a list where a string is expected — and historically that crashed
+    the entire takeoff with a TypeError and shipped nothing.
+
+    Coercion is silent for benign cases (missing key; numeric string "1,234").
+    When a HIGH-IMPACT numeric field arrives structurally wrong (list/dict) or
+    as null/garbage at a non-trivial rate, that signals a degraded extraction,
+    so the job is flagged for manual review rather than silently shipping a
+    smaller estimate.
+
+    Touches only wrong-typed values, so it is a no-op on well-formed data and
+    idempotent. Returns the (mutated) analysis dict.
+    """
+    if not isinstance(analysis, dict):
+        return {"floors": [], "project_info": {},
+                "manual_review_required": True,
+                "manual_review_reason": (
+                    f"Extraction returned a {type(analysis).__name__}, not a "
+                    "dict — flagged for manual review.")}
+
+    severe = []   # structurally-wrong (list/dict) high-impact values
+    soft = 0      # null/unparseable high-impact values
+
+    def _num_field(container, key, high_impact):
+        nonlocal soft
+        if key not in container:
+            return  # absent -> read sites already default via _num()
+        raw = container[key]
+        if isinstance(raw, (int, float)) and not isinstance(raw, bool):
+            return  # already a clean number — untouched (keeps no-op property)
+        if high_impact:
+            if isinstance(raw, (list, dict)):
+                severe.append(key)
+            elif raw is None or not _is_parseable_number(raw):
+                soft += 1
+        container[key] = _num(raw)
+
+    def _ensure_str(container, key):
+        if key in container and not isinstance(container[key], str):
+            container[key] = _coerce_str(container[key])
+
+    # --- project_info ---
+    pi = analysis.get("project_info")
+    if not isinstance(pi, dict):
+        pi = {}
+    for k in ("total_stories", "total_units", "footprint_sqft"):
+        _num_field(pi, k, high_impact=True)
+    _ensure_str(pi, "building_type")
+    analysis["project_info"] = pi
+
+    # --- floors -> rooms ---
+    if not isinstance(analysis.get("floors"), list):
+        analysis["floors"] = []
+    for floor in analysis["floors"]:
+        if not isinstance(floor, dict):
+            continue
+        _ensure_str(floor, "floor_name")
+        if not isinstance(floor.get("rooms"), list):
+            floor["rooms"] = []
+        for room in floor["rooms"]:
+            if not isinstance(room, dict):
+                continue
+            for sk in _ROOM_STR:
+                _ensure_str(room, sk)
+            _ensure_str(room, "notes")
+            if "in_scope" in room and not isinstance(room["in_scope"], bool):
+                room["in_scope"] = bool(room["in_scope"])
+            _num_field(room, "unit_multiplier", high_impact=False)
+            dims = room.get("dimensions")
+            if not isinstance(dims, dict):
+                dims = {}
+                room["dimensions"] = dims
+            for dk in _ROOM_DIM_NUM:
+                _num_field(dims, dk, high_impact=(dk in _HIGH_IMPACT_NUMERIC))
+            elems = room.get("elements")
+            if not isinstance(elems, dict):
+                room["elements"] = {}
+            else:
+                for ek in list(elems.keys()):
+                    _num_field(elems, ek, high_impact=False)
+            mats = room.get("materials")
+            if not isinstance(mats, dict):
+                room["materials"] = {}
+            else:
+                for mk in list(mats.keys()):
+                    _ensure_str(mats, mk)
+
+    # --- aggregated_totals (all numeric) ---
+    agg = analysis.get("aggregated_totals")
+    if isinstance(agg, dict):
+        for ak in list(agg.keys()):
+            _num_field(agg, ak, high_impact=(ak in _HIGH_IMPACT_NUMERIC))
+    elif agg is not None:
+        analysis["aggregated_totals"] = {}
+
+    # --- manual-review gate on high-impact corruption ---
+    if severe or soft:
+        total_rooms = sum(len(f.get("rooms", [])) for f in analysis["floors"]
+                          if isinstance(f, dict))
+        # Always review structurally-wrong values; for null/garbage only when
+        # the rate is non-trivial (a stray null is benign noise).
+        threshold = max(5, int(0.10 * total_rooms))
+        if severe or soft >= threshold:
+            analysis["manual_review_required"] = True
+            reason = (f"Normalization found malformed high-impact field(s) "
+                      f"(structurally-wrong={sorted(set(severe))}, "
+                      f"null/garbage={soft}) — likely a degraded extraction.")
+            prior = analysis.get("manual_review_reason")
+            analysis["manual_review_reason"] = (
+                f"{prior} | {reason}" if prior else reason)
+
+    return analysis
+
+
 # ---------------------------------------------------------------------------
 # Multi-pass extraction with per-room median merge
 # ---------------------------------------------------------------------------
@@ -11242,37 +11467,64 @@ def _merge_passes_with_median(pass_analyses, min_pass_presence=None):
     min_required = (int(min(nonzero_pass_counts) * keep_ratio)
                     if nonzero_pass_counts else 0)
     if kept_count < min_required:
-        # Pick the pass whose room count is the median of all passes —
-        # closest to the "central tendency" of what the LLM saw across
-        # runs. Ties broken by returning the first such pass.
+        # Selection rule (revised 2026-06-08): the old rule shipped the pass
+        # whose room count was closest to the median of ALL passes. That can
+        # pick a pass that DROPPED chunks and is therefore missing real scope.
+        # Aliante (Wingstop) hit exactly this: chunk 3 (A1.1 floor plan + A2.0
+        # RCP) failed in 2 of 3 passes, per-pass counts were [31, 12, 26], and
+        # the median rule shipped the 26-room pass (chunk 3 missing) while
+        # discarding the clean 31-room pass — undercounting walls ~34% and
+        # ceilings to near zero.
+        #
+        # Revised rule: FIRST restrict to the passes with the fewest dropped
+        # chunks (most complete coverage), THEN apply the median within that
+        # tier. The median step is still what guards against shipping a single
+        # wild-overshoot pass (the 2026-05-29 Ridgeview case this fallback was
+        # built for) — but we never prefer an incomplete pass over a complete
+        # one. Ties prefer the lower room count (conservative vs. overshoot).
         import statistics as _stats
+
+        def _pass_failed_chunks(a):
+            ct = a.get("_chunk_tracking") or {}
+            return len(ct.get("chunks_failed") or [])
+
+        failed_by_pass = [_pass_failed_chunks(a) for a in pass_analyses]
+        fewest_failed = min(failed_by_pass)
+        eligible = [i for i in range(N) if failed_by_pass[i] == fewest_failed]
         if nonzero_pass_counts:
-            target = _stats.median(per_pass_room_counts)
+            target = _stats.median([per_pass_room_counts[i] for i in eligible])
         else:
             target = 0
-        # closest-to-median pass
-        best_idx = min(range(N),
-                        key=lambda i: abs(per_pass_room_counts[i] - target))
+        # Closest-to-median among the most-complete passes; ties → fewer rooms.
+        best_idx = min(
+            eligible,
+            key=lambda i: (abs(per_pass_room_counts[i] - target),
+                           per_pass_room_counts[i]))
         chosen = _copy.deepcopy(pass_analyses[best_idx])
         note = (
-            f"[Multi-Pass Median: FALLBACK to median pass #{best_idx+1}] "
+            f"[Multi-Pass Median: FALLBACK to pass #{best_idx+1}] "
             f"Per-room merge kept only {kept_count} of "
             f"{sum(per_pass_room_counts)} candidate rooms across "
             f"N={N} passes (per-pass counts: {per_pass_room_counts}, "
+            f"dropped-chunks per pass: {failed_by_pass}, "
             f"min required to ship merged: {min_required}). Room-name / "
             f"floor-name / sheet variation across passes prevented matching. "
-            f"Shipping the pass whose room count is closest to the median "
-            f"({per_pass_room_counts[best_idx]} rooms) instead of the empty "
+            f"Shipping the most-complete pass (fewest dropped chunks = "
+            f"{fewest_failed}), median-of-tier on ties "
+            f"({per_pass_room_counts[best_idx]} rooms), instead of the empty "
             f"merge that would otherwise trigger the footprint fallback."
         )
         chosen.setdefault("notes", []).append(note)
         chosen["_extracted_with_median_of_passes"] = N
         chosen["_multi_pass_median_fallback"] = True
         chosen["_multi_pass_per_pass_room_counts"] = per_pass_room_counts
+        chosen["_multi_pass_per_pass_failed_chunks"] = failed_by_pass
         chosen["_multi_pass_chosen_pass_index"] = best_idx
         print(f"   ⚠️  Multi-pass merge kept {kept_count}/{sum(per_pass_room_counts)} rooms "
               f"(< {min_required} required) — falling back to pass {best_idx+1} "
-              f"({per_pass_room_counts[best_idx]} rooms, closest to median)")
+              f"({per_pass_room_counts[best_idx]} rooms; per-pass counts "
+              f"{per_pass_room_counts}, dropped-chunks {failed_by_pass}, "
+              f"chose fewest-dropped tier)")
         # Re-aggregate the chosen pass's totals before returning so the
         # caller gets a consistent analysis.
         _recalculate_totals(chosen)
@@ -11776,12 +12028,28 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     l5_rate     = _get_tiered_rate(pm['level_5_finish'], level_5_sqft)
     conc_rate   = _get_tiered_rate(pm['concrete_sealer'], concrete_sqft)
     col_rate    = _get_tiered_rate(pm['painted_columns'], columns_ea)
-    # Wallcovering rate: use prep rate ($0.50/SF) for bathroom heuristic, full install ($9/SF) otherwise
+    # Wallcovering rate & label:
+    #   - bathroom heuristic  → prep rate ($0.50/SF)
+    #   - scope = remove/strip → removal rate (NOT $9 install)
+    #   - otherwise            → full install ($9/SF)
     _wc_source = project_info.get('_wallcovering_source', '')
+    _wc_scope = str(project_info.get('_scope_notes', '')).lower()
+    _wc_is_removal = (
+        any(v in _wc_scope for v in ('remov', 'strip', 'tear off', 'tear-off', 'demo'))
+        and any(k in _wc_scope for k in ('wallpaper', 'wall paper', 'wallcovering', 'wall covering'))
+    )
     if _wc_source == 'bathroom_heuristic' and 'wallcovering_prep' in pm:
         wc_rate = _get_tiered_rate(pm['wallcovering_prep'], wallcovering_sqft)
+        wc_markup_key = 'wallcovering_prep'
+        wc_label = "Wallcovering Prep"
+    elif _wc_is_removal and 'wallpaper_removal' in pm:
+        wc_rate = _get_tiered_rate(pm['wallpaper_removal'], wallcovering_sqft)
+        wc_markup_key = 'wallpaper_removal'
+        wc_label = "Wallpaper Removal (Labor)"
     else:
         wc_rate = _get_tiered_rate(pm['wallcovering_install'], wallcovering_sqft) if 'wallcovering_install' in pm else 9.00
+        wc_markup_key = 'wallcovering_install'
+        wc_label = "Wallcovering Install (Labor)"
     sw_rate     = _get_tiered_rate(pm['stained_wood'], stained_wood_sqft) if 'stained_wood' in pm else 6.00
     soffit_rate = _get_tiered_rate(pm['interior_soffit'], soffit_sqft) if 'interior_soffit' in pm else 0.85
     corn_rate   = _get_tiered_rate(pm['exterior_cornice'], cornice_lf)
@@ -12130,8 +12398,8 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
               conc_rate, _get_markup('concrete_sealer')),
         _line(f"Painted Columns - {columns_ea:.0f} EA @ ${col_rate:.2f}", columns_ea,
               col_rate, _get_markup('painted_columns')),
-        _line(f"Wallcovering Install (Labor) - {wallcovering_sqft:,.0f} sqft @ ${wc_rate:.2f}", wallcovering_sqft,
-              wc_rate, _get_markup('wallcovering_install') if 'wallcovering_install' in pm else 0.04),
+        _line(f"{wc_label} - {wallcovering_sqft:,.0f} sqft @ ${wc_rate:.2f}", wallcovering_sqft,
+              wc_rate, _get_markup(wc_markup_key) if wc_markup_key in pm else 0.04),
         _line(f"Stained Wood Panels - {stained_wood_sqft:,.0f} sqft @ ${sw_rate:.2f}", stained_wood_sqft,
               sw_rate, _get_markup('stained_wood') if 'stained_wood' in pm else 0.04),
         _line(f"Interior Soffits - {soffit_sqft:,.0f} sqft @ ${soffit_rate:.2f}", soffit_sqft,
@@ -12366,8 +12634,11 @@ def _validate_cost_estimate(analysis, cost_estimate):
             warnings.append({
                 "severity": "high",
                 "item": "Wallcovering",
-                "message": "Finish schedule references wallcovering (WC-x) but 0 sqft extracted. "
-                           "Wallcovering is typically $9/sqft — verify rooms with WC finish types."
+                "message": "Scope/notes reference wallcovering or wallpaper but 0 sqft was extracted "
+                           "(no finish schedule or explicit WC label confirms which walls). Per hard-numbers "
+                           "policy the quantity was NOT estimated. Provide the room finish schedule (or confirm "
+                           "the wallpapered walls and whether the scope is removal, new install, or both) so the "
+                           "wallcovering line can be priced."
             })
 
     # 4c. Cornice validation for commercial buildings (EIFS/parapet misidentification)
@@ -13573,6 +13844,8 @@ def run_analysis_merge(prior_json, new_pdf_paths, scope_tags=None,
         print("\n🧮 Notes-only re-run — keeping prior takeoff totals "
               "(skipping re-extraction passes to avoid double-counting).")
 
+    merged_analysis = _normalize_analysis(merged_analysis)
+
     # 4. Cost.
     pricing_snapshot = prior_json.get("pricing_model") or PRICING_MODEL
     if new_pdf_paths:
@@ -13827,7 +14100,7 @@ def _merge_building_inventory(prior_inv, delta_inv):
     out["total_buildings"] = sum(int(b.get("count", 0) or 0)
                                   for b in p_buildings if isinstance(b, dict))
     out["total_units"] = sum(
-        int(b.get("count", 0) or 0) * int(b.get("units_per_building", 1) or 1)
+        int(_num(b.get("count", 0))) * int(_num(b.get("units_per_building", 1)))
         for b in p_buildings if isinstance(b, dict)
     )
 
@@ -13927,6 +14200,7 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
 
                 # Jump straight to cost calculation with cached analysis
                 analysis = cached_analysis
+                analysis = _normalize_analysis(analysis)
 
                 # Apply corrections to cached analysis (if any)
                 corrections = _load_corrections(corrections_path)
@@ -14751,6 +15025,10 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             )
             # Recalculate totals after floor removal
             analysis = _recalculate_totals(analysis)
+
+    # Normalize Claude's JSON to the expected schema before any consumer
+    # reads it (prevents off-type TypeErrors; flags degraded extractions).
+    analysis = _normalize_analysis(analysis)
 
     # Run extraction validation checks
     analysis = _validate_extraction(analysis, file_room_counts=file_room_counts,
