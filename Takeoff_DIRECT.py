@@ -14762,7 +14762,12 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             if n_passes >= 2:
                 extra_passes = n_passes - 1  # we already have pass 1 in `result`
                 pass_results = [result]
-                mode_label = "image mode" if used_image_fb else "vector mode"
+                if used_image_fb:
+                    mode_label = "image mode"
+                elif used_enhanced:
+                    mode_label = "enhanced (tiled) mode"
+                else:
+                    mode_label = "vector mode"
                 print(f"   🔄 Multi-pass median ({mode_label}): "
                       f"running passes 2..{n_passes} of {n_passes}")
                 for i in range(extra_passes):
@@ -14773,6 +14778,25 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                                 client, pdf_path, scope_notes=scope_notes,
                                 schedule_hints=image_schedule_data,
                                 building_inventory=building_inventory,
+                                project_overview=project_overview)
+                        elif used_enhanced:
+                            # Pass 1 only reached its room count via enhanced
+                            # (tiled large-format) extraction — native vector
+                            # returned ~0. Running the extra passes in plain
+                            # vector mode produces a sparse, incompatible result
+                            # set, so the per-room merge can't reconcile them and
+                            # the median fallback ships the sparse pass. Observed
+                            # 2026-06-08 on both Wingstop jobs: Eastern pass 1
+                            # enhanced=52 rooms, vector passes 2-3 = 11/12, merge
+                            # kept 0/75 → shipped 12; Aliante 31 vs 12/26 →
+                            # shipped 26. Keep every pass on pass 1's extraction
+                            # path so they're comparable and actually mergeable.
+                            extra = _analyze_with_enhanced_extraction(
+                                client, pdf_path,
+                                scope_notes=scope_notes,
+                                schedule_hints=image_schedule_data,
+                                building_inventory=building_inventory,
+                                page_indices=painting_page_indices,
                                 project_overview=project_overview)
                         else:
                             extra = analyze_and_parse(
