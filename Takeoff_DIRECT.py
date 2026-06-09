@@ -2217,6 +2217,10 @@ def _analyze_floor_plan_as_images(client, pdf_path, scope_notes="",
         image_batches.append(images[i:i + MAX_IMAGES_PER_CALL])
 
     all_batch_results = []
+    # Per-batch tracking so a dropped image batch is visible downstream
+    # (same rationale as the enhanced/tiled path's _chunk_tracking).
+    _img_total_batches = len(image_batches)
+    _img_ok_batches = []
 
     for batch_idx, batch_images in enumerate(image_batches):
         if len(image_batches) > 1:
@@ -2292,6 +2296,7 @@ def _analyze_floor_plan_as_images(client, pdf_path, scope_notes="",
                     'total_rooms_found', 0)
                 if rooms > 0:
                     all_batch_results.append(analysis)
+                    _img_ok_batches.append(batch_idx + 1)
                     print(f"   🖼️  Batch {batch_idx + 1}: extracted {rooms} rooms")
             except json.JSONDecodeError:
                 pass
@@ -2310,6 +2315,15 @@ def _analyze_floor_plan_as_images(client, pdf_path, scope_notes="",
     rooms = final.get('project_info', {}).get('total_rooms_found', 0)
     print(f"   🖼️  Image fallback extracted {rooms} rooms total")
     _attach_bbox_anchors(final, pdf_path)
+    _img_failed = [b for b in range(1, _img_total_batches + 1)
+                   if b not in _img_ok_batches]
+    final["_chunk_tracking"] = {
+        "mode": "image_fallback",
+        "total_chunks": _img_total_batches,
+        "chunks_succeeded": list(_img_ok_batches),
+        "chunks_failed": _img_failed,
+        "chunk_page_ranges": [],
+    }
     return (pdf_path, final)
 
 
@@ -2541,6 +2555,15 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
     del all_tiles
 
     all_analysis_results = []
+    # Tile-batch tracking — the enhanced (tiled) path is the large-format
+    # equivalent of the chunked-vector path's _chunk_tracking. Without it,
+    # large-format jobs (which route here precisely because native vector
+    # failed) ship chunk_tracking=null, which (a) blinds the >=50%-chunks-
+    # failed manual-review trigger and (b) makes the multi-pass fallback's
+    # "fewest dropped chunks" tiering meaningless. Record which batches yielded
+    # rooms so a dropped tile batch is visible downstream.
+    _enh_total_batches = len(tile_batches)
+    _enh_ok_batches = []
 
     for batch_idx, batch_tiles in enumerate(tile_batches):
         if len(tile_batches) > 1:
@@ -2723,6 +2746,7 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
 
         if rooms > 0 and analysis is not None:
             all_analysis_results.append(analysis)
+            _enh_ok_batches.append(batch_idx + 1)
 
         # Free this batch's tile data after sending (saves ~5-10MB per batch)
         tile_batches[batch_idx] = None
@@ -2744,6 +2768,16 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
     total_rooms = final_analysis.get('project_info', {}).get('total_rooms_found', 0)
     print(f"   🔬 Enhanced extraction found {total_rooms} rooms total")
     _attach_bbox_anchors(final_analysis, pdf_path)
+    # Synthetic chunk tracking for the tiled path (see init comment above).
+    _enh_failed = [b for b in range(1, _enh_total_batches + 1)
+                   if b not in _enh_ok_batches]
+    final_analysis["_chunk_tracking"] = {
+        "mode": "enhanced_tiled",
+        "total_chunks": _enh_total_batches,
+        "chunks_succeeded": list(_enh_ok_batches),
+        "chunks_failed": _enh_failed,
+        "chunk_page_ranges": [],
+    }
     return (pdf_path, final_analysis)
 
 
