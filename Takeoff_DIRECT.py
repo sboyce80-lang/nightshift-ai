@@ -15861,25 +15861,79 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         # floor plans for room dimensions." That's a clear "extraction
         # is incomplete, do NOT ship" signal we need to honor.
         if not _footprint or _footprint <= 0:
-            flag_msg = (
-                f"[MANUAL REVIEW REQUIRED] Building footprint could not "
-                f"be determined from the extracted rooms (extracted "
-                f"paintable surface: {_total_paintable:,.0f} sqft). For "
-                f"a commercial building this means the architectural "
-                f"floor plans either weren't included in the extraction "
-                f"or their dimensions couldn't be parsed. Every "
-                f"downstream area/cost estimate has no anchor to verify "
-                f"against. Do NOT send this proposal without a reviewer "
-                f"confirming what's missing — and consider whether the "
-                f"customer needs to resubmit a different drawing set."
-            )
-            analysis["manual_review_required"] = True
-            analysis["manual_review_reason"] = flag_msg
-            analysis.setdefault("notes", []).append(flag_msg)
-            print(f"\n🚨 PRE-FINALIZE SANITY CHECK FAILED — NO FOOTPRINT")
-            print(f"   Extracted paintable: {_total_paintable:,.0f} sqft")
-            print(f"   Footprint:           (missing — set to None/0)")
-            print(f"   ⚠️  Flagged for manual review.")
+            # Distinguish "footprint legitimately not derivable from the plans
+            # but we still extracted a substantial, dimensioned takeoff" from a
+            # genuinely thin/incomplete extraction. The latter MUST block
+            # (Urban Air: 16 rooms, $17k, notes self-reported "obtain A-series
+            # plans"); the former is better served by an RFI so a sound job
+            # isn't needlessly held. NIGHTSHIFT_FOOTPRINT_RFI=1 enables the soft
+            # path; default off preserves the current always-block behavior.
+            _soft_footprint = (
+                os.environ.get("NIGHTSHIFT_FOOTPRINT_RFI", "0") == "1")
+            _rooms_with_dims = sum(
+                1 for _f in (analysis.get("floors", []) or [])
+                for _r in (_f.get("rooms", []) or [])
+                if _r.get("in_scope", True)
+                and _num((_r.get("dimensions") or {}).get(
+                    "wall_area_sqft", 0)) > 0)
+            try:
+                _fp_min_rooms = int(os.environ.get(
+                    "NIGHTSHIFT_FOOTPRINT_RFI_MIN_ROOMS", "20"))
+            except (ValueError, TypeError):
+                _fp_min_rooms = 20
+            _notes_blob = " ".join(
+                str(n) for n in (analysis.get("notes", []) or [])).lower()
+            # The extractor's own "this is incomplete" admissions — if present,
+            # always block regardless of room count (honors the Urban Air signal).
+            _self_incomplete = any(kw in _notes_blob for kw in (
+                "incomplete", "obtain and review", "not included",
+                "next steps", "resubmit", "couldn't be parsed",
+                "could not be parsed"))
+            if (_soft_footprint and not _self_incomplete
+                    and _rooms_with_dims >= _fp_min_rooms
+                    and _total_paintable >= 10000):
+                rfi_text = (
+                    f"Building footprint could not be derived from the plans, "
+                    f"but a substantial dimensioned takeoff was extracted "
+                    f"({_rooms_with_dims} rooms with measured walls; "
+                    f"{_total_paintable:,.0f} sqft paintable). Confirm the gross "
+                    f"building footprint (or provide the A-series plan with a "
+                    f"dimensioned outline) so the takeoff can be cross-checked "
+                    f"against it.")
+                analysis.setdefault("_pre_pricing_rfis", []).append({
+                    "category": "Missing Information",
+                    "question": rfi_text,
+                    "action_required": (
+                        "Provide/confirm gross building footprint to validate "
+                        "the extracted takeoff."),
+                    "severity": "medium",
+                    "source": "footprint_unconfirmed_soft",
+                })
+                analysis.setdefault("notes", []).append(
+                    f"[Footprint Unconfirmed] {rfi_text}")
+                print(f"\n⚠️  No footprint, but {_rooms_with_dims} dimensioned "
+                      f"rooms / {_total_paintable:,.0f} sqft extracted — "
+                      f"surfaced as RFI instead of blocking.")
+            else:
+                flag_msg = (
+                    f"[MANUAL REVIEW REQUIRED] Building footprint could not "
+                    f"be determined from the extracted rooms (extracted "
+                    f"paintable surface: {_total_paintable:,.0f} sqft). For "
+                    f"a commercial building this means the architectural "
+                    f"floor plans either weren't included in the extraction "
+                    f"or their dimensions couldn't be parsed. Every "
+                    f"downstream area/cost estimate has no anchor to verify "
+                    f"against. Do NOT send this proposal without a reviewer "
+                    f"confirming what's missing — and consider whether the "
+                    f"customer needs to resubmit a different drawing set."
+                )
+                analysis["manual_review_required"] = True
+                analysis["manual_review_reason"] = flag_msg
+                analysis.setdefault("notes", []).append(flag_msg)
+                print(f"\n🚨 PRE-FINALIZE SANITY CHECK FAILED — NO FOOTPRINT")
+                print(f"   Extracted paintable: {_total_paintable:,.0f} sqft")
+                print(f"   Footprint:           (missing — set to None/0)")
+                print(f"   ⚠️  Flagged for manual review.")
 
         # Threshold: paintable_surface < footprint × 3 is structurally
         # implausible for a commercial building. A typical retail box:
