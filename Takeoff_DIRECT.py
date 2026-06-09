@@ -12744,6 +12744,11 @@ def _validate_cost_estimate(analysis, cost_estimate):
             warnings.append({
                 "severity": "medium",
                 "item": "CMU/Dryfall",
+                # Under hard-numbers policy a 0 here is the POLICY-CORRECT outcome
+                # when no spec confirms painted CMU / exposed-deck coating — it is
+                # surfaced as an RFI, not fabricated. Don't also dock confidence for
+                # behaving correctly (see scoring loop's policy_zero handling).
+                "policy_zero": bool(HARD_NUMBERS_ONLY),
                 "message": "Commercial building with no CMU walls or dryfall ceiling detected. "
                            "Verify specs for painted CMU or exposed ceiling coating."
             })
@@ -12784,6 +12789,13 @@ def _validate_cost_estimate(analysis, cost_estimate):
             warnings.append({
                 "severity": "high",
                 "item": "Wallcovering",
+                # Policy-driven zero: the hard-numbers policy deliberately did NOT
+                # estimate wallcovering without a finish schedule / WC label, and
+                # an RFI is already generated to obtain it. This is correct
+                # behavior, not a degraded extraction — keep it visible as a
+                # warning but don't deduct from confidence (it fires on nearly
+                # every commercial job and was pinning scores at 50-60).
+                "policy_zero": True,
                 "message": "Scope/notes reference wallcovering or wallpaper but 0 sqft was extracted "
                            "(no finish schedule or explicit WC label confirms which walls). Per hard-numbers "
                            "policy the quantity was NOT estimated. Provide the room finish schedule (or confirm "
@@ -12864,8 +12876,22 @@ def _validate_cost_estimate(analysis, cost_estimate):
             })
 
     # 6. Data quality score (0-100)
+    # Decouple POLICY-driven zeros from extraction QUALITY. A quantity that is 0
+    # because the hard-numbers policy correctly refused to fabricate it (and
+    # raised an RFI instead) should not also tank the confidence score — that
+    # double-counts the same gap (once as an RFI, once as a -20/-10) and was
+    # pinning commercial jobs at 50-60 even when the extraction was sound.
+    # Such warnings are tagged policy_zero and still shown to the user, but are
+    # excluded from the deduction. Genuine failures (zero walls/doors with no
+    # policy explanation) keep their full penalty. Set
+    # NIGHTSHIFT_CONFIDENCE_DECOUPLE=0 to restore the old behavior.
+    decouple = os.environ.get("NIGHTSHIFT_CONFIDENCE_DECOUPLE", "1") == "1"
     quality_score = 100
+    policy_excluded = 0
     for w in warnings:
+        if decouple and w.get("policy_zero"):
+            policy_excluded += 1
+            continue
         if w["severity"] == "high":
             quality_score -= 20
         elif w["severity"] == "medium":
@@ -12876,6 +12902,7 @@ def _validate_cost_estimate(analysis, cost_estimate):
         "warnings": warnings,
         "data_quality_score": quality_score,
         "warning_count": len(warnings),
+        "policy_excluded_warnings": policy_excluded,
     }
 
 
