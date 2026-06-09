@@ -762,9 +762,11 @@ def _detect_index_pages(pdf_path):
 
         is_index = any(kw in text_lower for kw in _INDEX_KEYWORDS)
 
-        # Also check for high density of sheet number patterns (A-101, A-102, etc.)
-        # which indicates a drawing index even without explicit "drawing index" title
-        sheet_refs = re.findall(r'[A-Z]{1,2}\s*[-.]?\s*\d{2,3}', text)
+        # Also check for high density of sheet number patterns (A-101, A1.02, etc.)
+        # which indicates a drawing index even without explicit "drawing index" title.
+        # Accept both the 3-digit convention (A101) and the dotted convention (A1.02);
+        # require the dot for short numbers so bare "A1" mentions aren't counted.
+        sheet_refs = re.findall(r'[A-Z]{1,2}\s*[-.]?\s*(?:\d{2,3}|\d{1,2}\.\d{1,2})', text)
         if len(sheet_refs) >= 10:
             is_index = True
 
@@ -11147,6 +11149,39 @@ def _num(val):
     return 0
 
 
+def _recover_area_fields(dims):
+    """Fill missing/zero high-impact area fields from a room's geometry instead
+    of letting a null coerce to a destructive 0.
+
+    A degraded vision pass can return e.g. wall_area_sqft=null while still
+    reporting length/width/height — coercing that null to 0 (the old behavior)
+    permanently undercounts the room. When the geometric inputs exist we
+    reconstruct the area; when they don't, the field stays 0 and the caller
+    counts it toward the degraded-extraction gate.
+
+    Only fills fields that are <=0 (null/absent/zero), so a legitimately
+    extracted positive value is never overwritten — keeps the no-op property
+    on well-formed data. Mutates `dims` in place; returns nothing.
+    """
+    L = _num(dims.get("length_feet"))
+    W = _num(dims.get("width_feet"))
+    H = _num(dims.get("ceiling_height_feet"))
+    P = _num(dims.get("perimeter_lf"))
+    if P <= 0 and L > 0 and W > 0:
+        P = 2 * (L + W)
+        dims["perimeter_lf"] = round(P)
+    floor_area = _num(dims.get("floor_area_sqft"))
+    if floor_area <= 0 and L > 0 and W > 0:
+        floor_area = L * W
+        dims["floor_area_sqft"] = round(floor_area)
+    if _num(dims.get("wall_area_sqft")) <= 0 and P > 0 and H > 0:
+        dims["wall_area_sqft"] = round(P * H)
+    # Ceiling area tracks floor area for a flat ceiling — the standard
+    # takeoff assumption already used elsewhere in the pipeline.
+    if _num(dims.get("ceiling_area_sqft")) <= 0 and floor_area > 0:
+        dims["ceiling_area_sqft"] = round(floor_area)
+
+
 # Numeric fields whose corruption materially changes the estimate. When one of
 # these arrives structurally-wrong (list/dict) or null/garbage, we don't just
 # coerce silently — we route the whole job to manual review so a degraded
@@ -11261,8 +11296,35 @@ def _normalize_analysis(analysis):
             if not isinstance(dims, dict):
                 dims = {}
                 room["dimensions"] = dims
+            # Track which high-impact area fields arrived null/unparseable so we
+            # count only the UNRECOVERABLE ones toward the degraded gate below
+            # (a null we can rebuild from geometry is not a degraded extraction).
+            _recoverable = ("wall_area_sqft", "floor_area_sqft",
+                            "ceiling_area_sqft", "perimeter_lf")
+            # null or garbage-string (but not list/dict, which are severe below)
+            _null_before = {
+                k for k in _recoverable
+                if k in dims and not _is_parseable_number(dims[k])
+                and not isinstance(dims[k], (list, dict))
+            }
+            # Structurally-wrong (list/dict) high-impact values are always severe.
+            for k in _recoverable:
+                if isinstance(dims.get(k), (list, dict)):
+                    severe.append(k)
+            # Coerce every dimension (incl. length/width, needed for recompute)
+            # to a number, then rebuild any missing area from geometry.
             for dk in _ROOM_DIM_NUM:
-                _num_field(dims, dk, high_impact=(dk in _HIGH_IMPACT_NUMERIC))
+                if dk in dims:
+                    dims[dk] = _num(dims[dk])
+            for _g in ("length_feet", "width_feet"):
+                if _g in dims:
+                    dims[_g] = _num(dims[_g])
+            _recover_area_fields(dims)
+            # Count toward the soft (degraded-extraction) gate only the
+            # high-impact area fields that were null AND stayed 0 after recovery.
+            for k in _null_before:
+                if k in _HIGH_IMPACT_NUMERIC and _num(dims.get(k)) <= 0:
+                    soft += 1
             elems = room.get("elements")
             if not isinstance(elems, dict):
                 room["elements"] = {}
@@ -15525,78 +15587,96 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     # details — these are reference material and don't contain room
     # measurements. If they're in the denominator the metric is unhittable
     # (a typical 17-sheet set has only 4-7 rooms-expected sheets).
-    _extracted_arch_sheets = set()
-    for _floor in analysis.get("floors", []) or []:
-        for _room in _floor.get("rooms", []) or []:
-            _sheet = re.sub(r'\s+', '', str(_room.get("source_sheet", "")).upper())
-            if re.match(r'^A[D]?\d', _sheet) or re.match(r'^A[D]?-\d', _sheet):
-                _extracted_arch_sheets.add(_sheet)
-
-    # Parse (sheet_id, title) pairs from the index_text. Architects render
-    # the index as a table; in text-layer extraction it often becomes:
-    #   "A-101 1st Floor Plan"
-    #   "A-101\n1st Floor Plan"
-    # or with various separators. Pair each A-xxx mention with the next ~80
-    # chars of context, then classify by keyword.
+    # Sheet-ID recognition uses the canonical _SHEET_NUMBER_RE + _normalize_sheet_token
+    # so dotted IDs ("A1.02", "A2.01a") and dashed/spaced variants all parse. The old
+    # `\d{2,3}` regex silently missed every dotted-convention sheet and instead matched
+    # ASTM spec callouts (A653, A615, A706…) and reference-symbol examples (1/A101) as
+    # if they were sheets — a phantom denominator that produced a false "low coverage /
+    # DO NOT SEND" alarm (observed on the Tesla Cybercab set: real sheets A1.02/A2.01/
+    # A3.01 compared against phantom {A653,A570,A611,…} → bogus 33% coverage).
+    #
+    # To stay robust we (a) title-anchor each ID — a real sheet has a plan/elevation/
+    # section/schedule/detail keyword next to it in the index; an ASTM spec does not;
+    # (b) intersect with sheets physically present in the upload (title-block scan);
+    # (c) treat any sheet that actually yielded rooms as both covered AND room-bearing,
+    # so numerator and denominator share an attribution basis and the alarm fires only
+    # when real plan sheets present in the set yielded nothing (true truncation).
+    _ARCH_PREFIXES = ("A", "AD")
     _ROOMS_EXPECTED_KW = (
         "floor plan", "foundation plan", "roof plan",
         "apartment plan", "ceiling plan", "rcp",
+        "enlarged floor", "enlarged plan",
     )
     _REFERENCE_ONLY_KW = (
-        "elevation", "section", "schedule", "detail",
+        "elevation", "section", "schedule", "detail", "cover", "index",
+        "general note", "site plan", "demolition", "abbreviation",
         "wall section", "stair section", "canopy", "key plan",
     )
+    _TITLE_KW = _ROOMS_EXPECTED_KW + _REFERENCE_ONLY_KW
 
-    def _classify_sheet_from_index(sheet_id, index_text):
-        """Return 'rooms_expected', 'reference_only', or 'ambiguous' based on
-        the title that appears near the sheet ID in the drawing index."""
-        sid_re = re.compile(re.escape(sheet_id), re.IGNORECASE)
-        for m in sid_re.finditer(index_text):
-            # Look at up to 80 chars AFTER the sheet ID (the title)
-            context = index_text[m.end():m.end() + 80].lower()
-            if any(kw in context for kw in _ROOMS_EXPECTED_KW):
-                return "rooms_expected"
-            if any(kw in context for kw in _REFERENCE_ONLY_KW):
-                return "reference_only"
-        return "ambiguous"
+    def _arch_sheet_id(raw):
+        """Normalize a string to an A/AD architectural sheet token
+        ('A1.02' -> 'A102'), or None if it isn't one. Drops bare fragments
+        like 'A2' (len < 3) that fall out of partial matches."""
+        m = _SHEET_NUMBER_RE.match(str(raw).strip())
+        if not m or m.group(1).upper() not in _ARCH_PREFIXES:
+            return None
+        norm = _normalize_sheet_token(m.group(1) + m.group(2))
+        return norm if len(norm) >= 3 else None
 
+    # Sheets physically present in the uploaded set (authoritative title-block scan).
+    _present_arch = {s for s in (analysis.get("_upload_sheet_numbers") or [])
+                     if s and s[0] == "A"}
+
+    # Sheets the extraction actually attributed rooms to.
+    _extracted_arch_sheets = set()
+    for _floor in analysis.get("floors", []) or []:
+        for _room in _floor.get("rooms", []) or []:
+            _sid = _arch_sheet_id(_room.get("source_sheet", ""))
+            if _sid:
+                _extracted_arch_sheets.add(_sid)
+
+    # Parse the drawing index: each real sheet ID sits next to its title. Titles run
+    # together in linearized index text, so classify room-bearing only when a room
+    # keyword precedes any reference keyword in the adjacent context window.
     _all_arch_sheets = set()
     _rooms_expected_sheets = set()
-    _full_index_text = ""
     for _info in _index_info_per_pdf:
         _txt = _info.get("index_text") or ""
-        _full_index_text += "\n" + _txt
-        for _m in re.finditer(r'\bA[D]?\s*-?\s*\d{2,3}[A-Z]?\b', _txt.upper()):
-            _all_arch_sheets.add(re.sub(r'\s+', '', _m.group()))
+        for _m in _SHEET_NUMBER_RE.finditer(_txt):
+            if _m.group(1).upper() not in _ARCH_PREFIXES:
+                continue
+            _norm = _normalize_sheet_token(_m.group(1) + _m.group(2))
+            if len(_norm) < 3:
+                continue
+            _ctx = _txt[_m.end():_m.end() + 40].lower()
+            if not any(kw in _ctx for kw in _TITLE_KW):
+                continue  # ASTM spec / random number / equipment tag — not a sheet
+            _all_arch_sheets.add(_norm)
+            _first_room = min([_ctx.find(kw) for kw in _ROOMS_EXPECTED_KW if kw in _ctx] or [10 ** 9])
+            _first_ref = min([_ctx.find(kw) for kw in _REFERENCE_ONLY_KW if kw in _ctx] or [10 ** 9])
+            if _first_room < _first_ref:
+                _rooms_expected_sheets.add(_norm)
 
-    for _sid in _all_arch_sheets:
-        if _classify_sheet_from_index(_sid, _full_index_text) == "rooms_expected":
-            _rooms_expected_sheets.add(_sid)
-
-    # Denominator: rooms-expected sheets only. If classification yielded
-    # nothing (very short index, no recognizable plan-type titles), fall back
-    # to the full set so we don't suppress legitimate alarms — but require a
-    # higher absolute miss count before flagging.
-    _denominator = _rooms_expected_sheets if _rooms_expected_sheets else _all_arch_sheets
-    _extracted_in_denom = _extracted_arch_sheets & _denominator if _rooms_expected_sheets else _extracted_arch_sheets
+    # Room-bearing sheets that genuinely exist in the upload, unioned with the sheets
+    # that produced rooms. Coverage < 60% now means "real plan sheets present in the
+    # set yielded nothing" — not "rooms were attributed to the occupant-load/FFE plan
+    # instead of the floor plan."
+    _rooms_present = (_rooms_expected_sheets & _present_arch) if _present_arch else _rooms_expected_sheets
+    _denominator = _rooms_present | _extracted_arch_sheets
+    _extracted_in_denom = _extracted_arch_sheets & _denominator
 
     if (len(_denominator) >= 4
             and _extracted_in_denom
             and len(_extracted_in_denom) / len(_denominator) < 0.60):
-        _coverage_pct = (len(_extracted_in_denom)
-                         / len(_denominator)) * 100
+        _coverage_pct = (len(_extracted_in_denom) / len(_denominator)) * 100
         _missed_sheets = sorted(_denominator - _extracted_in_denom)
-        _classification_note = (
-            "(rooms-expected sheets only; reference sheets like elevations / "
-            "sections / schedules / details excluded from denominator)"
-            if _rooms_expected_sheets else
-            "(could not classify sheets by type; denominator is all architectural sheets)"
-        )
         _flag_partial_extraction(
             f"Extracted rooms came from only {len(_extracted_in_denom)} of "
-            f"{len(_denominator)} architectural sheets that should contain rooms "
+            f"{len(_denominator)} architectural plan sheets present in the set "
             f"({_coverage_pct:.0f}% coverage; ≥60% expected). "
-            f"{_classification_note} "
+            f"(room-bearing sheets physically present in the upload; ASTM specs, "
+            f"reference-symbol callouts, and detail/schedule sheets excluded). "
             f"Missed sheets: {_missed_sheets[:8]}"
             f"{'...' if len(_missed_sheets) > 8 else ''}. "
             f"Extracted: {sorted(_extracted_in_denom)[:8]}."
