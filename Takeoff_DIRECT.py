@@ -11365,7 +11365,18 @@ def _merge_passes_with_median(pass_analyses, min_pass_presence=None):
     import math as _math
     N = len(pass_analyses)
     if min_pass_presence is None:
-        min_pass_presence = max(2, _math.ceil(N / 2))  # majority
+        # Default: a room must appear in a MAJORITY of passes to survive.
+        # That structurally discards real rooms that Claude's non-deterministic
+        # vision only happened to catch in one pass — biasing room counts low.
+        # NIGHTSHIFT_MERGE_UNION=1 keeps any room seen in >=1 pass (union),
+        # medianing its dimensions over only the passes that contributed it,
+        # so single-pass real rooms aren't dropped. Default off pending
+        # corpus A/B (it can also let a one-pass hallucination through, which
+        # the downstream footprint/area sanity checks are expected to catch).
+        if os.environ.get("NIGHTSHIFT_MERGE_UNION", "0") == "1":
+            min_pass_presence = 1
+        else:
+            min_pass_presence = max(2, _math.ceil(N / 2))  # majority
 
     # Index every room by (floor_name_norm, sheet, name_norm). The
     # floor_name is normalized the same way as room names (lowercase,
@@ -11491,15 +11502,58 @@ def _merge_passes_with_median(pass_analyses, min_pass_presence=None):
         failed_by_pass = [_pass_failed_chunks(a) for a in pass_analyses]
         fewest_failed = min(failed_by_pass)
         eligible = [i for i in range(N) if failed_by_pass[i] == fewest_failed]
-        if nonzero_pass_counts:
-            target = _stats.median([per_pass_room_counts[i] for i in eligible])
-        else:
-            target = 0
-        # Closest-to-median among the most-complete passes; ties → fewer rooms.
-        best_idx = min(
-            eligible,
-            key=lambda i: (abs(per_pass_room_counts[i] - target),
-                           per_pass_room_counts[i]))
+
+        # PREFER-COMPLETE rule (NIGHTSHIFT_MERGE_PREFER_COMPLETE=1, default off):
+        # within the fewest-dropped-chunks tier, ship the pass with the MOST
+        # rooms rather than the median. With Stage 1a making every pass use the
+        # same extraction mode, the [52,11,12] mode-divergence that produced
+        # under-counts is gone, so the dominant remaining failure is
+        # under-extraction, not over-extraction — prefer coverage. The
+        # Ridgeview overshoot the median rule guarded against is still blocked
+        # by a FOOTPRINT sanity cap: a pass whose footprint_sqft is an outlier
+        # (> overshoot_factor x the median footprint across eligible passes) is
+        # excluded, because that runaway footprint is exactly what fed the
+        # catastrophic footprint-fallback estimate ($335K / 113,400 SF on a
+        # 60,000 SF footprint emitted in only one of three passes). If every
+        # eligible pass is an outlier, we fall back to the median rule below.
+        prefer_complete = (
+            os.environ.get("NIGHTSHIFT_MERGE_PREFER_COMPLETE", "0") == "1")
+        best_idx = None
+        if prefer_complete and eligible:
+            try:
+                overshoot = float(os.environ.get(
+                    "NIGHTSHIFT_MERGE_OVERSHOOT_FACTOR", "1.5"))
+            except (ValueError, TypeError):
+                overshoot = 1.5
+            overshoot = max(1.0, overshoot)
+            elig_fps = [_num(pass_analyses[i].get("project_info", {})
+                             .get("footprint_sqft")) for i in eligible]
+            nz_fps = [x for x in elig_fps if x > 0]
+            med_fp = _stats.median(nz_fps) if nz_fps else 0
+
+            def _fp_sane(i):
+                fp = _num(pass_analyses[i].get("project_info", {})
+                          .get("footprint_sqft"))
+                # 0/absent footprint can't drive the footprint fallback blowup;
+                # treat as sane. Outlier-high footprint is the overshoot signal.
+                return not (med_fp > 0 and fp > overshoot * med_fp)
+
+            sane = [i for i in eligible if _fp_sane(i)] or eligible
+            # Most rooms among the sane, most-complete passes; ties → first.
+            best_idx = max(sane, key=lambda i: per_pass_room_counts[i])
+
+        if best_idx is None:
+            # Default median rule: closest-to-median among the most-complete
+            # passes; ties → fewer rooms (conservative vs. overshoot).
+            if nonzero_pass_counts:
+                target = _stats.median(
+                    [per_pass_room_counts[i] for i in eligible])
+            else:
+                target = 0
+            best_idx = min(
+                eligible,
+                key=lambda i: (abs(per_pass_room_counts[i] - target),
+                               per_pass_room_counts[i]))
         chosen = _copy.deepcopy(pass_analyses[best_idx])
         note = (
             f"[Multi-Pass Median: FALLBACK to pass #{best_idx+1}] "
