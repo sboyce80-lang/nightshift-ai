@@ -8771,8 +8771,10 @@ def _audit_room_provenance(analysis, project_overview=None):
                             ),
                         }))
 
-            # 2. Outlier wall area
-            wall_area = _num(room.get("wall_area_sqft", 0))
+            # 2. Outlier wall area. Wall area lives under room["dimensions"]
+            # (the top-level key never exists in the extraction schema — a
+            # prior version read it and the outlier checks below never fired).
+            wall_area = _num((room.get("dimensions") or {}).get("wall_area_sqft", 0))
             rname_l = (room.get("room_name") or "").lower()
             is_closet_or_small = any(
                 kw in rname_l for kw in
@@ -12143,15 +12145,25 @@ def _normalize_room_name_mp(name):
 
 
 def _median_num(values):
-    """Median of a list of numeric values. Skips Nones; returns 0 if empty."""
+    """Median of a list of numeric values. Skips Nones; returns 0 if empty.
+
+    Zero handling: a 0 from a pass usually means "field not extracted",
+    so a MINORITY of zeros is ignored (median of the nonzero values —
+    one pass missing a dimension shouldn't drag the merged value down).
+    But when zeros are the MAJORITY, the passes agree the value is 0 and
+    a single nonzero outlier must not win: the old behavior turned
+    [0, 0, 800] into 800, letting a one-pass hallucination through the
+    consensus merge. Majority-zero now returns 0.
+    """
     import statistics as _stats
     vals = [_num(v) for v in values if v is not None]
-    vals = [v for v in vals if v != 0] or [_num(v) for v in values
-                                            if v is not None]
     if not vals:
         return 0
+    nonzero = [v for v in vals if v != 0]
+    if len(nonzero) * 2 < len(vals):
+        return 0
     try:
-        return _stats.median(vals)
+        return _stats.median(nonzero or vals)
     except _stats.StatisticsError:
         return 0
 
@@ -14424,6 +14436,22 @@ def merge_versioned_analyses(prior_analysis, delta_analysis, scope_tags=None):
     additive_only = (_SCOPE_TAG_NONE in norm_tags) or (not norm_tags)
 
     merged = _copy.deepcopy(prior_analysis)
+
+    # Clear idempotency flags persisted from the prior run's stored JSON.
+    # The merged analysis contains NEW rooms/floors that have never been
+    # through the dedup / canonicalization / safety-net passes; a stale
+    # True flag makes every one of them silently no-op on the re-run
+    # (v2 quotes double-counting entire floors was the observed failure).
+    for _stale_flag in (
+        "_template_floors_deduped",
+        "_cross_sheet_rooms_deduped",
+        "_residential_corridor_ceiling_fixed",
+        "_source_sheets_canonicalized",
+        "_residential_ceiling_floor_applied",
+    ):
+        merged.pop(_stale_flag, None)
+    if isinstance(merged.get("project_info"), dict):
+        merged["project_info"].pop("_unit_multipliers_validated", None)
 
     # ── Floors ────────────────────────────────────────────────────────────
     prior_floors = merged.get("floors", []) or []
