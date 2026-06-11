@@ -44,6 +44,20 @@ _MULTIMODAL_DENSE_PAGES_ENABLED = (
 )
 
 
+class TruncatedResponseError(Exception):
+    """The model's response hit max_tokens and was cut off mid-output.
+
+    Before this existed, truncated chunk responses were recorded as
+    "succeeded" and silently died at JSON-parse time inside the merge —
+    an entire chunk's floors vanished with no log, no chunks_failed entry,
+    and no manual-review flag. Raised by the streaming call sites when
+    stop_reason == "max_tokens" so the chunk-failure ladder can route the
+    chunk to page-level retry (single pages produce small responses that
+    cannot truncate). Resending the identical chunk is pointless at
+    temperature 0 — it truncates again.
+    """
+
+
 def _release_memory(label=""):
     """Force the Python heap and the C allocator to return freed memory to
     the OS at a phase boundary.
@@ -380,7 +394,8 @@ def _split_pdf_from_plan(pdf_path, chunk_plan):
     return results
 
 
-def _retry_chunk_without_bad_pages(chunk_path, call_api_fn, chunk_label=""):
+def _retry_chunk_without_bad_pages(chunk_path, call_api_fn, chunk_label="",
+                                   dropped_pages_out=None):
     """
     When a multi-page chunk fails with 'Could not process PDF', test each
     page individually, discard bad pages, reassemble the good ones, and retry.
@@ -389,10 +404,21 @@ def _retry_chunk_without_bad_pages(chunk_path, call_api_fn, chunk_label=""):
         chunk_path:   Path to the chunk PDF that failed.
         call_api_fn:  Callable(base64_str, label="") -> response_text.
         chunk_label:  Human-readable label for logging.
+        dropped_pages_out: optional list; 1-based (chunk-relative) page
+                      numbers that were permanently removed are appended so
+                      the caller can record them in _chunk_tracking instead
+                      of the drop existing only in console output.
 
     Returns:
         str or None — API response text from the cleaned chunk,
                       or None if no good pages remain.
+
+    Error taxonomy (the old behavior marked a page bad on ANY exception —
+    a 2-second network blip during the probe permanently deleted a page
+    from the takeoff): only BadRequestError means the page content itself
+    is unprocessable. Every other exception is about the connection or the
+    response, not the page — the page is KEPT (untested) and the
+    reassembled-chunk call exercises it again with its own retry logic.
     """
     try:
         reader = PyPDF2.PdfReader(chunk_path)
@@ -403,6 +429,8 @@ def _retry_chunk_without_bad_pages(chunk_path, call_api_fn, chunk_label=""):
     total_pages = len(reader.pages)
     if total_pages <= 1:
         print(f"   ⚠️  Single-page chunk failed — skipping this page")
+        if dropped_pages_out is not None and total_pages == 1:
+            dropped_pages_out.append(1)
         return None
 
     print(f"   🔍 {chunk_label}: Testing {total_pages} pages individually ...")
@@ -433,14 +461,17 @@ def _retry_chunk_without_bad_pages(chunk_path, call_api_fn, chunk_label=""):
             print(f"      Page {i+1}: ✅")
 
         except anthropic.BadRequestError:
+            # The API rejected the page content itself — genuinely bad.
             bad_page_nums.append(i + 1)
             print(f"      Page {i+1}: ❌ skipped (unreadable)")
 
         except Exception as e:
-            # Non-PDF error (rate limit, network, overloaded) — skip page
-            # rather than crashing entire file analysis
-            bad_page_nums.append(i + 1)
-            print(f"      Page {i+1}: ⚠️  skipped ({type(e).__name__}: {str(e)[:80]})")
+            # Transient/connection/truncation error — NOT evidence the page
+            # is bad. Keep it; the reassembled chunk call retries transients
+            # internally. (Old behavior dropped the page here permanently.)
+            good_pages.append((i, reader.pages[i]))
+            print(f"      Page {i+1}: ⚠️  probe inconclusive, keeping page "
+                  f"({type(e).__name__}: {str(e)[:80]})")
 
         finally:
             if single_path:
@@ -451,6 +482,8 @@ def _retry_chunk_without_bad_pages(chunk_path, call_api_fn, chunk_label=""):
 
     if bad_page_nums:
         print(f"   🗑️  Removed bad pages: {bad_page_nums}")
+        if dropped_pages_out is not None:
+            dropped_pages_out.extend(bad_page_nums)
 
     if not good_pages:
         print(f"   ⚠️  No usable pages remain in {chunk_label}")
@@ -475,11 +508,16 @@ def _retry_chunk_without_bad_pages(chunk_path, call_api_fn, chunk_label=""):
         result = call_api_fn(clean_b64, label=f"Retrying cleaned {chunk_label} ({len(clean_b64)/1024:.0f} KB)")
         return result
 
-    except anthropic.BadRequestError as e:
+    except (anthropic.BadRequestError, TruncatedResponseError) as e:
+        # BadRequest: cleaned chunk still unprocessable as a whole.
+        # Truncated: combined output overflows max_tokens (the reason the
+        # chunk was routed here in the first place) — per-page responses
+        # are individually small and cannot truncate.
         print(f"   ⚠️  Cleaned chunk still fails — {e}")
         # Last resort: send each page individually and combine results
         print(f"   🔄 Falling back to single-page processing for {chunk_label}")
         page_results = []
+        recovered_page_nums = []
         for i, (page_idx, page_obj) in enumerate(good_pages):
             single_writer = PyPDF2.PdfWriter()
             single_writer.add_page(page_obj)
@@ -493,8 +531,11 @@ def _retry_chunk_without_bad_pages(chunk_path, call_api_fn, chunk_label=""):
                 result = call_api_fn(single_b64,
                     label=f"  Page {page_idx+1} individually ({len(single_b64)/1024:.0f} KB)")
                 page_results.append(result)
+                recovered_page_nums.append(page_idx + 1)
             except Exception as page_err:
                 print(f"      Page {page_idx+1}: ❌ {page_err}")
+                if dropped_pages_out is not None:
+                    dropped_pages_out.append(page_idx + 1)
             finally:
                 if single_tmp:
                     try:
@@ -503,7 +544,14 @@ def _retry_chunk_without_bad_pages(chunk_path, call_api_fn, chunk_label=""):
                         pass
         if page_results:
             print(f"   ✅ Recovered {len(page_results)}/{len(good_pages)} pages individually")
-            return "\n".join(page_results)
+            if len(page_results) == 1:
+                return page_results[0]
+            # Merge into ONE valid JSON document. The old "\n".join produced
+            # concatenated JSON objects that the downstream regex+json.loads
+            # could never parse — the whole recovered chunk then silently
+            # dropped at merge time, defeating this entire fallback.
+            return _merge_chunk_responses(page_results,
+                                          page_offsets=recovered_page_nums)
         return None
 
     finally:
@@ -3610,7 +3658,8 @@ def _merge_batch_results(all_results):
     return final
 
 
-def _merge_chunk_responses(texts, page_offsets=None):
+def _merge_chunk_responses(texts, page_offsets=None, chunk_indices=None,
+                           parse_failures=None):
     """
     Merge multiple JSON response texts (from chunked PDF processing) into
     a single combined JSON string.  Each chunk may contain partial floor/room
@@ -3622,27 +3671,53 @@ def _merge_chunk_responses(texts, page_offsets=None):
     with more rooms/data (usually from the actual floor plan sheet rather than
     a demolition or code compliance sheet).
 
-    page_offsets: optional list of 1-based page offsets for each chunk,
-                  used to fix source_page values (which Claude reports relative
+    page_offsets: optional list of 1-based page offsets, indexed by chunk
+                  NUMBER (page_offsets[k] is the offset of chunk k+1), used
+                  to fix source_page values (which Claude reports relative
                   to each chunk rather than the original PDF).
+    chunk_indices: optional list parallel to `texts` giving each text's
+                  1-based chunk number. Without it, offsets used to be
+                  applied POSITIONALLY over the successfully parsed texts —
+                  so one failed/unparseable chunk shifted every later
+                  chunk's rooms onto the wrong source pages, corrupting the
+                  very coverage checks meant to detect the failure.
+    parse_failures: optional list; chunk numbers whose text could not be
+                  parsed as JSON are appended (previously a silent `pass` —
+                  the chunk's rooms vanished and the chunk stayed recorded
+                  as "succeeded").
     """
-    parsed = []
-    for t in texts:
+    parsed = []             # successfully parsed chunk dicts
+    parsed_chunk_nums = []  # parallel: 1-based chunk number per parsed dict
+    for pos, t in enumerate(texts):
+        if chunk_indices and pos < len(chunk_indices):
+            chunk_num = chunk_indices[pos]
+        else:
+            chunk_num = pos + 1
         m = re.search(r'\{.*\}', t, re.DOTALL)
         if m:
             try:
                 parsed.append(json.loads(m.group()))
+                parsed_chunk_nums.append(chunk_num)
+                continue
             except json.JSONDecodeError:
                 pass
+        print(f"   ⚠️  Chunk {chunk_num}: response could not be parsed as JSON "
+              f"({len(t)} chars) — its rooms are NOT in the merged result")
+        if parse_failures is not None:
+            parse_failures.append(chunk_num)
 
     if not parsed:
         return texts[0]  # nothing could be parsed — return first raw text
 
     # Apply page offsets to source_page values (Claude reports page numbers
-    # relative to each chunk; we need them relative to the original PDF)
-    if page_offsets and len(page_offsets) >= len(parsed):
-        for chunk_idx, chunk_data in enumerate(parsed):
-            offset = page_offsets[chunk_idx] - 1  # convert to 0-based addition
+    # relative to each chunk; we need them relative to the original PDF).
+    # Indexed by true chunk number so a failed earlier chunk cannot shift
+    # later chunks onto the wrong pages.
+    if page_offsets:
+        for chunk_num, chunk_data in zip(parsed_chunk_nums, parsed):
+            if not (1 <= chunk_num <= len(page_offsets)):
+                continue
+            offset = page_offsets[chunk_num - 1] - 1  # convert to 0-based addition
             if offset > 0:
                 for floor in chunk_data.get("floors", []):
                     for room in floor.get("rooms", []):
@@ -4726,6 +4801,20 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
                 ) as stream:
                     for text in stream.text_stream:
                         result_parts.append(text)
+                    final_msg = stream.get_final_message()
+                # Truncation detection: a response that hit max_tokens cut
+                # off mid-JSON. Before this check, truncated chunks were
+                # recorded as "succeeded" and their rooms silently vanished
+                # at parse time — the single biggest source of run-to-run
+                # room-count variance (53 rooms vs 15 on identical plans).
+                # Raise so the caller's chunk-failure ladder retries/records
+                # it instead of shipping a partial extraction.
+                if getattr(final_msg, "stop_reason", None) == "max_tokens":
+                    raise TruncatedResponseError(
+                        f"Response truncated at max_tokens"
+                        f"{' (' + label + ')' if label else ''} — "
+                        f"{len(''.join(result_parts))} chars received"
+                    )
                 return "".join(result_parts)
             except anthropic.RateLimitError:
                 if attempt < max_retries - 1:
@@ -4756,6 +4845,10 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
     try:
         # --- Primary call with the first (or only) chunk ---
         result_text = None
+        # Chunk-relative page numbers permanently removed by page-level
+        # retries, keyed by chunk number. Persisted into _chunk_tracking so
+        # a dropped page exists somewhere other than the console log.
+        pages_dropped_by_chunk = {}
         try:
             result_text = _call_api(pdf_data)
         except anthropic.BadRequestError as e:
@@ -4796,7 +4889,8 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
                         tmp.write(raw_bytes)
                         first_tmp = tmp.name
                     result_text = _retry_chunk_without_bad_pages(
-                        first_tmp, _call_api, chunk_label="chunk 1"
+                        first_tmp, _call_api, chunk_label="chunk 1",
+                        dropped_pages_out=pages_dropped_by_chunk.setdefault(1, [])
                     )
                 finally:
                     if first_tmp:
@@ -4970,7 +5064,8 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
                     elif "Could not process" in err_str or "500" in err_str:
                         print(f"   ⚠️  Chunk {idx}/{total_chunks} failed ({err_str[:120]}) — attempting page-level retry")
                         retry_result = _retry_chunk_without_bad_pages(
-                            chunk_path, _call_api, chunk_label=f"chunk {idx}/{total_chunks}"
+                            chunk_path, _call_api, chunk_label=f"chunk {idx}/{total_chunks}",
+                            dropped_pages_out=pages_dropped_by_chunk.setdefault(idx, [])
                         )
                         if retry_result:
                             all_texts.append(retry_result)
@@ -4980,6 +5075,23 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
                             chunks_failed.append(idx)
                     else:
                         print(f"   ⚠️  Chunk {idx}/{total_chunks} failed: {e}")
+                        chunks_failed.append(idx)
+                except TruncatedResponseError as chunk_err:
+                    # Response overflowed max_tokens — resending the same
+                    # chunk truncates again (temperature 0). Page-level
+                    # retry sends each page alone: small responses, no
+                    # truncation possible.
+                    print(f"   ✂️  Chunk {idx}/{total_chunks} truncated at max_tokens — "
+                          f"retrying page-by-page ({chunk_err})")
+                    retry_result = _retry_chunk_without_bad_pages(
+                        chunk_path, _call_api, chunk_label=f"chunk {idx}/{total_chunks}",
+                        dropped_pages_out=pages_dropped_by_chunk.setdefault(idx, [])
+                    )
+                    if retry_result:
+                        all_texts.append(retry_result)
+                        chunks_succeeded.append(idx)
+                    else:
+                        print(f"   ⚠️  Chunk {idx}/{total_chunks} — page-level retry after truncation recovered nothing")
                         chunks_failed.append(idx)
                 except anthropic.InternalServerError as chunk_err:
                     # Overloaded or 500 after all retries exhausted — try one
@@ -5019,7 +5131,22 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
 
             # Merge all successful chunk responses (with page offsets for source tracking)
             if len(all_texts) > 1:
-                result_text = _merge_chunk_responses(all_texts, page_offsets=_chunk_page_offsets)
+                _parse_failed_chunks = []
+                result_text = _merge_chunk_responses(
+                    all_texts,
+                    page_offsets=_chunk_page_offsets,
+                    chunk_indices=chunks_succeeded,
+                    parse_failures=_parse_failed_chunks,
+                )
+                # A chunk whose response failed to parse contributed zero
+                # rooms — it FAILED, whatever the API status said. Reconcile
+                # the ledgers so downstream warnings/triggers see the loss.
+                if _parse_failed_chunks:
+                    chunks_succeeded = [c for c in chunks_succeeded
+                                        if c not in _parse_failed_chunks]
+                    chunks_failed = sorted(set(chunks_failed) | set(_parse_failed_chunks))
+                    print(f"   ⚠️  {len(_parse_failed_chunks)} chunk(s) reclassified "
+                          f"as FAILED (unparseable response): {_parse_failed_chunks}")
             elif len(all_texts) == 1:
                 result_text = all_texts[0]
             else:
@@ -5036,6 +5163,7 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
                     "chunks_succeeded": chunks_succeeded,
                     "chunks_failed": chunks_failed,
                     "chunk_page_ranges": list(_chunk_plan_ranges),
+                    "pages_dropped": {k: v for k, v in pages_dropped_by_chunk.items() if v},
                 }
                 result_text = json.dumps(merged_data)
             except (json.JSONDecodeError, AttributeError) as _parse_err:
