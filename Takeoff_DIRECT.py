@@ -12804,19 +12804,28 @@ def _apply_rate_overrides(rate_overrides):
             new_rate = float(val)
             for tier in pm[pm_key]["tiers"]:
                 tier["rate"] = new_rate
+            # Record explicit org overrides so calculate_costs' building-type
+            # rate defaults don't silently clobber a negotiated rate.
+            pm[pm_key]["_rate_overridden"] = True
 
     # Per-item markup overrides (markup_gyp_walls, markup_exterior_cornice, etc.)
+    _markup_overridden = set()
     for key, val in rate_overrides.items():
         if key.startswith("markup_"):
             pm_key = key[len("markup_"):]
             if pm_key in pm:
                 pm[pm_key]["markup"] = float(val)
+                pm[pm_key]["_markup_overridden"] = True
+                _markup_overridden.add(pm_key)
 
     # Global markup override (applies to all items not already overridden above)
     if "markup" in rate_overrides:
         new_markup = float(rate_overrides["markup"])
         for item_key in pm:
+            if item_key in _markup_overridden:
+                continue  # per-item override wins over the global one
             pm[item_key]["markup"] = new_markup
+            pm[item_key]["_markup_overridden"] = True
 
     return pm
 
@@ -12830,13 +12839,19 @@ def _get_tiered_rate(item_config, quantity):
                     {"min_qty": 3500, "max_qty": None, "rate": 0.80}]}
     """
     tiers = item_config.get("tiers", [])
-    for tier in tiers:
-        max_qty = tier.get("max_qty")
-        if tier["min_qty"] <= quantity and (max_qty is None or quantity <= max_qty):
+    # Half-open ranges: a tier matches when min_qty <= q < next tier's
+    # min_qty. The old inclusive-integer bounds (max_qty 3499 / min_qty
+    # 3500) left a gap for fractional quantities — 3,499.5 sqft matched
+    # NO tier and fell through to the last (cheapest, volume) tier.
+    sorted_tiers = sorted(tiers, key=lambda t: t.get("min_qty", 0))
+    for i, tier in enumerate(sorted_tiers):
+        next_min = (sorted_tiers[i + 1].get("min_qty")
+                    if i + 1 < len(sorted_tiers) else None)
+        if tier.get("min_qty", 0) <= quantity and (next_min is None or quantity < next_min):
             return tier["rate"]
-    # Fallback: use last tier if quantity exceeds all ranges
-    if tiers:
-        return tiers[-1]["rate"]
+    # Fallback: below all tiers (negative qty / malformed config) — first tier
+    if sorted_tiers:
+        return sorted_tiers[0]["rate"]
     return 0
 
 
@@ -12987,10 +13002,23 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
         markup_override = None  # None = use per-item default (6%)
 
     def _get_markup(item_key):
-        """Return markup for an item — override for single-family, else use config default."""
+        """Return markup for an item.
+
+        Precedence: explicit org override (set via _apply_rate_overrides,
+        marked _markup_overridden) > building-type default > config default.
+        The building-type default used to win unconditionally, silently
+        discarding negotiated org markups on most jobs.
+        """
+        if pm.get(item_key, {}).get("_markup_overridden"):
+            return pm[item_key]['markup']
         if markup_override is not None:
             return markup_override
         return pm[item_key]['markup']
+
+    def _rate_locked(item_key):
+        """True when the org explicitly overrode this item's rate — the
+        building-type hardcoded defaults below must not clobber it."""
+        return bool(pm.get(item_key, {}).get("_rate_overridden"))
 
     def _line(label, qty, unit_cost, markup_pct):
         cost = qty * unit_cost
@@ -13254,11 +13282,16 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     # Single-family rate overrides: force small-project rates regardless of quantity
     # (A single-family home with 7,000+ sqft walls is still a single-family job)
     if is_single_family:
-        wall_rate = 1.25   # Rider single-family rate
-        ceil_rate = 1.25   # Rider single-family rate
-        trim_rate = 3.25   # Rider single-family rate
-        door_fp_rate = 225.00  # Rider single-family rate
-        win_rate = 120.00  # Rider single-family: pre-primed trim only
+        if not _rate_locked('gyp_walls'):
+            wall_rate = 1.25   # Rider single-family rate
+        if not _rate_locked('gyp_ceilings'):
+            ceil_rate = 1.25   # Rider single-family rate
+        if not _rate_locked('base_trim'):
+            trim_rate = 3.25   # Rider single-family rate
+        if not _rate_locked('doors_full_paint'):
+            door_fp_rate = 225.00  # Rider single-family rate
+        if not _rate_locked('windows'):
+            win_rate = 120.00  # Rider single-family: pre-primed trim only
 
     # Commercial rate overrides: split by building size
     if is_commercial:
@@ -13267,10 +13300,14 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
 
         if is_large_commercial:
             # Large retail/warehouse rates (calibrated from Camping World, Kingston NY)
-            wall_rate = 0.85   # Large open spaces, lower labor density
-            ceil_rate = 0.85
-            door_fp_rate = 155.00  # Commercial HM door+frame rate (Rider Mazda)
-            door_hm_rate = 110.00  # HM panel only stays at config rate
+            if not _rate_locked('gyp_walls'):
+                wall_rate = 0.85   # Large open spaces, lower labor density
+            if not _rate_locked('gyp_ceilings'):
+                ceil_rate = 0.85
+            if not _rate_locked('doors_full_paint'):
+                door_fp_rate = 155.00  # Commercial HM door+frame rate (Rider Mazda)
+            if not _rate_locked('doors_hm_panel'):
+                door_hm_rate = 110.00  # HM panel only stays at config rate
 
             # Wall area cap: large open commercial spaces have non-paintable perimeter
             # (glass storefronts, metal panels, overhead doors).
@@ -13284,10 +13321,14 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
                     wall_sqft = max_wall_sqft
         else:
             # Small commercial / renovation rates (from config.py SMALL_COMMERCIAL_RATES)
-            wall_rate = SMALL_COMMERCIAL_RATES["wall_rate"]
-            ceil_rate = SMALL_COMMERCIAL_RATES["ceil_rate"]
-            door_fp_rate = SMALL_COMMERCIAL_RATES["door_fp_rate"]
-            door_hm_rate = SMALL_COMMERCIAL_RATES["door_hm_rate"]
+            if not _rate_locked('gyp_walls'):
+                wall_rate = SMALL_COMMERCIAL_RATES["wall_rate"]
+            if not _rate_locked('gyp_ceilings'):
+                ceil_rate = SMALL_COMMERCIAL_RATES["ceil_rate"]
+            if not _rate_locked('doors_full_paint'):
+                door_fp_rate = SMALL_COMMERCIAL_RATES["door_fp_rate"]
+            if not _rate_locked('doors_hm_panel'):
+                door_hm_rate = SMALL_COMMERCIAL_RATES["door_hm_rate"]
 
     # Non-apartment residential rate overrides (senior living, care facilities, expansions)
     # These buildings lack the spray-application efficiency of repetitive apartment units.
@@ -13295,9 +13336,12 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     # Windows are typically factory-finished (vinyl/aluminum) → trim paint only at $120/EA.
     # Calibrated from Edgehill IL Expansion vs Rider Estimate #3241: Rider effective rate ~$1.27/SF.
     if is_non_apartment_residential:
-        wall_rate = 1.05   # Higher labor density than apartments, spray efficiency is lower
-        ceil_rate = 1.05
-        win_rate = 120.00  # Factory-finished windows: trim paint only (not full interior paint)
+        if not _rate_locked('gyp_walls'):
+            wall_rate = 1.05   # Higher labor density than apartments, spray efficiency is lower
+        if not _rate_locked('gyp_ceilings'):
+            ceil_rate = 1.05
+        if not _rate_locked('windows'):
+            win_rate = 120.00  # Factory-finished windows: trim paint only (not full interior paint)
 
     # --- PCA Section 5D: Multi-story productivity adjustment ---
     # Productivity diminishes 1-2% per floor above 4th due to material handling,
