@@ -94,6 +94,50 @@ def update_status(submission_id, status, error=None, subtotal=None):
                        submission_id, status, exc, exc_info=True)
 
 
+def claim_email_send(submission_id):
+    """Atomically claim the right to send this submission's outbound email.
+
+    Returns True exactly once per submission (UPDATE ... WHERE emailed_at
+    IS NULL). A re-run of the job (warm-shutdown requeue, retry after a
+    crash) loses the claim and must not send — multi-pass extraction is
+    non-deterministic, so a duplicate estimate email can carry DIFFERENT
+    numbers, the worst possible trust outcome.
+
+    Fails open (True) if the column/DB is unavailable so a transient DB
+    error can't silently suppress every customer email.
+    """
+    try:
+        with session_scope() as session:
+            stmt = (
+                Submission.__table__.update()
+                .where(Submission.id == submission_id)
+                .where(Submission.emailed_at.is_(None))
+                .values(emailed_at=datetime.now(timezone.utc))
+            )
+            result = session.execute(stmt)
+            return result.rowcount == 1
+    except Exception as exc:
+        logger.warning("claim_email_send failed for %s (%s) — failing open",
+                       submission_id, exc)
+        return True
+
+
+def release_email_claim(submission_id):
+    """Release the email claim after a FAILED send so a retry/manual
+    resend can still deliver the estimate."""
+    try:
+        with session_scope() as session:
+            stmt = (
+                Submission.__table__.update()
+                .where(Submission.id == submission_id)
+                .values(emailed_at=None)
+            )
+            session.execute(stmt)
+    except Exception as exc:
+        logger.warning("release_email_claim failed for %s: %s",
+                       submission_id, exc)
+
+
 # Submissions older than this still in queued/processing on worker startup
 # are treated as abandoned. 4h leaves a wide margin past the longest
 # realistic DD-scale takeoff (~1.5h) so live jobs are never false-positived.
@@ -503,18 +547,28 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
                     submission_id,
                     result.get("manual_review_reason") or "(none provided)",
                 )
-                try:
-                    send_manual_review_email(
-                        contact_info, result, submission_id)
-                except Exception as exc:
-                    logger.error(
-                        "Failed to send manual-review email for %s: %s",
-                        submission_id, exc)
+                # Persist state BEFORE sending email: a crash/requeue in
+                # the old order (email -> status) re-ran the job and sent
+                # a duplicate notification.
+                update_status(submission_id, "needs_review", subtotal=subtotal)
+                if claim_email_send(submission_id):
+                    try:
+                        send_manual_review_email(
+                            contact_info, result, submission_id)
+                    except Exception as exc:
+                        release_email_claim(submission_id)
+                        logger.error(
+                            "Failed to send manual-review email for %s: %s",
+                            submission_id, exc)
+                else:
+                    logger.info(
+                        "Submission %s: email already claimed by a prior "
+                        "run — skipping duplicate manual-review email",
+                        submission_id)
                 # Admin still receives the raw JSON archive so they can
                 # eyeball the result and decide whether to ship a
                 # corrected version or kick back to the customer.
                 send_result_json_to_admin(contact_info, result, submission_id)
-                update_status(submission_id, "needs_review", subtotal=subtotal)
                 logger.info(
                     "Submission %s marked needs_review — subtotal $%s "
                     "(NOT auto-sent)",
@@ -523,20 +577,46 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
                         "subtotal": subtotal,
                         "needs_review": True}
 
-            # Confidence checks passed — ship the customer email.
-            send_result_email(
-                contact_info, result,
-                extra_attachment_paths=annotated_pdf_paths,
-                estimate_pdf_path=estimate_pdf_path,
-            )
-            # Internal-only archive: ship the raw result JSON to admins so
-            # we keep a deliverability copy even though end users no longer
-            # see it in their inbox.
-            send_result_json_to_admin(contact_info, result, submission_id)
-
+            # Confidence checks passed. Persist completion BEFORE emailing:
+            # the old order (email -> status) meant a SIGTERM/requeue in
+            # that window re-ran the entire job and sent a SECOND estimate
+            # email — with potentially different numbers, since multi-pass
+            # extraction is non-deterministic. Results are already uploaded
+            # to R2 at this point, so completing first loses nothing.
             update_status(submission_id, "completed", subtotal=subtotal)
             logger.info("Submission %s completed — $%s estimate",
                         submission_id, f"{subtotal:,.2f}")
+
+            if claim_email_send(submission_id):
+                try:
+                    send_result_email(
+                        contact_info, result,
+                        extra_attachment_paths=annotated_pdf_paths,
+                        estimate_pdf_path=estimate_pdf_path,
+                    )
+                except Exception as email_exc:
+                    # The job is complete and results are stored — an email
+                    # failure must not flip the row to failed and trigger a
+                    # full (non-deterministic, paid) re-run. Release the
+                    # claim so a manual resend can deliver, and shout.
+                    release_email_claim(submission_id)
+                    logger.error(
+                        "Estimate email FAILED for completed submission %s "
+                        "— results stored, claim released for resend: %s",
+                        submission_id, email_exc, exc_info=True)
+            else:
+                logger.info(
+                    "Submission %s: email already claimed by a prior run — "
+                    "skipping duplicate estimate email", submission_id)
+
+            # Internal-only archive: ship the raw result JSON to admins so
+            # we keep a deliverability copy even though end users no longer
+            # see it in their inbox.
+            try:
+                send_result_json_to_admin(contact_info, result, submission_id)
+            except Exception as admin_exc:
+                logger.error("Admin JSON archive email failed for %s: %s",
+                             submission_id, admin_exc)
 
             return {"submission_id": submission_id, "subtotal": subtotal}
 
@@ -694,14 +774,21 @@ def merge_submission(submission_id, parent_id, new_pdf_keys, contact_info,
                     submission_id,
                     result.get("manual_review_reason") or "(none provided)",
                 )
-                try:
-                    send_manual_review_email(
-                        contact_info, result, submission_id)
-                except Exception as exc:
-                    logger.error(
-                        "Failed to send manual-review email for merge %s: %s",
-                        submission_id, exc)
+                # Status first, then claimed email — see process_submission.
                 update_status(submission_id, "needs_review", subtotal=subtotal)
+                if claim_email_send(submission_id):
+                    try:
+                        send_manual_review_email(
+                            contact_info, result, submission_id)
+                    except Exception as exc:
+                        release_email_claim(submission_id)
+                        logger.error(
+                            "Failed to send manual-review email for merge %s: %s",
+                            submission_id, exc)
+                else:
+                    logger.info(
+                        "Merge submission %s: email already claimed by a "
+                        "prior run — skipping duplicate", submission_id)
                 logger.info(
                     "Merge submission %s marked needs_review — subtotal "
                     "$%s (NOT auto-sent)",
@@ -711,11 +798,25 @@ def merge_submission(submission_id, parent_id, new_pdf_keys, contact_info,
                         "subtotal": subtotal,
                         "needs_review": True}
 
-            send_result_email(contact_info, result)
-
+            # Persist completion BEFORE emailing (duplicate-send guard —
+            # see process_submission for the full rationale).
             update_status(submission_id, "completed", subtotal=subtotal)
             logger.info("Merge submission %s completed — $%s estimate",
                         submission_id, f"{subtotal:,.2f}")
+
+            if claim_email_send(submission_id):
+                try:
+                    send_result_email(contact_info, result)
+                except Exception as email_exc:
+                    release_email_claim(submission_id)
+                    logger.error(
+                        "Estimate email FAILED for completed merge %s — "
+                        "results stored, claim released for resend: %s",
+                        submission_id, email_exc, exc_info=True)
+            else:
+                logger.info(
+                    "Merge submission %s: email already claimed by a prior "
+                    "run — skipping duplicate estimate email", submission_id)
 
             return {"submission_id": submission_id,
                     "parent_id": parent_id,

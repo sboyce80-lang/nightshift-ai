@@ -265,6 +265,15 @@ class Submission(Base):
     error: Mapped[Optional[str]] = mapped_column(String(2000))
     subtotal: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
 
+    # Idempotency claim for the outbound result/manual-review email. Set
+    # via UPDATE ... WHERE emailed_at IS NULL before sending; a re-run of
+    # the job (warm-shutdown requeue, retry) that loses the claim must NOT
+    # send a second estimate — multi-pass extraction is non-deterministic,
+    # so a duplicate email can carry different numbers.
+    emailed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+
     # Versioning for re-runs. v1 has parent_submission_id=NULL; revisions
     # (revised plans, RFI responses, amendments) point at the parent and
     # increment version. The merge worker re-extracts only the new files
