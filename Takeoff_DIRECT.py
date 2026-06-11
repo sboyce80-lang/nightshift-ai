@@ -15823,15 +15823,52 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                 "NIGHTSHIFT_MULTI_PASS_MIN_ROOMS", "20"))
         except (ValueError, TypeError):
             mp_min_rooms = 20
-        should_multi_pass = (multi_pass and not use_cache
-                              and result and best_rooms >= mp_min_rooms)
+        # Gate on DOCUMENT signals, not pass-1 output. The old gate
+        # (best_rooms >= 20) conditioned the variance fix on a sample of
+        # the very random variable it exists to stabilize: a pass-1
+        # under-extraction of 15 rooms skipped consensus entirely and
+        # shipped as the final answer — the exact 53-vs-15 failure mode.
+        # The page classifier is deterministic and zero-API-cost: if the
+        # document objectively contains paint-relevant pages, the variance
+        # fix applies regardless of how many rooms pass 1 happened to see.
+        # The room-count gate survives only as a fallback when
+        # classification is unavailable (no PyMuPDF / unreadable PDF).
+        try:
+            mp_min_plan_pages = int(os.environ.get(
+                "NIGHTSHIFT_MULTI_PASS_MIN_PLAN_PAGES", "1"))
+        except (ValueError, TypeError):
+            mp_min_plan_pages = 1
+        doc_included_pages = None
+        if multi_pass and not use_cache and result:
+            try:
+                _mp_cls = _classify_pdf_pages(pdf_path)
+                if _mp_cls:
+                    doc_included_pages = sum(
+                        1 for c in _mp_cls if c.get("include"))
+            except Exception:
+                doc_included_pages = None
+
+        if doc_included_pages is not None:
+            should_multi_pass = (multi_pass and not use_cache and result
+                                  and best_rooms > 0
+                                  and doc_included_pages >= mp_min_plan_pages)
+        else:
+            should_multi_pass = (multi_pass and not use_cache
+                                  and result and best_rooms >= mp_min_rooms)
 
         if (multi_pass and not use_cache and result
                 and not should_multi_pass):
             # Surface the skip reason so worker logs are honest about
             # whether the variance fix actually fired on this job.
-            print(f"   ⏭  Multi-pass median skipped: pass 1 returned "
-                  f"{best_rooms} rooms < threshold {mp_min_rooms}")
+            if doc_included_pages is not None:
+                print(f"   ⏭  Multi-pass median skipped: document has "
+                      f"{doc_included_pages} paint-relevant page(s) < "
+                      f"threshold {mp_min_plan_pages} "
+                      f"(pass 1 rooms: {best_rooms})")
+            else:
+                print(f"   ⏭  Multi-pass median skipped: classification "
+                      f"unavailable and pass 1 returned {best_rooms} rooms "
+                      f"< fallback threshold {mp_min_rooms}")
 
         if should_multi_pass:
             try:
