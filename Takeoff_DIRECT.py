@@ -5941,9 +5941,28 @@ def _maybe_run_schedule_recovery_pass(client, pdf_path, analysis_result):
     # _recalculate_totals re-firing because by this point the per-file
     # totals are already aggregated and downstream merge logic doesn't
     # know to re-trigger the safety net.
+    #
+    # HARD_NUMBERS_ONLY: footprint x 0.75 is an assumption, not a
+    # measurement. This block was an ungated COPY of the dryfall safety
+    # net in _recalculate_totals (which has always been gated) — the
+    # callout evidence is real, but the quantity is invented. Under the
+    # policy we capture the callouts (above) and flag the unpriced
+    # exposure; the estimator confirms the area from the RCP instead of
+    # the bid silently carrying ~$15k of assumed scope.
     est_dryfall = round(footprint * 0.75)
     gap = est_dryfall - dryfall
-    if gap > 0:
+    if gap > 0 and HARD_NUMBERS_ONLY:
+        analysis_result.setdefault("notes", []).append(
+            f"[Dryfall Recovery Pass] Finish schedule contains "
+            f"{len(struct_scope)} structural-finish callout(s) "
+            f"(deck/structure/MEP paint-to-deck) but only {dryfall:,.0f} sqft "
+            f"of dryfall was extracted from the drawings. RFI REQUIRED: "
+            f"confirm exposed-deck area (footprint-based estimate would be "
+            f"~{est_dryfall:,.0f} sqft — NOT priced under hard-numbers policy)."
+        )
+        print(f"   🔒 Dryfall recovery: callouts captured, +{gap:,.0f} sqft "
+              f"NOT applied (HARD_NUMBERS_ONLY) — flagged for RFI")
+    elif gap > 0:
         agg["total_dryfall_ceiling_sqft"] = dryfall + gap
         analysis_result["aggregated_totals"] = agg
         analysis_result.setdefault("notes", []).append(
@@ -7346,14 +7365,31 @@ def _apply_schedule_overrides(combined):
                     _supp_pct = 0.35 - (sched_doors_total - 100) / 50 * 0.20
                 max_supplement = round(sched_doors_total * _supp_pct)
                 supplement = min(raw_supplement, max_supplement)
-                agg["total_doors_full_paint"] = agg.get("total_doors_full_paint", 0) + supplement
-                overrides_applied.append(
-                    f"[Door Supplement] Residential building: room-level extraction found "
-                    f"{room_total_doors:.0f} doors vs schedule {sched_doors_total:.0f}. "
-                    f"Added {supplement} interior doors (closets/pantries likely omitted "
-                    f"from architectural door schedule)."
-                    + (f" (capped from {raw_supplement} to {supplement})" if raw_supplement > max_supplement else "")
-                )
+                if HARD_NUMBERS_ONLY:
+                    # The schedule is the authoritative count; the room-level
+                    # count is a noisy measurement this same function's
+                    # docstring admits can double-count. The delta is
+                    # EVIDENCE of possibly-unscheduled closet doors, not a
+                    # quantity — surface it for confirmation, price the
+                    # schedule.
+                    overrides_applied.append(
+                        f"[Door Count Check] Room-level extraction found "
+                        f"{room_total_doors:.0f} doors vs door schedule "
+                        f"{sched_doors_total:.0f}. RFI REQUIRED: confirm "
+                        f"whether typical interior doors (closet/linen/"
+                        f"pantry) are omitted from the door schedule — "
+                        f"~{supplement} doors NOT priced under hard-numbers "
+                        f"policy."
+                    )
+                else:
+                    agg["total_doors_full_paint"] = agg.get("total_doors_full_paint", 0) + supplement
+                    overrides_applied.append(
+                        f"[Door Supplement] Residential building: room-level extraction found "
+                        f"{room_total_doors:.0f} doors vs schedule {sched_doors_total:.0f}. "
+                        f"Added {supplement} interior doors (closets/pantries likely omitted "
+                        f"from architectural door schedule)."
+                        + (f" (capped from {raw_supplement} to {supplement})" if raw_supplement > max_supplement else "")
+                    )
 
     # --- Storefront door mark filter ---
     # LLM sometimes counts storefront/glazing entries (100A-100M, SF101, AD1 types)
@@ -7805,6 +7841,36 @@ def _supplement_missing_secondary_spaces(analysis):
             supplement_doors = round(supplement_doors * scale)
             supplement_details.append(f"Capped at {MAX_SUPPLEMENT_RATIO:.0%} of extracted")
 
+    # HARD_NUMBERS_ONLY: the quantities below come from per-room TEMPLATES
+    # ("a closet has 190 sqft of wall, 20 LF of trim, 1 door"), not from
+    # anything measured on this project's drawings — this is exactly the
+    # "prices items because other jobs have had that" failure customers
+    # reported. Under the policy: record the density evidence + the
+    # would-have-been quantities as an RFI, price nothing.
+    if HARD_NUMBERS_ONLY:
+        analysis["_secondary_space_supplement_suppressed"] = {
+            "wall_would_add": supplement_wall,
+            "ceil_would_add": supplement_ceil,
+            "trim_would_add": supplement_trim,
+            "doors_would_add": supplement_doors,
+            "density_ratio": density_ratio,
+            "rooms_per_unit": rooms_per_unit,
+        }
+        analysis.setdefault("notes", []).append(
+            f"[Secondary Space Check] Room extraction density is low "
+            f"({rooms_per_unit:.1f} rooms/unit vs ~{weighted_expected:.1f} "
+            f"expected, {density_ratio:.0%}) — closets/entry halls are likely "
+            f"missing from the extraction. RFI REQUIRED: confirm secondary "
+            f"spaces (closets, entry halls, unit hallways) per unit on the "
+            f"enlarged unit plans. Template-based supplement "
+            f"(~{supplement_wall:,} wall sqft, ~{supplement_trim:,} trim LF, "
+            f"~{supplement_doors} doors) NOT priced under hard-numbers policy."
+        )
+        print(f"   🔒 Secondary space supplement suppressed "
+              f"(HARD_NUMBERS_ONLY): would have added +{supplement_wall:,} "
+              f"wall sqft at {density_ratio:.0%} density — flagged for RFI")
+        return analysis
+
     # --- Apply supplement ---
     agg["total_paintable_wall_sqft"] = current_wall + supplement_wall
     agg["total_paintable_ceiling_sqft"] = current_ceil + supplement_ceil
@@ -7896,7 +7962,15 @@ def _validate_and_boost_walls(analysis):
             if boost_factor > 1.05:
                 boosted_wall = round(current_wall * boost_factor)
                 current_trim = _num(agg.get("total_base_trim_lf", 0))
-                boosted_trim = round(current_trim * boost_factor) if current_trim > 0 else current_trim
+                # HARD_NUMBERS_ONLY: the wall correction is derived from
+                # MEASURED per-room perimeter × height (repairing aggregation
+                # loss against the same drawings) and stays. Trim, however,
+                # is measured per-room in LF — multiplying it by a wall-area
+                # ratio is not a measurement, so it is no longer scaled.
+                if HARD_NUMBERS_ONLY:
+                    boosted_trim = current_trim
+                else:
+                    boosted_trim = round(current_trim * boost_factor) if current_trim > 0 else current_trim
 
                 agg["total_paintable_wall_sqft"] = boosted_wall
                 agg["total_base_trim_lf"] = boosted_trim
@@ -7906,7 +7980,8 @@ def _validate_and_boost_walls(analysis):
                     f"[Perimeter Wall Boost] Aggregated walls ({current_wall:,} sqft) "
                     f"< perimeter-derived ({perimeter_wall:,} sqft). "
                     f"Boosted to {boosted_wall:,} sqft ({boost_factor:.2f}x). "
-                    f"Trim {current_trim:,}->{boosted_trim:,} LF. "
+                    f"Trim {current_trim:,}->{boosted_trim:,} LF"
+                    f"{' (trim not scaled — hard-numbers policy)' if HARD_NUMBERS_ONLY else ''}. "
                     f"Ceilings not boosted (no measurement basis)."
                 )
                 print(f"   📐 Perimeter wall boost: {current_wall:,} -> {boosted_wall:,} sqft "
@@ -7959,6 +8034,27 @@ def _validate_and_boost_walls(analysis):
     # extraction variance: same PDF can yield 0.87x one run and 1.05x the next.
     boost_threshold = expected_wall_ratio * 0.92
     if actual_ratio < boost_threshold:
+        # HARD_NUMBERS_ONLY: unlike Mode 1, this mode's target is footprint
+        # × stories × a 1.25 ratio calibrated from ONE reference job (364
+        # Main) — an assumption, not a measurement from this project's
+        # drawings, applied to a footprint with documented ±36% extraction
+        # variance. Under the policy: flag the discrepancy for RFI, price
+        # only what was measured.
+        if HARD_NUMBERS_ONLY:
+            analysis.setdefault("notes", []).append(
+                f"[Wall Cross-Check] Extracted wall area ({current_wall:,.0f} "
+                f"sqft) is {actual_ratio:.2f}x floor area — residential "
+                f"multi-family typically runs ~{expected_wall_ratio}x; walls "
+                f"may be under-extracted. RFI REQUIRED: verify wall scope on "
+                f"the unit/floor plans (footprint-ratio correction to "
+                f"~{expected_wall:,.0f} sqft NOT applied under hard-numbers "
+                f"policy)."
+            )
+            print(f"   🔒 Footprint wall boost suppressed (HARD_NUMBERS_ONLY): "
+                  f"ratio {actual_ratio:.2f}x < {boost_threshold:.2f}x — "
+                  f"flagged for RFI")
+            return analysis
+
         # Boost to expected ratio
         boost_target = expected_wall
         boost_factor = boost_target / current_wall if current_wall > 0 else 1.0
@@ -10290,6 +10386,17 @@ def _recalculate_totals(analysis):
             ch = _num(dims.get("ceiling_height_feet", 0))
 
             if floor_area > 0 and wall_area == 0 and perimeter == 0 and ch > 0:
+                if HARD_NUMBERS_ONLY:
+                    # A square-room perimeter (4 × √area) is an assumption,
+                    # not a measurement — and it used to silently set BASE
+                    # TRIM = that invented perimeter too. Leave the room's
+                    # walls/trim at zero and mark it; the Incomplete
+                    # Dimensions RFI machinery surfaces zero-wall rooms.
+                    note = room.get("notes", "")
+                    room["notes"] = (note + " [Dimensions incomplete: floor "
+                                     "area only — walls/trim NOT estimated "
+                                     "under hard-numbers policy]").strip()
+                    continue
                 # Estimate perimeter from floor area assuming square-ish room
                 est_side = floor_area ** 0.5
                 est_perimeter = round(4 * est_side)
@@ -11044,7 +11151,23 @@ def _recalculate_totals(analysis):
                 round(expected_ceiling - total_ceiling),
                 round(total_ceiling * 0.15)
             )
-            if supplement > 100:
+            if supplement > 100 and HARD_NUMBERS_ONLY:
+                # The expected value comes from a cross-job wall:ceiling
+                # ratio, not from this project's drawings. Flag instead of
+                # price. (The GSF-based residential ceiling floor — measured
+                # footprint × stories — handles the systematic-undercount
+                # case with a measurement basis.)
+                analysis.setdefault("notes", []).append(
+                    f"[Ceiling Check] Ceiling SF is ~{ceiling_gap_pct:.0%} "
+                    f"below the wall:ceiling ratio expectation — small "
+                    f"spaces (linen/coat closets, pantries) may be missing "
+                    f"from extraction. RFI REQUIRED: confirm closet/small-"
+                    f"space ceilings on the unit plans (~{supplement:,.0f} "
+                    f"sqft NOT priced under hard-numbers policy)."
+                )
+                print(f"   🔒 Ceiling supplement suppressed (HARD_NUMBERS_ONLY): "
+                      f"would have added +{supplement:,.0f} sqft — flagged for RFI")
+            elif supplement > 100:
                 total_ceiling += supplement
                 analysis["aggregated_totals"]["total_paintable_ceiling_sqft"] = total_ceiling
                 analysis.setdefault("notes", []).append(
@@ -11537,6 +11660,32 @@ def generate_rfi_items(analysis):
                 "Confirm whether base trim is painted and identify the base material "
                 "(painted wood/MDF vs. resilient/vinyl cove base) per room or per the "
                 "finish schedule."
+            ),
+        })
+
+    # --- 0b. Hard-numbers suppressed scope ---
+    # Heuristics gated by HARD_NUMBERS_ONLY (dryfall recovery, secondary-
+    # space supplement, door supplement, wall boost, stair note parsing,
+    # ceiling supplement) record the scope they would have added as a note
+    # containing "RFI REQUIRED:". Surface each as an RFI item so the
+    # unpriced exposure is visible to the estimator and customer instead
+    # of existing only as a buried note. Notes (unlike custom underscore
+    # keys) survive the multi-file merge, so this works on combined jobs.
+    _seen_rfi_notes = set()
+    for _n in analysis.get("notes", []) or []:
+        if not (isinstance(_n, str) and "RFI REQUIRED:" in _n):
+            continue
+        _q = _n.split("RFI REQUIRED:", 1)[1].strip()
+        if not _q or _q in _seen_rfi_notes:
+            continue
+        _seen_rfi_notes.add(_q)
+        items.append({
+            "category": "Clarification Needed",
+            "question": _q,
+            "action_required": (
+                "Confirm the quantity from the drawings/schedules — it is "
+                "NOT included in the priced takeoff under the hard-numbers "
+                "policy."
             ),
         })
 
@@ -16353,9 +16502,10 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         # Stairs are missing or seem too low for the building
         est_stairs = 0
 
+        _stairwell_note_seen = False
         if current_stairs == 0:
             # Try to parse stair count from stair-specific notes only
-            for note in analysis.get("notes", []):
+            for note in list(analysis.get("notes", [])):
                 note_lower = note.lower()
                 # Skip notes that aren't about stairs
                 if 'stair' not in note_lower:
@@ -16370,12 +16520,20 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                 m1b = re.search(r'(\d+)\s*stair\s*(?:section|flight)', note_lower)
                 if m1b:
                     est_stairs = max(est_stairs, int(m1b.group(1)))
-                # "N stairwells" — multiply by effective_levels × 2 flights per transition
-                m2 = re.search(r'(\d+)\s*stairwell', note_lower)
-                if m2:
-                    stairwells = int(m2.group(1))
-                    transitions = max(1, effective_levels - 1)
-                    est_stairs = max(est_stairs, stairwells * transitions * 2)
+                # "N stairwells" — multiply by effective_levels × 2 flights
+                # per transition. HARD_NUMBERS_ONLY: the stairwell COUNT may
+                # be stated, but flights-per-transition is an assumption —
+                # a free-text "2 stairwells" turned into 12 priced sections
+                # ($18k on a 4-level building). Explicit section/flight
+                # counts (m, m1b, m3) are stated numbers and stay accepted.
+                if not HARD_NUMBERS_ONLY:
+                    m2 = re.search(r'(\d+)\s*stairwell', note_lower)
+                    if m2:
+                        stairwells = int(m2.group(1))
+                        transitions = max(1, effective_levels - 1)
+                        est_stairs = max(est_stairs, stairwells * transitions * 2)
+                elif re.search(r'(\d+)\s*stairwell', note_lower):
+                    _stairwell_note_seen = True
                 # "= X total" at end of stair note
                 m3 = re.search(r'=\s*(\d+)\s*total', note_lower)
                 if m3:
@@ -16385,6 +16543,15 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             max_reasonable = 4 * effective_levels * 2
             if est_stairs > max_reasonable:
                 est_stairs = 0
+
+            if HARD_NUMBERS_ONLY and est_stairs == 0 and _stairwell_note_seen:
+                analysis.setdefault("notes", []).append(
+                    "[Stair Check] Notes mention a stairwell count but no "
+                    "explicit section/flight count was extracted. RFI "
+                    "REQUIRED: confirm the number of stair sections/flights "
+                    "to paint (stairwell-count extrapolation is NOT priced "
+                    "under hard-numbers policy)."
+                )
 
         # If notes didn't give us a number, use building heuristic.
         # Gated by HARD_NUMBERS_ONLY: a geometry-based stair estimate — and the
