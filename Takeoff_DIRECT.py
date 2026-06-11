@@ -161,10 +161,34 @@ EXPECTED_ROOMS_PER_UNIT = {
     "3br":    {"total_rooms": 11, "secondary": [("closet", 3), ("walk_in_closet", 1), ("entry_hall", 1), ("unit_hall", 1)]},
 }
 
-# Footprint-based estimation constants (calibrated to Rider Painting / Chestnut)
-# Paintable residential unit area as fraction of gross floor area.
-# Excludes corridors, mechanical, structure, retail — which are NOT painted.
-RESIDENTIAL_EFFICIENCY = 0.63
+# Footprint-based estimation constants. Two efficiency values are kept because
+# the painter's scope of work determines which one applies:
+#
+#  * RESIDENTIAL_EFFICIENCY_UNITS_ONLY (0.63) — apartments only, commons
+#    NOT painted. Original Rider Painting / Chestnut calibration, valid for
+#    projects where corridors, lobbies, common rooms are out of scope.
+#
+#  * RESIDENTIAL_EFFICIENCY_FULL_INTERIOR (0.97) — apartments PLUS painted
+#    commons (corridors, lobbies, common rooms, common baths, laundry).
+#    Validated against KonstructIQ's Ridgeview takeoff (42,923 SF ceiling =
+#    100% of GSF since Rider painted all commons there) and Rider's manual
+#    measurement of 42,900 SF on the same project. Use this for supportive
+#    housing, dorms, and projects whose finish schedule shows painted GYP
+#    on corridor/lobby/common-area ceilings.
+#
+# The default is FULL_INTERIOR because (a) most NY supportive housing /
+# multifamily projects we see do paint commons, and (b) the failure mode of
+# the FULL value being wrong (bid runs ~30% high, gets adjusted in review)
+# is recoverable, while the failure mode of UNITS_ONLY being wrong
+# (Ridgeview's 24% under-bid, hard to detect from the proposal alone) is
+# not. Per-org override via project_info['_residential_efficiency'] or
+# pricing_overrides.residential_efficiency.
+RESIDENTIAL_EFFICIENCY_UNITS_ONLY = 0.63
+RESIDENTIAL_EFFICIENCY_FULL_INTERIOR = 0.97
+RESIDENTIAL_EFFICIENCY = RESIDENTIAL_EFFICIENCY_UNITS_ONLY  # legacy alias
+                                                            # (footprint
+                                                            # fallback only)
+# Wall sqft per ceiling/floor sqft — accounts for interior partitions
 # Wall sqft per ceiling/floor sqft — accounts for interior partitions
 # (closets, bathrooms, hallways within units).
 WALL_TO_FLOOR_RATIO = 3.3
@@ -1218,14 +1242,60 @@ def _classify_pdf_pages(pdf_path):
     return classifications
 
 
-def _detect_finish_schedule(pdf_path):
-    """Zero-API-cost detector: scan a PDF's page text for a Room Finish
-    Schedule table.
+# Excluded patterns that mark a hit as a cross-reference, not a schedule
+# sheet title. "A13 Finish Schedule & Details" on a sheet-index list looks
+# like a finish-schedule mention but isn't the schedule itself. The "&
+# details/detail" suffix is the giveaway because Coppola-style schedule
+# sheets are named e.g. "FINISH SCHEDULE & DETAILS" in the title block but
+# the SPAN extracted from the rotated title block contains JUST the title
+# phrase ("FINISH SCHEDULE"), while the T1-style sheet-list reference
+# extracts as a longer span that pulls in the sheet number and ampersand.
+_SCHEDULE_REFERENCE_EXCLUDES = ("& detail", "& details", "see sheet",
+                                "see drawing", "refer to sheet")
 
-    Returns True if one is found, False if the PDF was scanned and none was
-    found, or None if the PDF could not be scanned (PyMuPDF unavailable or a
-    read error). Mirrors the door/window-schedule flags so a project that
-    actually includes a finish schedule is not RFI'd as if one is missing.
+
+def _has_schedule_sheet_title(page, title_phrases, excludes=_SCHEDULE_REFERENCE_EXCLUDES):
+    """Return True if any text span on the page contains a title phrase as
+    a standalone sheet title (not a cross-reference in a list).
+
+    PyMuPDF's "dict" extraction gives us spans, not just concatenated text.
+    A schedule sheet's title block emits a span like 'FINISH SCHEDULE';
+    a sheet-index list entry on T1 emits 'A13 Finish Schedule & Details'.
+    Filtering on excluded suffixes ("& details") cleanly separates them.
+    """
+    title_l = [p.lower() for p in title_phrases]
+    excl_l = [e.lower() for e in excludes]
+    try:
+        d = page.get_text("dict")
+    except Exception:
+        return False
+    for block in d.get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                txt = (span.get("text") or "").strip().lower()
+                if not txt:
+                    continue
+                if not any(p in txt for p in title_l):
+                    continue
+                if any(e in txt for e in excl_l):
+                    continue
+                return True
+    return False
+
+
+def _detect_schedule_in_pdf(pdf_path, title_phrases, table_tokens=()):
+    """Generic schedule detector. Two passes per page:
+      1. Span-level: title phrase appears as a standalone sheet title.
+         Works when the schedule table itself is vector art (no extractable
+         text inside the table) — the only thing PyMuPDF sees is the
+         rotated title-block span. Catches Coppola's A12 (DOOR SCHEDULE),
+         A13 (FINISH SCHEDULE), etc.
+      2. Concatenated-text + table_tokens: title phrase appears anywhere
+         AND 2+ column-header tokens appear. Works for projects where the
+         schedule table content is real PDF text. Kept for back-compat
+         with the projects this function was originally tuned for.
+
+    Returns True / False if scanned, None if the PDF could not be opened.
     """
     try:
         import fitz  # PyMuPDF
@@ -1236,25 +1306,55 @@ def _detect_finish_schedule(pdf_path):
     except Exception:
         return None
     try:
-        # A page that NAMES a finish schedule/legend...
-        TITLE_PHRASES = ("room finish schedule", "finish schedule",
-                         "interior finish schedule", "finish legend",
-                         "room finish legend")
-        # ...AND carries finish-table column headers is the schedule itself.
-        # Requiring 2+ strong headers keeps a stray "see finish schedule"
-        # callout on a floor plan from tripping the detector.
-        TABLE_TOKENS = ("wall finish", "ceiling finish", "base finish",
-                        "floor finish", "room finish", "room name",
-                        "room no", "room number")
         for page in doc:
-            t = page.get_text().lower()
-            if not any(p in t for p in TITLE_PHRASES):
-                continue
-            if sum(1 for tok in TABLE_TOKENS if tok in t) >= 2:
+            if _has_schedule_sheet_title(page, title_phrases):
                 return True
+            if table_tokens:
+                t = page.get_text().lower()
+                if any(p.lower() in t for p in title_phrases) \
+                        and sum(1 for tok in table_tokens if tok in t) >= 2:
+                    return True
         return False
     finally:
         doc.close()
+
+
+_FINISH_TITLE_PHRASES = ("room finish schedule", "finish schedule",
+                         "interior finish schedule", "finish legend",
+                         "room finish legend")
+_FINISH_TABLE_TOKENS = ("wall finish", "ceiling finish", "base finish",
+                        "floor finish", "room finish", "room name",
+                        "room no", "room number")
+_DOOR_TITLE_PHRASES = ("door schedule", "door & window schedule",
+                       "door and window schedule", "door schedule:")
+_DOOR_TABLE_TOKENS = ("door no", "door number", "door type", "door size",
+                      "frame type", "hardware set", "fire rating",
+                      "head detail", "jamb detail")
+_WINDOW_TITLE_PHRASES = ("window schedule", "window & door schedule",
+                         "glazing schedule", "window schedule:")
+_WINDOW_TABLE_TOKENS = ("window no", "window number", "window type",
+                        "window mark", "rough opening", "unit size",
+                        "glazing type", "sill height")
+
+
+def _detect_finish_schedule(pdf_path):
+    """Detect a Room Finish Schedule in the PDF (text-only, no API calls).
+    See _detect_schedule_in_pdf for the dual-pass strategy.
+    """
+    return _detect_schedule_in_pdf(pdf_path, _FINISH_TITLE_PHRASES,
+                                   _FINISH_TABLE_TOKENS)
+
+
+def _detect_door_schedule(pdf_path):
+    """Detect a Door Schedule in the PDF (text-only, no API calls)."""
+    return _detect_schedule_in_pdf(pdf_path, _DOOR_TITLE_PHRASES,
+                                   _DOOR_TABLE_TOKENS)
+
+
+def _detect_window_schedule(pdf_path):
+    """Detect a Window Schedule in the PDF (text-only, no API calls)."""
+    return _detect_schedule_in_pdf(pdf_path, _WINDOW_TITLE_PHRASES,
+                                   _WINDOW_TABLE_TOKENS)
 
 
 def _set_finish_schedule_flag(analysis, pdf_paths):
@@ -1284,10 +1384,222 @@ def _set_finish_schedule_flag(analysis, pdf_paths):
               f"{'found in upload' if found else 'none found'}")
 
 
+def _set_door_schedule_flag(analysis, pdf_paths):
+    """Set analysis['has_door_schedule'] from a zero-cost PDF text scan.
+
+    Honors an upstream True from LLM extraction. Only flips False -> True
+    when the text scan finds explicit evidence (the LLM is the source of
+    truth when it has actually read the page). The LLM is wrong often
+    enough on schedule-sheet recognition for Coppola-style projects that
+    a text-based safety net is worth running unconditionally.
+    """
+    if analysis.get("has_door_schedule") is True:
+        return
+    for p in pdf_paths or []:
+        d = _detect_door_schedule(p)
+        if d:
+            analysis["has_door_schedule"] = True
+            print("   🚪 Door schedule detection: found in upload "
+                  "(text-scan override)")
+            return
+
+
+def _set_window_schedule_flag(analysis, pdf_paths):
+    """Set analysis['has_window_schedule'] from a zero-cost PDF text scan.
+    Mirrors _set_door_schedule_flag.
+    """
+    if analysis.get("has_window_schedule") is True:
+        return
+    for p in pdf_paths or []:
+        d = _detect_window_schedule(p)
+        if d:
+            analysis["has_window_schedule"] = True
+            print("   🪟 Window schedule detection: found in upload "
+                  "(text-scan override)")
+            return
+
+
 def _normalize_sheet_token(s):
     """Normalize a sheet number for comparison: uppercase, drop separators.
     'A-101' / 'A 101' / 'A1.01' all normalize to 'A101'."""
     return re.sub(r'[^A-Z0-9]', '', str(s).upper())
+
+
+def _detect_sheet_id_on_page(page, known_prefixes):
+    """Return the most likely sheet ID rendered on this page's title block,
+    or None if undetectable. Picks raw text (not normalized) so the caller
+    can preserve the architect's convention.
+
+    Strategy: look at every text span, keep ones that are either rotated
+    (vertical-running text, typical of architectural title-block sidebars)
+    or rendered at >=24pt (sheet numbers are usually the largest text on
+    a page). Filter to spans matching _SHEET_NUMBER_RE with a known
+    discipline prefix. If multiple candidates remain, pick the largest
+    (the actual sheet number is bigger than any cross-reference callouts).
+
+    Tested against Coppola's Ridgeview set (14 sheets, T1 + A1..A13): the
+    old bottom-strip clip approach missed 5 of 14 pages because Coppola's
+    title block lives in a rotated right-edge strip whose y-coordinates
+    extend past page.height; the new approach identifies all 14.
+    """
+    try:
+        d = page.get_text("dict")
+    except Exception:
+        return None
+    best = None  # (size, raw_id)
+    for block in d.get("blocks", []):
+        for line in block.get("lines", []):
+            dir_ = line.get("dir", (1.0, 0.0))
+            is_rotated = abs(dir_[1]) > 0.5
+            for span in line.get("spans", []):
+                txt = (span.get("text", "") or "").strip()
+                if not txt or len(txt) > 8:
+                    continue
+                size = span.get("size", 0) or 0
+                if not (is_rotated or size >= 24):
+                    continue
+                for m in _SHEET_NUMBER_RE.finditer(txt):
+                    prefix = m.group(1).upper()
+                    if not any(prefix == p or prefix.startswith(p)
+                               for p in known_prefixes):
+                        continue
+                    raw = prefix + m.group(2)
+                    if best is None or size > best[0]:
+                        best = (size, raw)
+    return best[1] if best else None
+
+
+def _build_page_to_sheet_map(pdf_paths):
+    """Return {(pdf_path, page_idx_0based): raw_sheet_id} for every page
+    where a sheet ID is detectable. raw_sheet_id is the EXACT string from
+    the title block (not normalized) so source_sheet substitutions preserve
+    the architect's convention.
+
+    Used by _canonicalize_source_sheets to override LLM-emitted source_sheet
+    values that don't match what's actually printed on the page.
+    """
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        return {}
+    known_prefixes = tuple(dp for dp, _, _ in _DISCIPLINE_MAP)
+    out = {}
+    for path in pdf_paths or []:
+        try:
+            doc = fitz.open(path)
+        except Exception:
+            continue
+        try:
+            for i, page in enumerate(doc):
+                raw = _detect_sheet_id_on_page(page, known_prefixes)
+                if raw:
+                    out[(path, i)] = raw
+        finally:
+            doc.close()
+    return out
+
+
+def _canonicalize_source_sheets(analysis, pdf_paths):
+    """Override room.source_sheet with the actual sheet ID printed on the
+    page indicated by room.source_page.
+
+    The 2026-05-28 Ridgeview run had the model emit rooms tagged
+    'A-101', 'A-102', 'A-103' (ANSI-style) for what were actually pages
+    on sheets 'A2' and 'A3' (Coppola-style). The downstream pipeline
+    treats different source_sheet strings as different sheets, so the
+    same physical floor plan got extracted twice under two sheet IDs,
+    creating phantom floors. The regex dedup catches the symptom; this
+    pass prevents the bad data from being created in the first place.
+
+    For each room with a numeric source_page, look up the sheet ID
+    actually rendered on that page (via the page→sheet map built from
+    the PDF title blocks). If different from room.source_sheet, override
+    it and stash the original under '_source_sheet_llm' for audit.
+
+    Idempotent via analysis['_source_sheets_canonicalized'].
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if analysis.get("_source_sheets_canonicalized"):
+        return analysis
+
+    page_map = _build_page_to_sheet_map(pdf_paths)
+    if not page_map:
+        analysis["_source_sheets_canonicalized"] = True
+        return analysis
+
+    # Multi-PDF case: each room knows its PDF via bbox.source_pdf. Single-
+    # PDF case (most common): just use the only PDF path. Group page_map
+    # by PDF for fast lookup, and also build a single-PDF fallback.
+    by_pdf = {}
+    for (path, idx), sid in page_map.items():
+        by_pdf.setdefault(path, {})[idx] = sid
+    single_pdf = pdf_paths[0] if (pdf_paths and len(pdf_paths) == 1) else None
+
+    overrides = 0
+    unmapped = 0
+    for floor in analysis.get("floors", []) or []:
+        for room in floor.get("rooms", []) or []:
+            sp = room.get("source_page")
+            if sp is None:
+                continue
+            try:
+                page_idx = int(sp) - 1  # source_page is 1-based
+            except (TypeError, ValueError):
+                continue
+            if page_idx < 0:
+                continue
+            # Find which PDF this room came from. Resolution order:
+            #   1. bbox.source_pdf if that exact path is in by_pdf (live run)
+            #   2. by basename match against by_pdf keys (re-processing a
+            #      stored result where bbox.source_pdf points at a stale
+            #      worker /tmp path that no longer exists)
+            #   3. single PDF fallback when only one was supplied
+            room_pdf = None
+            bbox = room.get("bbox") or {}
+            bbox_path = bbox.get("source_pdf") if isinstance(bbox, dict) else None
+            if bbox_path and bbox_path in by_pdf:
+                room_pdf = bbox_path
+            elif bbox_path:
+                bbox_base = os.path.basename(bbox_path)
+                for k in by_pdf:
+                    if os.path.basename(k) == bbox_base:
+                        room_pdf = k
+                        break
+            if room_pdf is None and single_pdf:
+                room_pdf = single_pdf
+            if room_pdf is None:
+                continue
+            true_sheet = by_pdf.get(room_pdf, {}).get(page_idx)
+            if not true_sheet:
+                unmapped += 1
+                continue
+            current = str(room.get("source_sheet", "") or "").strip()
+            if current == true_sheet:
+                continue
+            # Override — stash original for audit.
+            room["_source_sheet_llm"] = current
+            room["source_sheet"] = true_sheet
+            overrides += 1
+
+    if overrides:
+        note = (f"[Source Sheet Canonicalization] Overrode {overrides} "
+                f"room source_sheet values with the actual sheet IDs "
+                f"printed on the PDF pages. Prevents phantom-floor "
+                f"duplication caused by the LLM emitting normalized / "
+                f"convention-substituted sheet IDs (e.g. 'A-102' for a "
+                f"page actually marked 'A2').")
+        if unmapped:
+            note += f" {unmapped} additional rooms had source_page values " \
+                    f"with no detectable sheet ID in the title block."
+        existing_notes = analysis.get("notes") or []
+        if not isinstance(existing_notes, list):
+            existing_notes = [existing_notes] if existing_notes else []
+        analysis["notes"] = list(existing_notes) + [note]
+        print(f"   🪪 {note}", flush=True)
+
+    analysis["_source_sheets_canonicalized"] = True
+    return analysis
 
 
 def _collect_upload_sheet_numbers(pdf_paths):
@@ -7566,6 +7878,267 @@ def _validate_and_boost_walls(analysis):
     return analysis
 
 
+def _validate_unit_multipliers(analysis):
+    """Sanity-check unit-template multipliers against project_info.total_units.
+
+    Three checks, each emits a structured note + sets a project_info flag:
+
+      1. SUM_MISMATCH — sum of all residential-template multipliers differs
+         from total_units by >10%. Either too few templates (missed unit
+         types) or too many (phantom floors slipped past dedup).
+
+      2. SINGLE_TYPE_DOMINANCE — one unit type carries >95% of the total
+         multiplier when 2+ unit types were extracted. Likely a missed
+         second typology.
+
+      3. RATIO_IMPLAUSIBLE — for residential building_type, the implied
+         unit_mix has 2BR/3BR carrying >35% of unit count. Most supportive
+         housing / dorm / senior-living mixes are 1BR-dominant (≥80% 1BR);
+         the 2026-05-28 Ridgeview run reported 24% 2BR when reality was 7%
+         and the bid would have run high on a per-unit doors/trim basis if
+         downstream rates differ between typologies.
+
+    None of these reshape the multipliers — see the function docstring
+    why we don't: the over-/under-counts often compensate for per-room
+    dimension extraction error, so a "rebalance" can make the bid less
+    accurate, not more. The real fix is OCR/vision on the T1 unit-mix
+    table; this validator surfaces the issue for estimator review in the
+    meantime (tracked as task #16 in the Ridgeview release plan).
+
+    Idempotent via project_info['_unit_multipliers_validated'].
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    pi = analysis.get("project_info") or {}
+    if pi.get("_unit_multipliers_validated"):
+        return analysis
+
+    bt = str(pi.get("building_type", "")).lower()
+    is_residential = any(kw in bt for kw in (
+        "residential", "multifamily", "multi-family", "apartment", "condo",
+        "dorm", "supportive housing", "senior living", "assisted living",
+        "mixed-use residential",
+    ))
+    total_units = int(_num(pi.get("total_units", 0)))
+    if not is_residential or total_units < 4:
+        pi["_unit_multipliers_validated"] = True
+        analysis["project_info"] = pi
+        return analysis
+
+    # Collect per-unit-type multipliers from the rooms. A unit type's
+    # multiplier is the MAX multiplier of rooms tagged with that unit_type
+    # (not sum — each room emits the SAME multiplier within a template).
+    type_mults = {}  # unit_type -> max multiplier seen
+    for floor in analysis.get("floors", []) or []:
+        for room in floor.get("rooms", []) or []:
+            ut = str(room.get("unit_type", "") or "").strip()
+            if not ut:
+                continue
+            rn = str(room.get("room_name", "") or "").lower()
+            # Skip non-apartment rooms (corridors, common areas tagged with
+            # a "Typical Floor" label sometimes have unit_type set).
+            if any(kw in rn for kw in ("corridor", "lobby", "hall ", "stair",
+                                       "vestibule", "elevator")):
+                continue
+            mult = int(_num(room.get("unit_multiplier", 1)) or 1)
+            type_mults[ut] = max(type_mults.get(ut, 0), mult)
+
+    if not type_mults:
+        pi["_unit_multipliers_validated"] = True
+        analysis["project_info"] = pi
+        return analysis
+
+    sum_mults = sum(type_mults.values())
+    warnings = []
+
+    # Check 1: sum vs total_units
+    if total_units > 0:
+        gap_pct = abs(sum_mults - total_units) / total_units
+        if gap_pct > 0.10:
+            direction = "over" if sum_mults > total_units else "under"
+            warnings.append(
+                f"SUM_MISMATCH: sum of unit-template multipliers is "
+                f"{sum_mults} but project_info.total_units is {total_units} "
+                f"({direction} by {gap_pct:.0%}). "
+                f"Per-type multipliers: {dict(sorted(type_mults.items()))}."
+            )
+
+    # Check 2: single-type dominance when 2+ types extracted
+    if len(type_mults) >= 2 and sum_mults > 0:
+        top_type, top_mult = max(type_mults.items(), key=lambda x: x[1])
+        if top_mult / sum_mults > 0.95:
+            warnings.append(
+                f"SINGLE_TYPE_DOMINANCE: '{top_type}' carries "
+                f"{top_mult}/{sum_mults} ({top_mult/sum_mults:.0%}) of all "
+                f"unit-template multipliers. A second extracted unit type "
+                f"has near-zero count — possible missed typology."
+            )
+
+    # Check 3: 2BR/3BR share warrants verification. Tuned to fire on the
+    # Ridgeview case (24% 2BR, true 7%) — typical multifamily is 60-90%
+    # 1BR, so >20% 2BR/3BR is high enough to warrant a "verify against
+    # unit-mix table" note even if it's a legitimate family-housing project.
+    # False-positive cost is one extra note; false-negative cost is bidding
+    # several thousand $ off on per-unit doors / trim line items.
+    big_unit_mult = sum(
+        m for ut, m in type_mults.items()
+        if any(kw in ut.lower() for kw in ("2br", "2 br", "two bedroom",
+                                            "3br", "3 br", "three bedroom"))
+    )
+    if sum_mults > 0:
+        big_share = big_unit_mult / sum_mults
+        if big_share > 0.20:
+            warnings.append(
+                f"VERIFY_UNIT_MIX: 2BR/3BR units carry {big_share:.0%} "
+                f"of total multiplier ({big_unit_mult}/{sum_mults}). Typical "
+                f"multifamily is 60-90% 1BR; please confirm against the "
+                f"unit-mix table on the title sheet — vector-rendered tables "
+                f"often misread on first pass. Per-type counts: "
+                f"{dict(sorted(type_mults.items()))}."
+            )
+
+    if warnings:
+        existing_notes = analysis.get("notes") or []
+        if not isinstance(existing_notes, list):
+            existing_notes = [existing_notes] if existing_notes else []
+        for w in warnings:
+            existing_notes.append(f"[Unit Multiplier Check] {w}")
+            print(f"   ⚠️  Unit multiplier: {w}", flush=True)
+        analysis["notes"] = existing_notes
+        pi["_unit_multiplier_warnings"] = warnings
+
+    pi["_unit_multipliers_validated"] = True
+    analysis["project_info"] = pi
+    return analysis
+
+
+def _apply_residential_ceiling_floor(analysis):
+    """Apply a GSF-based floor to residential ceiling SF after extraction.
+
+    Background: per-room ceiling extraction systematically under-counts on
+    dense vector-rendered architectural sets. The 2026-05-28 Ridgeview run
+    extracted 32,601 SF ceiling after all dedup / corridor / supplement
+    fixes, but Rider's manual takeoff and KonstructIQ both measured 42,923
+    SF (= the building's gross floor area). The gap is methodology, not a
+    bug: extraction sums per-room geometry, while Rider's and Konstruct's
+    scope-of-work treat the entire painted-ceiling envelope as the painted
+    quantity.
+
+    This pass computes an expected ceiling SF from footprint × stories ×
+    efficiency, and if extracted < expected by >10%, bumps the aggregated
+    ceiling total to the expected value. Door / trim / wall totals are
+    untouched (those are measured per-room with reasonable accuracy and
+    have their own boost paths).
+
+    Efficiency factor:
+      * Default: RESIDENTIAL_EFFICIENCY_FULL_INTERIOR (0.97) — apartments
+        plus commons painted. Matches most NY supportive housing /
+        multifamily contracts including Rider's Ridgeview scope.
+      * Override via project_info['_residential_efficiency'] (float in
+        [0.5, 1.0]) for projects where commons are excluded — e.g. set to
+        0.63 (UNITS_ONLY) for a tenant-improvement-only scope.
+      * Auto-downshift to UNITS_ONLY when the finish schedule was detected
+        AND it lists ACT on corridor/lobby ceilings (commons not painted
+        in that case). Requires has_finish_schedule == True from the
+        schedule detector AND ACT evidence in any common-area room.
+
+    Gate: only fires for residential buildings with footprint and stories
+    known. Skips when _used_footprint_fallback is already set (the
+    footprint path already produced the GSF-scaled answer).
+
+    Idempotent via analysis['_residential_ceiling_floor_applied'].
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if analysis.get("_residential_ceiling_floor_applied"):
+        return analysis
+    if analysis.get("_used_footprint_fallback"):
+        analysis["_residential_ceiling_floor_applied"] = True
+        return analysis
+
+    pi = analysis.get("project_info") or {}
+    bt = str(pi.get("building_type", "")).lower()
+    is_residential = any(kw in bt for kw in (
+        "residential", "multifamily", "multi-family", "apartment", "condo",
+        "dorm", "supportive housing", "senior living", "assisted living",
+        "mixed-use residential",
+    ))
+    if not is_residential:
+        analysis["_residential_ceiling_floor_applied"] = True
+        return analysis
+
+    footprint = _num(pi.get("footprint_sqft", 0))
+    stories = _num(pi.get("total_stories", 0))
+    if footprint <= 0 or stories <= 0:
+        analysis["_residential_ceiling_floor_applied"] = True
+        return analysis
+
+    # Resolve efficiency factor.
+    override = pi.get("_residential_efficiency")
+    if isinstance(override, (int, float)) and 0.5 <= float(override) <= 1.0:
+        efficiency = float(override)
+        efficiency_source = "project override"
+    else:
+        # Auto-downshift if the finish schedule says commons are ACT.
+        has_fs = bool(analysis.get("has_finish_schedule"))
+        commons_act = False
+        if has_fs:
+            for floor in analysis.get("floors", []) or []:
+                for room in floor.get("rooms", []) or []:
+                    rn = str(room.get("room_name", "")).lower()
+                    if not any(kw in rn for kw in (
+                            "corridor", "hallway", " hall", "lobby",
+                            "vestibule", "common room", "common area")):
+                        continue
+                    mat = str((room.get("materials") or {}).get("ceiling", "")).upper()
+                    if mat in ("ACT", "ACOUSTIC", "ACOUSTIC TILE",
+                               "DROP", "SUSPENDED"):
+                        commons_act = True
+                        break
+                if commons_act:
+                    break
+        if commons_act:
+            efficiency = RESIDENTIAL_EFFICIENCY_UNITS_ONLY
+            efficiency_source = "finish schedule shows ACT in commons"
+        else:
+            efficiency = RESIDENTIAL_EFFICIENCY_FULL_INTERIOR
+            efficiency_source = "default (commons painted)"
+
+    expected_ceil = round(footprint * stories * efficiency)
+    agg = analysis.setdefault("aggregated_totals", {})
+    current_ceil = _num(agg.get("total_paintable_ceiling_sqft", 0))
+
+    # Only bump when extracted is materially under expected. >10% gap is
+    # the trigger — smaller gaps fall within the noise of per-room
+    # measurement and don't justify overriding actual extraction.
+    if current_ceil >= expected_ceil * 0.90:
+        analysis["_residential_ceiling_floor_applied"] = True
+        return analysis
+
+    added = expected_ceil - current_ceil
+    agg["total_paintable_ceiling_sqft"] = expected_ceil
+
+    note = (f"[Residential Ceiling Floor] Extracted ceiling SF "
+            f"({current_ceil:,}) was below the GSF-based floor "
+            f"({expected_ceil:,}) for this residential building "
+            f"({footprint:,.0f} SF footprint × {stories:.0f} stories × "
+            f"{efficiency:.2f} efficiency from {efficiency_source}). "
+            f"Bumped ceiling total by +{added:,} SF to match the floor. "
+            f"Per-room extraction systematically under-counts dense "
+            f"vector-rendered floor plans; this floor catches the gap "
+            f"without requiring a re-extraction.")
+    existing_notes = analysis.get("notes") or []
+    if not isinstance(existing_notes, list):
+        existing_notes = [existing_notes] if existing_notes else []
+    analysis["notes"] = list(existing_notes) + [note]
+    print(f"   🪟 Residential ceiling floor: {current_ceil:,} → "
+          f"{expected_ceil:,} SF (+{added:,}, efficiency "
+          f"{efficiency:.2f} from {efficiency_source})", flush=True)
+
+    analysis["_residential_ceiling_floor_applied"] = True
+    return analysis
+
+
 def _validate_wall_area_by_perimeter(analysis):
     """
     Cross-check total wall area using per-room perimeter × ceiling height.
@@ -9044,6 +9617,33 @@ _FLOOR_SINGLE_RE = re.compile(
     r'(?:level|levels|floor|floors)\s+(\d+)',
     re.IGNORECASE,
 )
+# Ordinal-numeric in front: "1st Floor", "2nd Floor", "10th Floor".
+# The original two regexes above only matched the word-first form
+# ("Floor 2", "Floors 2-9") used by the Waverly architect. Coppola
+# Associates and many other firms put the ordinal first ("2nd Floor"),
+# which left ~all of Ridgeview unparseable — see incident_2026-05-28.
+_FLOOR_ORDINAL_NUM_RE = re.compile(
+    r'(\d+)(?:st|nd|rd|th)\s+(?:level|floor)',
+    re.IGNORECASE,
+)
+_ORDINAL_WORDS = {
+    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
+    "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
+}
+_FLOOR_ORDINAL_WORD_RE = re.compile(
+    r'\b(' + '|'.join(_ORDINAL_WORDS.keys()) + r')\s+(?:level|floor)',
+    re.IGNORECASE,
+)
+# Parenthetical multi-floor template names — e.g.
+#   "Typical Residential Floors (2nd & 3rd)"
+#   "(2nd, 3rd & 4th)"
+# Match any parenthesized chunk that contains at least one ordinal-numeric
+# ("Nth"), then pick out every ordinal-numeric inside it.
+_FLOOR_PAREN_COMPOUND_RE = re.compile(
+    r'\([^)]*?\d+(?:st|nd|rd|th)[^)]*\)',
+    re.IGNORECASE,
+)
+_ORDINAL_NUM_BARE_RE = re.compile(r'(\d+)(?:st|nd|rd|th)', re.IGNORECASE)
 
 
 def _parse_floor_range(name):
@@ -9053,7 +9653,11 @@ def _parse_floor_range(name):
       'Typical Residential Floors (Levels 1-7)' → {1,2,3,4,5,6,7}
       'Typical Residential Levels (Floors 2-9)' → {2,3,4,5,6,7,8,9}
       'Level 0 - Dining'                        → {0}
-      'Penthouse'                               → set()  (unparseable, won't dedupe)
+      '1st Floor', '2nd Floor', '10th Floor'    → {1}, {2}, {10}
+      'First Floor', 'Second Floor'             → {1}, {2}
+      'Typical Residential Floors (2nd & 3rd)'  → {2, 3}
+      '3rd Floor - Typical to 2nd Floor'        → {2, 3}
+      'Penthouse', 'Basement'                   → set()  (unparseable, won't dedupe)
 
     Unparseable floor names return an empty set, which means the dedup
     pass leaves them alone — safer to keep a possibly-unique floor than
@@ -9061,18 +9665,151 @@ def _parse_floor_range(name):
     """
     if not name:
         return set()
+    found = set()
+    # Parenthetical compounds like "(2nd & 3rd)" first — collect every
+    # ordinal-numeric inside any paren chunk that has at least one.
+    for m in _FLOOR_PAREN_COMPOUND_RE.finditer(name):
+        for om in _ORDINAL_NUM_BARE_RE.finditer(m.group()):
+            n = int(om.group(1))
+            if 0 < n <= 50:
+                found.add(n)
+    # Word-first range, e.g. "Floors 2-9"
     if m := _FLOOR_RANGE_RE.search(name):
         a, b = int(m.group(1)), int(m.group(2))
         lo, hi = min(a, b), max(a, b)
         # Sanity: an architectural set with floors 1..50+ is plausible
         # but a parsed range >25 is more likely a misparse (e.g., room
         # numbers being treated as floor numbers). Bail.
-        if hi - lo > 25:
-            return set()
-        return set(range(lo, hi + 1))
+        if hi - lo <= 25:
+            found |= set(range(lo, hi + 1))
+    # Word-first single, e.g. "Floor 2"
     if m := _FLOOR_SINGLE_RE.search(name):
-        return {int(m.group(1))}
-    return set()
+        found.add(int(m.group(1)))
+    # Ordinal-numeric, e.g. "2nd Floor", "10th Floor" — anywhere in the name.
+    # Using finditer so "3rd Floor - Typical to 2nd Floor" yields {2, 3}.
+    for m in _FLOOR_ORDINAL_NUM_RE.finditer(name):
+        n = int(m.group(1))
+        if 0 < n <= 50:
+            found.add(n)
+    # Ordinal-word, e.g. "First Floor", "Second Floor"
+    for m in _FLOOR_ORDINAL_WORD_RE.finditer(name):
+        found.add(_ORDINAL_WORDS[m.group(1).lower()])
+    return found
+
+
+_COMMON_AREA_ROOM_KEYWORDS = (
+    "corridor", "hallway", " hall", "lobby", "vestibule",
+    "common room", "common area", "elevator lobby",
+)
+# Building types that genuinely use ACT in corridors — keep model's call.
+_COMMERCIAL_BUILDING_KEYWORDS = (
+    "office", "retail", "commercial", "healthcare", "hospital", "clinic",
+    "hospitality", "hotel", "warehouse", "industrial",
+)
+
+
+def _fix_residential_corridor_ceilings(analysis):
+    """Flip ACT-defaulted corridor/lobby ceilings back to painted GYP for
+    residential buildings when there is no explicit ACT evidence.
+
+    The 2026-05-28 Ridgeview run lost ~2,900 sqft of corridor ceiling because
+    the per-room extraction prompt told the model that public corridors
+    "ALMOST ALWAYS have ACT ceilings — do NOT assume painted". That guidance
+    is correct for commercial but wrong for residential supportive housing,
+    multifamily, dorms, and similar building types where painted GYP is the
+    corridor norm. The prompt has been corrected to branch on building_type,
+    but this safety net catches:
+      • Re-runs of result JSON produced before the prompt fix.
+      • Any future prompt regression.
+      • The case where the model defaults ACT before reading building_type.
+
+    A corridor/lobby ceiling is "ACT-defaulted" when:
+      1. building_type indicates residential AND
+      2. materials.ceiling is empty/ACT AND ceiling_painted is false AND
+      3. notes do NOT explicitly mention ACT/grid/RCP evidence AND
+      4. dimensions.floor_area_sqft > 0 (so we have something to paint).
+
+    When all four hold, flip ceiling_painted to true, set ceiling material
+    to "GYP", populate ceiling_area_sqft from floor_area_sqft, and append
+    an audit note. Wallcovering, stained wood, etc. are unaffected.
+
+    Idempotent via analysis['_residential_corridor_ceiling_fixed'].
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if analysis.get('_residential_corridor_ceiling_fixed'):
+        return analysis
+
+    pi = analysis.get('project_info') or {}
+    bt = str(pi.get('building_type', '')).lower()
+    is_residential = any(kw in bt for kw in (
+        "residential", "multifamily", "multi-family", "apartment", "condo",
+        "dorm", "supportive housing", "senior living", "assisted living",
+        "mixed-use residential",
+    ))
+    is_commercial = any(kw in bt for kw in _COMMERCIAL_BUILDING_KEYWORDS) \
+                    and not is_residential
+    # Mixed-use that isn't clearly residential or commercial: don't touch.
+    if not is_residential or is_commercial:
+        analysis['_residential_corridor_ceiling_fixed'] = True
+        return analysis
+
+    fixed_count = 0
+    fixed_sqft = 0
+    for floor in analysis.get('floors', []) or []:
+        for room in floor.get('rooms', []) or []:
+            rn = str(room.get('room_name', '')).lower()
+            if not any(kw in rn for kw in _COMMON_AREA_ROOM_KEYWORDS):
+                continue
+            materials = room.setdefault('materials', {})
+            ceiling_mat = str(materials.get('ceiling', '')).upper().strip()
+            already_painted = bool(materials.get('ceiling_painted'))
+            if already_painted:
+                continue
+            # If the model has explicit ACT evidence in the notes, respect it.
+            notes_lc = str(room.get('notes', '') or '').lower()
+            has_explicit_act = (
+                ('act ' in notes_lc and 'grid' in notes_lc)
+                or 'reflected ceiling plan' in notes_lc
+                or 'rcp shows act' in notes_lc
+                or 'act per finish schedule' in notes_lc
+            )
+            if has_explicit_act:
+                continue
+            # Material must be empty / unknown / ACT (not e.g. DRYFALL, exposed).
+            if ceiling_mat and ceiling_mat not in ("", "ACT", "ACOUSTIC",
+                                                    "ACOUSTIC TILE", "DROP",
+                                                    "SUSPENDED"):
+                continue
+            dims = room.setdefault('dimensions', {})
+            floor_area = _num(dims.get('floor_area_sqft', 0))
+            if floor_area <= 0:
+                continue
+
+            # Flip it.
+            materials['ceiling'] = 'GYP'
+            materials['ceiling_painted'] = True
+            if _num(dims.get('ceiling_area_sqft', 0)) == 0:
+                dims['ceiling_area_sqft'] = floor_area
+            mult = room.get('unit_multiplier', 1) or 1
+            fixed_count += 1
+            fixed_sqft += floor_area * mult
+
+    if fixed_count:
+        note = (f"[Residential Corridor Ceiling Fix] {fixed_count} corridor/lobby "
+                f"room(s) had ACT-defaulted ceilings overridden to painted GYP "
+                f"(~{fixed_sqft:,.0f} sqft effective area added). "
+                f"Residential corridors almost always use painted gypsum; "
+                f"the original extraction defaulted to ACT due to a "
+                f"commercial-biased prompt rule.")
+        existing_notes = analysis.get('notes') or []
+        if not isinstance(existing_notes, list):
+            existing_notes = [existing_notes] if existing_notes else []
+        analysis['notes'] = list(existing_notes) + [note]
+        print(f"   🛠  {note}", flush=True)
+
+    analysis['_residential_corridor_ceiling_fixed'] = True
+    return analysis
 
 
 def _dedupe_overlapping_template_floors(analysis):
@@ -9402,6 +10139,15 @@ def _recalculate_totals(analysis):
     # without dedup their unit_multipliers all get summed and the totals
     # inflate ~3×. Idempotent via _template_floors_deduped flag.
     _dedupe_overlapping_template_floors(analysis)
+
+    # Safety net: residential corridor / lobby ceiling correction.
+    # The extraction prompt previously told the model that public corridors
+    # "ALMOST ALWAYS have ACT ceilings". That's right for commercial but
+    # wrong for residential supportive housing, multifamily, dorms, etc.,
+    # where painted GYP is the corridor norm. The Ridgeview 2026-05-28 run
+    # lost ~2,900 sqft of corridor ceiling this way. Idempotent via
+    # _residential_corridor_ceiling_fixed flag.
+    _fix_residential_corridor_ceilings(analysis)
 
     # Pre-pass: estimate missing wall area from floor area for rooms that have
     # floor_area but zero wall_area/perimeter (common with chunk-processing gaps)
@@ -14059,6 +14805,8 @@ def run_analysis_merge(prior_json, new_pdf_paths, scope_tags=None,
     if _prior_an_fs.get("has_finish_schedule") or _prior_an_fs.get("room_finish_schedule"):
         merged_analysis["has_finish_schedule"] = True
     _set_finish_schedule_flag(merged_analysis, new_pdf_paths)
+    _set_door_schedule_flag(merged_analysis, new_pdf_paths)
+    _set_window_schedule_flag(merged_analysis, new_pdf_paths)
 
     # Upload sheet inventory: prior run's sheets plus the newly uploaded files.
     _prior_sheets = set(_prior_an_fs.get("_upload_sheet_numbers") or [])
@@ -15173,6 +15921,14 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     if room_finish_schedule and not analysis.get("room_finish_schedule"):
         analysis["room_finish_schedule"] = room_finish_schedule
     _set_finish_schedule_flag(analysis, pdf_paths)
+    _set_door_schedule_flag(analysis, pdf_paths)
+    _set_window_schedule_flag(analysis, pdf_paths)
+    # Canonicalize source_sheet on every room BEFORE the upload-sheet
+    # inventory is built and BEFORE downstream dedup runs. The LLM
+    # sometimes emits ANSI-style sheet IDs ('A-102') for pages actually
+    # marked in a different convention ('A2'); the dedup pass treats
+    # those as different sheets and ends up with phantom floor templates.
+    analysis = _canonicalize_source_sheets(analysis, pdf_paths)
     analysis["_upload_sheet_numbers"] = sorted(_collect_upload_sheet_numbers(pdf_paths))
 
     # --- Whitebox / Prime Only exclusion (before validation) ---
@@ -15298,6 +16054,26 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     # supplements wall/ceiling/trim with estimated area. Must run BEFORE
     # perimeter cross-check and wall boost so those operate on supplemented totals.
     analysis = _supplement_missing_secondary_spaces(analysis)
+
+    # --- Unit-multiplier sanity validator ---
+    # Catches the Ridgeview-2026-05-28 case: model emits multipliers that
+    # sum correctly to total_units but distribute wildly wrong across unit
+    # types (e.g. 18 1BR + 10 2BR for a building that's actually 28/2).
+    # Cannot deterministically fix without OCR on the T1 unit-mix table
+    # (which is vector art on most architectural sets), but adds an audit
+    # note + RFI flag so the estimator catches the issue manually instead
+    # of bidding blind.
+    analysis = _validate_unit_multipliers(analysis)
+
+    # --- Residential ceiling floor (GSF-based) ---
+    # Per-room ceiling extraction systematically under-counts dense
+    # vector-rendered architectural sets. When extracted ceiling falls
+    # materially below footprint × stories × efficiency, bump to the
+    # GSF-based floor. KonstructIQ comparison on Ridgeview: extracted
+    # 32,601 SF vs truth 42,923 SF (= GSF). Default efficiency assumes
+    # commons are painted (typical for supportive housing / multifamily);
+    # auto-downshifts when the finish schedule shows ACT in commons.
+    analysis = _apply_residential_ceiling_floor(analysis)
 
     # --- Perimeter-based wall cross-check (must run BEFORE wall boost) ---
     # Computes perimeter-derived wall totals and stores in _perimeter_cross_check
