@@ -367,6 +367,7 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
         try:
             from pdf_preprocess import decrypt_pdf_if_needed, PdfPasswordLockedError
             locked_files = []
+            locked_filenames = []
             for key in pdf_keys:
                 filename = key.rsplit("/", 1)[-1]
                 local_path = os.path.join(workdir, filename)
@@ -382,6 +383,7 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
                 except PdfPasswordLockedError as lock_exc:
                     logger.warning("Submission %s: %s", submission_id, lock_exc)
                     locked_files.append(str(lock_exc))
+                    locked_filenames.append(f"{filename} (password-protected)")
 
             # If every file was password-locked there is nothing to analyze —
             # fail now with a clear, customer-facing reason instead of the
@@ -440,6 +442,11 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
                 scope_notes=scope_notes,
                 rate_overrides=rate_overrides,
                 multi_pass=_multi_pass,
+                # Password-locked files in a mixed upload used to be dropped
+                # silently — the customer was never told a volume wasn't
+                # priced. Seeding files_skipped forces manual review + an RFI
+                # naming the locked file(s).
+                pre_skipped_files=locked_filenames,
             )
 
             for key_name, content_type in (
@@ -630,6 +637,7 @@ def merge_submission(submission_id, parent_id, new_pdf_keys, contact_info,
             # Claude parser and PyPDF2 don't choke — see decrypt_pdf_if_needed).
             from pdf_preprocess import decrypt_pdf_if_needed, PdfPasswordLockedError
             locked_files = []
+            locked_filenames = []
             for key in new_pdf_keys:
                 filename = key.rsplit("/", 1)[-1]
                 local_path = os.path.join(workdir, filename)
@@ -639,6 +647,7 @@ def merge_submission(submission_id, parent_id, new_pdf_keys, contact_info,
                 except PdfPasswordLockedError as lock_exc:
                     logger.warning("Submission %s (merge): %s", submission_id, lock_exc)
                     locked_files.append(str(lock_exc))
+                    locked_filenames.append(f"{filename} (password-protected)")
 
             if not local_pdfs:
                 raise ValueError(" ".join(locked_files) or "All submitted PDFs were password-protected.")
@@ -652,6 +661,7 @@ def merge_submission(submission_id, parent_id, new_pdf_keys, contact_info,
                 scope_notes=scope_notes or "",
                 sheet_hint=sheet_hint,
                 rate_overrides=rate_overrides,
+                pre_skipped_files=locked_filenames,
             )
 
             for key_name, content_type in (

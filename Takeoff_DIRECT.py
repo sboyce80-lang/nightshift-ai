@@ -13752,7 +13752,8 @@ def _max_merge_exterior(prior_ext, delta_ext):
 def run_analysis_merge(prior_json, new_pdf_paths, scope_tags=None,
                         contact_name="", contact_email="", scope_notes="",
                         sheet_hint=None,
-                        rate_overrides=None, version=None, parent_id=None):
+                        rate_overrides=None, version=None, parent_id=None,
+                        pre_skipped_files=None):
     """Re-run analysis using a prior result JSON as the baseline, merging
     in extraction from `new_pdf_paths` only.
 
@@ -13815,6 +13816,7 @@ def run_analysis_merge(prior_json, new_pdf_paths, scope_tags=None,
             contact_email=contact_email,
             scope_notes=scope_notes,
             rate_overrides=rate_overrides,
+            pre_skipped_files=pre_skipped_files,
         )
         delta_analysis = delta_result.get("analysis") or {}
 
@@ -14124,7 +14126,8 @@ def _merge_building_inventory(prior_inv, delta_inv):
 def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                   corrections_path=None, use_cache=False, multi_pass=False,
                   image_fallback=True, schedule_estimation=True,
-                  rate_overrides=None, interactive=False):
+                  rate_overrides=None, interactive=False,
+                  pre_skipped_files=None):
     """
     Programmatic entry point for the analysis pipeline.
     Called by email_processor.py (or any external caller).
@@ -14480,7 +14483,11 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     # --- Analyse each PDF ---
     all_results = []
     files_analyzed = []
-    files_skipped = []
+    # Seed with files the caller already had to exclude (e.g. password-
+    # locked PDFs in a mixed upload) so they hit the same manual-review +
+    # RFI surfacing as files that fail during analysis. Previously a
+    # partially locked upload was silently priced without the locked file.
+    files_skipped = list(pre_skipped_files or [])
     file_room_counts = {}  # Track per-file room counts for extraction validation
     image_fallback_files = []  # Track which files used image fallback
     schedule_estimated_files = []  # Track which files used schedule-based estimation
@@ -14970,6 +14977,29 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     # Normalize scope fields after merge (ensures every room has in_scope)
     _update_progress(5, TOTAL_STEPS, "Validating & Recalculating", "Applying guardrails and schedule overrides...")
     analysis = _normalize_scope_fields(analysis)
+
+    # --- Skipped files: block silent partial estimates ---
+    # files_skipped used to be written into the result JSON and read by
+    # NOTHING — a 3-file upload missing one whole file shipped a normal-
+    # looking proposal. A missing file is missing scope: force manual
+    # review and surface an RFI naming the files.
+    if files_skipped:
+        analysis["manual_review_required"] = True
+        _skip_reason = (
+            f"{len(files_skipped)} of {len(pdf_paths)} uploaded file(s) "
+            f"could not be analyzed: {', '.join(files_skipped)}. "
+            f"Their scope is MISSING from this estimate."
+        )
+        if analysis.get("manual_review_reason"):
+            analysis["manual_review_reason"] = (
+                str(analysis["manual_review_reason"]) + " | " + _skip_reason)
+        else:
+            analysis["manual_review_reason"] = _skip_reason
+        analysis.setdefault("notes", []).append(
+            f"[Files Skipped] {_skip_reason} RFI REQUIRED: re-supply or "
+            f"re-run the failed file(s) before relying on this estimate — "
+            f"no quantities from them are priced."
+        )
 
     # --- Finish schedule + upload sheet inventory ---
     # Carry the pre-extracted Room Finish Schedule onto the result so the
