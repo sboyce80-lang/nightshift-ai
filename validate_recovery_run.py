@@ -53,7 +53,16 @@ def main():
             rooms = pi.get("total_rooms_found")
             fp = pi.get("footprint_sqft")
             sub = (result.get("cost_estimate", {}) or {}).get("subtotal", 0) or 0
+            # data_quality_score lives top-level in the SAVED json, not in
+            # the run_analysis return dict — read it from the output file.
             dqs = (result.get("validation", {}) or {}).get("data_quality_score")
+            if dqs is None and result.get("output_json_path"):
+                try:
+                    with open(result["output_json_path"]) as _fh:
+                        dqs = (json.load(_fh).get("validation") or {}).get(
+                            "data_quality_score")
+                except Exception:
+                    pass
             mr = bool(result.get("manual_review_required"))
             rfi = len(result.get("rfi_items") or [])
             jp = result.get("output_json_path")

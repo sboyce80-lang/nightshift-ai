@@ -131,7 +131,12 @@ REFERENCE_CASES = {
                        "corrugated walls (paintable, future target); r12 = "
                        "831.21 LF × 16 ft = 13,299.36 SF corrugated metal "
                        "walls (specifically OUT of paint scope per Rider).",
-        "match_keywords": ["fishkill"],
+        # NOTE: was ["fishkill"], which false-matched 397Fishkill.pdf — a
+        # 15-unit residential building at 397 Fishkill Ave (different
+        # project entirely; 2026-06-12 validation run compared apples to
+        # oranges and reported a phantom 665% regression). Require a
+        # cenhud token so only Cen Hud outputs match.
+        "match_keywords": ["cenhud", "cen hud", "cen_hud"],
         "source": "Rider takeoff cenHud_Fishkill-takeoffs.xlsx (May 2026)",
         "targets": {
             # Rider r2: 2,102.58 LF × 9' = 18,925 SF gyp walls
