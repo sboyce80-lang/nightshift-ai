@@ -258,13 +258,16 @@
     <script src="{{ url_for('static', filename='file-merge.js') }}"></script>
     <script>
     const SUB_ID = {{ submission_id|tojson }};
-    const TERMINAL = new Set(["completed", "failed"]);
-    const PROGRESS = { queued: 10, processing: 55, completed: 100, failed: 100 };
+    const TERMINAL = new Set(["completed", "failed", "cancelled", "needs_review"]);
+    const PROGRESS = { queued: 10, processing: 55, completed: 100, failed: 100,
+                       cancelled: 100, needs_review: 100 };
     const MSGS = {
         queued: "Waiting in queue…",
         processing: "Extracting rooms, walls, doors, windows…",
         completed: "Done — your estimate is ready below.",
         failed: "Something went wrong. See error below.",
+        cancelled: "This job was cancelled.",
+        needs_review: "Takeoff complete — our team is reviewing it before release.",
     };
     let pollTimer = null;
 
@@ -275,8 +278,18 @@
         const pill = document.getElementById("status-pill");
         pill.textContent = d.status;
         pill.className = "status-pill status-" + d.status;
-        document.getElementById("progress-fill").style.width = (PROGRESS[d.status] || 0) + "%";
-        document.getElementById("status-msg").textContent = MSGS[d.status] || "";
+        // Real engine progress when available; the static per-status map is
+        // only the fallback (the bar used to sit at a constant 55%).
+        let pct = PROGRESS[d.status] || 0;
+        let msg = MSGS[d.status] || "";
+        if (d.status === "processing" && d.progress && d.progress.pct != null) {
+            pct = Math.max(10, Math.min(99, d.progress.pct));
+            msg = d.progress.label
+                ? d.progress.label + (d.progress.detail ? " — " + d.progress.detail : "")
+                : msg;
+        }
+        document.getElementById("progress-fill").style.width = pct + "%";
+        document.getElementById("status-msg").textContent = msg;
 
         if (d.status === "completed") {
             document.getElementById("results-section").style.display = "";

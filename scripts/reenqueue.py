@@ -125,6 +125,22 @@ def main():
                 print(f"  · {sid}  RQ job gone — reconstructed from DB "
                       f"(rate_overrides=None; re-apply manually if needed)")
 
+            # Persisted routing beats the flat RQ_JOB_TIMEOUT default —
+            # this script killed re-runs of 4h DD jobs at the 2h mark.
+            job_timeout = RQ_JOB_TIMEOUT
+            try:
+                row = conn.execute(text(
+                    "SELECT queue_name, job_timeout FROM submissions "
+                    "WHERE id = :sid"), {"sid": sid}).fetchone()
+                if row is not None:
+                    if row[1]:
+                        job_timeout = max(int(row[1]), RQ_JOB_TIMEOUT)
+                    if args.queue is None and row[0]:
+                        queue_name = row[0]
+            except Exception as exc:
+                print(f"  · {sid}  could not read persisted routing ({exc}); "
+                      f"using defaults")
+
             queue = Queue(queue_name, connection=redis)
 
             conn.execute(text("""
@@ -139,7 +155,7 @@ def main():
                 "jobs.process_submission",
                 kwargs=kwargs,
                 job_id=sid,
-                job_timeout=RQ_JOB_TIMEOUT,
+                job_timeout=job_timeout,
                 result_ttl=RQ_RESULT_TTL,
                 failure_ttl=RQ_RESULT_TTL,
             )

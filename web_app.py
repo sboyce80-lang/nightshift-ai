@@ -811,6 +811,7 @@ def submit():
     uploaded_files = []   # list of (filename, r2_key, size_bytes)
     total_pages = 0
     max_size_bytes = 0
+    total_size_bytes = 0  # SUM across files — routing must see the whole payload
     manifest_raw = (request.form.get("uploaded_manifest") or "").strip()
 
     if manifest_raw:
@@ -862,6 +863,7 @@ def submit():
                     flash(f"{filename} exceeds the {MAX_PDF_SIZE_MB} MB size limit.", "error")
                     return redirect(url_for("index"))
 
+                total_size_bytes += size_bytes
                 if size_bytes > max_size_bytes:
                     max_size_bytes = size_bytes
                 uploaded_files.append((filename, key, size_bytes))
@@ -910,6 +912,7 @@ def submit():
                         return redirect(url_for("index"))
 
                     total_pages += _count_pdf_pages(local_path)
+                    total_size_bytes += size_bytes
                     if size_bytes > max_size_bytes:
                         max_size_bytes = size_bytes
 
@@ -1017,8 +1020,8 @@ def submit():
     #    timeout sized to the payload (big DD-scale sets need 4h, small
     #    single-PDF jobs only need 30 min).
     pdf_keys = [k for (_, k, _) in uploaded_files]
-    queue, queue_name = _pick_queue(total_pages, max_size_bytes)
-    job_timeout = _pick_timeout(total_pages, max_size_bytes)
+    queue, queue_name = _pick_queue(total_pages, total_size_bytes)
+    job_timeout = _pick_timeout(total_pages, total_size_bytes)
     try:
         job = queue.enqueue(
             "jobs.process_submission",
@@ -1213,6 +1216,7 @@ def resubmit(parent_id):
     uploaded_files = []   # (filename, key, size_bytes)
     total_pages = 0
     max_size_bytes = 0
+    total_size_bytes = 0  # SUM across files — routing must see the whole payload
 
     with tempfile.TemporaryDirectory(prefix=f"ns-resubmit-{submission_id}-") as staging:
         try:
@@ -1234,6 +1238,7 @@ def resubmit(parent_id):
                     return redirect(url_for("index"))
 
                 total_pages += _count_pdf_pages(local_path)
+                total_size_bytes += size_bytes
                 if size_bytes > max_size_bytes:
                     max_size_bytes = size_bytes
 
@@ -1300,8 +1305,24 @@ def resubmit(parent_id):
     # keep the quote rate-stable across versions by default.
 
     pdf_keys = [k for (_, k, _) in uploaded_files]
-    queue, queue_name = _pick_queue(total_pages, max_size_bytes)
-    job_timeout = _pick_timeout(total_pages, max_size_bytes)
+    queue, queue_name = _pick_queue(total_pages, total_size_bytes)
+    job_timeout = _pick_timeout(total_pages, total_size_bytes)
+    # A merge re-run re-extracts only the NEW files but re-renders and
+    # re-prices the WHOLE project — sizing the timeout on the new files
+    # alone killed DD-scale re-runs with one small addendum. Floor it at
+    # the parent's recorded timeout, and inherit the parent's heavy-queue
+    # routing.
+    try:
+        with session_scope() as session:
+            parent_sub = session.get(Submission, parent_id)
+            if parent_sub is not None:
+                if getattr(parent_sub, "job_timeout", None):
+                    job_timeout = max(job_timeout, int(parent_sub.job_timeout))
+                if getattr(parent_sub, "queue_name", None) == RQ_QUEUE_HEAVY:
+                    queue, queue_name = _queue_heavy, RQ_QUEUE_HEAVY
+    except Exception as exc:
+        logger.warning("Could not read parent routing for %s: %s",
+                       parent_id, exc)
     try:
         job = queue.enqueue(
             "jobs.merge_submission",
@@ -1385,7 +1406,10 @@ def jobs_list():
     uid = current_user_id()
     status_filter = (request.args.get("status") or "active").lower()
     if status_filter == "completed":
-        wanted = ("completed", "failed", "cancelled")
+        # needs_review is terminal-ish for the customer: the takeoff ran,
+        # a human is checking it. It used to match NEITHER filter, so the
+        # submission vanished from the UI entirely (review finding 6.5).
+        wanted = ("completed", "failed", "cancelled", "needs_review")
     else:
         wanted = ("queued", "processing")
         status_filter = "active"
@@ -1491,6 +1515,13 @@ def job_status_api(submission_id):
             "updated_at": sub.updated_at.isoformat() if sub.updated_at else None,
             "subtotal": float(sub.subtotal) if sub.subtotal is not None else None,
             "results": results,
+            # Live engine progress ({step,total_steps,label,detail,pct,
+            # updated}) written by the worker's progress callback, plus the
+            # heartbeat so the UI can distinguish "alive but slow" from
+            # "dead" instead of showing a frozen bar.
+            "progress": getattr(sub, "progress", None),
+            "heartbeat_at": (sub.heartbeat_at.isoformat()
+                             if getattr(sub, "heartbeat_at", None) else None),
         }
 
     # RQ status is best-effort; the DB row is authoritative.

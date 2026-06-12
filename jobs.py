@@ -59,12 +59,29 @@ if not logger.handlers:
 # Status helpers
 # ---------------------------------------------------------------------------
 
+# Source states each target status may NOT transition from. The old blind
+# UPDATE let any writer stomp any state — the worst observed case: the
+# (undeployed) watchdog marks a live job failed, the worker later flips
+# failed -> completed, and the customer gets "please resubmit" followed by
+# an estimate. Blocked transitions are logged, not raised.
+_BLOCKED_TRANSITIONS = {
+    "completed": ("failed", "cancelled"),
+    "needs_review": ("completed", "failed", "cancelled"),
+    "failed": ("completed", "cancelled"),
+    "processing": ("cancelled",),
+    "queued": ("cancelled",),
+}
+
+
 def update_status(submission_id, status, error=None, subtotal=None):
     """Patch the submission row's status (and optionally error/subtotal).
 
     Uses a raw UPDATE (not the ORM session.get + dirty-tracking path) so
     behavior is predictable even on the work-horse's first-ever DB call,
     and logs the affected rowcount so a silent no-op is visible in logs.
+    Transitions in _BLOCKED_TRANSITIONS are refused at the SQL level
+    (WHERE status NOT IN ...), so two racing writers can't stomp a
+    terminal state.
     """
     values = {
         "status": status,
@@ -82,16 +99,162 @@ def update_status(submission_id, status, error=None, subtotal=None):
                 .where(Submission.id == submission_id)
                 .values(**values)
             )
+            blocked_from = _BLOCKED_TRANSITIONS.get(status)
+            if blocked_from:
+                stmt = stmt.where(Submission.status.notin_(blocked_from))
             result = session.execute(stmt)
             if result.rowcount == 0:
-                logger.warning("update_status: no row affected for %s (status=%s)",
-                               submission_id, status)
+                logger.warning(
+                    "update_status: no row affected for %s (status=%s) — "
+                    "row missing or transition blocked from a terminal state",
+                    submission_id, status)
             else:
                 logger.info("update_status: %s -> %s (rows=%d)",
                             submission_id, status, result.rowcount)
     except Exception as exc:
         logger.warning("Could not update status for %s -> %s: %s",
                        submission_id, status, exc, exc_info=True)
+
+
+def _start_heartbeat(submission_id, interval=60):
+    """Touch submissions.heartbeat_at every `interval` seconds while the
+    job runs. Returns a threading.Event — set() it to stop the ticker.
+
+    The watchdog reaps on STALE HEARTBEAT + RQ cross-check, never on
+    wall-clock age alone, so this thread is what makes a healthy
+    90-minute takeoff distinguishable from a dead worker.
+    """
+    import threading
+    stop = threading.Event()
+
+    def _touch():
+        try:
+            with session_scope() as session:
+                session.execute(
+                    Submission.__table__.update()
+                    .where(Submission.id == submission_id)
+                    .where(Submission.status == "processing")
+                    .values(heartbeat_at=datetime.now(timezone.utc))
+                )
+        except Exception as exc:
+            logger.debug("heartbeat write failed for %s: %s", submission_id, exc)
+
+    def _loop():
+        _touch()
+        while not stop.wait(interval):
+            _touch()
+
+    t = threading.Thread(target=_loop, daemon=True,
+                         name=f"hb-{str(submission_id)[:8]}")
+    t.start()
+    return stop
+
+
+def _make_progress_callback(submission_id):
+    """Persist engine progress checkpoints ({step,label,pct,...}) to the
+    submissions.progress column. Wired into Takeoff_DIRECT's
+    _PROGRESS_CALLBACK hook — before this, the engine's 8 progress
+    checkpoints were dead code in prod and the UI showed a constant bar."""
+    def _cb(progress):
+        try:
+            with session_scope() as session:
+                session.execute(
+                    Submission.__table__.update()
+                    .where(Submission.id == submission_id)
+                    .values(progress=progress,
+                            heartbeat_at=datetime.now(timezone.utc))
+                )
+        except Exception as exc:
+            logger.debug("progress write failed for %s: %s", submission_id, exc)
+    return _cb
+
+
+def _persist_routing(submission_id):
+    """Record the queue + timeout this job actually runs with (from the
+    live RQ job) so every re-enqueue path can reuse them instead of
+    inheriting a short legacy default."""
+    try:
+        from rq import get_current_job
+        job = get_current_job()
+        if job is None:
+            return None
+        with session_scope() as session:
+            session.execute(
+                Submission.__table__.update()
+                .where(Submission.id == submission_id)
+                .values(queue_name=job.origin, job_timeout=job.timeout)
+            )
+        return job
+    except Exception as exc:
+        logger.debug("routing persist failed for %s: %s", submission_id, exc)
+        return None
+
+
+def _reroute_to_heavy_if_misrouted(submission_id, local_pdfs, kwargs_for_requeue):
+    """Belt-and-suspenders routing guard, run AFTER download+decrypt when
+    real page counts are known.
+
+    The browser-direct manifest path never counts pages, so a 600-page
+    vector set under 30 MB routes to the fast (OOM-prone, 1h-timeout)
+    worker. If this worker is the FAST one and the measured payload is
+    heavy-class, re-enqueue onto the heavy queue with a properly tiered
+    timeout and return True — the caller exits without analyzing.
+    """
+    try:
+        from config import RQ_QUEUE_FAST, RQ_QUEUE_HEAVY, REDIS_URL
+        from config import HEAVY_QUEUE_PAGE_THRESHOLD, HEAVY_QUEUE_FILE_MB
+    except ImportError:
+        return False
+    current_queue = os.environ.get("RQ_QUEUE_NAME", "")
+    if current_queue != RQ_QUEUE_FAST:
+        return False  # already on heavy (or unknown) — never bounce back
+
+    total_pages = 0
+    total_bytes = 0
+    for p in local_pdfs:
+        try:
+            total_bytes += os.path.getsize(p)
+            import PyPDF2
+            total_pages += len(PyPDF2.PdfReader(p).pages)
+        except Exception:
+            continue
+    total_mb = total_bytes / (1024 * 1024)
+    if total_pages < HEAVY_QUEUE_PAGE_THRESHOLD and total_mb < HEAVY_QUEUE_FILE_MB:
+        return False  # genuinely a fast-class job
+
+    # Tiered timeout on MEASURED totals (mirrors web_app._pick_timeout).
+    if total_mb >= 300 or total_pages >= 50:
+        timeout = 4 * 3600
+    elif total_mb >= 100 or total_pages >= 25:
+        timeout = 2 * 3600
+    else:
+        timeout = 3600
+    try:
+        from redis import Redis
+        from rq import Queue
+        heavy = Queue(RQ_QUEUE_HEAVY, connection=Redis.from_url(REDIS_URL))
+        with session_scope() as session:
+            session.execute(
+                Submission.__table__.update()
+                .where(Submission.id == submission_id)
+                .values(queue_name=RQ_QUEUE_HEAVY, job_timeout=timeout)
+            )
+        update_status(submission_id, "queued")
+        heavy.enqueue(
+            "jobs.process_submission",
+            kwargs=kwargs_for_requeue,
+            job_id=f"{submission_id}-heavy",
+            job_timeout=timeout,
+        )
+        logger.warning(
+            "Submission %s re-routed fast -> heavy: measured %d pages / "
+            "%.0f MB exceeds heavy-class thresholds (timeout %ds)",
+            submission_id, total_pages, total_mb, timeout)
+        return True
+    except Exception as exc:
+        logger.error("Heavy re-route failed for %s — continuing on fast: %s",
+                     submission_id, exc)
+        return False
 
 
 def claim_email_send(submission_id):
@@ -190,14 +353,21 @@ def reconcile_abandoned_submissions(redis_conn, queue_names):
 
     for sid, db_status, last_seen in stuck_snapshot:
         # 1. Look up the RQ job by its id (which equals submission_id).
+        #    A job re-routed fast -> heavy runs under "<sid>-heavy", so
+        #    check that id too before declaring the job missing.
         try:
             job = Job.fetch(sid, connection=redis_conn)
             rq_status = job.get_status()
             exc_summary = (job.exc_info or "").splitlines()[-1] if job.exc_info else ""
         except NoSuchJobError:
-            job = None
-            rq_status = "missing"
-            exc_summary = ""
+            try:
+                job = Job.fetch(f"{sid}-heavy", connection=redis_conn)
+                rq_status = job.get_status()
+                exc_summary = (job.exc_info or "").splitlines()[-1] if job.exc_info else ""
+            except NoSuchJobError:
+                job = None
+                rq_status = "missing"
+                exc_summary = ""
         except Exception as exc:
             logger.warning("Reconcile: Job.fetch failed for %s: %s", sid, exc)
             continue
@@ -405,6 +575,13 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
     """
     logger.info("Processing submission %s (%d PDFs)", submission_id, len(pdf_keys))
     update_status(submission_id, "processing")
+    _persist_routing(submission_id)
+    _hb_stop = _start_heartbeat(submission_id)
+    try:
+        import Takeoff_DIRECT as _td_mod
+        _td_mod._PROGRESS_CALLBACK = _make_progress_callback(submission_id)
+    except Exception:
+        _td_mod = None
 
     with tempfile.TemporaryDirectory(prefix=f"ns-job-{submission_id}-") as workdir:
         local_pdfs = []
@@ -434,6 +611,21 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
             # generic "No PDFs could be analysed" message.
             if not local_pdfs:
                 raise ValueError(" ".join(locked_files) or "All submitted PDFs were password-protected.")
+
+            # Routing guard: the browser-direct manifest path enqueues with
+            # 0 known pages, so heavy vector sets can land on the fast
+            # (OOM-prone, short-timeout) worker. Now that the files are
+            # local, measure them; if this is the fast worker holding a
+            # heavy-class payload, bounce the job to the heavy queue and
+            # exit before burning any API spend.
+            if _reroute_to_heavy_if_misrouted(submission_id, local_pdfs, {
+                "submission_id": submission_id,
+                "pdf_keys": pdf_keys,
+                "contact_info": contact_info,
+                "scope_notes": scope_notes,
+                "rate_overrides": rate_overrides,
+            }):
+                return {"submission_id": submission_id, "rerouted": "heavy"}
 
             # Pre-normalize any pages that would be too dense for the heavy
             # worker to process without triggering Render's CPU-load
@@ -637,6 +829,10 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
             except Exception as email_exc:
                 logger.error("Failed to send error email: %s", email_exc)
             raise
+        finally:
+            _hb_stop.set()
+            if _td_mod is not None:
+                _td_mod._PROGRESS_CALLBACK = None
 
 
 # ---------------------------------------------------------------------------
@@ -690,6 +886,13 @@ def merge_submission(submission_id, parent_id, new_pdf_keys, contact_info,
     logger.info("Merging submission %s onto parent %s (%d new PDFs, tags=%s)",
                 submission_id, parent_id, len(new_pdf_keys), scope_tags)
     update_status(submission_id, "processing")
+    _persist_routing(submission_id)
+    _hb_stop = _start_heartbeat(submission_id)
+    try:
+        import Takeoff_DIRECT as _td_mod
+        _td_mod._PROGRESS_CALLBACK = _make_progress_callback(submission_id)
+    except Exception:
+        _td_mod = None
 
     parent_json_key = _find_parent_result_json_key(parent_id)
     if not parent_json_key:
@@ -701,6 +904,9 @@ def merge_submission(submission_id, parent_id, new_pdf_keys, contact_info,
             send_error_email(contact_info, msg)
         except Exception:
             pass
+        _hb_stop.set()
+        if _td_mod is not None:
+            _td_mod._PROGRESS_CALLBACK = None
         raise RuntimeError(msg)
 
     with tempfile.TemporaryDirectory(prefix=f"ns-merge-{submission_id}-") as workdir:
@@ -837,6 +1043,10 @@ def merge_submission(submission_id, parent_id, new_pdf_keys, contact_info,
             except Exception as email_exc:
                 logger.error("Failed to send error email: %s", email_exc)
             raise
+        finally:
+            _hb_stop.set()
+            if _td_mod is not None:
+                _td_mod._PROGRESS_CALLBACK = None
 
 
 # ---------------------------------------------------------------------------
