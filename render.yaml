@@ -92,19 +92,20 @@ services:
           name: nightshift-db
           property: connectionString
 
-  # Stuck-job watchdog — every 10 minutes, sweeps any Submission in
-  # queued / processing / running state whose updated_at is older than
-  # --threshold-min (30) and marks it 'failed' with an explanatory
-  # error. Customers get a Resend notification telling them to resubmit
-  # instead of staring at a silent UI. Catches the failure mode that
-  # took 5h 29m to notice on 2026-05-29 (submission 45c7eca6, killed
-  # mid-job by a deploy, sat in 'processing' forever).
+  # Stuck-job watchdog v2 — every 10 minutes. Reaps a Submission ONLY
+  # when BOTH liveness signals are dead: the worker heartbeat
+  # (submissions.heartbeat_at, touched every ~60s while processing) is
+  # stale AND RQ no longer reports the job active. Never reaps on
+  # wall-clock age alone — v1 did, was never deployed, and would have
+  # killed healthy 90-minute DD-scale jobs at minute 31 and emailed
+  # customers "resubmit" while the estimate was still coming.
+  # Catches the failure mode that took 5h29m to notice on 2026-05-29
+  # (submission 45c7eca6, killed mid-job by a deploy).
   #
-  # Cheap to run — single DB query + 0..N updates per tick. Idempotent
-  # (a swept job stays 'failed', won't be re-emailed). The --threshold
-  # is the longest-legitimate processing window we've observed plus
-  # margin; bump to 45 or 60 if long-running multi-PDF batches start
-  # tripping false positives.
+  # REQUIRES alembic 0022 (heartbeat_at column) + the heartbeat-enabled
+  # worker build. Safe against older rows: legacy rows with no heartbeat
+  # need 2h of idle age AND an inactive RQ job before reaping.
+  # Cheap — one DB scan + one RQ lookup per candidate. Idempotent.
   - type: cron
     name: nightshift-stuck-job-watchdog
     runtime: python
@@ -112,7 +113,7 @@ services:
     plan: starter
     schedule: "*/10 * * * *"
     buildCommand: pip install -r requirements.txt
-    startCommand: python scripts/sweep_stuck_jobs.py --threshold-min 30
+    startCommand: python scripts/sweep_stuck_jobs.py --hb-stale-min 10 --queued-grace-min 30
     envVars:
       - fromGroup: nightshift-shared
       - key: DATABASE_URL

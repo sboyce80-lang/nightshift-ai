@@ -425,9 +425,18 @@ except Exception:
 # ---------------------------------------------------------------------------
 _PROGRESS_FILE = None  # Set by run_analysis() when called from Streamlit
 
+# Optional callback set by the RQ worker (jobs.py) to persist progress to
+# the submissions.progress column. Before this hook existed the 8
+# _update_progress checkpoints were dead code in prod — only the Streamlit
+# fallback ever set _PROGRESS_FILE, and web customers watched a constant
+# 55% bar whether the job was healthy or the worker died an hour ago.
+_PROGRESS_CALLBACK = None
+
+
 def _update_progress(step, total_steps, label, detail="", pct=None):
-    """Write progress to a JSON file so the Streamlit UI can display it."""
-    if not _PROGRESS_FILE:
+    """Report engine progress to whichever sinks are wired (JSON file for
+    the Streamlit fallback, DB callback for the web/RQ path)."""
+    if not _PROGRESS_FILE and _PROGRESS_CALLBACK is None:
         return
     try:
         progress = {
@@ -438,8 +447,11 @@ def _update_progress(step, total_steps, label, detail="", pct=None):
             "pct": pct if pct is not None else round(step / total_steps * 100),
             "updated": datetime.now().isoformat(),
         }
-        with open(_PROGRESS_FILE, "w") as f:
-            json.dump(progress, f)
+        if _PROGRESS_FILE:
+            with open(_PROGRESS_FILE, "w") as f:
+                json.dump(progress, f)
+        if _PROGRESS_CALLBACK is not None:
+            _PROGRESS_CALLBACK(progress)
     except Exception:
         pass
 
