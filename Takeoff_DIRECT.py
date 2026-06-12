@@ -10399,6 +10399,128 @@ def _base_confirmed_paintable(room, building_type):
     return True  # residential / unknown — painted wood base is the norm
 
 
+# Floor names that indicate an ENLARGED UNIT PLAN sheet rather than a real
+# building level: "Unit Types x01–x06 (Typical Residential Unit Plans)",
+# "Special Unit Plans — Units x01 through x06", "Enlarged Unit Plans", etc.
+_ENLARGED_PLAN_FLOOR_RE = re.compile(
+    r"(?:unit\s+(?:type|plan)|typical\s+.*unit\s+plan|enlarged\s+(?:unit\s+)?plan"
+    r"|special\s+unit|unit\s+types?\b)", re.IGNORECASE)
+
+
+def _dedupe_enlarged_plan_floors(analysis):
+    """Zero the geometry of pseudo-floors created from enlarged unit-plan
+    sheets when the same rooms were already extracted on real floors.
+
+    2026-06-12 Fishkill validation: the extraction produced real floors
+    ('1st Floor' 87 rooms, '2nd/3rd Floor — Residential' 92 each) PLUS
+    'Unit Types x01–x06 (Typical Residential Unit Plans — A-105/A-106/
+    A-107)' (18 rooms) and 'Special Unit Plans — Units x01 through x06'
+    (27 rooms) — the enlarged unit-plan SHEETS extracted as if they were
+    additional building levels. Their rooms duplicate apartments already
+    counted on the ranged floors, inflating walls ~4-10x. The template-
+    floor dedup can't catch them because their names parse to no floor
+    range, and cross-sheet dedup keys on (floor, unit, name) so the
+    pseudo-floor boundary hides the duplication.
+
+    A floor is treated as an enlarged-plan duplicate ONLY when ALL hold:
+      1. Its name matches the enlarged-plan pattern AND parses to no
+         floor range.
+      2. Real (range-parsed) floors exist and carry a substantive room
+         count (the building wasn't extracted solely from unit plans).
+      3. >=50% of its rooms have a same-type counterpart on the real
+         floors (room names compared with digits/unit tokens stripped).
+      4. Its rooms carry no unit_multiplier > 1 — a multiplied template
+         floor is the LEGITIMATE source of unit scope (the pattern where
+         floor plans show shells and unit plans carry the detail), and
+         zeroing it would delete real rooms.
+
+    Matching floors keep their rooms (provenance preserved) with geometry
+    zeroed, mirroring the cross-sheet dedup convention. Doors/windows are
+    retained (schedule overrides govern those). Idempotent via
+    _enlarged_plan_floors_deduped.
+    """
+    if analysis.get("_enlarged_plan_floors_deduped"):
+        return
+    floors = analysis.get("floors", []) or []
+    if len(floors) < 2:
+        analysis["_enlarged_plan_floors_deduped"] = True
+        return
+
+    def _strip_name(n):
+        # "Unit x01 Type — Bath 1" / "Unit 201 — Bathroom 2" -> "unit bath"
+        s = re.sub(r"[x#]?\d+[a-z]?", " ", str(n or "").lower())
+        s = re.sub(r"[^a-z]+", " ", s)
+        # Normalize the naming variants the enlarged-plan sheets use
+        # ("Type —" infix, Bath vs Bathroom, trailing "Room").
+        s = s.replace("bathroom", "bath").replace("bedroom", "bed")
+        words = [w for w in s.split() if w not in ("type", "room", "rm", "the")]
+        return " ".join(words)
+
+    ranged, candidates = [], []
+    for fl in floors:
+        fname = str(fl.get("floor_name", "") or "")
+        if _parse_floor_range(fname):
+            ranged.append(fl)
+        elif _ENLARGED_PLAN_FLOOR_RE.search(fname):
+            candidates.append(fl)
+    if not ranged or not candidates:
+        analysis["_enlarged_plan_floors_deduped"] = True
+        return
+
+    ranged_rooms = [r for fl in ranged for r in fl.get("rooms", [])
+                    if r.get("in_scope", True)]
+    ranged_names = {_strip_name(r.get("room_name")) for r in ranged_rooms}
+    ranged_names.discard("")
+    if len(ranged_rooms) < 10:
+        # Real floors are thin — the unit plans may be the only source of
+        # unit detail. Don't risk deleting the actual scope.
+        analysis["_enlarged_plan_floors_deduped"] = True
+        return
+
+    zeroed_floors = 0
+    zeroed_rooms = 0
+    zeroed_wall_sqft = 0
+    for fl in candidates:
+        rooms = [r for r in fl.get("rooms", []) if r.get("in_scope", True)]
+        if not rooms:
+            continue
+        if any(int(_num(r.get("unit_multiplier", 1)) or 1) > 1 for r in rooms):
+            analysis.setdefault("notes", []).append(
+                f"[Enlarged-Plan Check] Floor {fl.get('floor_name')!r} looks "
+                f"like an enlarged unit-plan sheet but carries unit "
+                f"multipliers — left intact (it is the template source of "
+                f"unit scope, not a duplicate).")
+            continue
+        matched = sum(1 for r in rooms if _strip_name(r.get("room_name")) in ranged_names)
+        if matched / len(rooms) < 0.5:
+            continue
+        for r in rooms:
+            d = r.setdefault("dimensions", {})
+            zeroed_wall_sqft += _num(d.get("wall_area_sqft", 0))
+            for k in ("wall_area_sqft", "perimeter_lf", "ceiling_area_sqft",
+                      "floor_area_sqft"):
+                d[k] = 0
+            r.setdefault("elements", {})["base_trim_lf"] = 0
+            r.setdefault("materials", {})["ceiling_painted"] = False
+            r["notes"] = (str(r.get("notes", "") or "") +
+                          " [Enlarged-plan dedup] room duplicates a unit "
+                          "already measured on the building floor plans; "
+                          "geometry counted once there.").strip()
+            zeroed_rooms += 1
+        zeroed_floors += 1
+
+    if zeroed_floors:
+        note = (f"[Enlarged-Plan Dedup] {zeroed_floors} enlarged unit-plan "
+                f"pseudo-floor(s) duplicated rooms already measured on the "
+                f"building floor plans — zeroed geometry on {zeroed_rooms} "
+                f"room(s) (~{zeroed_wall_sqft:,.0f} wall sqft de-duplicated; "
+                f"doors/windows retained).")
+        analysis.setdefault("notes", []).append(note)
+        print(f"   🪞 {note}")
+
+    analysis["_enlarged_plan_floors_deduped"] = True
+
+
 def _dedupe_cross_sheet_rooms(analysis):
     """Count each room ONCE when the same room is extracted from multiple sheets
     (floor plan + fixture plan + RCP + code plan).
@@ -10419,36 +10541,51 @@ def _dedupe_cross_sheet_rooms(analysis):
     open). Walls then flow through the geometric perimeter floor +
     _validate_and_boost_walls to recover the real shell perimeter.
 
-    Tightly gated to SINGLE-STORY COMMERCIAL jobs with no unit multipliers,
-    where a repeated room NAME is a genuine cross-sheet duplicate. It must NEVER
-    run on residential / multi-unit work, where many distinct rooms legitimately
-    share a name ("Bedroom", "Bath"). Duplicates are only merged when they span
-    >1 source page, so genuinely distinct same-name rooms drawn on one sheet are
-    left alone. Idempotent via the _cross_sheet_rooms_deduped flag.
+    Two modes:
+      * COMMERCIAL single-tenant (original Five Below mode): no unit
+        multipliers, room NAME is the identity — a repeated name across
+        sheets is a genuine duplicate.
+      * RESIDENTIAL / multi-unit (2026-06-12 Fishkill validation): many
+        distinct rooms legitimately share a name ("Bedroom", "Bath"), so
+        identity requires a UNIT token — rooms only group when the same
+        (floor, unit, room name) appears on multiple sheets (floor plan +
+        RCP + enlarged unit plan). Rooms with no recognizable unit token
+        are never merged in this mode.
+
+    Duplicates are only merged when they span >1 source page, so genuinely
+    distinct same-name rooms drawn on one sheet are left alone. Idempotent
+    via the _cross_sheet_rooms_deduped flag.
     """
     if analysis.get("_cross_sheet_rooms_deduped"):
         return
     pi = analysis.get("project_info", {}) or {}
     bt = str(pi.get("building_type", "")).lower()
+    is_residentialish = any(k in bt for k in (
+        "residential", "mixed", "multi", "apartment", "condo", "senior",
+        "dorm", "assisted", "supportive"))
     is_commercial = any(k in bt for k in (
         "commercial", "retail", "auto", "industrial", "warehouse",
         "dealership", "restaurant", "fitness", "recreational",
-        "institutional", "entertain", "fit-out", "fitout", "tenant"))
-    # Exclude anything residential/mixed — those repeat room names legitimately.
-    if not is_commercial or any(k in bt for k in (
-            "residential", "mixed", "multi", "apartment", "condo", "senior")):
-        return
+        "institutional", "entertain", "fit-out", "fitout", "tenant")) \
+        and not is_residentialish
     rooms = [r for fl in analysis.get("floors", []) for r in fl.get("rooms", [])
              if r.get("in_scope", True)]
     if not rooms:
         return
-    # Hard guard: a single repeated/template unit means this isn't a simple
-    # single-tenant box — bail rather than risk merging real repeats.
-    if _num(pi.get("total_units", 0)) > 1:
-        return
-    for r in rooms:
-        if _extract_multiplier_from_notes(r) > 1 or _num(r.get("unit_multiplier", 1)) > 1:
+
+    unit_mode = False
+    if is_commercial:
+        # Hard guard: a single repeated/template unit means this isn't a
+        # simple single-tenant box — bail rather than risk merging repeats.
+        if _num(pi.get("total_units", 0)) > 1:
             return
+        for r in rooms:
+            if _extract_multiplier_from_notes(r) > 1 or _num(r.get("unit_multiplier", 1)) > 1:
+                return
+    elif is_residentialish:
+        unit_mode = True
+    else:
+        return  # unknown building type — leave alone
 
     import collections
 
@@ -10458,28 +10595,124 @@ def _dedupe_cross_sheet_rooms(analysis):
     def _warea(r):
         return _num((r.get("dimensions", {}) or {}).get("wall_area_sqft", 0))
 
+    _UNIT_TOKEN_RE = re.compile(
+        r"(?:unit|apt|apartment|suite)[\s\-_#]*([a-z]?\d{1,4}[a-z]?)", re.IGNORECASE)
+
+    def _unit_token(r):
+        for field in (r.get("room_id"), r.get("unit_type"), r.get("room_name")):
+            m = _UNIT_TOKEN_RE.search(str(field or ""))
+            if m:
+                return m.group(1).lower()
+        return None
+
+    _FILLER_WORDS = {"type", "room", "rm", "the", "s", "of", "and"}
+
+    def _type_tokens(name):
+        """Order-independent room-identity tokens within a unit.
+
+        'Unit 201 — Master Bedroom', 'Unit 201 Bedroom (Master)', and
+        'Master Bedroom — Unit 201' all reduce to {'master', 'bed'} —
+        the multi-pass-union naming variants of one physical room. Digits
+        survive as tokens so 'Bath 1' vs 'Bath 2' stay distinct.
+        """
+        s = _UNIT_TOKEN_RE.sub(" ", str(name or "").lower())
+        s = s.replace("bathroom", "bath").replace("bedroom", "bed")
+        toks = frozenset(w for w in re.split(r"[^a-z0-9]+", s)
+                         if w and w not in _FILLER_WORDS)
+        return toks
+
+    # Single generic words a unit can legitimately contain several of —
+    # same-page dedupe for these requires near-identical geometry too.
+    _GENERIC_SINGLES = ({"closet"}, {"storage"}, {"hall"}, {"hallway"},
+                        {"bath"}, {"bed"})
+
     groups = collections.defaultdict(list)
-    for r in rooms:
-        nm = _norm(r.get("room_name") or r.get("name"))
-        if nm:
-            groups[nm].append(r)
+    if unit_mode:
+        # Residential: identity = (floor, unit, room-type tokens). Floor
+        # keyed by the ordinal-aware range parse so '2nd Floor' and '2nd
+        # Floor — Residential' collide; rooms without a unit token are
+        # skipped — too ambiguous to merge safely.
+        for fl in analysis.get("floors", []):
+            fkey = tuple(sorted(_parse_floor_range(fl.get("floor_name", "")))) or \
+                _normalize_floor_key(fl.get("floor_name", ""))
+            for r in fl.get("rooms", []):
+                if not r.get("in_scope", True):
+                    continue
+                ut = _unit_token(r)
+                tt = _type_tokens(r.get("room_name") or r.get("name"))
+                if ut and tt:
+                    groups[(fkey, ut, tt)].append(r)
+    else:
+        for r in rooms:
+            nm = _norm(r.get("room_name") or r.get("name"))
+            if nm:
+                groups[nm].append(r)
 
     removed = 0
-    for nm, insts in groups.items():
+    ceilings_backfilled = 0
+    for key, insts in groups.items():
         if len(insts) < 2:
             continue
-        # Only treat as cross-sheet duplicates when they appear on >1 sheet.
+        # Only treat as cross-sheet duplicates when they appear on >1 sheet —
+        # EXCEPT in unit mode, where the same (floor, unit, name) appearing
+        # twice on ONE page with near-identical geometry is a tile-overlap /
+        # multi-pass-union duplicate of the same physical room (a real
+        # second room of the same name in the same unit — e.g. Bath 1 vs
+        # Bath 2 — has different geometry and is left alone).
         pages = {str(r.get("source_page")) for r in insts if r.get("source_page") is not None}
         if len(pages) < 2:
-            continue
+            if not unit_mode:
+                continue
+            # Same (floor, unit, type-tokens) on ONE page. For distinctive
+            # token sets ({'master','bed'}, {'laundry','closet'}) the plans
+            # label real second rooms distinctly ('Bath 1' vs 'Bath 2'
+            # carry the digit as a token), so same-key instances are
+            # multi-pass-union / tile-overlap variants of one room — keep
+            # the most complete. For generic single-word sets a unit can
+            # legitimately contain several of (e.g. unlabeled closets),
+            # require near-identical geometry as well.
+            ordered = sorted(insts, key=_warea, reverse=True)
+            anchor = ordered[0]
+            aw = _warea(anchor)
+            if aw <= 0:
+                continue
+            type_toks = key[2] if isinstance(key, tuple) and len(key) == 3 else None
+            if type_toks is not None and set(type_toks) in [set(g) for g in _GENERIC_SINGLES]:
+                near_dups = [r for r in ordered[1:]
+                             if _warea(r) > 0 and abs(_warea(r) - aw) <= 0.10 * aw]
+            else:
+                near_dups = [r for r in ordered[1:] if _warea(r) > 0]
+            if not near_dups:
+                continue
+            insts = [anchor] + near_dups
         # Keep the most-complete instance (largest measured wall area).
         keeper = max(insts, key=_warea)
         # Majority vote on whether this room's ceiling is painted (tie -> painted).
         painted = sum(1 for r in insts if (r.get("materials", {}) or {}).get("ceiling_painted", False))
         keep_painted = painted >= (len(insts) - painted) and painted > 0
         km = keeper.setdefault("materials", {})
+        kd = keeper.setdefault("dimensions", {})
         if not keep_painted and km.get("ceiling_painted", False):
             km["ceiling_painted"] = False
+        elif keep_painted and not km.get("ceiling_painted", False):
+            # SYMMETRIC vote (Five Below fix gap): the keeper is usually the
+            # floor-plan instance (max wall area) which often carries NO
+            # ceiling data, while the zeroed RCP instance had the real
+            # ceiling. The old one-way vote made the ceiling vanish entirely
+            # on exactly the jobs this dedup targets.
+            km["ceiling_painted"] = True
+        if km.get("ceiling_painted") and _num(kd.get("ceiling_area_sqft", 0)) == 0:
+            best_ceil = max(
+                (_num((r.get("dimensions", {}) or {}).get("ceiling_area_sqft", 0))
+                 for r in insts if r is not keeper), default=0)
+            if best_ceil > 0:
+                kd["ceiling_area_sqft"] = best_ceil
+                ceilings_backfilled += 1
+        # Reconcile multipliers: the keeper must carry the group's max so
+        # dedup can't silently keep an unscaled instance and drop the x3 one.
+        max_mult = max(int(_num(r.get("unit_multiplier", 1)) or 1) for r in insts)
+        if max_mult > int(_num(keeper.get("unit_multiplier", 1)) or 1):
+            keeper["unit_multiplier"] = max_mult
         # Zero only the DIMENSIONAL quantities on the non-keeper instances —
         # each sheet measures the full room geometry, so walls/ceiling/floor are
         # true duplicates. Doors/windows are left intact: each sheet tends to
@@ -10502,8 +10735,12 @@ def _dedupe_cross_sheet_rooms(analysis):
 
     analysis["_cross_sheet_rooms_deduped"] = True
     if removed:
-        print(f"   🪞 [cross-sheet room dedup] de-duplicated geometry on {removed} "
-              f"duplicate room instance(s) across sheets (single-story commercial).")
+        mode = "residential unit-aware" if unit_mode else "single-story commercial"
+        msg = (f"   🪞 [cross-sheet room dedup] de-duplicated geometry on {removed} "
+               f"duplicate room instance(s) across sheets ({mode})")
+        if ceilings_backfilled:
+            msg += f"; backfilled {ceilings_backfilled} keeper ceiling area(s) from RCP instances"
+        print(msg + ".")
 
 
 def _recalculate_totals(analysis):
@@ -10528,6 +10765,11 @@ def _recalculate_totals(analysis):
     # lost ~2,900 sqft of corridor ceiling this way. Idempotent via
     # _residential_corridor_ceiling_fixed flag.
     _fix_residential_corridor_ceilings(analysis)
+
+    # Enlarged unit-plan sheets extracted as pseudo-floors duplicate rooms
+    # already on the ranged floors (Fishkill 2026-06-12: ~4-10x wall
+    # inflation). Must run BEFORE totals are summed.
+    _dedupe_enlarged_plan_floors(analysis)
 
     # Pre-pass: estimate missing wall area from floor area for rooms that have
     # floor_area but zero wall_area/perimeter (common with chunk-processing gaps)
@@ -14920,6 +15162,7 @@ def merge_versioned_analyses(prior_analysis, delta_analysis, scope_tags=None):
     for _stale_flag in (
         "_template_floors_deduped",
         "_cross_sheet_rooms_deduped",
+        "_enlarged_plan_floors_deduped",
         "_residential_corridor_ceiling_fixed",
         "_source_sheets_canonicalized",
         "_residential_ceiling_floor_applied",
