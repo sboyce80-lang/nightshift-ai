@@ -57,6 +57,142 @@ class TruncatedResponseError(Exception):
     temperature 0 — it truncates again.
     """
 
+    def __init__(self, message, partial_text=""):
+        super().__init__(message)
+        # The text received before the cutoff — a repair-parse of this
+        # often recovers most of the batch's rooms (see
+        # _parse_json_response), which beats discarding the whole batch.
+        self.partial_text = partial_text
+
+
+def _collect_stream_text(stream, label=""):
+    """Drain a messages.stream() text stream and return the full text.
+
+    Raises TruncatedResponseError (carrying the partial text) when the
+    response stopped on max_tokens — every call site used to treat a
+    cut-off response as a success and let it die silently at JSON-parse
+    time. Use inside the `with client.messages.stream(...) as stream:`
+    block.
+    """
+    parts = []
+    for text in stream.text_stream:
+        parts.append(text)
+    final_msg = stream.get_final_message()
+    joined = "".join(parts)
+    if getattr(final_msg, "stop_reason", None) == "max_tokens":
+        raise TruncatedResponseError(
+            f"Response truncated at max_tokens"
+            f"{' (' + label + ')' if label else ''} — "
+            f"{len(joined)} chars received",
+            partial_text=joined,
+        )
+    return joined
+
+
+def _repair_truncated_json(candidate):
+    """Best-effort close-out of a JSON object cut off mid-output.
+
+    Walks the text once tracking string/escape/nesting state and records
+    every position where a container ({...} or [...]) closed, along with
+    the closers still open at that point. A truncated response is then
+    repaired by cutting back to the deepest such safe point and appending
+    the missing closers — dangling fragments like a half-written room
+    object or a key with no value are discarded rather than poisoning the
+    parse. Yields candidate repairs from deepest cut to shallowest, or []
+    when the input is hopeless.
+    """
+    start = candidate.find("{")
+    if start < 0:
+        return []
+    s = candidate[start:]
+    stack = []
+    in_str = False
+    escape = False
+    safe_points = []  # (index_after_close, closers_for_open_stack)
+    for i, ch in enumerate(s):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            if in_str:
+                escape = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if stack:
+                stack.pop()
+            safe_points.append((i + 1, "".join(reversed(stack))))
+    if not safe_points:
+        return []
+    if not stack:
+        return [s]  # already balanced
+    attempts = []
+    # Deepest cut first; cap the number of fallbacks so a pathological
+    # input can't turn this into an O(n^2) parse loop.
+    for idx_after, closers in reversed(safe_points[-25:]):
+        attempts.append(s[:idx_after].rstrip().rstrip(",") + closers)
+    return attempts
+
+
+def _parse_json_response(text, context=""):
+    """Extract and parse the JSON object from a model response.
+
+    Replaces the bare `re.search(r'\\{.*\\}') + json.loads` pattern that
+    silently dropped entire batches/chunks on any imperfection. Tries, in
+    order: direct parse, fenced ```json block, greedy brace span,
+    trailing-comma repair, and truncation close-out repair. Returns a
+    dict, or None after logging the failure (callers decide whether None
+    is a batch failure).
+    """
+    if not text:
+        return None
+
+    def _try(s):
+        try:
+            obj = json.loads(s)
+            return obj if isinstance(obj, dict) else None
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+
+    # 1. Direct parse (response is pure JSON)
+    obj = _try(text.strip())
+    if obj is not None:
+        return obj
+    # 2. Fenced code block
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fence:
+        obj = _try(fence.group(1))
+        if obj is not None:
+            return obj
+    # 3. Greedy brace span (legacy behavior)
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    candidate = m.group() if m else text
+    obj = _try(candidate)
+    if obj is not None:
+        return obj
+    # 4. Trailing-comma repair (the most common model slip)
+    obj = _try(re.sub(r",\s*([}\]])", r"\1", candidate))
+    if obj is not None:
+        return obj
+    # 5. Truncation close-out repair (response cut off mid-output)
+    for repaired in _repair_truncated_json(text):
+        obj = _try(repaired) or _try(re.sub(r",\s*([}\]])", r"\1", repaired))
+        if obj is not None:
+            print(f"   🩹 JSON repair recovered a truncated/malformed "
+                  f"response{' (' + context + ')' if context else ''} "
+                  f"({len(text)} chars in)")
+            return obj
+    print(f"   ⚠️  JSON parse failed after all repair attempts"
+          f"{' (' + context + ')' if context else ''} — "
+          f"{len(text)} chars, head: {text[:80]!r}")
+    return None
+
 
 def _release_memory(label=""):
     """Force the Python heap and the C allocator to return freed memory to
@@ -2379,9 +2515,15 @@ def _analyze_page_multimodal(client, pdf_path, page_index, prompt_text,
                 timeout=300.0,
                 messages=[{"role": "user", "content": content_blocks}],
             ) as stream:
-                for text in stream.text_stream:
-                    result_parts.append(text)
-            return "".join(result_parts)
+                try:
+                    return _collect_stream_text(stream, label="multimodal retry")
+                except TruncatedResponseError as _te:
+                    # Salvage: the repair parser downstream recovers most
+                    # rooms from a cut-off response — better than dropping
+                    # the whole chunk.
+                    print("   ✂️  Multimodal retry truncated at max_tokens — "
+                          "salvaging partial response")
+                    return _te.partial_text
         except anthropic.RateLimitError:
             if attempt < max_retries - 1:
                 delay = base_delay * (2 ** attempt)
@@ -2621,8 +2763,13 @@ def _analyze_floor_plan_as_images(client, pdf_path, scope_notes="",
                     timeout=300.0,
                     messages=[{"role": "user", "content": content_blocks}]
                 ) as stream:
-                    for text in stream.text_stream:
-                        result_parts.append(text)
+                    try:
+                        result_parts.append(_collect_stream_text(
+                            stream, label="image fallback batch"))
+                    except TruncatedResponseError as _te:
+                        result_parts.append(_te.partial_text)
+                        print("   ✂️  Image fallback batch truncated at "
+                              "max_tokens — salvaging partial response")
                 break
             except anthropic.RateLimitError:
                 if attempt < max_retries - 1:
@@ -2650,10 +2797,10 @@ def _analyze_floor_plan_as_images(client, pdf_path, scope_notes="",
         if not result_text:
             continue
 
-        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        json_match = _parse_json_response(result_text)
         if json_match:
             try:
-                analysis = json.loads(json_match.group())
+                analysis = json_match
                 rooms = analysis.get('project_info', {}).get(
                     'total_rooms_found', 0)
                 if rooms > 0:
@@ -2985,8 +3132,13 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
                     timeout=600.0,
                     messages=[{"role": "user", "content": content_blocks}]
                 ) as stream:
-                    for text in stream.text_stream:
-                        result_parts.append(text)
+                    try:
+                        result_parts.append(_collect_stream_text(
+                            stream, label="enhanced batch"))
+                    except TruncatedResponseError as _te:
+                        result_parts.append(_te.partial_text)
+                        print("   ✂️  Enhanced batch truncated at max_tokens "
+                              "— salvaging partial response")
                 break
             except anthropic.RateLimitError:
                 if attempt < max_retries - 1:
@@ -3027,8 +3179,13 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
                     timeout=600.0,
                     messages=[{"role": "user", "content": content_blocks}]
                 ) as stream:
-                    for text in stream.text_stream:
-                        result_parts.append(text)
+                    try:
+                        result_parts.append(_collect_stream_text(
+                            stream, label="enhanced empty-retry"))
+                    except TruncatedResponseError as _te:
+                        result_parts.append(_te.partial_text)
+                        print("   ✂️  Enhanced empty-retry truncated — "
+                              "salvaging partial response")
                 result_text = "".join(result_parts)
             except Exception as e:
                 print(f"   ❌ Batch {batch_idx + 1} empty-response retry failed: {e}")
@@ -3039,10 +3196,10 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
 
         # Parse JSON response
         analysis = None
-        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        json_match = _parse_json_response(result_text)
         if json_match:
             try:
-                analysis = json.loads(json_match.group())
+                analysis = json_match
             except json.JSONDecodeError:
                 print(f"   ❌ Enhanced extraction batch: could not parse JSON")
 
@@ -3086,13 +3243,18 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
                     timeout=600.0,
                     messages=[{"role": "user", "content": sharpened_blocks}]
                 ) as stream:
-                    for text in stream.text_stream:
-                        result_parts2.append(text)
+                    try:
+                        result_parts2.append(_collect_stream_text(
+                            stream, label="enhanced sharpened-retry"))
+                    except TruncatedResponseError as _te:
+                        result_parts2.append(_te.partial_text)
+                        print("   ✂️  Sharpened retry truncated — "
+                              "salvaging partial response")
                 result_text2 = "".join(result_parts2)
-                json_match2 = re.search(r'\{.*\}', result_text2, re.DOTALL)
+                json_match2 = _parse_json_response(result_text2)
                 if json_match2:
                     try:
-                        analysis2 = json.loads(json_match2.group())
+                        analysis2 = json_match2
                         rooms2 = analysis2.get('project_info', {}).get(
                             'total_rooms_found', 0)
                         print(f"   🔬 Batch {batch_idx + 1} retry: "
@@ -3344,9 +3506,9 @@ def analyze_schedule_images(client, pdf_path, schedule_page_nums):
     # Parse JSON from the response
     try:
         # Find JSON in the response (may have markdown fences)
-        json_match = re.search(r'\{[\s\S]*\}', raw)
+        json_match = _parse_json_response(raw)
         if json_match:
-            schedule_data = json.loads(json_match.group())
+            schedule_data = json_match
         else:
             print(f"   ❌ No JSON found in schedule image response")
             return None
@@ -3693,10 +3855,10 @@ def _merge_chunk_responses(texts, page_offsets=None, chunk_indices=None,
             chunk_num = chunk_indices[pos]
         else:
             chunk_num = pos + 1
-        m = re.search(r'\{.*\}', t, re.DOTALL)
+        m = _parse_json_response(t)
         if m:
             try:
-                parsed.append(json.loads(m.group()))
+                parsed.append(m)
                 parsed_chunk_nums.append(chunk_num)
                 continue
             except json.JSONDecodeError:
@@ -4799,23 +4961,11 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
                         ]
                     }]
                 ) as stream:
-                    for text in stream.text_stream:
-                        result_parts.append(text)
-                    final_msg = stream.get_final_message()
-                # Truncation detection: a response that hit max_tokens cut
-                # off mid-JSON. Before this check, truncated chunks were
-                # recorded as "succeeded" and their rooms silently vanished
-                # at parse time — the single biggest source of run-to-run
-                # room-count variance (53 rooms vs 15 on identical plans).
-                # Raise so the caller's chunk-failure ladder retries/records
-                # it instead of shipping a partial extraction.
-                if getattr(final_msg, "stop_reason", None) == "max_tokens":
-                    raise TruncatedResponseError(
-                        f"Response truncated at max_tokens"
-                        f"{' (' + label + ')' if label else ''} — "
-                        f"{len(''.join(result_parts))} chars received"
-                    )
-                return "".join(result_parts)
+                    # Raises TruncatedResponseError on max_tokens so the
+                    # caller's chunk-failure ladder routes the chunk to
+                    # page-level retry instead of shipping a partial
+                    # extraction (the 53-vs-15 rooms variance class).
+                    return _collect_stream_text(stream, label=label or "native chunk")
             except anthropic.RateLimitError:
                 if attempt < max_retries - 1:
                     delay = base_delay * (2 ** attempt)  # 30s, 60s, 120s, 240s
@@ -4921,10 +5071,10 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
                 total_units = 0
                 floors_seen = []
                 for t in texts:
-                    m = re.search(r'\{.*\}', t, re.DOTALL)
+                    m = _parse_json_response(t)
                     if m:
                         try:
-                            data = json.loads(m.group())
+                            data = m
                             # Gather project info
                             pi = data.get("project_info", {})
                             if pi.get("building_type"):
@@ -5157,7 +5307,9 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
             # validation flag pages that returned 0 rooms inside a chunk
             # whose siblings yielded data — i.e., silent truncation.
             try:
-                merged_data = json.loads(re.search(r'\{.*\}', result_text, re.DOTALL).group())
+                merged_data = _parse_json_response(result_text, context='chunk-tracking inject')
+                if merged_data is None:
+                    raise json.JSONDecodeError('unparseable merged response', result_text[:50], 0)
                 merged_data["_chunk_tracking"] = {
                     "total_chunks": total_chunks,
                     "chunks_succeeded": chunks_succeeded,
@@ -5180,7 +5332,9 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
         # --- Remap source_page from filtered PDF indices → original PDF indices ---
         if _page_index_map:
             try:
-                data = json.loads(re.search(r'\{.*\}', result_text, re.DOTALL).group())
+                data = _parse_json_response(result_text, context='chunk-tracking inject (single)')
+                if data is None:
+                    raise json.JSONDecodeError('unparseable response', result_text[:50], 0)
                 remapped = 0
                 for floor in data.get("floors", []):
                     for room in floor.get("rooms", []):
@@ -5336,9 +5490,9 @@ Be precise — count every entry in each schedule row by row."""
                 result_parts.append(text)
 
         result_text = "".join(result_parts)
-        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        json_match = _parse_json_response(result_text)
         if json_match:
-            schedule_data = json.loads(json_match.group())
+            schedule_data = json_match
             if schedule_data.get("has_schedules"):
                 ds = schedule_data.get("door_schedule", {})
                 ws = schedule_data.get("window_schedule", {})
@@ -5528,9 +5682,9 @@ Be precise — extract every room listed in the schedule, and capture every stru
                 result_parts.append(text)
 
         result_text = "".join(result_parts)
-        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        json_match = _parse_json_response(result_text)
         if json_match:
-            rfs_data = json.loads(json_match.group())
+            rfs_data = json_match
             rooms = rfs_data.get("room_finish_schedule", [])
             bi = rfs_data.get("building_info", {})
             struct_scope = rfs_data.get("structural_finish_scope", []) or []
@@ -5770,12 +5924,12 @@ exterior scope visible.")."""
                 result_parts.append(text)
 
         result_text = "".join(result_parts)
-        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        json_match = _parse_json_response(result_text)
         if not json_match:
             print(f"   ⚠️  Could not parse exterior scope response")
             return None
 
-        ext_data = json.loads(json_match.group())
+        ext_data = json_match
         ext_data["source_pages"] = [i + 1 for i in elevation_indices]
 
         sqft = _num(ext_data.get("exterior_paint_sqft", 0))
@@ -6234,10 +6388,10 @@ If you cannot determine building counts from these pages, return:
                     "Could not process PDF — empty inventory response after retry"
                 )
 
-        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        json_match = _parse_json_response(result_text)
 
         if json_match:
-            inventory = json.loads(json_match.group())
+            inventory = json_match
             buildings = inventory.get("buildings", [])
 
             # Empty-buildings retry: Claude sometimes returns a parseable
@@ -6276,9 +6430,9 @@ If you cannot determine building counts from these pages, return:
                         for text in stream.text_stream:
                             result_parts2.append(text)
                     result_text2 = "".join(result_parts2)
-                    json_match2 = re.search(r'\{.*\}', result_text2, re.DOTALL)
+                    json_match2 = _parse_json_response(result_text2)
                     if json_match2:
-                        inventory2 = json.loads(json_match2.group())
+                        inventory2 = json_match2
                         buildings2 = inventory2.get("buildings", [])
                         if buildings2:
                             inventory = inventory2
@@ -6350,9 +6504,9 @@ If you cannot determine building counts from these pages, return:
                     for text in stream.text_stream:
                         result_parts.append(text)
                 result_text = "".join(result_parts)
-                json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+                json_match = _parse_json_response(result_text)
                 if json_match:
-                    inventory = json.loads(json_match.group())
+                    inventory = json_match
                     buildings = inventory.get("buildings", [])
                     if buildings:
                         inventory["source_pdf"] = os.path.basename(pdf_path)
@@ -6658,11 +6812,11 @@ If a field is not stated on these pages, use 0 for numbers and "" for strings.""
             for text in stream.text_stream:
                 result_parts.append(text)
         result_text = "".join(result_parts)
-        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        json_match = _parse_json_response(result_text)
         if not json_match:
             print(f"   ⚠️  Could not parse project overview JSON")
             return None
-        overview = json.loads(json_match.group())
+        overview = json_match
         overview["source_pdfs"] = sources_used
         overview["source_pages"] = {
             os.path.basename(p): [i + 1 for i in idxs]
@@ -14632,9 +14786,9 @@ def analyze_and_parse(client, pdf_path, scope_notes="", schedule_hints=None,
                                                 schedule_hints=schedule_hints,
                                                 building_inventory=building_inventory,
                                                 project_overview=project_overview)
-        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        json_match = _parse_json_response(result_text)
         if json_match:
-            analysis = json.loads(json_match.group())
+            analysis = json_match
             _attach_bbox_anchors(analysis, pdf_path)
             return (pdf_path, analysis)
         else:
