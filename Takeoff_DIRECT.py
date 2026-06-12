@@ -194,6 +194,173 @@ def _parse_json_response(text, context=""):
     return None
 
 
+class CoverageLedger:
+    """Per-page accounting for every uploaded PDF: each page must end the
+    run in exactly one state, and the result carries the proof.
+
+    States (upgrade-only precedence, left to right):
+        unaccounted -> failed -> excluded -> degraded -> measured
+    A page marked failed by one pass that a later retry/pass measures is
+    upgraded to measured; nothing ever silently downgrades. The 2026-06
+    review found ~10 independent code paths that dropped pages with only
+    a console print as the record — this ledger is the machine-readable
+    replacement, and _apply_coverage_gate() blocks auto-send when a page
+    ends the run failed.
+
+    v1 gate policy: FAILED pages block (manual review + RFI naming
+    file:pages). UNACCOUNTED pages are reported in the coverage summary
+    but do not block — not every measuring path is wired yet, and a
+    false block on every job would train users to ignore the gate. The
+    target end-state (Phase 2) is unaccounted == 0 asserted.
+    """
+
+    _RANK = {"unaccounted": 0, "failed": 1, "excluded": 2,
+             "degraded": 3, "measured": 4}
+
+    def __init__(self):
+        self.files = {}  # abspath -> {name, total_pages, pages: {idx0: {state, reason}}}
+
+    def register_file(self, pdf_path):
+        key = os.path.abspath(pdf_path)
+        if key in self.files:
+            return
+        total = 0
+        try:
+            total = len(PyPDF2.PdfReader(pdf_path).pages)
+        except Exception:
+            try:
+                import fitz
+                doc = fitz.open(pdf_path)
+                total = len(doc)
+                doc.close()
+            except Exception:
+                total = 0
+        self.files[key] = {
+            "name": os.path.basename(pdf_path),
+            "total_pages": total,
+            "pages": {i: {"state": "unaccounted", "reason": ""}
+                      for i in range(total)},
+        }
+
+    def _entry(self, pdf_path):
+        key = os.path.abspath(pdf_path)
+        if key not in self.files:
+            # Match stored files by basename too — retries sometimes hand
+            # back a copied/temp path for the same upload.
+            base = os.path.basename(str(pdf_path))
+            for k, v in self.files.items():
+                if v["name"] == base:
+                    return v
+            return None
+        return self.files[key]
+
+    def mark(self, pdf_path, page_idx0, state, reason=""):
+        """Upgrade-only mark of one 0-based ORIGINAL-pdf page index."""
+        entry = self._entry(pdf_path)
+        if entry is None:
+            return
+        try:
+            page_idx0 = int(page_idx0)
+        except (TypeError, ValueError):
+            return
+        rec = entry["pages"].get(page_idx0)
+        if rec is None:
+            return
+        if self._RANK.get(state, -1) > self._RANK.get(rec["state"], 0):
+            rec["state"] = state
+            rec["reason"] = reason
+
+    def mark_pages(self, pdf_path, page_idxs0, state, reason=""):
+        for i in page_idxs0 or []:
+            self.mark(pdf_path, i, state, reason)
+
+    def mark_file(self, pdf_path, state, reason=""):
+        entry = self._entry(pdf_path)
+        if entry is None:
+            return
+        for i in entry["pages"]:
+            self.mark(pdf_path, i, state, reason)
+
+    def summary(self):
+        out = {"files": [], "totals": {s: 0 for s in self._RANK}}
+        for v in self.files.values():
+            counts = {s: 0 for s in self._RANK}
+            failed_pages = []
+            unaccounted_pages = []
+            for idx in sorted(v["pages"]):
+                st = v["pages"][idx]["state"]
+                counts[st] += 1
+                if st == "failed":
+                    failed_pages.append(idx + 1)   # report 1-based
+                elif st == "unaccounted":
+                    unaccounted_pages.append(idx + 1)
+            for s, c in counts.items():
+                out["totals"][s] += c
+            out["files"].append({
+                "file": v["name"],
+                "total_pages": v["total_pages"],
+                "counts": counts,
+                "failed_pages": failed_pages,
+                "unaccounted_pages": unaccounted_pages,
+            })
+        out["total_pages"] = sum(v["total_pages"] for v in self.files.values())
+        return out
+
+
+# Module-level current ledger, set by run_analysis for the duration of a
+# job (the codebase's established pattern for cross-call state — see
+# _pending_chunks / _page_index_map). None outside a run: every mark call
+# is guarded so library use of individual functions stays unaffected.
+_COVERAGE_LEDGER = None
+
+
+def _ledger_mark(pdf_path, page_idxs0, state, reason=""):
+    """Convenience guard: no-op when no ledger is active."""
+    if _COVERAGE_LEDGER is not None and pdf_path:
+        _COVERAGE_LEDGER.mark_pages(pdf_path, page_idxs0, state, reason)
+
+
+def _apply_coverage_gate(analysis, ledger):
+    """Attach the coverage summary to the analysis and BLOCK auto-send
+    when any page ended the run failed.
+
+    The proposal gets one honest line ("120 pages: 96 measured, 21
+    excluded, 3 failed"); failed pages force manual_review_required and
+    an RFI naming the exact file:pages so a short estimate can never ship
+    silently.
+    """
+    if ledger is None or not ledger.files:
+        return analysis
+    s = ledger.summary()
+    analysis["coverage"] = s
+    t = s["totals"]
+    cov_line = (f"{s['total_pages']} page(s) across {len(s['files'])} file(s): "
+                f"{t['measured']} measured, {t['excluded']} excluded "
+                f"(non-paint disciplines), {t['degraded']} degraded, "
+                f"{t['failed']} FAILED, {t['unaccounted']} untracked")
+    analysis.setdefault("notes", []).append(f"[Coverage] {cov_line}.")
+    print(f"   📋 Coverage: {cov_line}")
+
+    if t["failed"] > 0:
+        detail = "; ".join(
+            f"{f['file']} p.{','.join(str(p) for p in f['failed_pages'][:20])}"
+            f"{'…' if len(f['failed_pages']) > 20 else ''}"
+            for f in s["files"] if f["failed_pages"])
+        analysis["manual_review_required"] = True
+        reason = (f"{t['failed']} page(s) could not be analyzed and are "
+                  f"MISSING from this estimate: {detail}")
+        if analysis.get("manual_review_reason"):
+            analysis["manual_review_reason"] = (
+                str(analysis["manual_review_reason"]) + " | " + reason)
+        else:
+            analysis["manual_review_reason"] = reason
+        analysis.setdefault("notes", []).append(
+            f"[Coverage] {reason} RFI REQUIRED: re-run or re-supply these "
+            f"pages before relying on this estimate — no quantities from "
+            f"them are priced.")
+    return analysis
+
+
 def _release_memory(label=""):
     """Force the Python heap and the C allocator to return freed memory to
     the OS at a phase boundary.
@@ -741,6 +908,11 @@ def _load_pdf_for_api(pdf_path, _client_for_validation=None):
         if excluded and kept > 0:
             print(f"   🔍 Page filter: {kept}/{total} pages are painting-relevant")
             print(f"      Excluded: {len(excluded)} pages ({_summarize_excluded(excluded)})")
+            if _COVERAGE_LEDGER is not None:
+                for c in excluded:
+                    _ledger_mark(pdf_path, [c.get('page_index')], "excluded",
+                                 str(c.get('reason') or c.get('discipline') or
+                                     'discipline filter'))
 
             # Build page index mapping: filtered_index → original_index
             page_indices = [c['page_index'] for c in included]
@@ -2797,18 +2969,26 @@ def _analyze_floor_plan_as_images(client, pdf_path, scope_notes="",
         if not result_text:
             continue
 
+        _img_batch_pages = sorted({p for p, _ in (batch_images or [])})
         json_match = _parse_json_response(result_text)
+        _img_batch_rooms = 0
         if json_match:
             try:
                 analysis = json_match
-                rooms = analysis.get('project_info', {}).get(
+                _img_batch_rooms = analysis.get('project_info', {}).get(
                     'total_rooms_found', 0)
-                if rooms > 0:
+                if _img_batch_rooms > 0:
                     all_batch_results.append(analysis)
                     _img_ok_batches.append(batch_idx + 1)
-                    print(f"   🖼️  Batch {batch_idx + 1}: extracted {rooms} rooms")
+                    print(f"   🖼️  Batch {batch_idx + 1}: extracted {_img_batch_rooms} rooms")
             except json.JSONDecodeError:
                 pass
+        if _img_batch_rooms > 0:
+            _ledger_mark(pdf_path, _img_batch_pages, "measured",
+                         f"image fallback batch {batch_idx + 1}")
+        else:
+            _ledger_mark(pdf_path, _img_batch_pages, "failed",
+                         f"image fallback batch {batch_idx + 1} returned no rooms")
 
     # Merge batch results
     if not all_batch_results:
@@ -2990,14 +3170,26 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
         print(f"   ❌ Enhanced extraction: no floor plan pages identified")
         return None
 
-    # Cap at 12 pages max to keep API payload reasonable (12 × 4 = 48 tiles)
-    MAX_PAGES_PER_CALL = int(os.environ.get("NIGHTSHIFT_MAX_TILE_PAGES", "12"))
-    if len(floor_plan_pages) > MAX_PAGES_PER_CALL:
-        # Prioritize pages with most dimensions (they have the most measurable rooms)
+    # Page cap REMOVED (2026-06 review C4): the old default of 12 silently
+    # cut pages 13+ from the takeoff — both 2026-06-12 validation jobs hit
+    # it (17 and 21 painting-relevant pages). The batching loop below
+    # already splits tiles into API-sized batches, so volume is handled by
+    # MORE BATCHES, not fewer pages. An explicit env cap is still honored
+    # for emergencies, and anything it cuts is recorded as failed coverage
+    # instead of vanishing.
+    _tile_cap_env = os.environ.get("NIGHTSHIFT_MAX_TILE_PAGES", "").strip()
+    if _tile_cap_env.isdigit() and len(floor_plan_pages) > int(_tile_cap_env):
+        cap = int(_tile_cap_env)
         floor_plan_pages.sort(
             key=lambda pg: len(parsed_pages.get(pg, {}).get("dimensions", [])),
             reverse=True)
-        floor_plan_pages = sorted(floor_plan_pages[:MAX_PAGES_PER_CALL])
+        cut_pages = sorted(floor_plan_pages[cap:])
+        floor_plan_pages = sorted(floor_plan_pages[:cap])
+        print(f"   ⚠️  NIGHTSHIFT_MAX_TILE_PAGES={cap}: cutting "
+              f"{len(cut_pages)} plan page(s) from tiling: "
+              f"{[p + 1 for p in cut_pages]}")
+        _ledger_mark(pdf_path, cut_pages, "failed",
+                     f"cut by NIGHTSHIFT_MAX_TILE_PAGES={cap}")
 
     print(f"   🔬 ENHANCED EXTRACTION: Tiling {len(floor_plan_pages)} floor plan page(s) "
           f"(of {len(page_indices)} painting-relevant, {total_pages} total)")
@@ -3191,6 +3383,8 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
                 print(f"   ❌ Batch {batch_idx + 1} empty-response retry failed: {e}")
             if not result_text:
                 print(f"   ❌ Batch {batch_idx + 1}: still empty after retry — skipping")
+                _ledger_mark(pdf_path, sorted({t[0] for t in (batch_tiles or [])}),
+                             "failed", f"enhanced batch {batch_idx + 1} empty after retry")
                 tile_batches[batch_idx] = None
                 continue
 
@@ -3268,9 +3462,16 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
             except Exception as e:
                 print(f"   ❌ Batch {batch_idx + 1} sharpened retry failed: {e}")
 
+        _batch_pages = sorted({t[0] for t in (batch_tiles or [])})
         if rooms > 0 and analysis is not None:
             all_analysis_results.append(analysis)
             _enh_ok_batches.append(batch_idx + 1)
+            _ledger_mark(pdf_path, _batch_pages, "measured",
+                         f"enhanced tiled batch {batch_idx + 1}")
+        else:
+            _ledger_mark(pdf_path, _batch_pages, "failed",
+                         f"enhanced batch {batch_idx + 1} returned no rooms "
+                         f"after retries")
 
         # Free this batch's tile data after sending (saves ~5-10MB per batch)
         tile_batches[batch_idx] = None
@@ -5325,6 +5526,42 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
                 print(f"   ⚠️  Could not inject chunk_tracking into merged response "
                       f"({type(_parse_err).__name__}: {str(_parse_err)[:120]}); "
                       f"chunks_succeeded={chunks_succeeded}, chunks_failed={chunks_failed}")
+
+            # --- Coverage ledger: per-page outcome of every chunk ---
+            # Ranges are 1-based inclusive on the FILTERED pdf; translate to
+            # ORIGINAL 0-based via _page_index_map. Pages excised by the
+            # page-level retry stay failed (the succeeded-chunk mark skips
+            # them; the ledger is upgrade-only so order matters here).
+            if _COVERAGE_LEDGER is not None:
+                def _orig0(filtered_1based):
+                    f0 = filtered_1based - 1
+                    return _page_index_map.get(f0, f0) if _page_index_map else f0
+                for rng in _chunk_plan_ranges:
+                    cidx = rng.get("chunk_idx")
+                    pages_f1 = range(rng.get("page_start", 1),
+                                     rng.get("page_end", 0) + 1)
+                    dropped_rel = set(pages_dropped_by_chunk.get(cidx) or [])
+                    for off, p1 in enumerate(pages_f1, start=1):
+                        if off in dropped_rel:
+                            _ledger_mark(pdf_path, [_orig0(p1)], "failed",
+                                         "page dropped during page-level retry")
+                        elif cidx in chunks_succeeded:
+                            _ledger_mark(pdf_path, [_orig0(p1)], "measured",
+                                         f"chunk {cidx} extracted")
+                        elif cidx in chunks_failed:
+                            _ledger_mark(pdf_path, [_orig0(p1)], "failed",
+                                         f"chunk {cidx} failed after retries")
+        elif result_text:
+            # Single-call path: the whole (possibly filtered) PDF went to the
+            # API in one request that succeeded — every included page was
+            # analyzed. Mark via the filter map when one exists.
+            if _COVERAGE_LEDGER is not None:
+                if _page_index_map:
+                    _ledger_mark(pdf_path, list(_page_index_map.values()),
+                                 "measured", "single-call extraction")
+                else:
+                    _COVERAGE_LEDGER.mark_file(pdf_path, "measured",
+                                               "single-call extraction")
 
         if result_text is None:
             raise RuntimeError("PDF analysis produced no results")
@@ -16146,6 +16383,19 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         print(f"   ⚠️  Phase 1 project overview scan failed: {e}")
         project_overview = None
 
+    # --- Coverage ledger: every page of every upload must end the run in
+    # exactly one accounted state. Module-global for the duration of the
+    # job so the chunk/tiled/image paths can mark outcomes without
+    # threading a parameter through ten signatures.
+    global _COVERAGE_LEDGER
+    _COVERAGE_LEDGER = CoverageLedger()
+    for _p in pdf_paths:
+        try:
+            _COVERAGE_LEDGER.register_file(_p)
+        except Exception as _reg_err:
+            print(f"   ⚠️  Coverage ledger could not register "
+                  f"{os.path.basename(str(_p))}: {_reg_err}")
+
     # --- Analyse each PDF ---
     all_results = []
     files_analyzed = []
@@ -16652,6 +16902,9 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                 all_results[-1] = (path, analysis_result)
         else:
             files_skipped.append(filename)
+            if _COVERAGE_LEDGER is not None:
+                _COVERAGE_LEDGER.mark_file(
+                    pdf_path, "failed", "file could not be analyzed after retries")
             print(f"\n   ❌ FAILED: {filename} could not be analyzed after 2 attempts")
             print(f"   ⚠️  This file's data will be MISSING from the estimate")
 
@@ -16727,6 +16980,15 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             f"re-run the failed file(s) before relying on this estimate — "
             f"no quantities from them are priced."
         )
+
+    # --- Coverage gate: every page accounted for, failed pages block ---
+    # Attaches analysis["coverage"] (per-file page states), one honest
+    # summary note for the proposal, and forces manual review + an RFI
+    # naming file:pages when any page ended the run FAILED.
+    try:
+        analysis = _apply_coverage_gate(analysis, _COVERAGE_LEDGER)
+    except Exception as _cov_err:
+        print(f"   ⚠️  Coverage gate error (non-fatal): {_cov_err}")
 
     # --- Finish schedule + upload sheet inventory ---
     # Carry the pre-extracted Room Finish Schedule onto the result so the
