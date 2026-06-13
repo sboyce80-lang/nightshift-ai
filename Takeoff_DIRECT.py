@@ -17694,7 +17694,15 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         used_enhanced = False
         attempted_enhanced = False  # True once the enhanced-extraction block ran
         rooms_have_zero_dims = False
-        if best_result and best_rooms > 0:
+        # Per-sheet mode already tiles each plan sheet internally and returns a
+        # COMPLETE result. The enhanced-extraction recovery below re-extracts the
+        # whole set via tiling — running it on top of per-sheet re-reads every
+        # unit a second time (at a different ceiling-height guess) and roughly
+        # DOUBLES the rooms (Fishkill 131 -> 262, walls 2.5x over truth, 2026-06
+        # validation). When per-sheet produced the result, trust it; a genuine
+        # per-sheet failure already returned None and fell through to the legacy
+        # path, which still gets enhanced recovery.
+        if best_result and best_rooms > 0 and not used_per_sheet:
             _, _check_analysis = best_result
             _all_rooms = []
             for _fl in _check_analysis.get("floors", []):
@@ -17712,10 +17720,12 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         # than per-floor data. Treat that as a partial extraction so the
         # large-format rescue path (text-layer + tiling) gets a shot.
         likely_incomplete = bool(
-            best_result and _extraction_likely_incomplete(best_result[1])
+            best_result and not used_per_sheet
+            and _extraction_likely_incomplete(best_result[1])
         )
 
-        if best_rooms == 0 or rooms_have_zero_dims or likely_incomplete:
+        if not used_per_sheet and (
+                best_rooms == 0 or rooms_have_zero_dims or likely_incomplete):
             try:
                 from config import ENABLE_ENHANCED_EXTRACTION, LARGE_FORMAT_THRESHOLD_PT
             except ImportError:
