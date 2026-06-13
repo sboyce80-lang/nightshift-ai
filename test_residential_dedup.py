@@ -225,6 +225,44 @@ def test_template_source_protected():
           f"{before_tmpl} -> {after_tmpl}")
 
 
+def test_per_floor_covers_building_drops_template():
+    # Per-sheet mode: the per-floor plans already measure every unit in the
+    # building (6 distinct units >= 80% of total_units=6) with real geometry,
+    # AND an enlarged x01 template carries unit_multiplier — that template is
+    # now the DUPLICATE, not the source, and must be zeroed despite its
+    # multiplier (the residual that kept per-sheet ~18% over on Fishkill).
+    a = _fishkill_like()
+    a["project_info"]["total_units"] = 6  # ranged floors carry 6 distinct units
+    tmpl = a["floors"][3]  # "Unit Types x01..." — matches ranged unit room names
+    for r in tmpl["rooms"]:
+        r["unit_multiplier"] = 3
+    before_tmpl = sum(T._num(r["dimensions"]["wall_area_sqft"]) for r in tmpl["rooms"])
+    T._dedupe_enlarged_plan_floors(a)
+    after_tmpl = sum(T._num(r["dimensions"]["wall_area_sqft"]) for r in tmpl["rooms"])
+    check("multiplied template zeroed when per-floor plans cover the building",
+          before_tmpl > 0 and after_tmpl == 0, f"{before_tmpl} -> {after_tmpl}")
+    check("real per-floor units untouched by the reconciliation",
+          T._num(a["floors"][1]["rooms"][0]["dimensions"]["wall_area_sqft"]) == 350)
+    check("reconciliation note explains the per-floor coverage",
+          any("per-floor units" in str(n) for n in a.get("notes", [])))
+
+
+def test_partial_per_floor_keeps_template():
+    # Guard rail: if the per-floor plans cover only SOME units (below the 80%
+    # threshold), the multiplied template is still the genuine source for the
+    # missing floors — must stay protected (no false deletion of real scope).
+    a = _fishkill_like()
+    a["project_info"]["total_units"] = 30  # 6 ranged units << 80% of 30
+    tmpl = a["floors"][3]
+    for r in tmpl["rooms"]:
+        r["unit_multiplier"] = 6
+    before_tmpl = sum(T._num(r["dimensions"]["wall_area_sqft"]) for r in tmpl["rooms"])
+    T._dedupe_enlarged_plan_floors(a)
+    after_tmpl = sum(T._num(r["dimensions"]["wall_area_sqft"]) for r in tmpl["rooms"])
+    check("template protected when per-floor coverage is partial",
+          before_tmpl == after_tmpl and before_tmpl > 0)
+
+
 def test_thin_ranged_floors_protected():
     # When ranged floors are thin (<10 rooms), the unit plans may be the
     # only real source — pseudo-floors must be left alone.
@@ -246,6 +284,8 @@ def main():
     test_commercial_mode_unchanged()
     test_enlarged_plan_floors_zeroed()
     test_template_source_protected()
+    test_per_floor_covers_building_drops_template()
+    test_partial_per_floor_keeps_template()
     test_thin_ranged_floors_protected()
     print(f"\n=== {PASS} passed, {FAIL} failed ===")
     return 1 if FAIL else 0

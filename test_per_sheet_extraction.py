@@ -365,6 +365,44 @@ def main():
           T._verification_output_kwargs() == {})
     T._STRUCTURED_OUTPUTS_BROKEN = False
 
+    print("\n── Schedule-read consensus merge (determinism) ──")
+    # Two reads of the same door schedule that each miss a different row:
+    # read A has D1,D2,D3 (sees 3); read B has D1,D2,D4 (sees 3). The union
+    # is D1-D4 (the real 4), recovering the row each read dropped.
+    readA = {"door_schedule": {"total_doors_full_paint": 3,
+                               "total_doors_hm_panel": 0,
+                               "door_marks_counted": [{"mark": "D1"}, {"mark": "D2"},
+                                                      {"mark": "D3"}]},
+             "window_schedule": {"total_windows": 5, "window_types": [{"mark": "W1"}]},
+             "stair_info": {"total_stair_sections": 6}}
+    readB = {"door_schedule": {"total_doors_full_paint": 3,
+                               "total_doors_hm_panel": 1,
+                               "door_marks_counted": [{"mark": "D1"}, {"mark": "D2"},
+                                                      {"mark": "D4"}]},
+             "window_schedule": {"total_windows": 4, "window_types": [{"mark": "W2"}]},
+             "stair_info": {"total_stair_sections": 8}}
+    merged = T._merge_schedule_reads([readA, readB])
+    ds = merged["door_schedule"]
+    check("door marks unioned across reads (D1-D4 recovered)",
+          {m["mark"] for m in ds["door_marks_counted"]} == {"D1", "D2", "D3", "D4"})
+    check("door totals take the max across reads (HM 0 vs 1 → 1)",
+          ds["total_doors_hm_panel"] == 1 and ds["total_doors_full_paint"] == 3)
+    check("window types unioned (W1 + W2)",
+          {w["mark"] for w in merged["window_schedule"]["window_types"]} == {"W1", "W2"})
+    check("stair sections take the max (6 vs 8 → 8)",
+          merged["stair_info"]["total_stair_sections"] == 8)
+    check("single read passes through unchanged",
+          T._merge_schedule_reads([readA]) is readA)
+    check("empty reads → None", T._merge_schedule_reads([]) is None)
+    # Determinism: order must not change the merged result
+    m1 = T._merge_schedule_reads([readA, readB])
+    m2 = T._merge_schedule_reads([readB, readA])
+    check("merge is order-independent on counts",
+          m1["door_schedule"]["total_doors_hm_panel"]
+          == m2["door_schedule"]["total_doors_hm_panel"]
+          and {m["mark"] for m in m1["door_schedule"]["door_marks_counted"]}
+          == {m["mark"] for m in m2["door_schedule"]["door_marks_counted"]})
+
     print(f"\n=== {PASS} passed, {FAIL} failed ===")
     return 1 if FAIL else 0
 

@@ -3880,6 +3880,19 @@ def _analyze_pdf_per_sheet(client, pdf_path, scope_notes="",
         building_inventory=building_inventory,
         project_overview=project_overview)
 
+    # Checkpoint signature EXCLUDES schedule_hints. The schedule pre-scan is
+    # vision-nondeterministic (Fishkill: 120/6 doors-stairs one run, 160/8 the
+    # next), so embedding its output in the key changed the key every run and
+    # made all sheet checkpoints miss — defeating resume entirely. Door/window/
+    # stair counts are SET authoritatively downstream by _apply_schedule_overrides
+    # regardless of these hints, and the per-sheet ROOM geometry (the cached
+    # payload that matters for walls/ceilings) does not depend on them — so a
+    # hint-free signature is both stable and correct for keying.
+    ckpt_prompt_sig = _build_extraction_prompt(
+        scope_notes=scope_notes, schedule_hints=None,
+        building_inventory=building_inventory,
+        project_overview=project_overview)
+
     verify_on = _sheet_verification_enabled()
     ckpt_dir = _sheet_checkpoint_dir(pdf_path) \
         if _sheet_checkpoint_enabled() else None
@@ -3898,7 +3911,7 @@ def _analyze_pdf_per_sheet(client, pdf_path, scope_notes="",
         parsed = parsed_pages.get(pg)
         sheet_context = _build_sheet_context(sheet_id, page_no, total_pages,
                                              text_layers.get(pg))
-        ckpt_key = _sheet_checkpoint_key(static_prompt, sheet_context,
+        ckpt_key = _sheet_checkpoint_key(ckpt_prompt_sig, sheet_context,
                                          verify_on)
 
         sheet_analysis = _sheet_checkpoint_load(ckpt_dir, pg, ckpt_key)
@@ -4918,6 +4931,107 @@ def analyze_schedule_images(client, pdf_path, schedule_page_nums):
 
     _release_memory("after schedule extraction")
     return schedule_data
+
+
+def _merge_schedule_reads(reads):
+    """Union-merge N schedule-extraction reads into one deterministic result.
+
+    The schedule scan is vision-nondeterministic: a given read can miss
+    table rows, so door/stair counts swing run-to-run (Fishkill: 120/6 one
+    read, 160/8 the next) — and since _apply_schedule_overrides treats the
+    schedule as AUTHORITATIVE, that swing lands directly in the bid. Door
+    and window rows are NAMED (mark ids), so the union across reads recovers
+    rows any single read dropped: a mark real in either read is real. Counts
+    are recomputed from the unioned rows; stair sections take the max.
+
+    Pure function (no API) — unit-testable. Returns a single schedule_data
+    dict, or None if `reads` is empty.
+    """
+    reads = [r for r in (reads or []) if isinstance(r, dict)]
+    if not reads:
+        return None
+    if len(reads) == 1:
+        return reads[0]
+
+    out = dict(reads[0])
+
+    # --- Doors: union door_marks_counted by mark id; recompute counts ---
+    ds_out = dict(out.get("door_schedule") or {})
+    marks_by_id = {}
+    for r in reads:
+        for m in ((r.get("door_schedule") or {}).get("door_marks_counted") or []):
+            mid = (m.get("mark") if isinstance(m, dict) else str(m))
+            mid = str(mid or "").strip().upper()
+            if not mid:
+                continue
+            # Keep the richest record seen for this mark (most populated dict).
+            prev = marks_by_id.get(mid)
+            if prev is None or (isinstance(m, dict) and len(m) > len(prev)
+                                if isinstance(prev, dict) else True):
+                marks_by_id[mid] = m
+    if marks_by_id:
+        ds_out["door_marks_counted"] = list(marks_by_id.values())
+    # Recompute door totals as the MAX across reads (union can only raise a
+    # complete count; max guards against a read that over-split a row).
+    for k in ("total_doors_full_paint", "total_doors_hm_panel",
+              "total_doors_frame_only"):
+        ds_out[k] = max(_num((r.get("door_schedule") or {}).get(k, 0))
+                        for r in reads)
+    out["door_schedule"] = ds_out
+
+    # --- Windows: union window_types by mark; counts = max across reads ---
+    ws_out = dict(out.get("window_schedule") or {})
+    wtypes_by_id = {}
+    for r in reads:
+        for w in ((r.get("window_schedule") or {}).get("window_types") or []):
+            wid = str((w.get("mark") if isinstance(w, dict) else w) or "").strip().upper()
+            if wid and wid not in wtypes_by_id:
+                wtypes_by_id[wid] = w
+    if wtypes_by_id:
+        ws_out["window_types"] = list(wtypes_by_id.values())
+    for k in ("total_windows", "windows_painted_interior"):
+        ws_out[k] = max(_num((r.get("window_schedule") or {}).get(k, 0))
+                        for r in reads)
+    out["window_schedule"] = ws_out
+
+    # --- Stairs: max sections across reads ---
+    si_out = dict(out.get("stair_info") or {})
+    si_out["total_stair_sections"] = max(
+        _num((r.get("stair_info") or {}).get("total_stair_sections", 0))
+        for r in reads)
+    out["stair_info"] = si_out
+    return out
+
+
+def analyze_schedule_images_consensus(client, pdf_path, schedule_page_nums):
+    """Run the schedule scan N times and union-merge for determinism.
+
+    N = NIGHTSHIFT_SCHEDULE_CONSENSUS (default 1 = single read, unchanged
+    behavior + zero added cost). Set to 2-3 to stabilize the door/window/
+    stair counts that otherwise swing run-to-run. Each read is one small
+    mini-PDF call, so consensus is cheap relative to extraction.
+    """
+    try:
+        n = int(os.environ.get("NIGHTSHIFT_SCHEDULE_CONSENSUS", "1"))
+    except (ValueError, TypeError):
+        n = 1
+    n = max(1, min(3, n))
+    if n == 1:
+        return analyze_schedule_images(client, pdf_path, schedule_page_nums)
+    reads = []
+    for i in range(n):
+        r = analyze_schedule_images(client, pdf_path, schedule_page_nums)
+        if r:
+            reads.append(r)
+    if not reads:
+        return None
+    merged = _merge_schedule_reads(reads)
+    ds = merged.get("door_schedule") or {}
+    print(f"   🔁 Schedule consensus over {len(reads)} read(s): "
+          f"{len(ds.get('door_marks_counted') or [])} door marks (union), "
+          f"{_num(ds.get('total_doors_full_paint',0)) + _num(ds.get('total_doors_hm_panel',0)):.0f} "
+          f"paintable doors")
+    return merged
 
 
 def _normalize_floor_key(name):
@@ -11910,6 +12024,35 @@ def _dedupe_enlarged_plan_floors(analysis):
         analysis["_enlarged_plan_floors_deduped"] = True
         return
 
+    # --- Per-floor-vs-template reconciliation (per-sheet mode) ---
+    # The mult>1 carve-out below assumes the ranged floors are SHELLS and the
+    # multiplied unit-plan templates carry the real detail. Per-sheet
+    # extraction breaks that assumption: it measures every unit on its own
+    # floor plan (201-206, 301-306) AND extracts the enlarged x01-x04
+    # templates — so both are full-detail and the building is counted twice
+    # (Fishkill 2026-06: ~18% wall/ceiling overage). When the ranged floors
+    # already carry substantive measured geometry AND their distinct unit
+    # count covers the building, the multiplied templates are the duplicate,
+    # not the source — so the carve-out is suspended for them.
+    pi = analysis.get("project_info", {}) or {}
+    total_units = _num(pi.get("total_units", 0))
+    ranged_units = set()
+    for r in ranged_rooms:
+        uk = _normalize_room_identity(r.get("room_id", ""),
+                                      r.get("room_name", ""))[0]
+        if not uk:
+            uk = _extract_unit_from_room_id(r.get("room_id", ""))
+        if uk:
+            ranged_units.add(str(uk).upper())
+    ranged_wall = sum(_num((r.get("dimensions") or {}).get("wall_area_sqft", 0))
+                      for r in ranged_rooms)
+    # Per-floor plans "cover the building" when they carry real wall geometry
+    # and their distinct unit count meets ~80% of the building's unit total
+    # (so we never drop templates that are filling in genuinely-missing floors).
+    per_floor_covers_building = (
+        ranged_wall > 0 and total_units > 0
+        and len(ranged_units) >= total_units * 0.8)
+
     zeroed_floors = 0
     zeroed_rooms = 0
     zeroed_wall_sqft = 0
@@ -11918,12 +12061,21 @@ def _dedupe_enlarged_plan_floors(analysis):
         if not rooms:
             continue
         if any(int(_num(r.get("unit_multiplier", 1)) or 1) > 1 for r in rooms):
+            if not per_floor_covers_building:
+                analysis.setdefault("notes", []).append(
+                    f"[Enlarged-Plan Check] Floor {fl.get('floor_name')!r} looks "
+                    f"like an enlarged unit-plan sheet but carries unit "
+                    f"multipliers — left intact (it is the template source of "
+                    f"unit scope, not a duplicate).")
+                continue
+            # else: per-floor plans already measure the whole building — this
+            # multiplied template is the duplicate; fall through to zero it.
             analysis.setdefault("notes", []).append(
-                f"[Enlarged-Plan Check] Floor {fl.get('floor_name')!r} looks "
-                f"like an enlarged unit-plan sheet but carries unit "
-                f"multipliers — left intact (it is the template source of "
-                f"unit scope, not a duplicate).")
-            continue
+                f"[Enlarged-Plan Check] Floor {fl.get('floor_name')!r} carries "
+                f"unit multipliers but the building's {len(ranged_units)} "
+                f"per-floor units (of {total_units:.0f}) are already measured "
+                f"with geometry — treating this enlarged template as a "
+                f"duplicate of the floor-plan units, not the source.")
         matched = sum(1 for r in rooms if _strip_name(r.get("room_name")) in ranged_names)
         if matched / len(rooms) < 0.5:
             continue
@@ -17611,7 +17763,7 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
 
                 if all_sched_pages:
                     print(f"   Found schedule pages: door={door_pages}, window={win_pages}")
-                    image_schedule_data = analyze_schedule_images(
+                    image_schedule_data = analyze_schedule_images_consensus(
                         client, pdf_path_scan, all_sched_pages
                     )
                     if image_schedule_data:
