@@ -24,6 +24,95 @@
         },
         "hard_gate_tripped": false
       }
+    },
+    {
+      "job": "fishkill_397",
+      "verified_on": "2026-06-13",
+      "true_error_pct": 28.9,
+      "true_error_metric": "mean abs % error vs tier-1 quantity targets",
+      "detail": [
+        "total_paintable_wall_sqft: 53130 vs 43003 (24%)",
+        "total_paintable_ceiling_sqft: 14310 vs 13451 (6%)",
+        "total_doors_full_paint: 136 vs 159 (14%)",
+        "total_stair_sections: 8 vs 8 (0%)",
+        "total_wallcovering_sqft: 0 vs 1758 (100%)"
+      ],
+      "inputs": {
+        "coverage_pct": 1.0,
+        "anchor_pct": 0.861,
+        "verifier_miss_rate": 0.0,
+        "unanchored_rate": 0.0,
+        "assumed_frac": 0.0,
+        "adjustment_mag": 0.0,
+        "n_rooms": 124,
+        "hard_gates": {
+          "failed_pages": false,
+          "missing_footprint": false,
+          "zero_walls": false,
+          "manual_review": true
+        },
+        "hard_gate_tripped": true
+      }
+    },
+    {
+      "job": "364_main",
+      "verified_on": "2026-06-13",
+      "true_error_pct": 36.9,
+      "true_error_metric": "mean abs % error vs tier-1 quantity targets",
+      "detail": [
+        "total_paintable_wall_sqft: 57520 vs 85353 (33%)",
+        "total_paintable_ceiling_sqft: 25976 vs 26839 (3%)",
+        "total_base_trim_lf: 2463 vs 8629 (71%)",
+        "total_doors_full_paint: 167 vs 155 (8%)",
+        "total_doors_hm_panel: 26 vs 28 (7%)",
+        "total_windows_painted_interior: 0 vs 26 (100%)",
+        "total_stair_sections: 15 vs 11 (36%)"
+      ],
+      "inputs": {
+        "coverage_pct": 1.0,
+        "anchor_pct": 0.825,
+        "verifier_miss_rate": 0.0,
+        "unanchored_rate": 0.0,
+        "assumed_frac": 0.0,
+        "adjustment_mag": 0.0,
+        "n_rooms": 65,
+        "hard_gates": {
+          "failed_pages": false,
+          "missing_footprint": false,
+          "zero_walls": false,
+          "manual_review": false
+        },
+        "hard_gate_tripped": false
+      }
+    },
+    {
+      "job": "dutchess_livestock",
+      "verified_on": "2026-06-13",
+      "true_error_pct": 268.2,
+      "true_error_metric": "mean abs % error vs tier-1 quantity targets",
+      "detail": [
+        "total_paintable_wall_sqft: 28557 vs 5371 (432%)",
+        "total_paintable_ceiling_sqft: 16455 vs 2061 (698%)",
+        "total_doors_full_paint: 10 vs 28 (64%)",
+        "total_base_trim_lf: 209 vs 391 (47%)",
+        "total_windows_painted_interior: 0 vs 25 (100%)"
+      ],
+      "inputs": {
+        "coverage_pct": 1.0,
+        "anchor_pct": 0.897,
+        "verifier_miss_rate": 0.0,
+        "unanchored_rate": 0.0,
+        "assumed_frac": 0.0,
+        "adjustment_mag": 0.0,
+        "n_rooms": 58,
+        "hard_gates": {
+          "failed_pages": false,
+          "missing_footprint": false,
+          "zero_walls": false,
+          "manual_review": false
+        },
+        "hard_gate_tripped": false
+      }
     }
   ]
 }
