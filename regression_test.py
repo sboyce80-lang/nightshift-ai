@@ -206,12 +206,19 @@ REFERENCE_CASES = {
     },
     "dutchess_livestock": {
         "display_name": "Dutchess Livestock Hill Restroom Facility",
-        "tier": 2,
-        "verified_on": None,
-        "verified_by": "Rider Excel claimed (LivestockHillRestrooms-takeoffs.xlsx "
-                       "Jan'26 revision) but targets in this file were never "
-                       "re-derived from the spreadsheet. Promote to tier 1 "
-                       "after re-verification.",
+        "tier": 1,
+        "verified_on": "2026-06-13",
+        "verified_by": "Re-derived 2026-06-13 from the source takeoff "
+                       "(golden/LivestockHillRestrooms-takeoffs.xlsx, Drive "
+                       "id 1MIK5yQu5m8_KIHBzxCS8b8wcT6HRVqjd), 'updated "
+                       "1/29/2026' block (subtotal $22,758.26 — the final "
+                       "revision). Walls = gyp 690.77 + 391.17 + 2,265.84 + "
+                       "652.50 + 521.57 + elevator shaft 558.24 = 5,080 SF + "
+                       "Meeting-Room wainscot 291.42 (Office-113 wainscot "
+                       "removed from scope) = 5,371 SF. Ceilings 2,060.63 "
+                       "(interior gyp; Boral 382.65 is exterior). Doors 28 "
+                       "(incl. added lift door). Base trim 390.91 FT. Windows "
+                       "25 casings. All match the prior targets exactly.",
         "match_keywords": ["dutchess"],
         "source": "Rider takeoff LivestockHillRestrooms-takeoffs.xlsx Jan'26 revision",
         "targets": {
@@ -238,11 +245,20 @@ REFERENCE_CASES = {
     },
     "honey_farms_malta": {
         "display_name": "Honey Farms Market — Malta NY",
-        "tier": 2,
-        "verified_on": None,
-        "verified_by": "Rider Excel claimed (Honey Farms - Malta, NY.xlsx) "
-                       "but targets never re-derived. Promote after "
-                       "re-verification.",
+        "tier": 1,
+        "verified_on": "2026-06-13",
+        "verified_by": "Re-derived 2026-06-13 from the source takeoff "
+                       "(golden/Honey Farms - Malta, NY.xlsx, Drive id "
+                       "1EpVFjkLJVy6v2QUdG-cOMa1D8HGwX-IR). Walls are billed "
+                       "as SEPARATE line items by height (5'6\" 299.75, 8' "
+                       "238.96, 9' 1,304.10, 9'-prime 724.14, 10' 343.90, 11' "
+                       "66.11) AND by color (PT-01 1,258.03, PT-02 190.05) — "
+                       "each priced at $1.50/SF, so additive = 4,425 + cooler "
+                       "epoxy 154.29 = 4,579 SF. Ceilings 1,029.4. Doors 6 HM "
+                       "panel + 2 HM frame-only = 8. WD-01 wood removed from "
+                       "scope. Total $10,855 int + $17,709 ext = $28,564.13 "
+                       "(labor 22,089 + materials 3,343 + lift 3,132). Matches "
+                       "the prior targets.",
         "match_keywords": ["honey farms"],
         "source": "Rider takeoff Honey Farms - Malta, NY.xlsx",
         "targets": {
@@ -266,9 +282,17 @@ REFERENCE_CASES = {
         "display_name": "TSC Fusion — Highland NY (Tractor Supply)",
         "tier": 2,
         "verified_on": None,
-        "verified_by": "Rider Excel claimed (Painting_Takeoff_TSC_Fusion_FINAL.xlsx, "
-                       "qty only — no $ target). Targets never re-derived. "
-                       "Promote after re-verification.",
+        "verified_by": "DO NOT PROMOTE on the current source. Inspected "
+                       "2026-06-13: Painting_Takeoff_TSC_Fusion_FINAL.xlsx "
+                       "(Drive id 1xysPc8VtfmXGyzU3NyzYzBhykW8tbjE3) is a "
+                       "DRAFT estimating worksheet, not a verified Rider "
+                       "manual takeoff — every quantity is an estimate "
+                       "('approx', 'est. from area', 'height assumed', "
+                       "'allowance'), and all cost columns are 0. These "
+                       "targets are heuristic, exactly the kind hard-numbers "
+                       "rejects. Tier-1 needs a real measured Rider takeoff "
+                       "or a hand takeoff from the plan set "
+                       "(2026-01-23_TSC Fusion_Highland_NY_Revision 2.pdf).",
         "match_keywords": ["tsc", "fusion"],
         "source": "Rider takeoff Painting_Takeoff_TSC_Fusion_FINAL.xlsx (qty only)",
         "targets": {
