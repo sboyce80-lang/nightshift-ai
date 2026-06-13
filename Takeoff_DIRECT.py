@@ -44,6 +44,183 @@ _MULTIMODAL_DENSE_PAGES_ENABLED = (
 )
 
 
+# ---------------------------------------------------------------------------
+# Structured outputs — schema-enforced extraction responses (Phase 2.0)
+# ---------------------------------------------------------------------------
+# The 2026-06-12 validation runs showed the model occasionally answering the
+# extraction prompt with PROSE ("I'll analyze these architectural drawings
+# systematically...") — 100K characters no parser can save — plus truncated
+# JSON the repair parser had to salvage. output_config.format makes the
+# response schema-valid JSON by construction: the API constrains decoding,
+# so the prose-mode failure class is structurally impossible. The repair
+# parser stays as the safety net for max_tokens truncation (still possible)
+# and for the text-mode fallback below.
+#
+# Schema rules (API): every object must set additionalProperties: false and
+# enumerate its keys. All fields are optional so the model can return either
+# the full extraction shape or the alternate {"no_floor_plans_found": ...}
+# shape the prompt allows.
+
+# Plain (non-nullable) leaf types: the API rejected nullable unions on
+# every field ("compiled grammar is too large") — ~100 type unions double
+# every grammar branch. The prompt's template already shows concrete
+# zero/empty defaults, so the model emits 0 / "" / false for unknowns.
+_SO_NUM = {"type": "number"}
+_SO_STR = {"type": "string"}
+_SO_BOOL = {"type": "boolean"}
+_SO_STR_ARR = {"type": "array", "items": {"type": "string"}}
+
+
+def _so_obj(props, nullable=False):
+    # All keys REQUIRED (nullable where unknown): the API caps OPTIONAL
+    # parameters at 24 per schema for grammar compilation, and this schema
+    # has ~100 fields. required+nullable is the standard pattern — the
+    # model emits null for what it can't read instead of omitting keys.
+    return {"type": ["object", "null"] if nullable else "object",
+            "properties": props,
+            "required": list(props.keys()),
+            "additionalProperties": False}
+
+
+_EXTRACTION_OUTPUT_SCHEMA = _so_obj({
+    "project_info": _so_obj({
+        "total_floors_analyzed": _SO_NUM,
+        "total_rooms_found": _SO_NUM,
+        "scale_notation": _SO_STR,
+        "building_type": _SO_STR,
+        "total_stories": _SO_NUM,
+        "total_units": _SO_NUM,
+        "footprint_sqft": _SO_NUM,
+        # prevailing_wage omitted: the dedicated document-level PW scan
+        # populates project_info.prevailing_wage; will_synthesis falls back
+        # gracefully when the main extraction lacks it. (Grammar budget:
+        # the API caps total schema properties at ~70.)
+    }),
+    "floors": {"type": "array", "items": _so_obj({
+        "floor_name": _SO_STR,
+        "rooms": {"type": "array", "items": _so_obj({
+            "room_id": _SO_STR,
+            "room_name": _SO_STR,
+            "source_page": _SO_NUM,
+            "source_sheet": _SO_STR,
+            "unit_multiplier": _SO_NUM,
+            "unit_type": _SO_STR,
+            "in_scope": _SO_BOOL,
+            "scope_exclusion_reason": _SO_STR,
+            "dimensions": _so_obj({
+                "length_feet": _SO_NUM,
+                "width_feet": _SO_NUM,
+                "ceiling_height_feet": _SO_NUM,
+                "floor_area_sqft": _SO_NUM,
+                "perimeter_lf": _SO_NUM,
+                "wall_area_sqft": _SO_NUM,
+                "ceiling_area_sqft": _SO_NUM,
+            }),
+            "materials": _so_obj({
+                "walls": _SO_STR,
+                "ceiling": _SO_STR,
+                "ceiling_painted": _SO_BOOL,
+                "base": _SO_STR,
+            }),
+            "elements": _so_obj({
+                "doors_full_paint": _SO_NUM,
+                "doors_hm_panel": _SO_NUM,
+                "doors_frame_only": _SO_NUM,
+                "windows_total": _SO_NUM,
+                "windows_painted_interior": _SO_NUM,
+                "base_trim_lf": _SO_NUM,
+                "stair_sections": _SO_NUM,
+                "gyp_between_stairs_sqft": _SO_NUM,
+                "level_5_finish_sqft": _SO_NUM,
+                "concrete_floor_sqft": _SO_NUM,
+                "painted_columns_ea": _SO_NUM,
+                "wallcovering_sqft": _SO_NUM,
+                "stained_wood_sqft": _SO_NUM,
+                "soffit_sqft": _SO_NUM,
+                "painted_railing_lf": _SO_NUM,
+            }),
+            "notes": _SO_STR,
+        })},
+    })},
+    # aggregated_totals intentionally OMITTED from the schema: the model's
+    # totals are recomputed from rooms by _recalculate_totals anyway, and
+    # the 23-key object pushed the compiled grammar over the API's size
+    # limit. additionalProperties:false means the model simply won't emit
+    # it; downstream .get("aggregated_totals") defaults handle absence.
+    "exterior": _so_obj({
+        "cornice_lf": _SO_NUM,
+        "window_trim_lf": _SO_NUM,
+        "soffit_sqft": _SO_NUM,
+        "railing_lf": _SO_NUM,
+        "lift_required": _SO_BOOL,
+        "interior_lift_required": _SO_BOOL,
+        "exterior_paint_sqft": _SO_NUM,
+        "hardie_siding_sqft": _SO_NUM,
+        "azek_trim_lf": _SO_NUM,
+        "corner_board_lf": _SO_NUM,
+        "steel_lintel_lf": _SO_NUM,
+        "exterior_siding_type": _SO_STR,
+        "notes": _SO_STR,
+    }),
+    "notes": _SO_STR_ARR,    "notes": _SO_STR_ARR,
+    # Alternate shape: the prompt instructs the model to return this when
+    # the PDF contains no floor plans.
+    "no_floor_plans_found": _SO_BOOL,
+    "no_detailed_floor_plans_found": _SO_BOOL,
+    "pages_reviewed": _SO_STR,
+    "has_door_schedule": _SO_BOOL,
+    "has_window_schedule": _SO_BOOL,
+})
+
+# Kill switch: if the API ever rejects the schema (400 naming output_config/
+# schema/format), flip to text mode for the rest of the process instead of
+# failing every call. The repair parser handles text mode as before.
+_STRUCTURED_OUTPUTS_BROKEN = False
+
+
+def _structured_outputs_enabled():
+    if _STRUCTURED_OUTPUTS_BROKEN:
+        return False
+    return os.environ.get("NIGHTSHIFT_STRUCTURED_OUTPUTS", "1").strip() not in (
+        "0", "false", "False")
+
+
+def _extraction_output_kwargs():
+    """Extra kwargs for messages.stream() on extraction calls: schema-
+    enforced JSON output when enabled, nothing otherwise."""
+    if not _structured_outputs_enabled():
+        return {}
+    return {"output_config": {
+        "format": {"type": "json_schema", "schema": _EXTRACTION_OUTPUT_SCHEMA},
+    }}
+
+
+def _maybe_disable_structured_outputs(exc):
+    """If `exc` is the API rejecting our output schema, flip the kill
+    switch (process-wide) and return True so the caller can retry the
+    call in text mode instead of failing the chunk/batch."""
+    global _STRUCTURED_OUTPUTS_BROKEN
+    if _STRUCTURED_OUTPUTS_BROKEN:
+        return False
+    msg = str(exc).lower()
+    if isinstance(exc, anthropic.BadRequestError) and any(
+            t in msg for t in ("output_config", "json_schema", "schema",
+                               "output format", "structured")):
+        _STRUCTURED_OUTPUTS_BROKEN = True
+        print("   ⚠️  API rejected the structured-output schema — falling "
+              "back to text mode for the rest of this run "
+              f"({str(exc)[:160]})")
+        return True
+    return False
+
+
+# Cache the static extraction prompt across calls/passes/retries. The
+# prompt is several thousand tokens and was re-sent at full price on every
+# chunk of every pass (~200 calls/job). 1h TTL covers a full multi-pass
+# run; write cost is 2x but a single re-read pays it back.
+_PROMPT_CACHE_CONTROL = {"type": "ephemeral", "ttl": "1h"}
+
+
 class TruncatedResponseError(Exception):
     """The model's response hit max_tokens and was cut off mid-output.
 
@@ -2684,6 +2861,7 @@ def _analyze_page_multimodal(client, pdf_path, page_index, prompt_text,
     content_blocks.append({
         "type": "text",
         "text": prompt_text,
+        "cache_control": _PROMPT_CACHE_CONTROL,
     })
 
     if label:
@@ -2698,6 +2876,7 @@ def _analyze_page_multimodal(client, pdf_path, page_index, prompt_text,
                 temperature=0,
                 timeout=300.0,
                 messages=[{"role": "user", "content": content_blocks}],
+                **_extraction_output_kwargs()
             ) as stream:
                 try:
                     return _collect_stream_text(stream, label="multimodal retry")
@@ -2931,7 +3110,8 @@ def _analyze_floor_plan_as_images(client, pdf_path, scope_notes="",
             })
         content_blocks.append({
             "type": "text",
-            "text": effective_prompt
+            "text": effective_prompt,
+            "cache_control": _PROMPT_CACHE_CONTROL
         })
 
         result_parts = []
@@ -2945,7 +3125,8 @@ def _analyze_floor_plan_as_images(client, pdf_path, scope_notes="",
                     max_tokens=64000,
                     temperature=0,
                     timeout=300.0,
-                    messages=[{"role": "user", "content": content_blocks}]
+                    messages=[{"role": "user", "content": content_blocks}],
+                    **_extraction_output_kwargs()
                 ) as stream:
                     try:
                         result_parts.append(_collect_stream_text(
@@ -2974,6 +3155,8 @@ def _analyze_floor_plan_as_images(client, pdf_path, scope_notes="",
                     print(f"   ❌ Image fallback batch failed: {e}")
                     continue
             except Exception as e:
+                if _maybe_disable_structured_outputs(e):
+                    continue  # retry this attempt in text mode
                 print(f"   ❌ Image fallback error: {e}")
                 break
 
@@ -3319,7 +3502,8 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
             })
         content_blocks.append({
             "type": "text",
-            "text": effective_prompt
+            "text": effective_prompt,
+            "cache_control": _PROMPT_CACHE_CONTROL
         })
 
         # Make the API call
@@ -3334,7 +3518,8 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
                     max_tokens=64000,
                     temperature=0,
                     timeout=600.0,
-                    messages=[{"role": "user", "content": content_blocks}]
+                    messages=[{"role": "user", "content": content_blocks}],
+                    **_extraction_output_kwargs()
                 ) as stream:
                     try:
                         result_parts.append(_collect_stream_text(
@@ -3363,6 +3548,8 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
                     print(f"   ❌ Enhanced extraction batch failed: {e}")
                     continue
             except Exception as e:
+                if _maybe_disable_structured_outputs(e):
+                    continue  # retry this attempt in text mode
                 print(f"   ❌ Enhanced extraction error: {e}")
                 break
 
@@ -3381,7 +3568,8 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
                     max_tokens=64000,
                     temperature=0,
                     timeout=600.0,
-                    messages=[{"role": "user", "content": content_blocks}]
+                    messages=[{"role": "user", "content": content_blocks}],
+                    **_extraction_output_kwargs()
                 ) as stream:
                     try:
                         result_parts.append(_collect_stream_text(
@@ -3447,7 +3635,8 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
                     max_tokens=64000,
                     temperature=0,
                     timeout=600.0,
-                    messages=[{"role": "user", "content": sharpened_blocks}]
+                    messages=[{"role": "user", "content": sharpened_blocks}],
+                    **_extraction_output_kwargs()
                 ) as stream:
                     try:
                         result_parts2.append(_collect_stream_text(
@@ -5169,10 +5358,17 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
                             },
                             {
                                 "type": "text",
-                                "text": effective_prompt
+                                "text": effective_prompt,
+                                # Cache document+prompt for the multi-pass
+                                # re-sends and retry ladder (identical
+                                # prefix). 1h TTL outlives a pass.
+                                "cache_control": _PROMPT_CACHE_CONTROL
                             }
                         ]
-                    }]
+                    }],
+                    # Schema-enforced JSON response — prose-mode answers
+                    # become structurally impossible (Phase 2.0).
+                    **_extraction_output_kwargs()
                 ) as stream:
                     # Raises TruncatedResponseError on max_tokens so the
                     # caller's chunk-failure ladder routes the chunk to
@@ -5196,6 +5392,13 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
                     time.sleep(delay)
                 else:
                     raise  # exhausted all retries
+            except anthropic.BadRequestError as _bre:
+                # Schema rejection -> flip to text mode and retry this
+                # attempt; any other 400 belongs to the caller's ladder
+                # (413 too-large handling etc.).
+                if _maybe_disable_structured_outputs(_bre):
+                    continue
+                raise
             except anthropic.APITimeoutError:
                 if attempt < max_retries - 1:
                     delay = base_delay * (2 ** attempt)
