@@ -373,3 +373,42 @@ def calibration_status(path):
     n = len(rows)
     return {"n": n, "min": MIN_CALIBRATION, "active": n >= MIN_CALIBRATION,
             "needed": max(0, MIN_CALIBRATION - n)}
+
+
+# Minimum calibrated confidence level to allow auto-send (mirrors Will's >=85).
+READY_TO_SEND_MIN_LEVEL = 85
+
+
+def reconcile_will_confidence(will_output, calibrated_confidence):
+    """Reconcile Will's self-reported confidence with the calibrated band
+    (review Part 5: Will's level_pct is model-self-report; the calibrated
+    number is evidence-grounded). Mutates and returns will_output.
+
+    Rule: the calibrated assessment can only TIGHTEN ready_to_send, never
+    loosen it — Will keeps its veto, and the deterministic evidence adds a
+    second, independent veto. So a job ships only when BOTH Will AND
+    calibrated confidence are comfortable. Both numbers are recorded for the
+    estimator; nothing is silently overwritten.
+    """
+    if not isinstance(will_output, dict) or not isinstance(calibrated_confidence, dict):
+        return will_output
+    conf = will_output.setdefault("confidence", {})
+    conf["calibrated_error_pct"] = calibrated_confidence.get("predicted_error_pct")
+    conf["calibrated_level"] = calibrated_confidence.get("confidence_level")
+    conf["calibrated_is_calibrated"] = calibrated_confidence.get("calibrated")
+
+    cal_level = calibrated_confidence.get("confidence_level")
+    hard_gate = (calibrated_confidence.get("inputs") or {}).get("hard_gate_tripped")
+    flags = will_output.setdefault("pipeline_flags", {})
+    reasons = []
+    if hard_gate:
+        reasons.append("calibrated hard gate tripped "
+                       f"({', '.join(k for k, v in (calibrated_confidence.get('inputs') or {}).get('hard_gates', {}).items() if v)})")
+    if isinstance(cal_level, (int, float)) and cal_level < READY_TO_SEND_MIN_LEVEL:
+        reasons.append(f"calibrated confidence {cal_level} < "
+                       f"{READY_TO_SEND_MIN_LEVEL}")
+    if reasons and flags.get("ready_to_send"):
+        flags["ready_to_send"] = False
+        flags["route_to_human_review"] = True
+        flags.setdefault("ready_to_send_overrides", []).extend(reasons)
+    return will_output

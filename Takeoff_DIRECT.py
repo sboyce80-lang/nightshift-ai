@@ -19490,6 +19490,18 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         client=client,
     )
     if will_result.get("will_synthesis"):
+        # Reconcile Will's self-reported confidence with the calibrated band
+        # (Phase 2.5b): calibrated confidence can only TIGHTEN ready_to_send,
+        # never loosen it — a job ships only when BOTH agree. Guarded; never
+        # fatal.
+        try:
+            _confidence.reconcile_will_confidence(
+                will_result["will_synthesis"],
+                analysis.get("calibrated_confidence") or {})
+        except Exception as _rc_err:
+            print(f"   ⚠️  Will/confidence reconciliation skipped: "
+                  f"{type(_rc_err).__name__}: {str(_rc_err)[:120]}")
+
         will_rfis = will_result.get("new_rfis", [])
         next_num = (max((r.get("number", 0) for r in rfi_items), default=0) + 1
                     if rfi_items else 1)

@@ -208,6 +208,36 @@ def main():
             p, "y", C.compute_confidence_inputs(good_analysis()), 9.0)
         check("append tolerates a legacy bare-list table", n_legacy == 2)
 
+    print("\n── Will / calibrated-confidence reconciliation ──")
+    # Will says ready; calibrated confidence is high + no gate → stays ready.
+    cc_good = C.assess_confidence(good_analysis())
+    w = {"confidence": {"level_pct": 90},
+         "pipeline_flags": {"ready_to_send": True}}
+    C.reconcile_will_confidence(w, cc_good)
+    check("both confident → ready_to_send preserved",
+          w["pipeline_flags"]["ready_to_send"] is True)
+    check("calibrated numbers recorded alongside Will's",
+          "calibrated_error_pct" in w["confidence"]
+          and "calibrated_level" in w["confidence"])
+    # Will says ready; calibrated has a hard gate (bad job) → vetoed.
+    cc_bad = C.assess_confidence(bad_analysis())
+    w2 = {"confidence": {"level_pct": 92},
+          "pipeline_flags": {"ready_to_send": True}}
+    C.reconcile_will_confidence(w2, cc_bad)
+    check("calibrated hard gate vetoes Will's ready_to_send",
+          w2["pipeline_flags"]["ready_to_send"] is False
+          and w2["pipeline_flags"]["route_to_human_review"] is True)
+    check("veto reason recorded", w2["pipeline_flags"].get("ready_to_send_overrides"))
+    check("Will's own level_pct not overwritten", w2["confidence"]["level_pct"] == 92)
+    # Calibrated can only TIGHTEN: if Will already said not-ready, stays not-ready.
+    w3 = {"confidence": {"level_pct": 50},
+          "pipeline_flags": {"ready_to_send": False}}
+    C.reconcile_will_confidence(w3, cc_good)
+    check("reconciliation never loosens a not-ready job",
+          w3["pipeline_flags"]["ready_to_send"] is False)
+    check("reconcile on malformed input is a no-op",
+          C.reconcile_will_confidence(None, cc_good) is None)
+
     print(f"\n=== {PASS} passed, {FAIL} failed ===")
     return 1 if FAIL else 0
 
