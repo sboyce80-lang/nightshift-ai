@@ -165,6 +165,45 @@ REFERENCE_CASES = {
              "No dryfall ceiling in Rider scope (baseline run hallucinated 2,912 SF)"),
         ],
     },
+    "fishkill_397": {
+        "display_name": "397 Fishkill Ave (15-unit mixed-use residential)",
+        "tier": 1,
+        "verified_on": "2026-06-12",
+        "verified_by": "Rider takeoff '397 fishkill take offs (3).xlsx' "
+                       "(archived: golden/397Fishkill_rider_takeoffs_"
+                       "2026-06-12.xlsx, 'Bid Pricing' sheet — the final "
+                       "version; Sheet1 is an earlier draft at different "
+                       "rates). Quantities re-derived row by row: walls = "
+                       "1st fl 746.99 LF x 10.08' (7,529.7) + 2nd 15,184.97 "
+                       "+ 3rd 15,184.97 + stair1 2,551.28 + stair2 1,031.73 "
+                       "+ misc gyp 1,520.75 = 43,003 SF. Ceilings = 3,835.13 "
+                       "+ 4,663.77 + 4,663.77 + 163.27 + 125.38 = 13,451 SF. "
+                       "Doors 29+65+65 = 159 EA. Stairs 8 sections. "
+                       "Wallcovering 1,409.49 + 174.22x2 = 1,758 SF. Stained "
+                       "oak 337.95 SF. Interior $90,277.12; with exterior "
+                       "$135,920.16. NOTE: Rider's 'footprint' (15,593.57) "
+                       "is a whole-building SF basis, not a per-floor "
+                       "footprint — no footprint target here. Subtotal "
+                       "target uses Rider INTERIOR only; KS rates differ "
+                       "from Rider's $0.90/SF so treat quantity targets as "
+                       "primary.",
+        "match_keywords": ["397"],
+        "source": "Rider takeoff 397 fishkill take offs (3).xlsx (June 2026)",
+        "targets": {
+            "total_paintable_wall_sqft": (43003, 0.10),
+            "total_paintable_ceiling_sqft": (13451, 0.10),
+            "total_doors_full_paint": (159, 0.15),
+            "total_stair_sections": (8, 0.25),
+            "total_wallcovering_sqft": (1758, 0.30),
+            "total_stained_wood_sqft": (338, 0.30),
+        },
+        "assertions": [
+            ("total_dryfall_ceiling_sqft", "<", 500,
+             "No dryfall in Rider scope (residential GYP ceilings)"),
+            ("total_concrete_floor_sqft", "<", 500,
+             "No concrete sealer in Rider scope"),
+        ],
+    },
     "dutchess_livestock": {
         "display_name": "Dutchess Livestock Hill Restroom Facility",
         "tier": 2,
