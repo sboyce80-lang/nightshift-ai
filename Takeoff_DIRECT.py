@@ -12144,6 +12144,153 @@ def _dedupe_cross_sheet_rooms(analysis):
         print(msg + ".")
 
 
+# ---------------------------------------------------------------------------
+# Quantity-adjustment ledger + provenance pricing gate (Phase 2.3)
+# ---------------------------------------------------------------------------
+# Provenance dies at the aggregation->pricing boundary today: boosts, caps,
+# dedup, footprint reconciliation, and Will edits mutate aggregated_totals
+# with at best a prose note (2026-06 review Part 5). The ledger makes every
+# quantity change machine-readable WITHOUT changing behavior: the
+# orchestrator snapshots aggregated_totals around each named mutation stage
+# and records the per-key delta with a source tag. build_priced_takeoff then
+# classifies each priced quantity as measured / schedule / derived / assumed
+# and, in strict mode, removes the assumed increments and files an "unpriced
+# exposure" RFI — making HARD_NUMBERS_ONLY structurally enforced at one choke
+# point instead of via ~15 scattered guards.
+#
+# source tags:
+#   measured  — summed from per-room measured dimensions (the recalc baseline)
+#   schedule  — set from an authoritative door/window/stair schedule
+#   derived   — computed from measured data (e.g. perimeter x height repair of
+#               aggregation loss) — measurement-backed, kept under hard-numbers
+#   assumed   — heuristic/footprint/template fabrication — dropped to RFI under
+#               the strict gate
+#   correction— a REDUCTION (dedup, exclusion); never an exposure
+
+
+def _agg_snapshot(analysis):
+    """Snapshot every numeric aggregated_totals value (keys discovered
+    dynamically so a renamed/added total can never silently escape the
+    ledger)."""
+    agg = (analysis or {}).get("aggregated_totals", {}) or {}
+    out = {}
+    for k, v in agg.items():
+        try:
+            out[k] = float(v or 0)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _ledger_stage(analysis, stage, before, source="assumed", basis=""):
+    """Diff aggregated_totals against the `before` snapshot and append one
+    ledger entry per changed key. Returns a fresh snapshot so stages can be
+    chained: snap = _ledger_stage(a, 'boost', snap, source='derived').
+
+    A reduction is always recorded as a 'correction' regardless of `source`
+    (only positive increments can be unpriced exposures)."""
+    if not isinstance(analysis, dict):
+        return before
+    after = _agg_snapshot(analysis)
+    led = analysis.setdefault("_quantity_adjustments", [])
+    for k in set(list(before.keys()) + list(after.keys())):
+        frm = before.get(k, 0.0)
+        to = after.get(k, 0.0)
+        d = to - frm
+        if abs(d) < 0.5:
+            continue
+        led.append({
+            "stage": stage,
+            "item": k,
+            "from": round(frm, 2),
+            "to": round(to, 2),
+            "delta": round(d, 2),
+            "source": source if d > 0 else "correction",
+            "basis": basis,
+        })
+    return after
+
+
+def _provenance_gate_enabled():
+    return os.environ.get("NIGHTSHIFT_PROVENANCE_GATE", "0").strip() in (
+        "1", "true", "True")
+
+
+def build_priced_takeoff(analysis, strict=None):
+    """Single provenance choke point between aggregation and calculate_costs.
+
+    Classifies each aggregated quantity into measured / schedule / derived /
+    assumed portions using the adjustment ledger, stores the breakdown in
+    analysis['_priced_takeoff'], and (strict mode) removes the assumed
+    increments from aggregated_totals + registers an 'unpriced exposure'
+    note so the RFI machinery surfaces it. Idempotent via
+    analysis['_priced_takeoff_built'].
+
+    strict defaults to NIGHTSHIFT_PROVENANCE_GATE (off). HARD_NUMBERS_ONLY
+    already zeroes most fabrication at the source; the gate is the belt-and-
+    suspenders that catches any assumed increment that still reached the
+    priced totals (e.g. the perimeter wall boost), tagged honestly.
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if analysis.get("_priced_takeoff_built"):
+        return analysis
+    if strict is None:
+        strict = _provenance_gate_enabled()
+
+    agg = analysis.get("aggregated_totals", {}) or {}
+    ledger = analysis.get("_quantity_adjustments", []) or []
+    by_item = {}
+    for e in ledger:
+        by_item.setdefault(e.get("item"), []).append(e)
+
+    breakdown = {}
+    exposures = []
+    for k, v in list(agg.items()):
+        try:
+            final = float(v or 0)
+        except (TypeError, ValueError):
+            continue
+        entries = by_item.get(k, [])
+        assumed = sum(e["delta"] for e in entries
+                      if e.get("source") == "assumed" and e.get("delta", 0) > 0)
+        derived = sum(e["delta"] for e in entries
+                      if e.get("source") == "derived" and e.get("delta", 0) > 0)
+        measured = final - assumed - derived
+        rec = {"priced": round(final, 2),
+               "measured": round(max(0.0, measured), 2),
+               "derived": round(derived, 2),
+               "assumed": round(assumed, 2)}
+        if assumed > 0.5 and measured >= -0.5:
+            # measured < 0 means a later _recalculate_totals already wiped the
+            # assumed increment from agg (e.g. the sales-floor ACT re-flip):
+            # nothing left to remove, so it is not a live exposure.
+            exposures.append((k, assumed, max(0.0, measured)))
+            if strict:
+                agg[k] = round(max(0.0, final - assumed), 2)
+                rec["priced"] = agg[k]
+                rec["assumed_removed"] = round(assumed, 2)
+        breakdown[k] = rec
+
+    analysis["aggregated_totals"] = agg
+    analysis["_priced_takeoff"] = {
+        "strict": bool(strict),
+        "breakdown": breakdown,
+        "exposures": [{"item": k, "assumed_qty": round(a, 2),
+                       "measured_qty": round(m, 2)} for k, a, m in exposures],
+    }
+    if strict and exposures:
+        notes = analysis.setdefault("notes", [])
+        for k, a, m in exposures:
+            notes.append(
+                f"[Unpriced Exposure] {k}: {a:,.0f} assumed unit(s) removed "
+                f"under the provenance gate ({m:,.0f} measured priced). "
+                f"RFI REQUIRED: confirm this scope on the drawings before it "
+                f"is added to the bid.")
+    analysis["_priced_takeoff_built"] = True
+    return analysis
+
+
 def _recalculate_totals(analysis):
     """
     Recalculate aggregated_totals from individual room data.
@@ -18336,14 +18483,24 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             analysis["has_window_schedule"] = True
         print(f"\n   📋 Image-based schedule data injected into analysis")
     # Apply schedule overrides (from either PDF-based or image-based schedule)
+    # Ledger (Phase 2.3): snapshot aggregated_totals here, then attribute each
+    # downstream stage's delta to its source so build_priced_takeoff can split
+    # measured/schedule/derived/assumed. No behavior change — pure observability.
+    _adj_snap = _agg_snapshot(analysis)
     if analysis.get("schedule_data"):
         analysis = _apply_schedule_overrides(analysis)
+        _adj_snap = _ledger_stage(analysis, "schedule_overrides", _adj_snap,
+                                  source="schedule",
+                                  basis="authoritative door/window/stair schedule")
 
     # --- Secondary space supplement (closets, halls, entries) ---
     # Uses rooms-per-unit density to detect missing secondary spaces and
     # supplements wall/ceiling/trim with estimated area. Must run BEFORE
     # perimeter cross-check and wall boost so those operate on supplemented totals.
     analysis = _supplement_missing_secondary_spaces(analysis)
+    _adj_snap = _ledger_stage(analysis, "secondary_space_supplement", _adj_snap,
+                              source="assumed",
+                              basis="rooms-per-unit density heuristic")
 
     # --- Unit-multiplier sanity validator ---
     # Catches the Ridgeview-2026-05-28 case: model emits multipliers that
@@ -18364,6 +18521,9 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     # commons are painted (typical for supportive housing / multifamily);
     # auto-downshifts when the finish schedule shows ACT in commons.
     analysis = _apply_residential_ceiling_floor(analysis)
+    _adj_snap = _ledger_stage(analysis, "residential_ceiling_floor", _adj_snap,
+                              source="assumed",
+                              basis="footprint x stories x efficiency floor")
 
     # --- Perimeter-based wall cross-check (must run BEFORE wall boost) ---
     # Computes perimeter-derived wall totals and stores in _perimeter_cross_check
@@ -18375,11 +18535,21 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     # Boost cap elevated when secondary space supplement confirmed under-extraction.
     # Must come AFTER _recalculate_totals, secondary supplement, and perimeter cross-check.
     analysis = _validate_and_boost_walls(analysis)
+    # The Mode-1 perimeter boost is DERIVED (measured per-room perimeter x
+    # height repairing aggregation loss) — measurement-backed, kept under the
+    # gate. The Mode-2 footprint boost is already suppressed under
+    # HARD_NUMBERS_ONLY, so under that policy only derived deltas land here.
+    _adj_snap = _ledger_stage(analysis, "wall_boost", _adj_snap,
+                              source="derived",
+                              basis="perimeter x height (Mode 1) / footprint ratio (Mode 2)")
 
     # --- Commercial window exclusion (after all overrides/boosts) ---
     # For commercial (non-residential) buildings, zero all painted windows.
     # Must come AFTER schedule overrides so schedule data doesn't override back.
     analysis = _apply_commercial_window_exclusion(analysis)
+    _adj_snap = _ledger_stage(analysis, "commercial_window_exclusion", _adj_snap,
+                              source="correction",
+                              basis="zero painted windows for commercial")
 
     # --- Wall:Ceiling ratio guard rail (after all boosts/corrections) ---
     # Informational check — does NOT modify totals, only adds warnings/RFIs.
@@ -19048,6 +19218,13 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                   f"(ratio {ratio:.1f}×, expected 3-6×)")
             print(f"   ⚠️  Flagged for manual review — proposal will print "
                   f"but should NOT be sent without reviewer sign-off.")
+
+    # --- Provenance choke point (Phase 2.3): classify every priced quantity as
+    # measured / schedule / derived / assumed from the adjustment ledger, store
+    # the breakdown, and (strict mode, NIGHTSHIFT_PROVENANCE_GATE) remove assumed
+    # increments + file an unpriced-exposure RFI. Must be the LAST mutation of
+    # aggregated_totals before pricing. ---
+    analysis = build_priced_takeoff(analysis)
 
     # --- Calculate costs ---
     _update_progress(6, TOTAL_STEPS, "Calculating Costs", "Applying pricing model...")
