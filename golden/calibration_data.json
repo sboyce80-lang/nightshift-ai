@@ -1,0 +1,29 @@
+{
+  "_schema": "rows[]: {job, verified_on, true_error_pct, true_error_metric, inputs{...}}",
+  "_note": "Golden calibration table for confidence.predict_error (Phase 2.4). Append one row per Rider/customer-verified job: its computed confidence inputs + the measured per-job error. The calibrator reports calibrated=False until len(rows) >= confidence.MIN_CALIBRATION (8). Seeded 2026-06-13 with the Fishkill data point; grow it from Rider's Drive takeoffs to activate calibration.",
+  "min_calibration": 8,
+  "rows": [
+    {
+      "job": "fishkill_397_persheet_run1",
+      "verified_on": "2026-06-13",
+      "true_error_pct": 18.6,
+      "true_error_metric": "walls vs Rider 43,003 SF",
+      "inputs": {
+        "coverage_pct": 1.0,
+        "anchor_pct": 0.85,
+        "verifier_miss_rate": 0.034,
+        "unanchored_rate": 0.0544,
+        "assumed_frac": 0.0,
+        "adjustment_mag": 0.0,
+        "n_rooms": 147,
+        "hard_gates": {
+          "failed_pages": false,
+          "missing_footprint": false,
+          "zero_walls": false,
+          "manual_review": false
+        },
+        "hard_gate_tripped": false
+      }
+    }
+  ]
+}

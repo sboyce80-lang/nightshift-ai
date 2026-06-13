@@ -1140,12 +1140,48 @@ def json_to_pdf(json_path, pdf_path):
         ])
 
     exposures = priced_takeoff.get('exposures') or []
-    if prov_rows or exposures:
+    calibrated_conf = analysis.get('calibrated_confidence') or {}
+    if prov_rows or exposures or calibrated_conf:
         story.append(Spacer(1, 10))
-        story.append(Paragraph("Trust Summary — Quantity Provenance",
+        story.append(Paragraph("Trust Summary",
                                styles['SectionHead']))
         story.append(HRFlowable(width="100%", thickness=0.5, color=BORDER_GRAY))
         story.append(Spacer(1, 4))
+
+    # ── Calibrated confidence (Phase 2.4) ──
+    if calibrated_conf:
+        pe = _safe_num(calibrated_conf.get('predicted_error_pct'))
+        ci = int(_safe_num(calibrated_conf.get('ci_level', 0.9)) * 100)
+        cal = calibrated_conf.get('calibrated')
+        cal_txt = ("calibrated against verified jobs" if cal
+                   else "evidence-model estimate — not yet calibrated "
+                        "(awaiting more verified takeoffs)")
+        story.append(Paragraph(
+            f"<b>Predicted accuracy:</b> within <b>±{pe:.0f}%</b> at {ci}% "
+            f"confidence &mdash; <i>{cal_txt}</i>.", styles['BodyText2']))
+        caps = calibrated_conf.get('caps_applied') or []
+        if caps:
+            story.append(Paragraph(
+                "<b>Confidence capped:</b> " + "; ".join(caps) +
+                ". A known-incomplete estimate cannot read as high-confidence.",
+                styles['Note']))
+        inp = calibrated_conf.get('inputs') or {}
+        cov = inp.get('coverage_pct')
+        anc = inp.get('anchor_pct')
+        ev_bits = []
+        if cov is not None:
+            ev_bits.append(f"plan-page coverage {cov*100:.0f}%")
+        if anc is not None:
+            ev_bits.append(f"rooms anchored {anc*100:.0f}%")
+        if _safe_num(inp.get('assumed_frac')) > 0:
+            ev_bits.append(f"assumed area {_safe_num(inp.get('assumed_frac'))*100:.0f}%")
+        if ev_bits:
+            story.append(Paragraph(
+                "<i>Evidence: " + ", ".join(ev_bits) + ".</i>", styles['Note']))
+        story.append(Spacer(1, 6))
+
+    if prov_rows or exposures:
+        story.append(Paragraph("Quantity Provenance", styles['BodyText2']))
         story.append(Paragraph(
             "<i>Every priced quantity, split by how it was determined. "
             "<b>Measured</b> = read from the drawings; <b>Derived</b> = computed "

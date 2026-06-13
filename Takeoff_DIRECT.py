@@ -27,6 +27,38 @@ from pathlib import Path
 import PyPDF2
 from config import CLAUDE_API_KEY, PRICING_MODEL, SMALL_COMMERCIAL_RATES, PCA_CONSTANTS, HARD_NUMBERS_ONLY
 from will_synthesis import run_will_synthesis
+import confidence as _confidence
+
+# Golden calibration table for calibrated confidence (Phase 2.4). Grows as
+# verified takeoffs land; confidence reports calibrated=False until it has
+# confidence.MIN_CALIBRATION rows.
+_CALIBRATION_PATH = str(Path(__file__).parent / "golden" / "calibration_data.json")
+
+
+def _assess_calibrated_confidence(analysis, cost_estimate=None):
+    """Compute + store analysis['calibrated_confidence'] (Phase 2.4).
+    Additive and fully guarded — a confidence error never breaks a run, and
+    it does NOT alter pricing or ready_to_send (Will's gate is unchanged).
+    Env kill-switch: NIGHTSHIFT_CALIBRATED_CONFIDENCE=0."""
+    if os.environ.get("NIGHTSHIFT_CALIBRATED_CONFIDENCE", "1").strip() in (
+            "0", "false", "False"):
+        return analysis
+    try:
+        cc = _confidence.assess_confidence(
+            analysis, cost_estimate=cost_estimate,
+            calibration_path=_CALIBRATION_PATH)
+        analysis["calibrated_confidence"] = cc
+        _cal = "calibrated" if cc.get("calibrated") else "uncalibrated"
+        print(f"   🎯 Calibrated confidence: predicted error ≤ "
+              f"{cc.get('predicted_error_pct')}% at "
+              f"{int(cc.get('ci_level', 0.9) * 100)}% ({_cal}; "
+              f"level {cc.get('confidence_level')})"
+              + (f" — caps: {'; '.join(cc.get('caps_applied'))}"
+                 if cc.get("caps_applied") else ""))
+    except Exception as _cc_err:
+        print(f"   ⚠️  Calibrated confidence failed (non-fatal): "
+              f"{type(_cc_err).__name__}: {str(_cc_err)[:160]}")
+    return analysis
 import anthropic
 import base64
 from datetime import datetime
@@ -19237,6 +19269,12 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         analysis=analysis,
         pricing_model_override=pricing_model_used,
     )
+
+    # Calibrated confidence (Phase 2.4): honest predicted-error band from the
+    # deterministic evidence Phases 1-3 now produce. Additive — stored on the
+    # analysis, rendered in the Trust Summary; does not change pricing or the
+    # ready_to_send gate.
+    analysis = _assess_calibrated_confidence(analysis, cost_estimate=costs)
 
     print_estimate(analysis, costs)
 
