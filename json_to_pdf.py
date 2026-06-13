@@ -1092,6 +1092,102 @@ def json_to_pdf(json_path, pdf_path):
         story.append(Spacer(1, 4))
         story.append(t)
 
+    # ── Trust Summary (Phase 2.3): provenance of priced quantities ──
+    # Renders the build_priced_takeoff breakdown so the estimator can see, per
+    # quantity, how many units are MEASURED from the drawings vs DERIVED from
+    # measured data vs ASSUMED by a heuristic — plus any unpriced exposure the
+    # provenance gate removed. Makes "where did this number come from" answerable
+    # mechanically instead of from prose notes.
+    _QTY_LABELS = {
+        "total_paintable_wall_sqft": "Paintable Walls (SF)",
+        "total_paintable_ceiling_sqft": "Paintable Ceilings (SF)",
+        "total_dryfall_ceiling_sqft": "Dryfall Ceilings (SF)",
+        "total_base_trim_lf": "Base Trim (LF)",
+        "total_doors_full_paint": "Doors — Full Paint (EA)",
+        "total_doors_hm_panel": "Doors — HM Panel (EA)",
+        "total_windows_painted_interior": "Windows — Painted Int. (EA)",
+        "total_stair_sections": "Stair Sections (EA)",
+        "total_wallcovering_sqft": "Wallcovering (SF)",
+        "total_stained_wood_sqft": "Stained Wood (SF)",
+        "total_painted_railing_lf": "Painted Railing (LF)",
+        "total_concrete_floor_sqft": "Concrete Floor (SF)",
+        "total_painted_columns_ea": "Painted Columns (EA)",
+        "total_soffit_sqft": "Soffit (SF)",
+        "total_gyp_between_stairs_sqft": "Gyp Between Stairs (SF)",
+        "total_level_5_finish_sqft": "Level 5 Finish (SF)",
+    }
+    priced_takeoff = analysis.get('_priced_takeoff') or {}
+    breakdown = priced_takeoff.get('breakdown') or {}
+    # Only surface lines where some portion is NOT plain measured (derived or
+    # assumed present), or where the gate removed an exposure — a line that is
+    # 100% measured needs no provenance caveat.
+    prov_rows = []
+    for key, rec in breakdown.items():
+        derived = _safe_num(rec.get('derived', 0))
+        assumed = _safe_num(rec.get('assumed', 0))
+        priced = _safe_num(rec.get('priced', 0))
+        if priced <= 0 and assumed <= 0:
+            continue
+        if derived <= 0 and assumed <= 0:
+            continue  # fully measured — no caveat needed
+        measured = _safe_num(rec.get('measured', 0))
+        prov_rows.append([
+            _QTY_LABELS.get(key, key),
+            f"{measured:,.0f}",
+            f"{derived:,.0f}" if derived else "—",
+            f"{assumed:,.0f}" if assumed else "—",
+            f"{priced:,.0f}",
+        ])
+
+    exposures = priced_takeoff.get('exposures') or []
+    if prov_rows or exposures:
+        story.append(Spacer(1, 10))
+        story.append(Paragraph("Trust Summary — Quantity Provenance",
+                               styles['SectionHead']))
+        story.append(HRFlowable(width="100%", thickness=0.5, color=BORDER_GRAY))
+        story.append(Spacer(1, 4))
+        story.append(Paragraph(
+            "<i>Every priced quantity, split by how it was determined. "
+            "<b>Measured</b> = read from the drawings; <b>Derived</b> = computed "
+            "from measured data (e.g. perimeter × height); <b>Assumed</b> = "
+            "supplied by a heuristic. Assumed scope is the first thing to confirm "
+            "before bidding.</i>",
+            styles['Note']))
+
+    if prov_rows:
+        prov_rows.insert(0, ['Quantity', 'Measured', 'Derived', 'Assumed',
+                             'Priced'])
+        prov_tbl = Table(prov_rows, colWidths=[2.4*inch, 0.9*inch, 0.85*inch,
+                                               0.85*inch, 0.85*inch])
+        prov_tbl.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), DARK_BLUE),
+            ('TEXTCOLOR', (0, 0), (-1, 0), WHITE),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+            ('TOPPADDING', (0, 0), (-1, -1), 4),
+            ('LEFTPADDING', (0, 0), (-1, -1), 6),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 6),
+            ('BOX', (0, 0), (-1, -1), 0.5, BORDER_GRAY),
+            ('INNERGRID', (0, 0), (-1, -1), 0.25, BORDER_GRAY),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -1), [WHITE, LIGHT_GRAY]),
+        ]))
+        story.append(Spacer(1, 4))
+        story.append(prov_tbl)
+
+    if exposures and priced_takeoff.get('strict'):
+        story.append(Spacer(1, 6))
+        exp_lines = "; ".join(
+            f"{_QTY_LABELS.get(e.get('item'), e.get('item'))}: "
+            f"{_safe_num(e.get('assumed_qty')):,.0f} assumed unit(s) not priced"
+            for e in exposures)
+        story.append(Paragraph(
+            f"<b>Unpriced exposure (hard-numbers policy):</b> {exp_lines}. "
+            f"These are surfaced as RFIs above and were NOT added to the bid.",
+            styles['Note']))
+
     # ── Estimated Labor Hours (PCA Production Rates) ──
     labor_hours = data.get('labor_hours_estimate', {})
     lh_categories = labor_hours.get('categories', [])
