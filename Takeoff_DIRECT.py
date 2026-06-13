@@ -17256,6 +17256,9 @@ def run_analysis_merge(prior_json, new_pdf_paths, scope_tags=None,
         # PRICING_MODEL. This is the rate-stability rule: a v2 quote uses the
         # same rates v1 was priced at, so deltas are pure-quantity changes.
         print(f"💰 Re-pricing with parent snapshot...")
+        # Provenance choke point + calibrated confidence on the merge path too
+        # (Phase 2.5), so v2 quotes carry the same Trust Summary as fresh runs.
+        merged_analysis = build_priced_takeoff(merged_analysis)
         costs = calculate_costs(
             merged_analysis.get("aggregated_totals", {}),
             exterior=merged_analysis.get("exterior", {}),
@@ -17264,6 +17267,8 @@ def run_analysis_merge(prior_json, new_pdf_paths, scope_tags=None,
             analysis=merged_analysis,
             pricing_model_override=pricing_snapshot,
         )
+        merged_analysis = _assess_calibrated_confidence(merged_analysis,
+                                                        cost_estimate=costs)
     else:
         # Notes-only re-run: the prior cost estimate IS the baseline. Pricing
         # from raw aggregated_totals would discard the prior run's Will/manual
@@ -17621,6 +17626,11 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                     print(f"\n📊 Rate overrides applied: {', '.join(rate_overrides.keys())}")
 
                 # Re-run cost calculation (uses current pricing from config.py)
+                # Provenance gate + calibrated confidence on the cached path too
+                # (Phase 2.5). build_priced_takeoff is idempotent, so a cached
+                # analysis that already carries _priced_takeoff is untouched;
+                # one that predates the gate gets it now.
+                analysis = build_priced_takeoff(analysis)
                 print("\n💰 Calculating costs...")
                 costs = calculate_costs(
                     analysis.get('aggregated_totals', {}),
@@ -17630,6 +17640,7 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                     analysis=analysis,
                     pricing_model_override=pricing_model_used,
                 )
+                analysis = _assess_calibrated_confidence(analysis, cost_estimate=costs)
                 print_estimate(analysis, costs)
 
                 # Interactive adjustment mode (cached path)

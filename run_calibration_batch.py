@@ -26,7 +26,12 @@ Usage: python3 run_calibration_batch.py [case_id ...]   (default: all in MANIFES
 import os, sys, json, math
 from datetime import datetime, timezone
 
-os.environ["NIGHTSHIFT_PER_SHEET_EXTRACTION"] = "1"
+# Calibrate the DEPLOYED pipeline. Per-sheet extraction is OFF in prod (still
+# unstable — 2026-06-13 Fishkill walls swung 51k->101k on the same PDF), so
+# confidence must be calibrated against the legacy path that customers actually
+# get. Flip NIGHTSHIFT_PER_SHEET_EXTRACTION=1 here only once per-sheet is
+# stabilized AND becomes the prod default.
+os.environ.setdefault("NIGHTSHIFT_PER_SHEET_EXTRACTION", "0")
 os.environ.pop("NIGHTSHIFT_MERGE_UNION", None)
 os.environ.pop("NIGHTSHIFT_MERGE_PREFER_COMPLETE", None)
 

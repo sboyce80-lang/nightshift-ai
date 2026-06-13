@@ -173,6 +173,41 @@ def main():
     check("assess_confidence on non-dict-safe input",
           isinstance(C.compute_confidence_inputs(None), dict))
 
+    print("\n── Closed feedback loop (append + status) ──")
+    import tempfile
+    with tempfile.TemporaryDirectory() as td:
+        p = os.path.join(td, "calibration_data.json")
+        st0 = C.calibration_status(p)
+        check("status on missing file: 0 rows, inactive, needs MIN",
+              st0["n"] == 0 and st0["active"] is False
+              and st0["needed"] == C.MIN_CALIBRATION)
+        n1 = C.append_calibration_row(p, "jobA", C.compute_confidence_inputs(good_analysis()),
+                                      7.0, verified_on="2026-06-13",
+                                      metric="walls")
+        check("append writes the first row", n1 == 1 and os.path.exists(p))
+        # re-verify same job → replace, not duplicate
+        n2 = C.append_calibration_row(p, "jobA", C.compute_confidence_inputs(bad_analysis()),
+                                      30.0)
+        check("re-verifying a job replaces its row (dedupe by job)", n2 == 1)
+        rows = C.load_calibration(p)
+        check("replaced row carries the new error", rows[0]["true_error_pct"] == 30.0)
+        for i in range(C.MIN_CALIBRATION - 1):
+            C.append_calibration_row(p, f"job{i}",
+                                     C.compute_confidence_inputs(good_analysis()), 8.0)
+        st = C.calibration_status(p)
+        check("status activates once MIN_CALIBRATION rows reached",
+              st["n"] >= C.MIN_CALIBRATION and st["active"] is True
+              and st["needed"] == 0)
+        # the loop is closed: assess now uses the calibrated branch
+        cc = C.assess_confidence(good_analysis(), calibration_path=p)
+        check("assess_confidence flips to calibrated once table is full",
+              cc["calibrated"] is True, cc["basis"])
+        with open(p, "w") as _f:
+            _f.write('[{"job":"x","true_error_pct":5,"inputs":{}}]')
+        n_legacy = C.append_calibration_row(
+            p, "y", C.compute_confidence_inputs(good_analysis()), 9.0)
+        check("append tolerates a legacy bare-list table", n_legacy == 2)
+
     print(f"\n=== {PASS} passed, {FAIL} failed ===")
     return 1 if FAIL else 0
 

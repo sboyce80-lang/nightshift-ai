@@ -316,3 +316,60 @@ def assess_confidence(analysis, cost_estimate=None, calibration_path=None, ci=0.
         "caps_applied": caps_applied,
         "inputs": inputs,
     }
+
+
+# ---------------------------------------------------------------------------
+# Layer 4 — closed feedback loop (self-correcting calibration)
+# ---------------------------------------------------------------------------
+# The calibrated claim is only trustworthy if it refits as reality lands
+# (review Part 5, property #1: "every customer/Rider correction auto-appends
+# to golden/ and the curve refits"). These helpers are the append + status
+# hooks the correction-handling path (or a batch run) calls.
+
+def append_calibration_row(path, job, inputs, true_error_pct,
+                           verified_on=None, metric="", detail=None,
+                           source="correction"):
+    """Append (or replace) one verified-error row in the calibration table at
+    `path` and persist it. Dedupes by `job` so re-verifying a job updates its
+    row rather than double-counting. Pure I/O — no API. Returns the new row
+    count. The next assess_confidence() picks up the refit automatically once
+    the table reaches MIN_CALIBRATION rows.
+    """
+    table = {"min_calibration": MIN_CALIBRATION, "rows": []}
+    if path and os.path.exists(path):
+        try:
+            with open(path) as f:
+                loaded = json.load(f)
+            if isinstance(loaded, dict):
+                table = loaded
+            elif isinstance(loaded, list):
+                table = {"min_calibration": MIN_CALIBRATION, "rows": loaded}
+        except (json.JSONDecodeError, OSError):
+            pass
+    rows = [r for r in table.get("rows", []) if r.get("job") != job]
+    row = {
+        "job": job,
+        "verified_on": verified_on,
+        "true_error_pct": round(float(true_error_pct), 1),
+        "true_error_metric": metric,
+        "source": source,
+        "inputs": inputs,
+    }
+    if detail:
+        row["detail"] = detail
+    rows.append(row)
+    table["rows"] = rows
+    table["min_calibration"] = MIN_CALIBRATION
+    if path:
+        with open(path, "w") as f:
+            json.dump(table, f, indent=2)
+    return len(rows)
+
+
+def calibration_status(path):
+    """Report whether calibration is active and how far from it.
+    {n, min, active, needed}."""
+    rows = load_calibration(path)
+    n = len(rows)
+    return {"n": n, "min": MIN_CALIBRATION, "active": n >= MIN_CALIBRATION,
+            "needed": max(0, MIN_CALIBRATION - n)}
