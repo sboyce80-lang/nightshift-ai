@@ -12197,6 +12197,130 @@ def _dedupe_enlarged_plan_floors(analysis):
     analysis["_enlarged_plan_floors_deduped"] = True
 
 
+def _is_small_commercial_building(analysis):
+    """True for a small, single-tenant COMMERCIAL building with no repeated
+    units — the class where a floor is drawn on several plan sheets and the
+    'one authoritative sheet per floor' rule applies. Gated hard so the
+    multifamily path (unit-anchored rooms) is never touched."""
+    pi = (analysis or {}).get("project_info", {}) or {}
+    bt = str(pi.get("building_type", "")).lower()
+    residentialish = any(k in bt for k in (
+        "residential", "mixed", "multi", "apartment", "condo", "senior",
+        "dorm", "assisted", "supportive"))
+    if residentialish:
+        return False
+    if _num(pi.get("total_units", 0)) > 2:
+        return False
+    rooms = [r for fl in (analysis.get("floors") or [])
+             for r in (fl.get("rooms") or []) if isinstance(r, dict)]
+    if not rooms:
+        return False
+    # No meaningful unit anchoring (generic-named building).
+    unit_anchored = sum(
+        1 for r in rooms
+        if _normalize_room_identity(r.get("room_id", ""),
+                                    r.get("room_name", ""))[0]
+        or _extract_unit_from_room_id(r.get("room_id", "")))
+    return unit_anchored <= max(2, 0.15 * len(rooms))
+
+
+_SC_TYPE_SYNONYMS = {
+    "womens": "womens", "women": "womens",
+    "mens": "mens", "men": "mens",
+    "restroom": "restroom", "toilet": "restroom", "bathroom": "restroom",
+    "bath": "restroom", "ada": "restroom", "family": "restroom",
+    "storage": "storage", "stor": "storage", "attic": "storage",
+    "mechanical": "mech", "mech": "mech", "electrical": "elec", "elec": "elec",
+    "shower": "shower", "showers": "shower", "office": "office",
+    "stair": "stair", "stairs": "stair", "lift": "stair", "elevator": "elev",
+    "gathering": "gathering", "meeting": "meeting", "hall": "hall",
+    "corridor": "hall", "lobby": "lobby", "vestibule": "vestibule",
+    "janitor": "jan", "utility": "util", "closet": "closet",
+}
+
+
+def _sc_room_type(name):
+    """LOCAL generic room-type token for small-commercial dedup only (kept
+    OUT of the shared canonical identity so multifamily is unaffected).
+    Men's/Women's stay distinct."""
+    s = re.sub(r"[#/]", " ", str(name or "").lower())
+    s = re.sub(r"\d+", " ", s)
+    s = re.sub(r"\b(room|rm|area|space)\b", " ", s)
+    s = re.sub(r"[^a-z ]+", " ", s)
+    words = [w for w in s.split() if w]
+    if not words:
+        return ""
+    # whole-phrase first word that's a known synonym wins; else first word
+    for w in words:
+        if w in _SC_TYPE_SYNONYMS:
+            return _SC_TYPE_SYNONYMS[w]
+    return words[0]
+
+
+def _dedupe_small_commercial_floors(analysis):
+    """For a small-commercial building (gated), when a floor's rooms come from
+    multiple source pages — the same floor re-drawn on floor/dimension/finish
+    sheets — keep the AUTHORITATIVE page (most in-scope rooms) plus any
+    page-unique room TYPES from the other pages, marking the rest out of scope.
+
+    Fail-safe bias: page-unique types are KEPT (a complementary room over-
+    counts, which is visible) and only clear cross-sheet type duplicates are
+    dropped — never a silent under-count. Double-gated (small-commercial AND
+    per-sheet). Idempotent via _sc_floor_deduped.
+    """
+    if not isinstance(analysis, dict):
+        return
+    if analysis.get("_sc_floor_deduped"):
+        return
+    if not analysis.get("_per_sheet_extraction"):
+        return
+    if not _is_small_commercial_building(analysis):
+        return
+    analysis["_sc_floor_deduped"] = True
+
+    dropped_total = 0
+    walls_dropped = 0.0
+    for fl in (analysis.get("floors") or []):
+        rooms = [r for r in (fl.get("rooms") or [])
+                 if isinstance(r, dict) and r.get("in_scope", True)]
+        if len(rooms) < 2:
+            continue
+        by_page = {}
+        for r in rooms:
+            by_page.setdefault(r.get("source_page"), []).append(r)
+        if len(by_page) < 2:
+            continue  # floor drawn on a single sheet — nothing to reconcile
+        # authoritative page = most rooms (tie-break: most wall area)
+        def _pwalls(rs):
+            return sum(_num((x.get("dimensions") or {}).get("wall_area_sqft", 0))
+                       for x in rs)
+        auth_page = max(by_page, key=lambda p: (len(by_page[p]), _pwalls(by_page[p])))
+        if len(by_page[auth_page]) < 3:
+            continue  # authoritative page too thin to trust as the floor plan
+        auth_types = {_sc_room_type(r.get("room_name")) for r in by_page[auth_page]}
+        auth_types.discard("")
+        for pg, rs in by_page.items():
+            if pg == auth_page:
+                continue
+            for r in rs:
+                if _sc_room_type(r.get("room_name")) in auth_types:
+                    r["in_scope"] = False
+                    r["scope_exclusion_reason"] = (
+                        f"small-commercial: same floor re-drawn on sheet "
+                        f"p{pg}; counted once on the authoritative plan "
+                        f"p{auth_page}")
+                    dropped_total += 1
+                    walls_dropped += _num((r.get("dimensions") or {})
+                                          .get("wall_area_sqft", 0))
+    if dropped_total:
+        note = (f"[Small-Commercial Floor Dedup] {dropped_total} room(s) that "
+                f"re-drew an authoritative floor plan on secondary sheets were "
+                f"counted once (~{walls_dropped:,.0f} duplicate wall sqft "
+                f"removed; page-unique rooms kept).")
+        analysis.setdefault("notes", []).append(note)
+        print(f"   🪞 {note}")
+
+
 def _dedupe_cross_sheet_rooms(analysis):
     """Count each room ONCE when the same room is extracted from multiple sheets
     (floor plan + fixture plan + RCP + code plan).
@@ -12632,6 +12756,14 @@ def _recalculate_totals(analysis):
     # Collapse rooms extracted from multiple plan sheets so a room isn't counted
     # once per sheet for walls/ceiling/doors (single-story commercial only).
     _dedupe_cross_sheet_rooms(analysis)
+    # Small-commercial: the same floor is often drawn on multiple plan sheets
+    # with DIFFERENT generic names ("Women's 104" vs "Women's Restroom West"),
+    # which name-based cross-sheet dedup can't catch — so a floor gets counted
+    # 2-4x (Dutchess First Floor came from pages 5/9/13/14, walls 230% over).
+    # This pass keeps the authoritative page per floor + page-unique types.
+    # Double-gated (small-commercial AND per-sheet) so multifamily and the
+    # deployed legacy path are untouched.
+    _dedupe_small_commercial_floors(analysis)
 
     total_wall = 0
     total_ceiling = 0

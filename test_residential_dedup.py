@@ -296,7 +296,84 @@ def test_thin_ranged_floors_protected():
           wall_sum(a) == before)
 
 
+def test_sc_gating_and_type():
+    # _is_small_commercial_building: commercial + <=2 units + no unit anchors
+    sc = {"project_info": {"building_type": "commercial", "total_units": 1},
+          "floors": [{"floor_name": "First Floor", "rooms": [
+              room("Storage 101", wall=400, page=5),
+              room("Office 113", wall=700, page=5)]}]}
+    check("small-commercial detected", T._is_small_commercial_building(sc) is True)
+    mf = {"project_info": {"building_type": "mixed-use residential",
+                           "total_units": 15},
+          "floors": [{"floor_name": "2nd Floor", "rooms": [
+              room("Unit 201 Living", wall=600, page=5, rid="APT201-LIV")]}]}
+    check("multifamily NOT small-commercial (gated out)",
+          T._is_small_commercial_building(mf) is False)
+    check("type: 'Women's 104' and 'Women's Restroom West' both -> womens",
+          T._sc_room_type("Women's 104") == T._sc_room_type("Women's Restroom West")
+          == "womens")
+    check("type: men's stays distinct from women's",
+          T._sc_room_type("Men's 108") == "mens"
+          and T._sc_room_type("Men's 108") != T._sc_room_type("Women's 104"))
+    check("type: 'Storage 101' == 'Storage Room'",
+          T._sc_room_type("Storage 101") == T._sc_room_type("Storage Room") == "storage")
+
+
+def test_sc_floor_dedup():
+    # First floor drawn on TWO sheets: page 5 (authoritative, 4 rooms) and
+    # page 9 (re-draw: 2 dups + 1 page-unique). Page-9 dups -> out of scope,
+    # page-unique Gathering Room KEPT (fail-safe over-count).
+    a = {"_per_sheet_extraction": True,
+         "project_info": {"building_type": "commercial", "total_units": 1},
+         "floors": [{"floor_name": "First Floor", "rooms": [
+             room("Storage 101", wall=400, page=5),
+             room("Women's 104", wall=1000, page=5),
+             room("Men's 108", wall=900, page=5),
+             room("Office 113", wall=700, page=5),
+             room("Women's Restroom West", wall=1100, page=9),  # dup of Women's
+             room("Storage Room", wall=420, page=9),            # dup of Storage
+             room("Gathering Room", wall=1600, page=9)]}]}      # page-unique
+    T._dedupe_small_commercial_floors(a)
+    rooms = a["floors"][0]["rooms"]
+    insc = {r["room_name"]: r.get("in_scope", True) for r in rooms}
+    check("page-9 Women's re-draw marked out of scope",
+          insc["Women's Restroom West"] is False)
+    check("page-9 Storage re-draw marked out of scope",
+          insc["Storage Room"] is False)
+    check("page-unique Gathering Room KEPT (fail-safe over-count)",
+          insc["Gathering Room"] is True)
+    check("authoritative page-5 rooms all kept",
+          all(insc[n] for n in ("Storage 101", "Women's 104", "Men's 108", "Office 113")))
+    check("dedup note recorded",
+          any("Small-Commercial Floor Dedup" in str(n) for n in a.get("notes", [])))
+
+
+def test_sc_dedup_gated_off_for_multifamily_and_legacy():
+    # Multifamily per-sheet: must be untouched (gated out by building type/units)
+    mf = {"_per_sheet_extraction": True,
+          "project_info": {"building_type": "residential", "total_units": 15},
+          "floors": [{"floor_name": "2nd Floor", "rooms": [
+              room("Unit 201 Living", wall=600, page=5, rid="APT201-LIV"),
+              room("Unit 201 Living", wall=600, page=9, rid="APT201-LIV")]}]}
+    T._dedupe_small_commercial_floors(mf)
+    check("multifamily: pass is a no-op (both rooms stay in scope)",
+          all(r.get("in_scope", True) for r in mf["floors"][0]["rooms"]))
+    # Legacy (no _per_sheet_extraction): pass must not fire
+    lg = {"project_info": {"building_type": "commercial", "total_units": 1},
+          "floors": [{"floor_name": "First Floor", "rooms": [
+              room("Storage 101", wall=400, page=5),
+              room("Storage Room", wall=420, page=9),
+              room("Office", wall=700, page=5)]}]}
+    T._dedupe_small_commercial_floors(lg)
+    check("legacy path (no per-sheet flag): pass does not fire",
+          all(r.get("in_scope", True) for r in lg["floors"][0]["rooms"])
+          and not lg.get("_sc_floor_deduped"))
+
+
 def main():
+    test_sc_gating_and_type()
+    test_sc_floor_dedup()
+    test_sc_dedup_gated_off_for_multifamily_and_legacy()
     test_residential_cross_sheet()
     test_residential_no_unit_token_untouched()
     test_union_variant_dedup()
