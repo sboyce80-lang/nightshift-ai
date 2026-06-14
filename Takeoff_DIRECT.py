@@ -9466,6 +9466,14 @@ def _supplement_missing_secondary_spaces(analysis):
     Safety: Only supplements when rooms-per-unit density confirms under-extraction.
     Caps total supplement at 45% of current extracted totals to prevent runaway.
     """
+    # Per-sheet mode extracts every plan sheet completely (+ a verification
+    # pass that ADDS missed labeled rooms), so there is no under-extraction for
+    # this compensator to correct — it only adds noise that varies run-to-run
+    # with the nondeterministic density read. Skip it (2026-06-13: a per-sheet
+    # Fishkill run swung walls 2%->126% downstream when boosts/supplements
+    # fired inconsistently).
+    if isinstance(analysis, dict) and analysis.get("_per_sheet_extraction"):
+        return analysis
     pi = analysis.get("project_info", {})
     agg = analysis.get("aggregated_totals", {})
 
@@ -9661,6 +9669,15 @@ def _validate_and_boost_walls(analysis):
     2. Footprint-based (fallback): uses building footprint × stories × 1.25 ratio.
        Footprint extraction has ±36% variance.
     """
+    # Per-sheet mode measures walls completely per plan sheet (perimeter ×
+    # height per room, merged by canonical identity), so the aggregation-loss
+    # this boost repairs does not occur — boosting only inflates, and it fires
+    # inconsistently with the nondeterministic perimeter cross-check, which is
+    # the main downstream variance amplifier (2026-06-13: per-sheet walls 2%
+    # one run, 126% the next, when the boost fired). Skip in per-sheet mode.
+    if isinstance(analysis, dict) and analysis.get("_per_sheet_extraction"):
+        return analysis
+
     # Skip boost if unit-count fallback already used footprint-based estimation.
     # The footprint method (ceiling = footprint × stories × 0.63, walls = ceiling × 3.3)
     # is calibrated to Rider actuals and doesn't need additional boosting.
@@ -12126,6 +12143,7 @@ def _dedupe_enlarged_plan_floors(analysis):
         rooms = [r for r in fl.get("rooms", []) if r.get("in_scope", True)]
         if not rooms:
             continue
+        force_zero = False
         if any(int(_num(r.get("unit_multiplier", 1)) or 1) > 1 for r in rooms):
             if not per_floor_covers_building:
                 analysis.setdefault("notes", []).append(
@@ -12135,16 +12153,23 @@ def _dedupe_enlarged_plan_floors(analysis):
                     f"unit scope, not a duplicate).")
                 continue
             # else: per-floor plans already measure the whole building — this
-            # multiplied template is the duplicate; fall through to zero it.
+            # multiplied template is the duplicate. The unit-count
+            # reconciliation (>=80% of units measured per-floor with geometry)
+            # IS the evidence; the 50% room-name match below is a weaker
+            # heuristic that was silently blocking the zeroing (2026-06-13:
+            # "treating as duplicate" logged but walls not actually removed ->
+            # 126% over). Force the zeroing in this case.
+            force_zero = True
             analysis.setdefault("notes", []).append(
                 f"[Enlarged-Plan Check] Floor {fl.get('floor_name')!r} carries "
                 f"unit multipliers but the building's {len(ranged_units)} "
                 f"per-floor units (of {total_units:.0f}) are already measured "
                 f"with geometry — treating this enlarged template as a "
                 f"duplicate of the floor-plan units, not the source.")
-        matched = sum(1 for r in rooms if _strip_name(r.get("room_name")) in ranged_names)
-        if matched / len(rooms) < 0.5:
-            continue
+        if not force_zero:
+            matched = sum(1 for r in rooms if _strip_name(r.get("room_name")) in ranged_names)
+            if matched / len(rooms) < 0.5:
+                continue
         for r in rooms:
             d = r.setdefault("dimensions", {})
             zeroed_wall_sqft += _num(d.get("wall_area_sqft", 0))

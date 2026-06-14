@@ -247,6 +247,25 @@ def test_per_floor_covers_building_drops_template():
           any("per-floor units" in str(n) for n in a.get("notes", [])))
 
 
+def test_covers_building_forces_zero_despite_name_mismatch():
+    # The unit-count reconciliation is the evidence; the 50% room-name match
+    # must NOT block zeroing when per-floor coverage is established (2026-06-13:
+    # "treating as duplicate" logged but walls left in -> 126% over). Give the
+    # template rooms names that DON'T match the ranged rooms by name.
+    a = _fishkill_like()
+    a["project_info"]["total_units"] = 6
+    tmpl = a["floors"][3]
+    tmpl["rooms"] = [room("Alcove Nook A", wall=400, floor_a=120, page=15, rid="UX01-N1"),
+                     room("Vestibule Zone B", wall=350, floor_a=90, page=15, rid="UX01-N2")]
+    for r in tmpl["rooms"]:
+        r["unit_multiplier"] = 3
+    before = sum(T._num(r["dimensions"]["wall_area_sqft"]) for r in tmpl["rooms"])
+    T._dedupe_enlarged_plan_floors(a)
+    after = sum(T._num(r["dimensions"]["wall_area_sqft"]) for r in tmpl["rooms"])
+    check("coverage-established template zeroed even when room names don't match",
+          before > 0 and after == 0, f"{before} -> {after}")
+
+
 def test_partial_per_floor_keeps_template():
     # Guard rail: if the per-floor plans cover only SOME units (below the 80%
     # threshold), the multiplied template is still the genuine source for the
@@ -285,6 +304,7 @@ def main():
     test_enlarged_plan_floors_zeroed()
     test_template_source_protected()
     test_per_floor_covers_building_drops_template()
+    test_covers_building_forces_zero_despite_name_mismatch()
     test_partial_per_floor_keeps_template()
     test_thin_ranged_floors_protected()
     print(f"\n=== {PASS} passed, {FAIL} failed ===")
