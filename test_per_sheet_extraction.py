@@ -184,6 +184,27 @@ def main():
     check("wall-only geometry uses its own namespace",
           T._geom_bucket(room(wall_area=800)).startswith("w"))
 
+    print("\n── Generic-room normalization (P2-A, small-commercial dedup) ──")
+    def ck(name, floor="1st Floor", **kw):
+        return T._canonical_room_key(floor, room(name, **kw))
+    check("'Storage' == 'Storage Room' (room-suffix strip)",
+          ck("Storage", floor_area=60) == ck("Storage Room", floor_area=60))
+    check("'Mechanical' == 'Mechanical Room'",
+          ck("Mechanical", floor_area=120) == ck("Mechanical Room", floor_area=120))
+    check("'Toilet'/'Restroom'/'Bathroom' all collapse to bath",
+          ck("Toilet", floor_area=50) == ck("Restroom", floor_area=50)
+          == ck("Bathroom", floor_area=50))
+    check("'Electrical Room' == 'Electrical'",
+          ck("Electrical", floor_area=40) == ck("Electrical Room", floor_area=40))
+    check("'Gathering Room' normalizes (Dutchess space)",
+          T._normalize_room_identity("", "Gathering Room")[1] == "gather")
+    check("distinct generic types stay distinct (Storage != Mechanical)",
+          ck("Storage", floor_area=60) != ck("Mechanical", floor_area=60))
+    check("'powder room' multi-word mapping preserved (not broken by strip)",
+          T._normalize_room_identity("", "Powder Room")[1] == "hbath")
+    check("numbered generic rooms stay distinct (Storage 1 != Storage 2)",
+          ck("Storage 1", floor_area=60) != ck("Storage 2", floor_area=60))
+
     print("\n── Canonical room identity ──")
     a = room("Corridor", floor_area=800, sheet="A-102")
     b = room("Corridor", floor_area=820, sheet="A1.02")

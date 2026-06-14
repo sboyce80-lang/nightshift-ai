@@ -10378,22 +10378,37 @@ def _normalize_room_identity(room_id, room_name):
         '', text
     ).strip()
 
-    # Canonical room type mapping
+    # Canonical room type mapping. Residential + the generic COMMERCIAL spaces
+    # (P2-A) so cross-sheet/naming variants of the same space collapse to one
+    # token — the small-commercial dedup the unit-number anchor can't do.
     _type_map = {
         'bedroom': 'bed', 'bed room': 'bed', 'bed': 'bed', 'br': 'bed',
         'primary bedroom': 'pbed', 'master bedroom': 'pbed', 'master bed': 'pbed',
         'primary bed': 'pbed',
         'bathroom': 'bath', 'bath room': 'bath', 'bath': 'bath', 'ba': 'bath',
-        'half bath': 'hbath', 'powder room': 'hbath',
+        'toilet': 'bath', 'restroom': 'bath', 'water closet': 'bath', 'wc': 'bath',
+        'half bath': 'hbath', 'powder room': 'hbath', 'powder': 'hbath',
         'living': 'liv', 'living room': 'liv', 'living/dining': 'liv',
         'living/dining/kitchen': 'ldk', 'ldk': 'ldk',
-        'kitchen': 'kit', 'kit': 'kit',
+        'kitchen': 'kit', 'kit': 'kit', 'kitchenette': 'kit',
         'closet': 'clo', 'clo': 'clo', 'cl': 'clo', 'walk-in closet': 'wic',
         'dining': 'din', 'dining room': 'din',
         'den': 'den', 'study': 'den', 'office': 'den',
         'laundry': 'lau', 'laundry room': 'lau',
-        'entry': 'entry', 'foyer': 'entry', 'vestibule': 'entry',
+        'entry': 'entry', 'foyer': 'entry', 'vestibule': 'entry', 'lobby': 'lobby',
         'hallway': 'hall', 'hall': 'hall', 'corridor': 'hall',
+        # generic commercial / back-of-house
+        'storage': 'stor', 'stor': 'stor', 'storage room': 'stor',
+        'mechanical': 'mech', 'mech': 'mech', 'mechanical room': 'mech',
+        'electrical': 'elec', 'elec': 'elec', 'electrical room': 'elec',
+        'janitor': 'jan', 'janitorial': 'jan', 'mop': 'jan', 'custodial': 'jan',
+        'utility': 'util', 'mechanical/electrical': 'mech',
+        'telecom': 'it', 'it': 'it', 'data': 'it', 'idf': 'it', 'mdf': 'it',
+        'stair': 'stair', 'stairwell': 'stair', 'stairs': 'stair',
+        'elevator': 'elev', 'elev': 'elev', 'elevator lobby': 'elev',
+        'gathering': 'gather', 'gathering room': 'gather', 'meeting': 'meet',
+        'meeting room': 'meet', 'conference': 'meet', 'break': 'break',
+        'break room': 'break', 'breakroom': 'break',
     }
 
     # Extract trailing number (Bedroom 1, Bedroom 2, Closet 3)
@@ -10401,8 +10416,15 @@ def _normalize_room_identity(room_id, room_name):
     trail_num = trail_match.group(1) if trail_match else ""
     base_type = re.sub(r'\s*\d+\s*$', '', room_type).strip()
 
-    # Try to map to canonical type
-    canonical = _type_map.get(base_type, base_type)
+    # Map to canonical type. Try the full phrase first (preserves multi-word
+    # mappings like 'powder room'->hbath); if unmapped, strip a trailing
+    # generic 'room'/'rm' and retry so 'Storage Room' == 'Storage', 'Mechanical
+    # Room' == 'Mechanical', etc. — the cross-sheet generic-room collapse.
+    if base_type in _type_map:
+        canonical = _type_map[base_type]
+    else:
+        stripped = re.sub(r'\s+(room|rm)\.?$', '', base_type).strip()
+        canonical = _type_map.get(stripped, stripped)
 
     return (unit_key, f"{canonical}{trail_num}")
 
