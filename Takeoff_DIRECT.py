@@ -3102,39 +3102,6 @@ def _title_text_is_section_or_detail(raw_text):
     return any(k in txt for k in _SECTION_DETAIL_TITLE_RE)
 
 
-# Secondary roles contribute ATTRIBUTES to rooms a geometry sheet already
-# established; they must not introduce new geometry (the merge enforces this).
-_SECONDARY_SHEET_ROLES = {"ceiling", "finish"}
-
-
-def _sheet_role(raw_text):
-    """Classify a plan sheet's ROLE from its title so the merge knows whether
-    it's an authoritative GEOMETRY source or a SECONDARY attribute source for a
-    floor measured elsewhere. Roles are universal AIA sheet types, so this is a
-    general invariant — not a per-job rule.
-
-      'ceiling'  — reflected ceiling plan / RCP: ceiling data only
-      'finish'   — finish plan: materials only
-      'geometry' — floor / dimension / partition / enlarged / generic plan
-                   (the authoritative source for room existence + wall/floor area)
-
-    The same physical floor is drawn on several of these sheets; extracting a
-    full room set from each one triple-counted the floor (2026-06-13 Dutchess
-    'First Floor' 27 rooms for a ~6-room building). With roles, only geometry
-    sheets establish rooms; ceiling/finish sheets merge their specialty onto
-    those rooms (RCP ceilings already flow via canonical identity)."""
-    txt = str(raw_text or "").lower()
-    if not txt:
-        return "geometry"
-    if "reflected ceiling" in txt or "ceiling plan" in txt or \
-            re.search(r"\brcp\b", txt):
-        return "ceiling"
-    # 'finish plan' only — a 'finish schedule' is a schedule (handled elsewhere)
-    if "finish plan" in txt:
-        return "finish"
-    return "geometry"
-
-
 def _num_or_zero(v):
     try:
         f = float(v)
@@ -3737,27 +3704,9 @@ def _merge_sheet_analyses(sheet_results):
     has_window_schedule = False
     sheet_pages = []
 
-    # Sheet-role ordering (P2-B): process GEOMETRY sheets first so they
-    # establish the authoritative room set, THEN secondary sheets (reflected-
-    # ceiling / finish plans) which only contribute their specialty onto rooms
-    # that already exist — they never introduce new geometry. This is what
-    # stops a single floor drawn on plan + RCP + finish sheets from being
-    # counted 2-3x. Fallback: if NO geometry sheet produced rooms (degenerate
-    # set), secondary sheets are promoted to geometry so nothing is lost.
-    geometry_has_rooms = any(
-        (sr.get("role", "geometry") not in _SECONDARY_SHEET_ROLES)
-        and any((fl.get("rooms") for fl in (sr.get("analysis") or {}).get("floors") or []))
-        for sr in sheet_results)
-    ordered = sorted(
-        sheet_results,
-        key=lambda sr: 1 if sr.get("role", "geometry") in _SECONDARY_SHEET_ROLES else 0)
-    secondary_dropped = 0
-
-    for sr in ordered:
+    for sr in sheet_results:
         analysis = sr.get("analysis") or {}
         sheet_id = sr.get("sheet_id") or ""
-        role = sr.get("role", "geometry")
-        is_secondary = geometry_has_rooms and role in _SECONDARY_SHEET_ROLES
         n_sheet_rooms = 0
 
         for fl in (analysis.get("floors") or []):
@@ -3765,6 +3714,10 @@ def _merge_sheet_analyses(sheet_results):
                 continue
             fname = str(fl.get("floor_name") or "").strip() or "Unspecified"
             fkey = _normalize_floor_key(fname)
+            if fkey not in floors_by_key:
+                floors_by_key[fkey] = {"floor_name": fname, "rooms": {}}
+                floor_order.append(fkey)
+            bucket = floors_by_key[fkey]["rooms"]
             for room in (fl.get("rooms") or []):
                 if not isinstance(room, dict):
                     continue
@@ -3773,21 +3726,9 @@ def _merge_sheet_analyses(sheet_results):
                                 [s for s in [str(room.get("source_sheet")
                                                  or "").strip()] if s])
                 ckey = _canonical_room_key(fname, room)
-                existing_bucket = (floors_by_key.get(fkey) or {}).get("rooms", {})
-                if ckey not in existing_bucket:
-                    if is_secondary:
-                        # A ceiling/finish sheet showing a room no geometry
-                        # sheet established does NOT create geometry — that
-                        # path is what triple-counted floors. Genuine misses
-                        # are recovered by the per-sheet verification pass.
-                        secondary_dropped += 1
-                        continue
-                    if fkey not in floors_by_key:
-                        floors_by_key[fkey] = {"floor_name": fname, "rooms": {}}
-                        floor_order.append(fkey)
-                    floors_by_key[fkey]["rooms"][ckey] = room
+                if ckey not in bucket:
+                    bucket[ckey] = room
                     continue
-                bucket = floors_by_key[fkey]["rooms"]
                 a, b = bucket[ckey], room
                 # higher detail score is the keeper — deterministic
                 if _detail_score(b) > _detail_score(a):
@@ -3798,7 +3739,6 @@ def _merge_sheet_analyses(sheet_results):
                     "key": list(ckey),
                     "kept": merged.get("room_id") or merged.get("room_name"),
                     "sheets": merged.get("_source_sheets"),
-                    "role": role,
                     "changes": room_log,
                 })
 
@@ -3846,8 +3786,6 @@ def _merge_sheet_analyses(sheet_results):
     for fkey in floor_order:
         entry = floors_by_key[fkey]
         rooms = list(entry["rooms"].values())
-        if not rooms:
-            continue  # never emit an empty floor
         total_rooms += len(rooms)
         floors.append({"floor_name": entry["floor_name"], "rooms": rooms})
 
@@ -3862,15 +3800,6 @@ def _merge_sheet_analyses(sheet_results):
     project_info["total_floors_analyzed"] = len(floors)
     project_info["total_rooms_found"] = total_rooms
 
-    if secondary_dropped:
-        note = (f"[Sheet-Role] {secondary_dropped} room(s) on reflected-"
-                f"ceiling/finish sheets had no matching room on a floor/"
-                f"dimension plan — their geometry was NOT counted (these "
-                f"sheets contribute ceiling/finish attributes, not new "
-                f"rooms; genuine misses are caught by the verification pass).")
-        all_notes.append(note)
-        print(f"   📐 {note}")
-
     merged = {
         "project_info": project_info,
         "floors": floors,
@@ -3884,8 +3813,6 @@ def _merge_sheet_analyses(sheet_results):
         merged["exterior"] = exterior
     if merge_log:
         merged["_canonical_merge_log"] = merge_log
-    if secondary_dropped:
-        merged["_secondary_geometry_dropped"] = secondary_dropped
     return merged
 
 
@@ -4062,13 +3989,11 @@ def _analyze_pdf_per_sheet(client, pdf_path, scope_notes="",
                                    sheet_analysis)
         n_rooms_total = sum(len(fl.get("rooms") or [])
                             for fl in (sheet_analysis.get("floors") or []))
-        role = _sheet_role((text_layers.get(pg) or {}).get("raw_text", ""))
-        print(f"         → {n_rooms_total} room(s)"
-              + (f" [role: {role}]" if role != "geometry" else ""))
+        print(f"         → {n_rooms_total} room(s)")
         _ledger_mark(pdf_path, [pg], "measured",
                      f"per-sheet extraction (sheet {sheet_id})")
         sheet_results.append({"page_idx0": pg, "sheet_id": sheet_id,
-                              "role": role, "analysis": sheet_analysis})
+                              "analysis": sheet_analysis})
 
     if not sheet_results:
         print(f"   ❌ Per-sheet: all {len(plan_pages)} sheet(s) failed for "
