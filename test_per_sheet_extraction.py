@@ -129,6 +129,46 @@ def main():
           an_ps.get("_residential_ceiling_floor_applied") is True
           and any("per-sheet" in str(n) for n in an_ps.get("notes", [])))
 
+    print("\n── Sheet-role classification (P2-B) ──")
+    check("floor plan → geometry", T._sheet_role("A-102 SECOND FLOOR PLAN") == "geometry")
+    check("dimension plan → geometry", T._sheet_role("DIMENSION PLAN A-103") == "geometry")
+    check("enlarged plan → geometry (unit detail)",
+          T._sheet_role("ENLARGED UNIT PLANS A-105") == "geometry")
+    check("reflected ceiling plan → ceiling",
+          T._sheet_role("REFLECTED CEILING PLAN LEVEL 2") == "ceiling")
+    check("RCP → ceiling", T._sheet_role("A-201 RCP") == "ceiling")
+    check("finish plan → finish", T._sheet_role("FIRST FLOOR FINISH PLAN") == "finish")
+    check("empty → geometry (safe default)", T._sheet_role("") == "geometry")
+
+    print("\n── Role-aware merge: secondary sheets add attributes, not geometry ──")
+    # Geometry sheet (floor plan) establishes the Corridor with walls;
+    # RCP sheet has the same Corridor (ceiling only) + a NEW room not on the plan.
+    geo = {"page_idx0": 1, "sheet_id": "A-102", "role": "geometry",
+           "analysis": {"floors": [{"floor_name": "2nd Floor", "rooms": [
+               room("Corridor", floor_area=800, wall_area=1200, sheet="A-102")]}]}}
+    rcp_corr = room("Corridor", ceiling_area=780, sheet="A-201")
+    rcp_corr["materials"]["ceiling_painted"] = True
+    rcp = {"page_idx0": 9, "sheet_id": "A-201", "role": "ceiling",
+           "analysis": {"floors": [{"floor_name": "2nd Floor", "rooms": [
+               rcp_corr,
+               room("Plenum Void", ceiling_area=300, sheet="A-201")]}]}}
+    merged = T._merge_sheet_analyses([geo, rcp])
+    rooms = merged["floors"][0]["rooms"]
+    check("RCP did NOT add its non-matching 'Plenum Void' as new geometry",
+          len(rooms) == 1, f"got {len(rooms)} rooms")
+    corr = rooms[0]
+    check("matching RCP ceiling DID merge onto the floor-plan corridor",
+          corr["dimensions"]["ceiling_area_sqft"] == 780
+          and corr["dimensions"]["wall_area_sqft"] == 1200)
+    check("dropped secondary geometry counted", merged.get("_secondary_geometry_dropped") == 1)
+    # Fallback: if ALL sheets are secondary (no geometry), don't drop everything
+    only_rcp = {"page_idx0": 9, "sheet_id": "A-201", "role": "ceiling",
+                "analysis": {"floors": [{"floor_name": "2nd Floor", "rooms": [
+                    room("Corridor", ceiling_area=780, sheet="A-201")]}]}}
+    m2 = T._merge_sheet_analyses([only_rcp])
+    check("all-secondary set falls back to keeping rooms (nothing lost)",
+          m2["project_info"]["total_rooms_found"] == 1)
+
     print("\n── Geometry bucketing ──")
     check("re-read noise lands in the same bucket (800 vs 840 SF)",
           T._geom_bucket(room(floor_area=800)) ==
