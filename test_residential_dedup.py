@@ -370,7 +370,44 @@ def test_sc_dedup_gated_off_for_multifamily_and_legacy():
           and not lg.get("_sc_floor_deduped"))
 
 
+def test_base_trim_derivation():
+    # Residential room with paintable-by-default base + perimeter but base_trim
+    # under-emitted (0) -> derive base_trim = perimeter. Commercial-unconfirmed
+    # -> stays 0 (policy). Room that already has base_trim -> unchanged.
+    def _rm(name, perim, bt, base=""):
+        r = room(name, wall=perim*9, floor_a=200, page=5)
+        r["dimensions"]["perimeter_lf"] = perim
+        r["elements"] = {"base_trim_lf": bt}
+        r["materials"] = {"base": base, "ceiling_painted": False}
+        return r
+    res = {"project_info": {"building_type": "residential", "total_units": 8},
+           "floors": [{"floor_name": "1st Floor", "rooms": [
+               _rm("Bedroom", 60, 0),          # under-emitted -> derive 60
+               _rm("Living", 80, 80),          # already set -> unchanged
+               _rm("Closet", 20, 0, "painted wood base")]}]}  # confirmed -> derive 20
+    T._recalculate_totals(res)
+    rooms = res["floors"][0]["rooms"]
+    bt = {r["room_name"]: T._num(r["elements"]["base_trim_lf"]) for r in rooms}
+    check("residential under-emitted base trim derived from perimeter",
+          bt["Bedroom"] == 60 and bt["Closet"] == 20)
+    check("already-measured base trim left unchanged", bt["Living"] == 80)
+    check("residential agg base trim = 60+80+20 = 160",
+          T._num(res["aggregated_totals"]["total_base_trim_lf"]) == 160)
+    # Commercial-unconfirmed: derivation must NOT fire (policy → 0 + RFI)
+    com = {"project_info": {"building_type": "commercial retail", "total_units": 1},
+           "floors": [{"floor_name": "1st Floor", "rooms": [
+               _rm("Stockroom", 100, 0),                 # unconfirmed -> stays 0
+               _rm("Office", 50, 0, "1x6 wood base")]}]}  # confirmed wood -> derive 50
+    T._recalculate_totals(com)
+    crooms = com["floors"][0]["rooms"]
+    cbt = {r["room_name"]: T._num(r["elements"]["base_trim_lf"]) for r in crooms}
+    check("commercial-unconfirmed base trim stays 0 (policy)", cbt["Stockroom"] == 0)
+    check("commercial confirmed-wood base trim derived from perimeter",
+          cbt["Office"] == 50)
+
+
 def main():
+    test_base_trim_derivation()
     test_sc_gating_and_type()
     test_sc_floor_dedup()
     test_sc_dedup_gated_off_for_multifamily_and_legacy()

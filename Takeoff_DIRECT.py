@@ -12867,6 +12867,27 @@ def _recalculate_totals(analysis):
 
             # Base trim
             _room_bt = _num(elems.get("base_trim_lf", 0))
+            # Derive from the MEASURED perimeter when the room has a confirmed/
+            # defaulted-paintable base but the model under-emitted base_trim_lf.
+            # Base runs the wall perimeter, so this is measurement, not
+            # fabrication — and it's gated by _base_confirmed_paintable, so
+            # commercial-unconfirmed base still resolves to 0 (the suppression
+            # below) + RFI. Fills the per-sheet under-emission (2026-06-14
+            # golden regression: 364 base trim 2,950 vs 8,629, Dutchess 84 vs
+            # 391) without touching rooms the model already measured. The legacy
+            # prompt already defaults base_trim≈perimeter, so this rarely fires
+            # there — it mainly recovers per-sheet's missing trim.
+            _bt_perim = _num(dims.get("perimeter_lf", 0))
+            if _room_bt == 0 and _bt_perim > 0 and _base_confirmed_paintable(
+                    room, _bt_building_type):
+                _room_bt = _bt_perim
+                elems["base_trim_lf"] = _bt_perim
+                _bt_existing = str(room.get("notes", "") or "")
+                if "[Base Trim] derived from perimeter" not in _bt_existing:
+                    room["notes"] = (
+                        _bt_existing + " [Base Trim] derived from wall perimeter "
+                        "(paintable base; model under-emitted base_trim_lf)."
+                    ).strip()
             if HARD_NUMBERS_ONLY and _room_bt > 0 and not _base_confirmed_paintable(
                     room, _bt_building_type):
                 # Resilient/unconfirmed base on a commercial job — the perimeter
