@@ -52,7 +52,27 @@ _W = {
     "unanchored": 10.0,         # extracted rooms with no visible anchor (hallucination risk)
     "assumed_frac": 30.0,       # share of priced area that is heuristic, not measured
     "adjustment_mag": 12.0,     # |quantity adjustments| / measured baseline
+    "over_extraction": 44.0,    # walls/ceiling ballooned relative to schedule doors
 }
+
+# Over-extraction signal (2026-06-13 calibration finding). The other inputs
+# only sense UNDER-extraction; the deployed pipeline's dominant small-job
+# failure is the OPPOSITE — confidently hallucinating 5-8x the real wall/
+# ceiling area, internally consistent (footprint co-inflates, so geometry
+# ratios look normal). The tell is CROSS-QUANTITY: doors come from the
+# authoritative schedule, so wall/ceiling area PER DOOR spikes when the
+# vision-extracted areas balloon while the door count stays anchored.
+# Caps are the golden band + margin: verified jobs run 192-572 SF wall/door
+# and 74-147 SF ceiling/door; the 5x-over Dutchess run hit 985 / 567 and
+# the 2.9x-over Fishkill run hit 1,049 / 261, while an UNDER-extracted run
+# stays in band (no false positive). Soft by design — it raises predicted
+# error (lowering confidence, which the ready-to-send reconciliation then
+# acts on) rather than hard-vetoing, and it only applies at >= MIN_DOORS so
+# a legitimately low-door building (warehouse, open retail) isn't punished.
+OVEREXT_WALLS_PER_DOOR_CAP = 700.0
+OVEREXT_CEIL_PER_DOOR_CAP = 200.0
+OVEREXT_MIN_DOORS = 5
+OVEREXT_RATIO_CAP = 2.0       # clamp a single catastrophe's contribution
 
 # Hard gates: when any trips, predicted error is floored and the displayed
 # confidence level is capped — the estimate is known-incomplete.
@@ -140,6 +160,18 @@ def compute_confidence_inputs(analysis, cost_estimate=None):
                       and e.get("item") in area_keys)
     adjustment_mag = (assumed_adj / wall_final) if wall_final > 0 else 0.0
 
+    # --- Over-extraction: wall/ceiling area per (schedule-anchored) door ---
+    ceil_final = _num(agg.get("total_paintable_ceiling_sqft"))
+    doors = (_num(agg.get("total_doors_full_paint"))
+             + _num(agg.get("total_doors_hm_panel")))
+    walls_per_door = (wall_final / doors) if doors > 0 else None
+    ceil_per_door = (ceil_final / doors) if doors > 0 else None
+    over_extraction_ratio = 0.0
+    if doors >= OVEREXT_MIN_DOORS:
+        excess = max((walls_per_door or 0) / OVEREXT_WALLS_PER_DOOR_CAP,
+                     (ceil_per_door or 0) / OVEREXT_CEIL_PER_DOOR_CAP)
+        over_extraction_ratio = max(0.0, min(OVEREXT_RATIO_CAP, excess - 1.0))
+
     # --- Hard gates ---
     bt = str(pi.get("building_type", "")).lower()
     is_residential = any(k in bt for k in
@@ -159,6 +191,9 @@ def compute_confidence_inputs(analysis, cost_estimate=None):
         "unanchored_rate": round(unanchored_rate, 4),
         "assumed_frac": round(assumed_frac, 4),
         "adjustment_mag": round(adjustment_mag, 4),
+        "walls_per_door": round(walls_per_door, 1) if walls_per_door is not None else None,
+        "ceil_per_door": round(ceil_per_door, 1) if ceil_per_door is not None else None,
+        "over_extraction_ratio": round(over_extraction_ratio, 3),
         "n_rooms": n_rooms,
         "hard_gates": gates,
         "hard_gate_tripped": any(gates.values()),
@@ -187,6 +222,10 @@ def _evidence_score(inputs):
     err += _W["unanchored"] * _clamp01(inputs.get("unanchored_rate", 0))
     err += _W["assumed_frac"] * _clamp01(inputs.get("assumed_frac", 0))
     err += _W["adjustment_mag"] * _clamp01(inputs.get("adjustment_mag", 0))
+    # Over-extraction is linear in the ratio (already clamped to OVEREXT_RATIO_CAP
+    # in compute), NOT clamp01 — a 5x-over job must dominate the score, not
+    # saturate at the same level as a 1.1x one.
+    err += _W["over_extraction"] * inputs.get("over_extraction_ratio", 0.0)
     return err
 
 

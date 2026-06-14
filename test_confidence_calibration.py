@@ -208,6 +208,37 @@ def main():
             p, "y", C.compute_confidence_inputs(good_analysis()), 9.0)
         check("append tolerates a legacy bare-list table", n_legacy == 2)
 
+    print("\n── Over-extraction signal (walls/ceiling per schedule door) ──")
+    def over_extracted(walls, ceil, doors):
+        return {"project_info": {"building_type": "residential"},
+                "floors": [], "coverage": {"totals": {"measured": 5, "failed": 0,
+                            "degraded": 0, "unaccounted": 0}},
+                "aggregated_totals": {"total_paintable_wall_sqft": walls,
+                    "total_paintable_ceiling_sqft": ceil,
+                    "total_doors_full_paint": doors, "total_doors_hm_panel": 0}}
+    # Dutchess-like 5x over: walls 28557 / 29 doors = 985, ceil 567/door
+    bad = C.compute_confidence_inputs(over_extracted(28557, 16455, 29))
+    check("over-extracted job: walls_per_door computed",
+          bad["walls_per_door"] == round(28557/29, 1))
+    check("over-extracted job: over_extraction_ratio fires (>1)",
+          bad["over_extraction_ratio"] > 1.0, str(bad["over_extraction_ratio"]))
+    # In-band job: golden Fishkill 43003 / 159 = 270/door, 13451/159 = 85/door
+    okj = C.compute_confidence_inputs(over_extracted(43003, 13451, 159))
+    check("in-band job: over_extraction_ratio = 0", okj["over_extraction_ratio"] == 0.0)
+    # Low-door building (warehouse): big walls, 2 doors — must NOT flag (< MIN_DOORS)
+    wh = C.compute_confidence_inputs(over_extracted(20000, 8000, 2))
+    check("low-door building below MIN_DOORS is not flagged (no false positive)",
+          wh["over_extraction_ratio"] == 0.0)
+    check("ratio is clamped at the cap",
+          C.compute_confidence_inputs(over_extracted(500000, 300000, 20))
+          ["over_extraction_ratio"] == C.OVEREXT_RATIO_CAP)
+    check("over-extraction raises predicted error well above an in-band job",
+          C._evidence_score(bad) > C._evidence_score(okj) + 40,
+          f"bad={C._evidence_score(bad):.0f} ok={C._evidence_score(okj):.0f}")
+    check("the over-extraction signal would catch a Dutchess-class disaster "
+          "the other inputs miss",
+          C.predict_error(bad)["predicted_error_pct"] > 80)
+
     print("\n── Will / calibrated-confidence reconciliation ──")
     # Will says ready; calibrated confidence is high + no gate → stays ready.
     cc_good = C.assess_confidence(good_analysis())

@@ -1178,6 +1178,14 @@ def json_to_pdf(json_path, pdf_path):
         if ev_bits:
             story.append(Paragraph(
                 "<i>Evidence: " + ", ".join(ev_bits) + ".</i>", styles['Note']))
+        if _safe_num(inp.get('over_extraction_ratio')) > 0:
+            wpd = _safe_num(inp.get('walls_per_door'))
+            story.append(Paragraph(
+                "<b>⚠ Over-extraction risk:</b> wall/ceiling area is unusually "
+                f"high per scheduled door ({wpd:,.0f} SF wall/door vs a typical "
+                "200–600). The plan-area extraction may be over-counted relative "
+                "to the door schedule — verify quantities before bidding.",
+                styles['Note']))
         story.append(Spacer(1, 6))
 
     if prov_rows or exposures:
