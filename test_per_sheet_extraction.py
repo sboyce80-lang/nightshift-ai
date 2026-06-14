@@ -139,6 +139,17 @@ def main():
     check("RCP → ceiling", T._sheet_role("A-201 RCP") == "ceiling")
     check("finish plan → finish", T._sheet_role("FIRST FLOOR FINISH PLAN") == "finish")
     check("empty → geometry (safe default)", T._sheet_role("") == "geometry")
+    # GEOMETRY PRECEDENCE — the bug the golden regression caught: a floor plan
+    # that cross-references the ceiling/finish plan must NOT become secondary.
+    check("floor plan w/ 'reflected ceiling plan' cross-ref → geometry",
+          T._sheet_role("A-102 SECOND FLOOR PLAN — see reflected ceiling "
+                        "plan A-201") == "geometry")
+    check("floor plan w/ 'finish plan' cross-ref → geometry",
+          T._sheet_role("FIRST FLOOR PLAN (finish plan ref A-401)") == "geometry")
+    check("true RCP that cross-refs a floor plan stays geometry (safe bias — "
+          "never drops floor-plan rooms)",
+          T._sheet_role("REFLECTED CEILING PLAN see floor plan A-101")
+          == "geometry")
 
     print("\n── Role-aware merge: secondary sheets add attributes, not geometry ──")
     # Geometry sheet (floor plan) establishes the Corridor with walls;

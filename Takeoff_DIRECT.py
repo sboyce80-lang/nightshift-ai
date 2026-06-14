@@ -3126,6 +3126,23 @@ def _sheet_role(raw_text):
     txt = str(raw_text or "").lower()
     if not txt:
         return "geometry"
+    # GEOMETRY PRECEDENCE (critical): the role is read from the full page text,
+    # which on a floor plan routinely CROSS-REFERENCES the ceiling/finish plans
+    # ("see reflected ceiling plan A-201"). A sheet that is itself any kind of
+    # floor/dimension/enlarged/unit/partition plan is a geometry source — full
+    # stop — even if it mentions a ceiling plan. Only a sheet whose ONLY plan-
+    # type signal is ceiling/finish is secondary. This biases toward geometry
+    # (over-count = visible) and never drops a real floor plan's rooms
+    # (2026-06-14 golden regression: without this, Fishkill floor plans were
+    # misread as 'ceiling' and 99 rooms dropped → walls 89% UNDER).
+    GEOM_PLAN = (
+        "floor plan", "dimension plan", "enlarged plan", "partition plan",
+        "fixture plan", "equipment plan", "furniture plan", "roof plan",
+        "slab plan", "key plan", "overall plan", "unit plan", "site plan",
+        "demolition plan", "life safety plan",
+    )
+    if any(k in txt for k in GEOM_PLAN):
+        return "geometry"
     if "reflected ceiling" in txt or "ceiling plan" in txt or \
             re.search(r"\brcp\b", txt):
         return "ceiling"
