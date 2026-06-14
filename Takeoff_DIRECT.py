@@ -3074,6 +3074,34 @@ def _title_text_is_plan_sheet(raw_text):
     return False
 
 
+_SECTION_DETAIL_TITLE_RE = ("elevation", "section", "detail")
+
+
+def _title_text_is_section_or_detail(raw_text):
+    """True when the sheet's title marks it a section / elevation / detail and
+    NOT a plan. These carry dimension text (section heights, detail callouts)
+    that trips the dims-based plan detector, but their 'rooms' are the SAME
+    spaces seen elsewhere in section/elevation view — extracting them double-
+    counts (2026-06-13 Dutchess: 'Building Section A-300' added 12 rooms /
+    4,261 walls duplicating plan units; Fishkill A300/A301 sections likewise).
+    A sheet that is genuinely a plan (Enlarged Plan, Floor Plan) or that also
+    says 'plan' (e.g. 'Stairwell Plans & Sections') is NOT excluded."""
+    txt = str(raw_text or "").lower()
+    if not txt:
+        return False
+    STRONG_PLAN = (
+        "floor plan", "reflected ceiling", "ceiling plan", "finish plan",
+        "enlarged plan", "fixture plan", "dimension plan", "partition plan",
+        "furniture plan", "equipment plan", "roof plan", "slab plan",
+        "life safety plan", "demolition plan", "overall plan",
+    )
+    if any(k in txt for k in STRONG_PLAN):
+        return False
+    if "plan" in txt:
+        return False
+    return any(k in txt for k in _SECTION_DETAIL_TITLE_RE)
+
+
 def _num_or_zero(v):
     try:
         f = float(v)
@@ -3823,10 +3851,18 @@ def _analyze_pdf_per_sheet(client, pdf_path, scope_notes="",
     text_layers = {}
     parsed_pages = {}
     plan_pages = []
+    section_skipped = []
     for c in included:
         pg = c["page_index"]
         tl = _extract_page_text_layer(pdf_path, pg)
         text_layers[pg] = tl
+        raw = (tl or {}).get("raw_text", "")
+        # NEGATIVE gate FIRST: a section/elevation/detail sheet is never a plan
+        # sheet, even when it carries dimension text — its rooms duplicate the
+        # plan-view rooms. This must veto the dims-based detector below.
+        if _title_text_is_section_or_detail(raw):
+            section_skipped.append(pg)
+            continue
         parsed = _parse_floor_plan_text(tl) if tl else None
         if parsed:
             parsed_pages[pg] = parsed
@@ -3836,8 +3872,16 @@ def _analyze_pdf_per_sheet(client, pdf_path, scope_notes="",
             if n_dims >= 3 or (n_dims >= 1 and (n_labels >= 1 or n_ids >= 1)):
                 plan_pages.append(pg)
                 continue
-        if _title_text_is_plan_sheet((tl or {}).get("raw_text", "")):
+        if _title_text_is_plan_sheet(raw):
             plan_pages.append(pg)
+    if section_skipped:
+        print(f"   🚫 Per-sheet: excluded {len(section_skipped)} section/"
+              f"elevation/detail sheet(s) from extraction (pages "
+              f"{[p + 1 for p in section_skipped]}) — their rooms duplicate "
+              f"plan-view scope.")
+        _ledger_mark(pdf_path, section_skipped, "excluded",
+                     "section/elevation/detail sheet (per-sheet mode; rooms "
+                     "duplicate plan views)")
 
     if not plan_pages:
         # Mirror the enhanced-extraction fallback: large-format included
@@ -9980,6 +10024,19 @@ def _apply_residential_ceiling_floor(analysis):
     if analysis.get("_used_footprint_fallback"):
         analysis["_residential_ceiling_floor_applied"] = True
         return analysis
+    # Per-sheet mode extracts ceilings completely per plan sheet (RCP + floor-
+    # plan instances merged by canonical identity), so this legacy GSF
+    # under-extraction compensator only INFLATES it — and it amplifies any
+    # story-count misread (2026-06-13: a 3-story job mis-read as 5 stories
+    # produced footprint 10,200 × 5 × 0.97 = 49,470 SF, 3.7× the truth).
+    # Skip it when per-sheet produced the analysis.
+    if analysis.get("_per_sheet_extraction"):
+        analysis["_residential_ceiling_floor_applied"] = True
+        analysis.setdefault("notes", []).append(
+            "[Residential Ceiling Floor] Skipped — per-sheet extraction "
+            "measures ceilings completely (RCP + plan merged by identity); "
+            "the GSF compensator would only over-count.")
+        return analysis
 
     pi = analysis.get("project_info") or {}
     bt = str(pi.get("building_type", "")).lower()
@@ -11950,8 +12007,17 @@ def _base_confirmed_paintable(room, building_type):
 # building level: "Unit Types x01–x06 (Typical Residential Unit Plans)",
 # "Special Unit Plans — Units x01 through x06", "Enlarged Unit Plans", etc.
 _ENLARGED_PLAN_FLOOR_RE = re.compile(
-    r"(?:unit\s+(?:type|plan)|typical\s+.*unit\s+plan|enlarged\s+(?:unit\s+)?plan"
-    r"|special\s+unit|unit\s+types?\b)", re.IGNORECASE)
+    r"(?:unit\s+(?:type|plan)|typical\s+.*\bunit\b|enlarged\s+(?:unit\s+)?plan"
+    r"|special\s+unit|unit\s+types?\b|\bunit\s+x\d|\btemplate\b)",
+    re.IGNORECASE)
+# Broadened 2026-06-13: the model names enlarged unit-plan pseudo-floors many
+# ways run-to-run — "Typical Unit x01 (2BR/2BA Template)", "Typical Unit x05
+# Floor", "Unit Types x01-x06 (...A-105...)". The old pattern required the
+# literal "unit plan"/"unit type", so these escaped dedup and double-counted
+# the per-floor units (~10,500 walls on Fishkill). Now matches "typical ...
+# unit", a literal "unit x<digit>" (template ids never collide with real
+# units like 201), and "template". Real physical floors ("2nd Floor", "3rd
+# Floor (Sheet A103)") contain none of these tokens, so no false match.
 
 
 def _dedupe_enlarged_plan_floors(analysis):

@@ -91,6 +91,44 @@ def main():
     check("empty text is not a plan sheet",
           not T._title_text_is_plan_sheet(""))
 
+    print("\n── Section/elevation/detail exclusion (per-sheet over-extraction fix) ──")
+    check("'Building Section A-300' excluded",
+          T._title_text_is_section_or_detail("A-300 BUILDING SECTION scale 1/4"))
+    check("'Exterior Elevations' excluded",
+          T._title_text_is_section_or_detail("EXTERIOR ELEVATIONS north south"))
+    check("'Wall Details' excluded",
+          T._title_text_is_section_or_detail("A-500 WALL DETAILS typ"))
+    check("'Stairwell Plans & Sections' KEPT (has 'plan')",
+          not T._title_text_is_section_or_detail("STAIRWELL PLANS & SECTIONS A303"))
+    check("'Enlarged Plan' KEPT (strong plan, even if a section is drawn)",
+          not T._title_text_is_section_or_detail("ENLARGED PLAN & SECTION A-105"))
+    check("'2nd Floor Plan' not a section",
+          not T._title_text_is_section_or_detail("A-102 SECOND FLOOR PLAN"))
+    check("empty title is not a section", not T._title_text_is_section_or_detail(""))
+
+    print("\n── Enlarged-plan floor naming (broadened dedup match) ──")
+    for nm in ["Typical Unit x01 (2BR/2BA Template)", "Typical Unit x05 Floor",
+               "Unit Types x01-x06 (Typical Residential Unit Plans — A-105/A-106)",
+               "Special Unit Plans — Units x01 through x06"]:
+        check(f"enlarged match: {nm[:32]!r}",
+              bool(T._ENLARGED_PLAN_FLOOR_RE.search(nm)))
+    for nm in ["1st Floor", "2nd Floor", "3rd Floor (Sheet A103)",
+               "Roof / Bulkhead Level"]:
+        check(f"real floor NOT matched: {nm!r}",
+              not T._ENLARGED_PLAN_FLOOR_RE.search(nm))
+
+    print("\n── Residential ceiling floor skipped in per-sheet mode ──")
+    an_ps = {"_per_sheet_extraction": True,
+             "project_info": {"building_type": "residential",
+                              "footprint_sqft": 10200, "total_stories": 5},
+             "aggregated_totals": {"total_paintable_ceiling_sqft": 39412}}
+    T._apply_residential_ceiling_floor(an_ps)
+    check("per-sheet ceiling NOT boosted by the GSF compensator",
+          an_ps["aggregated_totals"]["total_paintable_ceiling_sqft"] == 39412)
+    check("skip is recorded + idempotency flag set",
+          an_ps.get("_residential_ceiling_floor_applied") is True
+          and any("per-sheet" in str(n) for n in an_ps.get("notes", [])))
+
     print("\n── Geometry bucketing ──")
     check("re-read noise lands in the same bucket (800 vs 840 SF)",
           T._geom_bucket(room(floor_area=800)) ==
