@@ -82,5 +82,28 @@ else:
     print("364 Main integration SKIPPED (PDF or PyMuPDF unavailable)")
 
 # --------------------------------------------------------------------------
+print("M2 centerline clustering (wall runs)")
+# one wall = two faces 0.5ft apart (4.5pt @ scale9), 10ft long -> ONE 10ft run
+one_wall = [(100.0, 0, 90), (104.5, 0, 90)]   # pts; /9 = 10 ft
+check("two faces of one wall -> one run", abs(vm.cluster_wall_runs(one_wall, 9.0) / 9 - 10) < 0.5,
+      f"{vm.cluster_wall_runs(one_wall, 9.0)/9:.1f}ft")
+# multi-line assembly (4 parallel lines within thickness) -> still one run
+assembly = [(100.0, 0, 90), (101.5, 0, 90), (103.0, 0, 90), (104.5, 0, 90)]
+check("4-line assembly -> one run", abs(vm.cluster_wall_runs(assembly, 9.0) / 9 - 10) < 0.5)
+# two distinct walls 3ft apart (27pt) -> two runs (not merged at 0.85ft thresh)
+two_walls = [(100.0, 0, 90), (127.0, 0, 90)]
+check("two distinct walls -> two runs", abs(vm.cluster_wall_runs(two_walls, 7.65) / 9 - 20) < 0.5,
+      f"{vm.cluster_wall_runs(two_walls, 7.65)/9:.1f}ft")
+check("empty -> 0", vm.cluster_wall_runs([], 9.0) == 0.0)
+
+FISH = os.path.join(HERE, "spike_samples", "397Fishkill.pdf")
+if vm.fitz is not None and os.path.exists(FISH):
+    # 1st floor (M-1_SD) faces/2 was 1,708 LF (229% over Rider 747); centerline
+    # clustering collapses the multi-line/poché over-count to a plausible run.
+    r = vm.measure_wall_runs(FISH, 4, layer_prefix="M-1_SD", pts_per_ft=9.0)
+    check("Fishkill 1st centerline << faces/2 over-count", r["wall_run_lf"] < 700,
+          f"{r['wall_run_lf']:.0f} LF (Rider 747)")
+
+# --------------------------------------------------------------------------
 print(f"\n=== {'ALL PASS' if not _fails else str(len(_fails)) + ' FAILED: ' + ', '.join(_fails)} ===")
 sys.exit(1 if _fails else 0)
