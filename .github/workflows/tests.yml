@@ -1,0 +1,50 @@
+name: tests
+
+# Runs the OFFLINE test suites on every push and PR. These are deterministic,
+# no API key / network required. The live golden regression (run_analysis ->
+# Claude API) is NOT run here — it needs credentials + spend and is run
+# manually as the pre-merge accuracy gate.
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  offline-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run offline test suites
+        run: |
+          set -e
+          SUITES="
+            test_watchdog_classify
+            test_coverage_ledger
+            test_json_repair
+            test_residential_dedup
+            test_confidence_calibration
+            test_confidence_room_recovery
+            test_provenance_gate
+            test_per_sheet_extraction
+            test_vector_measure
+            test_vme_attribution
+          "
+          fail=0
+          for t in $SUITES; do
+            echo "::group::$t"
+            if python "$t.py"; then echo "PASS $t"; else echo "FAIL $t"; fail=1; fi
+            echo "::endgroup::"
+          done
+          exit $fail
