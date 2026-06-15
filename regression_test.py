@@ -70,6 +70,15 @@ REFERENCE_CASES = {
             "total_stair_sections": (11, 0.25),
             "cost_estimate_subtotal": (162456, 0.15),
         },
+        # PHYSICAL geometry = Σ(wall_run_LF × per-floor height). A pure
+        # geometric measure (e.g. the vector-measure engine) should hit this.
+        # For 364 the billed total_paintable_wall_sqft IS pure geometry — no
+        # coat/color inflation (contrast honey_farms_malta). Per-floor heights
+        # 12'(1st)/9.5'(2nd,3rd)/9'(bsmt); run LF total 8,629 (= base-trim LF).
+        "wall_geometry": {
+            "physical_wall_sqft": 85353,
+            "billed_equals_physical": True,
+        },
         "assertions": [],
     },
     "grenadier_danbury": {
@@ -197,6 +206,14 @@ REFERENCE_CASES = {
             "total_wallcovering_sqft": (1758, 0.30),
             "total_stained_wood_sqft": (338, 0.30),
         },
+        # Pure geometry like 364 (no coat/color inflation). Σ(LF×height):
+        # 1st 746.99@10.08' + 2nd/3rd 1585.07@9.58' + stairs (48.37@21.33',
+        # 58.65@43.5') + gyp 1,520.75 SF = 43,003. Heights vary widely
+        # (stairwell walls 21-43.5'); take per-element height from the schedule.
+        "wall_geometry": {
+            "physical_wall_sqft": 43003,
+            "billed_equals_physical": True,
+        },
         "assertions": [
             ("total_dryfall_ceiling_sqft", "<", 500,
              "No dryfall in Rider scope (residential GYP ceilings)"),
@@ -271,6 +288,20 @@ REFERENCE_CASES = {
             "total_doors_full_paint": (8, 0.20),
             # Rider total: $10,855 int + $17,709 ext = $28,564.13
             "cost_estimate_subtotal": (28564, 0.10),
+        },
+        # IMPORTANT: the billed total_paintable_wall_sqft (4,580) is NOT physical
+        # wall area — it adds a by-COLOR breakdown (PT-01 1,258 + PT-02 190) AND
+        # cooler epoxy (154) ON TOP of the by-height geometry, additively, for
+        # pricing. A pure geometric measure (vector-measure engine) produces only
+        # the by-HEIGHT number (2,977 SF); coats/colors are a downstream pricing
+        # layer, NOT geometry. Validate a geometric extractor against
+        # physical_wall_sqft, not total_paintable_wall_sqft. Heights vary per-WALL
+        # within one story (5'6"-11'), so height must come from the schedule.
+        "wall_geometry": {
+            "physical_wall_sqft": 2977,   # 299.75+238.96+1304.10+724.14+343.90+66.11
+            "billed_equals_physical": False,
+            "billed_wall_sqft": 4580,
+            "note": "physical 2,977 + by-color 1,448 + epoxy 154 = 4,580 billed",
         },
         "assertions": [
             # Baseline hallucinated 669 LF base trim; Rider has 0 base trim line items
