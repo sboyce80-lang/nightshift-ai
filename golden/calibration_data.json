@@ -125,6 +125,168 @@
         "hard_gate_tripped": false
       },
       "output_path": "construction_analysis_20260613_152756.json"
+    },
+    {
+      "job": "fishkill_397_legacy_095917",
+      "true_error_pct": 33.0,
+      "true_error_metric": "mean abs % error vs tier-1 quantity targets",
+      "detail": [
+        "total_paintable_wall_sqft: 54414 vs 43003 (27%)",
+        "total_paintable_ceiling_sqft: 13733 vs 13451 (2%)",
+        "total_doors_full_paint: 141 vs 159 (11%)",
+        "total_stair_sections: 6 vs 8 (25%)",
+        "total_wallcovering_sqft: 0 vs 1758 (100%)"
+      ],
+      "inputs": {
+        "coverage_pct": 1.0,
+        "anchor_pct": 0.899,
+        "verifier_miss_rate": 0.0,
+        "unanchored_rate": 0.0,
+        "assumed_frac": 0.0,
+        "adjustment_mag": 0.0,
+        "walls_per_door": 340.1,
+        "ceil_per_door": 85.8,
+        "over_extraction_ratio": 0.0,
+        "n_rooms": 132,
+        "hard_gates": {
+          "failed_pages": false,
+          "missing_footprint": false,
+          "zero_walls": false,
+          "manual_review": true
+        },
+        "hard_gate_tripped": true
+      },
+      "output_path": "construction_analysis_20260614_095917.json"
+    },
+    {
+      "job": "fishkill_397_legacy_120854",
+      "true_error_pct": 39.1,
+      "true_error_metric": "mean abs % error vs tier-1 quantity targets",
+      "detail": [
+        "total_paintable_wall_sqft: 54908 vs 43003 (28%)",
+        "total_paintable_ceiling_sqft: 14318 vs 13451 (6%)",
+        "total_doors_full_paint: 101 vs 159 (36%)",
+        "total_stair_sections: 6 vs 8 (25%)",
+        "total_wallcovering_sqft: 0 vs 1758 (100%)"
+      ],
+      "inputs": {
+        "coverage_pct": 1.0,
+        "anchor_pct": 0.8740000000000001,
+        "verifier_miss_rate": 0.0,
+        "unanchored_rate": 0.0,
+        "assumed_frac": 0.0,
+        "adjustment_mag": 0.0,
+        "walls_per_door": 453.8,
+        "ceil_per_door": 118.3,
+        "over_extraction_ratio": 0.0,
+        "n_rooms": 140,
+        "hard_gates": {
+          "failed_pages": false,
+          "missing_footprint": false,
+          "zero_walls": false,
+          "manual_review": true
+        },
+        "hard_gate_tripped": true
+      },
+      "output_path": "construction_analysis_20260614_120854.json"
+    },
+    {
+      "job": "364_main_legacy_140819",
+      "true_error_pct": 33.4,
+      "true_error_metric": "mean abs % error vs tier-1 quantity targets",
+      "detail": [
+        "total_paintable_wall_sqft: 56260 vs 85353 (34%)",
+        "total_paintable_ceiling_sqft: 20017 vs 26839 (25%)",
+        "total_base_trim_lf: 3542 vs 8629 (59%)",
+        "total_doors_full_paint: 168 vs 155 (8%)",
+        "total_doors_hm_panel: 26 vs 28 (7%)",
+        "total_windows_painted_interior: 0 vs 26 (100%)",
+        "total_stair_sections: 11 vs 11 (0%)"
+      ],
+      "inputs": {
+        "coverage_pct": 1.0,
+        "anchor_pct": 0.8170000000000001,
+        "verifier_miss_rate": 0.0,
+        "unanchored_rate": 0.0,
+        "assumed_frac": 0.0,
+        "adjustment_mag": 0.0,
+        "walls_per_door": 290.0,
+        "ceil_per_door": 103.2,
+        "over_extraction_ratio": 0.0,
+        "n_rooms": 60,
+        "hard_gates": {
+          "failed_pages": false,
+          "missing_footprint": false,
+          "zero_walls": false,
+          "manual_review": false
+        },
+        "hard_gate_tripped": false
+      },
+      "output_path": "construction_analysis_20260614_140819.json"
+    },
+    {
+      "job": "dutchess_livestock_legacy_152824",
+      "true_error_pct": 201.9,
+      "true_error_metric": "mean abs % error vs tier-1 quantity targets",
+      "detail": [
+        "total_paintable_wall_sqft: 22417 vs 5371 (317%)",
+        "total_paintable_ceiling_sqft: 11992 vs 2061 (482%)",
+        "total_doors_full_paint: 11 vs 28 (61%)",
+        "total_base_trim_lf: 198 vs 391 (49%)",
+        "total_windows_painted_interior: 0 vs 25 (100%)"
+      ],
+      "inputs": {
+        "coverage_pct": 1.0,
+        "anchor_pct": 0.9009999999999999,
+        "verifier_miss_rate": 0.0,
+        "unanchored_rate": 0.0,
+        "assumed_frac": 0.0,
+        "adjustment_mag": 0.0,
+        "walls_per_door": 773.0,
+        "ceil_per_door": 413.5,
+        "over_extraction_ratio": 1.068,
+        "n_rooms": 53,
+        "hard_gates": {
+          "failed_pages": false,
+          "missing_footprint": false,
+          "zero_walls": false,
+          "manual_review": false
+        },
+        "hard_gate_tripped": false
+      },
+      "output_path": "construction_analysis_20260614_152824.json"
+    },
+    {
+      "job": "fishkill_397_legacy_104300",
+      "true_error_pct": 36.1,
+      "true_error_metric": "mean abs % error vs tier-1 quantity targets",
+      "detail": [
+        "total_paintable_wall_sqft: 44031 vs 43003 (2%)",
+        "total_paintable_ceiling_sqft: 11237 vs 13451 (16%)",
+        "total_doors_full_paint: 101 vs 159 (36%)",
+        "total_stair_sections: 10 vs 8 (25%)",
+        "total_wallcovering_sqft: 0 vs 1758 (100%)"
+      ],
+      "inputs": {
+        "coverage_pct": 1.0,
+        "anchor_pct": 0.9179999999999999,
+        "verifier_miss_rate": 0.0,
+        "unanchored_rate": 0.0,
+        "assumed_frac": 0.0,
+        "adjustment_mag": 0.0,
+        "walls_per_door": 363.9,
+        "ceil_per_door": 92.9,
+        "over_extraction_ratio": 0.0,
+        "n_rooms": 101,
+        "hard_gates": {
+          "failed_pages": false,
+          "missing_footprint": false,
+          "zero_walls": false,
+          "manual_review": true
+        },
+        "hard_gate_tripped": true
+      },
+      "output_path": "construction_analysis_20260615_104300.json"
     }
   ]
 }
