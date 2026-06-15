@@ -107,6 +107,46 @@ def select_floor_sources(pages) -> dict:
     return claimed
 
 
+def compute_vme_shadow(pdf_path):
+    """M3 (shadow) — run the vector measurement engine on a plan and return a
+    summary for COMPARISON alongside the pipeline. Does not replace anything.
+
+    Sums centerline wall RUN length over the canonical per-floor source pages
+    (M1 selection, so the all-floors composite isn't double-counted). Robust:
+    returns None on any failure (this is a shadow, never load-bearing).
+
+    Returns {total_wall_run_lf, n_floor_pages, primary_scale, by_page:[...]}.
+    """
+    if fitz is None:
+        return None
+    try:
+        pages, primary = classify_pages(pdf_path)
+        if not pages:
+            return None
+        sources = {}
+        for p in select_floor_sources(pages).values():
+            sources[id(p)] = p           # unique source pages, composite excluded
+        total = 0.0
+        by_page = []
+        for p in sources.values():
+            sc = p["scale"] or primary
+            try:
+                r = vm.measure_wall_runs(pdf_path, p["page"], pts_per_ft=sc)
+            except Exception:
+                continue
+            lf = r.get("wall_run_lf") or 0.0
+            total += lf
+            by_page.append({"page": p["page"] + 1, "scale": sc, "wall_run_lf": round(lf, 1)})
+        if not by_page:
+            return None
+        return {"total_wall_run_lf": round(total, 1),
+                "n_floor_pages": len(by_page),
+                "primary_scale": primary,
+                "by_page": by_page}
+    except Exception:
+        return None
+
+
 def recover_floor_wall_runs(demising_run_lf, unit_type_runs, unit_counts):
     """M2 part 2 — residential floor wall RUN with unit-partition recovery.
 

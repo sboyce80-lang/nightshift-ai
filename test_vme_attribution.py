@@ -68,4 +68,27 @@ if m1.recover_floor_wall_runs(0.0, {"A": 100.0}, {"A": 0}) != 0.0:
 else:
     print("  PASS  zero count contributes nothing")
 
+# --------------------------------------------------------------------------
+print("\nM3 shadow — compute_vme_shadow (robust, comparison-only)")
+# robustness: never raises, returns None on bad input
+if m1.compute_vme_shadow("/no/such/file.pdf") is not None:
+    fails.append("shadow bad-path should be None")
+else:
+    print("  PASS  bad path -> None (never raises)")
+if m1.compute_vme_shadow(None) is not None:
+    fails.append("shadow None should be None")
+else:
+    print("  PASS  None -> None")
+import os as _os
+_fish = _os.path.join(HERE, "spike_samples", "397Fishkill.pdf")
+if m1.fitz is not None and _os.path.exists(_fish):
+    s = m1.compute_vme_shadow(_fish)
+    ok = (s and s["total_wall_run_lf"] > 0 and s["n_floor_pages"] >= 1
+          and isinstance(s.get("by_page"), list))
+    if not ok:
+        fails.append(f"shadow on Fishkill malformed: {s}")
+    else:
+        print(f"  PASS  Fishkill shadow well-formed ({s['total_wall_run_lf']:.0f} LF, "
+              f"{s['n_floor_pages']} sheets)")
+
 print(f"\n=== {'PASS' if not fails else 'ISSUES: ' + '; '.join(fails)} ===")

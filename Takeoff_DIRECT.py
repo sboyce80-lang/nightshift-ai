@@ -19772,6 +19772,26 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     # ready_to_send gate.
     analysis = _assess_calibrated_confidence(analysis, cost_estimate=costs)
 
+    # --- VME shadow (Phase 3 M3, flag-gated NIGHTSHIFT_VECTOR_MEASURE, default
+    # OFF): run the deterministic vector measurement engine alongside extraction
+    # and attach its wall measurement for comparison. NEVER changes pricing or
+    # any output; never fatal. The engine is still maturing (~71% of verified
+    # takeoffs), so this is comparison-only until it's accurate enough to drive
+    # numbers. ---
+    if os.environ.get("NIGHTSHIFT_VECTOR_MEASURE", "0").strip() in ("1", "true", "True"):
+        try:
+            import vme_attribution as _vme
+            single_pdf = pdf_paths[0] if (pdf_paths and len(pdf_paths) == 1) else None
+            shadow = _vme.compute_vme_shadow(single_pdf) if single_pdf else None
+            if shadow:
+                analysis["_vme_shadow"] = shadow
+                print(f"   🧪 VME shadow: {shadow['total_wall_run_lf']:,.0f} LF wall run "
+                      f"across {shadow['n_floor_pages']} floor sheet(s) "
+                      f"(comparison only)")
+        except Exception as _vme_err:
+            print(f"   ⚠️  VME shadow skipped: {type(_vme_err).__name__}: "
+                  f"{str(_vme_err)[:100]}")
+
     print_estimate(analysis, costs)
 
     # --- Interactive adjustment mode ---
