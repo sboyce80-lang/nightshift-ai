@@ -1435,6 +1435,10 @@ _DIVISION_9_KEYWORDS = [
     # labels must still be retained for finish extraction).
     'finish legend', 'finishes legend', 'finish notes', 'paint legend',
     'material legend',
+    # review 1d: a sheet titled "PT-101 PAINT PLAN" has prefix "PT" which the
+    # discipline map reads as "P" (Plumbing) and excludes. These keywords let
+    # the override rescue an actual painting/finish plan from that misread.
+    'paint plan', 'painting plan', 'finish plan', 'paint and finish',
 ]
 
 # Sheet prefix → discipline mapping (order matters: check longer prefixes first)
@@ -1483,8 +1487,11 @@ _DISCIPLINE_MAP = [
 ]
 
 # Regex to match sheet numbers like A101, A-101, A 101, A1.01, AD101, FP-101, etc.
+# Trailing [A-Z]? consumes a revision suffix (review 4c): without it "A-101A"
+# failed to match entirely and "A2.01a" truncated to "2". The revision letter
+# is consumed but not captured, so group(1)+group(2) reconstruct the base sheet.
 _SHEET_NUMBER_RE = re.compile(
-    r'\b([A-Z]{1,2})\s*[-.]?\s*(\d{1,3}(?:\.\d{1,2})?)\b',
+    r'\b([A-Z]{1,2})\s*[-.]?\s*(\d{1,3}(?:\.\d{1,2})?)[A-Z]?\b',
     re.IGNORECASE,
 )
 
@@ -2002,8 +2009,10 @@ def _set_window_schedule_flag(analysis, pdf_paths):
 
 def _normalize_sheet_token(s):
     """Normalize a sheet number for comparison: uppercase, drop separators.
-    'A-101' / 'A 101' / 'A1.01' all normalize to 'A101'."""
-    return re.sub(r'[^A-Z0-9]', '', str(s).upper())
+    'A-101' / 'A 101' / 'A1.01' all normalize to 'A101'. A trailing revision
+    letter after the number is dropped so 'A-101A' == 'A-101' (review 4c)."""
+    t = re.sub(r'[^A-Z0-9]', '', str(s).upper())
+    return re.sub(r'(\d)[A-Z]$', r'\1', t)
 
 
 def _detect_sheet_id_on_page(page, known_prefixes):
@@ -11171,6 +11180,13 @@ def _extract_multiplier_from_notes(room):
     if isinstance(mult, (int, float)) and mult > 1:
         return int(mult)
 
+    # HARD_NUMBERS_ONLY (review 3e): a free-text note ("28 units total") is not
+    # a measured quantity — multiplying a room's quantities x28 from prose is
+    # exactly the assumption the policy forbids. Keep the explicit schema field
+    # above; skip the note-text fallback below.
+    if HARD_NUMBERS_ONLY:
+        return 1
+
     # Priority 2: parse from notes text
     notes = str(room.get("notes", ""))
     patterns = [
@@ -14964,7 +14980,10 @@ def _merge_passes_with_median(pass_analyses, min_pass_presence=None):
             fname_display = str(floor.get("floor_name") or "")
             fname_norm = _normalize_room_name_mp(fname_display)
             for room in floor.get("rooms", []) or []:
-                sheet = str(room.get("source_sheet") or "").strip().upper()
+                # review 2c: canonical sheet token, not raw .upper() — otherwise
+                # "A-102" vs "A1.02" key differently and the same room is split
+                # (the exact cross-pass deletion this fallback path could reintroduce).
+                sheet = _normalize_sheet_token(room.get("source_sheet") or "")
                 name_norm = _normalize_room_name_mp(room.get("room_name"))
                 if not name_norm:
                     continue
