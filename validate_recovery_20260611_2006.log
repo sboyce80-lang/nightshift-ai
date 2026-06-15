@@ -1,0 +1,198 @@
+[00:06:33] ===== START Fishkill_validate =====
+   ✓ 397Fishkill.pdf (4.6 MB)
+🎨 NIGHTSHIFT AI - CONSTRUCTION DOCUMENT ANALYZER
+================================================================================
+📄 Processing: 397Fishkill.pdf
+================================================================================
+
+🔎 Pre-scanning 397Fishkill.pdf for schedule pages...
+   Found schedule pages: door=[4, 5, 6], window=[4, 5, 6]
+
+   📋 TARGETED SCHEDULE EXTRACTION
+   Extracting 3 schedule page(s) as mini-PDF...
+   Mini-PDF: 818 KB, 3 page(s)
+   Sending schedule PDF to Claude for row-by-row counting...
+   ✅ Schedule extraction complete:
+      Doors: 104 full paint + 16 HM panel = 120 total (120 marks listed)
+      Windows: 67 total, 0 painted interior
+      Stairs: 8 flight sections
+   🧹 mem-release [after schedule extraction]: RSS peak 107424 MB (maxrss; not pre/post — Linux ru_maxrss is monotonic)
+
+📑 Index pages detected in 397Fishkill.pdf: pages [1, 2, 3, 4, 5, 6, 7, 8, 12, 14, 15]
+   Building keywords: building, bldg, duplex, tower, wing, residence, phase
+
+🏗️  Extracting Building Inventory from index pages: 397Fishkill.pdf
+   📄 Scanning pages: [1, 2, 3, 4, 5, 6, 7, 8, 12, 14, 15]
+   ✅ Building Inventory detected: 1 buildings total
+      • Mixed-Use Residential/Commercial Building [MAIN]: 1 building(s), 15 unit(s) each
+   🧹 mem-release [after building inventory]: RSS peak 141488 MB (maxrss; not pre/post — Linux ru_maxrss is monotonic)
+   🏗️  Building inventory: 1 buildings detected from index
+
+🏗️  Building inventory: 1 buildings (from 397Fishkill.pdf)
+
+📘 Phase 1: Extracting Project Overview from G-series / coversheets...
+📋 PageClassify summary: 17/20 pages included for room extraction; 3 excluded
+   PageClassify | p1   | sheet=CS100    | disc=Civil                    | include=N
+   PageClassify | p2   | sheet=CC101    | disc=Civil                    | include=N
+   PageClassify | p3   | sheet=CC102    | disc=Civil                    | include=N
+   PageClassify | p4   | sheet=A100     | disc=Architectural            | include=Y
+   PageClassify | p5   | sheet=A101     | disc=Architectural            | include=Y
+   PageClassify | p6   | sheet=A102     | disc=Architectural            | include=Y
+   PageClassify | p7   | sheet=A103     | disc=Architectural            | include=Y
+   PageClassify | p8   | sheet=A104     | disc=Architectural            | include=Y
+   PageClassify | p9   | sheet=A105     | disc=Architectural            | include=Y
+   PageClassify | p10  | sheet=A106     | disc=Architectural            | include=Y
+   PageClassify | p11  | sheet=A107     | disc=Architectural            | include=Y
+   PageClassify | p12  | sheet=A200     | disc=Architectural            | include=Y
+   PageClassify | p13  | sheet=A201     | disc=Architectural            | include=Y
+   PageClassify | p14  | sheet=A300     | disc=Architectural            | include=Y
+   PageClassify | p15  | sheet=A301     | disc=Architectural            | include=Y
+   PageClassify | p16  | sheet=A302     | disc=Architectural            | include=Y
+   PageClassify | p17  | sheet=A303     | disc=Architectural            | include=Y
+   PageClassify | p18  | sheet=A304     | disc=Architectural            | include=Y
+   PageClassify | p19  | sheet=A400     | disc=Architectural            | include=Y
+   PageClassify | p20  | sheet=A500     | disc=Architectural            | include=Y
+   ⚠️  No G-series / Title pages identified — skipping Phase 1
+
+📄 Reading PDF file...
+📋 PageClassify summary: 17/20 pages included for room extraction; 3 excluded
+   PageClassify | p1   | sheet=CS100    | disc=Civil                    | include=N
+   PageClassify | p2   | sheet=CC101    | disc=Civil                    | include=N
+   PageClassify | p3   | sheet=CC102    | disc=Civil                    | include=N
+   PageClassify | p4   | sheet=A100     | disc=Architectural            | include=Y
+   PageClassify | p5   | sheet=A101     | disc=Architectural            | include=Y
+   PageClassify | p6   | sheet=A102     | disc=Architectural            | include=Y
+   PageClassify | p7   | sheet=A103     | disc=Architectural            | include=Y
+   PageClassify | p8   | sheet=A104     | disc=Architectural            | include=Y
+   PageClassify | p9   | sheet=A105     | disc=Architectural            | include=Y
+   PageClassify | p10  | sheet=A106     | disc=Architectural            | include=Y
+   PageClassify | p11  | sheet=A107     | disc=Architectural            | include=Y
+   PageClassify | p12  | sheet=A200     | disc=Architectural            | include=Y
+   PageClassify | p13  | sheet=A201     | disc=Architectural            | include=Y
+   PageClassify | p14  | sheet=A300     | disc=Architectural            | include=Y
+   PageClassify | p15  | sheet=A301     | disc=Architectural            | include=Y
+   PageClassify | p16  | sheet=A302     | disc=Architectural            | include=Y
+   PageClassify | p17  | sheet=A303     | disc=Architectural            | include=Y
+   PageClassify | p18  | sheet=A304     | disc=Architectural            | include=Y
+   PageClassify | p19  | sheet=A400     | disc=Architectural            | include=Y
+   PageClassify | p20  | sheet=A500     | disc=Architectural            | include=Y
+   🔍 Page filter: 17/20 pages are painting-relevant
+      Excluded: 3 pages (3 Civil)
+      Filtered PDF: 2900 KB (original 4732 KB)
+✅ PDF loaded (3.8 MB encoded)
+   📋 Schedule hints injected into extraction prompt
+   🏗️  Building inventory injected into extraction prompt
+
+🔍 Sending PDF to Claude for analysis...
+   (This may take 60-90 seconds for complex drawings)
+   🔢 Remapped 52 source_page values to original PDF page numbers
+   📍 Bbox anchoring: 24/52 rooms (46.2%)
+   ⚠️  All 52 rooms have 0 wall area — dimension text likely unreadable
+📋 PageClassify summary: 17/20 pages included for room extraction; 3 excluded
+   PageClassify | p1   | sheet=CS100    | disc=Civil                    | include=N
+   PageClassify | p2   | sheet=CC101    | disc=Civil                    | include=N
+   PageClassify | p3   | sheet=CC102    | disc=Civil                    | include=N
+   PageClassify | p4   | sheet=A100     | disc=Architectural            | include=Y
+   PageClassify | p5   | sheet=A101     | disc=Architectural            | include=Y
+   PageClassify | p6   | sheet=A102     | disc=Architectural            | include=Y
+   PageClassify | p7   | sheet=A103     | disc=Architectural            | include=Y
+   PageClassify | p8   | sheet=A104     | disc=Architectural            | include=Y
+   PageClassify | p9   | sheet=A105     | disc=Architectural            | include=Y
+   PageClassify | p10  | sheet=A106     | disc=Architectural            | include=Y
+   PageClassify | p11  | sheet=A107     | disc=Architectural            | include=Y
+   PageClassify | p12  | sheet=A200     | disc=Architectural            | include=Y
+   PageClassify | p13  | sheet=A201     | disc=Architectural            | include=Y
+   PageClassify | p14  | sheet=A300     | disc=Architectural            | include=Y
+   PageClassify | p15  | sheet=A301     | disc=Architectural            | include=Y
+   PageClassify | p16  | sheet=A302     | disc=Architectural            | include=Y
+   PageClassify | p17  | sheet=A303     | disc=Architectural            | include=Y
+   PageClassify | p18  | sheet=A304     | disc=Architectural            | include=Y
+   PageClassify | p19  | sheet=A400     | disc=Architectural            | include=Y
+   PageClassify | p20  | sheet=A500     | disc=Architectural            | include=Y
+
+   🔬 Native rooms had unreadable dimensions — large-format pages detected, trying enhanced extraction (17 painting-relevant pages)...
+   📝 Phase 1: Extracting text layer from 17 pages...
+   📝 Text layer: 1477 dimensions, 210 labels, 201 IDs across 17 pages
+   🔬 ENHANCED EXTRACTION: Tiling 12 floor plan page(s) (of 17 painting-relevant, 20 total)
+      Page 4: 66 dims, 0 labels, 7 IDs
+      Page 5: 190 dims, 28 labels, 7 IDs
+      Page 6: 334 dims, 54 labels, 70 IDs
+      Page 7: 322 dims, 51 labels, 69 IDs
+      Page 8: 77 dims, 4 labels, 1 IDs
+      Page 9: 89 dims, 11 labels, 5 IDs
+      Page 10: 78 dims, 6 labels, 5 IDs
+      Page 11: 71 dims, 5 labels, 5 IDs
+      Page 12: 53 dims, 1 labels, 1 IDs
+      Page 14: 25 dims, 18 labels, 6 IDs
+      Page 17: 61 dims, 6 labels, 13 IDs
+      Page 19: 55 dims, 15 labels, 1 IDs
+   📐 Phase 2: Rendering page tiles...
+      Page 4: 36.0" × 24.0" (large format) → 2×2 tiles
+      📐 Tile R1C1: 2835×1890px (46 KB)
+      📐 Tile R1C2: 2835×1890px (276 KB)
+      📐 Tile R2C1: 2835×1890px (107 KB)
+      📐 Tile R2C2: 2835×1890px (308 KB)
+      Page 5: 36.0" × 24.0" (large format) → 2×2 tiles
+      📐 Tile R1C1: 2835×1890px (624 KB)
+      📐 Tile R1C2: 2835×1890px (472 KB)
+      📐 Tile R2C1: 2835×1890px (557 KB)
+      📐 Tile R2C2: 2835×1890px (659 KB)
+      Page 6: 36.0" × 24.0" (large format) → 2×2 tiles
+      📐 Tile R1C1: 2835×1890px (453 KB)
+      📐 Tile R1C2: 2835×1890px (644 KB)
+      📐 Tile R2C1: 2835×1890px (725 KB)
+      📐 Tile R2C2: 2835×1890px (1110 KB)
+      Page 7: 36.0" × 24.0" (large format) → 2×2 tiles
+      📐 Tile R1C1: 2835×1890px (422 KB)
+      📐 Tile R1C2: 2835×1890px (630 KB)
+      📐 Tile R2C1: 2835×1890px (752 KB)
+      📐 Tile R2C2: 2835×1890px (1108 KB)
+      Page 8: 36.0" × 24.0" (large format) → 2×2 tiles
+      📐 Tile R1C1: 2835×1890px (418 KB)
+      📐 Tile R1C2: 2835×1890px (348 KB)
+      📐 Tile R2C1: 2835×1890px (198 KB)
+      📐 Tile R2C2: 2835×1890px (511 KB)
+      Page 9: 36.0" × 24.0" (large format) → 2×2 tiles
+      📐 Tile R1C1: 2835×1890px (303 KB)
+      📐 Tile R1C2: 2835×1890px (292 KB)
+      📐 Tile R2C1: 2835×1890px (341 KB)
+      📐 Tile R2C2: 2835×1890px (331 KB)
+      Page 10: 36.0" × 24.0" (large format) → 2×2 tiles
+      📐 Tile R1C1: 2835×1890px (239 KB)
+      📐 Tile R1C2: 2835×1890px (392 KB)
+      📐 Tile R2C1: 2835×1890px (245 KB)
+      📐 Tile R2C2: 2835×1890px (468 KB)
+      Page 11: 36.0" × 24.0" (large format) → 2×2 tiles
+      📐 Tile R1C1: 2835×1890px (209 KB)
+      📐 Tile R1C2: 2835×1890px (274 KB)
+      📐 Tile R2C1: 2835×1890px (235 KB)
+      📐 Tile R2C2: 2835×1890px (305 KB)
+      Page 12: 36.0" × 24.0" (large format) → 2×2 tiles
+      📐 Tile R1C1: 2835×1890px (303 KB)
+      📐 Tile R1C2: 2835×1890px (163 KB)
+      📐 Tile R2C1: 2835×1890px (272 KB)
+      📐 Tile R2C2: 2835×1890px (344 KB)
+      Page 14: 36.0" × 24.0" (large format) → 2×2 tiles
+      📐 Tile R1C1: 2835×1890px (499 KB)
+      📐 Tile R1C2: 2835×1890px (439 KB)
+      📐 Tile R2C1: 2835×1890px (570 KB)
+      📐 Tile R2C2: 2835×1890px (509 KB)
+      Page 17: 36.0" × 24.0" (large format) → 2×2 tiles
+      📐 Tile R1C1: 2835×1890px (416 KB)
+      📐 Tile R1C2: 2835×1890px (280 KB)
+      📐 Tile R2C1: 2835×1890px (444 KB)
+      📐 Tile R2C2: 2835×1890px (383 KB)
+      Page 19: 36.0" × 24.0" (large format) → 2×2 tiles
+      📐 Tile R1C1: 2835×1890px (226 KB)
+      📐 Tile R1C2: 2835×1890px (204 KB)
+      📐 Tile R2C1: 2835×1890px (171 KB)
+      📐 Tile R2C2: 2835×1890px (226 KB)
+   📐 Rendered 48 tiles across 12 pages
+
+   🔍 Batch 1/6: sending 9 tiles...
+   🔬 Batch 1: extracted 127 rooms
+
+   🔍 Batch 2/6: sending 9 tiles...
+   🔬 Batch 2: extracted 142 rooms
+
+   🔍 Batch 3/6: sending 9 tiles...

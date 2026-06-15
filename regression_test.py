@@ -70,6 +70,15 @@ REFERENCE_CASES = {
             "total_stair_sections": (11, 0.25),
             "cost_estimate_subtotal": (162456, 0.15),
         },
+        # PHYSICAL geometry = Σ(wall_run_LF × per-floor height). A pure
+        # geometric measure (e.g. the vector-measure engine) should hit this.
+        # For 364 the billed total_paintable_wall_sqft IS pure geometry — no
+        # coat/color inflation (contrast honey_farms_malta). Per-floor heights
+        # 12'(1st)/9.5'(2nd,3rd)/9'(bsmt); run LF total 8,629 (= base-trim LF).
+        "wall_geometry": {
+            "physical_wall_sqft": 85353,
+            "billed_equals_physical": True,
+        },
         "assertions": [],
     },
     "grenadier_danbury": {
@@ -131,7 +140,12 @@ REFERENCE_CASES = {
                        "corrugated walls (paintable, future target); r12 = "
                        "831.21 LF × 16 ft = 13,299.36 SF corrugated metal "
                        "walls (specifically OUT of paint scope per Rider).",
-        "match_keywords": ["fishkill"],
+        # NOTE: was ["fishkill"], which false-matched 397Fishkill.pdf — a
+        # 15-unit residential building at 397 Fishkill Ave (different
+        # project entirely; 2026-06-12 validation run compared apples to
+        # oranges and reported a phantom 665% regression). Require a
+        # cenhud token so only Cen Hud outputs match.
+        "match_keywords": ["cenhud", "cen hud", "cen_hud"],
         "source": "Rider takeoff cenHud_Fishkill-takeoffs.xlsx (May 2026)",
         "targets": {
             # Rider r2: 2,102.58 LF × 9' = 18,925 SF gyp walls
@@ -160,14 +174,68 @@ REFERENCE_CASES = {
              "No dryfall ceiling in Rider scope (baseline run hallucinated 2,912 SF)"),
         ],
     },
+    "fishkill_397": {
+        "display_name": "397 Fishkill Ave (15-unit mixed-use residential)",
+        "tier": 1,
+        "verified_on": "2026-06-12",
+        "verified_by": "Rider takeoff '397 fishkill take offs (3).xlsx' "
+                       "(archived: golden/397Fishkill_rider_takeoffs_"
+                       "2026-06-12.xlsx, 'Bid Pricing' sheet — the final "
+                       "version; Sheet1 is an earlier draft at different "
+                       "rates). Quantities re-derived row by row: walls = "
+                       "1st fl 746.99 LF x 10.08' (7,529.7) + 2nd 15,184.97 "
+                       "+ 3rd 15,184.97 + stair1 2,551.28 + stair2 1,031.73 "
+                       "+ misc gyp 1,520.75 = 43,003 SF. Ceilings = 3,835.13 "
+                       "+ 4,663.77 + 4,663.77 + 163.27 + 125.38 = 13,451 SF. "
+                       "Doors 29+65+65 = 159 EA. Stairs 8 sections. "
+                       "Wallcovering 1,409.49 + 174.22x2 = 1,758 SF. Stained "
+                       "oak 337.95 SF. Interior $90,277.12; with exterior "
+                       "$135,920.16. NOTE: Rider's 'footprint' (15,593.57) "
+                       "is a whole-building SF basis, not a per-floor "
+                       "footprint — no footprint target here. Subtotal "
+                       "target uses Rider INTERIOR only; KS rates differ "
+                       "from Rider's $0.90/SF so treat quantity targets as "
+                       "primary.",
+        "match_keywords": ["397"],
+        "source": "Rider takeoff 397 fishkill take offs (3).xlsx (June 2026)",
+        "targets": {
+            "total_paintable_wall_sqft": (43003, 0.10),
+            "total_paintable_ceiling_sqft": (13451, 0.10),
+            "total_doors_full_paint": (159, 0.15),
+            "total_stair_sections": (8, 0.25),
+            "total_wallcovering_sqft": (1758, 0.30),
+            "total_stained_wood_sqft": (338, 0.30),
+        },
+        # Pure geometry like 364 (no coat/color inflation). Σ(LF×height):
+        # 1st 746.99@10.08' + 2nd/3rd 1585.07@9.58' + stairs (48.37@21.33',
+        # 58.65@43.5') + gyp 1,520.75 SF = 43,003. Heights vary widely
+        # (stairwell walls 21-43.5'); take per-element height from the schedule.
+        "wall_geometry": {
+            "physical_wall_sqft": 43003,
+            "billed_equals_physical": True,
+        },
+        "assertions": [
+            ("total_dryfall_ceiling_sqft", "<", 500,
+             "No dryfall in Rider scope (residential GYP ceilings)"),
+            ("total_concrete_floor_sqft", "<", 500,
+             "No concrete sealer in Rider scope"),
+        ],
+    },
     "dutchess_livestock": {
         "display_name": "Dutchess Livestock Hill Restroom Facility",
-        "tier": 2,
-        "verified_on": None,
-        "verified_by": "Rider Excel claimed (LivestockHillRestrooms-takeoffs.xlsx "
-                       "Jan'26 revision) but targets in this file were never "
-                       "re-derived from the spreadsheet. Promote to tier 1 "
-                       "after re-verification.",
+        "tier": 1,
+        "verified_on": "2026-06-13",
+        "verified_by": "Re-derived 2026-06-13 from the source takeoff "
+                       "(golden/LivestockHillRestrooms-takeoffs.xlsx, Drive "
+                       "id 1MIK5yQu5m8_KIHBzxCS8b8wcT6HRVqjd), 'updated "
+                       "1/29/2026' block (subtotal $22,758.26 — the final "
+                       "revision). Walls = gyp 690.77 + 391.17 + 2,265.84 + "
+                       "652.50 + 521.57 + elevator shaft 558.24 = 5,080 SF + "
+                       "Meeting-Room wainscot 291.42 (Office-113 wainscot "
+                       "removed from scope) = 5,371 SF. Ceilings 2,060.63 "
+                       "(interior gyp; Boral 382.65 is exterior). Doors 28 "
+                       "(incl. added lift door). Base trim 390.91 FT. Windows "
+                       "25 casings. All match the prior targets exactly.",
         "match_keywords": ["dutchess"],
         "source": "Rider takeoff LivestockHillRestrooms-takeoffs.xlsx Jan'26 revision",
         "targets": {
@@ -194,11 +262,20 @@ REFERENCE_CASES = {
     },
     "honey_farms_malta": {
         "display_name": "Honey Farms Market — Malta NY",
-        "tier": 2,
-        "verified_on": None,
-        "verified_by": "Rider Excel claimed (Honey Farms - Malta, NY.xlsx) "
-                       "but targets never re-derived. Promote after "
-                       "re-verification.",
+        "tier": 1,
+        "verified_on": "2026-06-13",
+        "verified_by": "Re-derived 2026-06-13 from the source takeoff "
+                       "(golden/Honey Farms - Malta, NY.xlsx, Drive id "
+                       "1EpVFjkLJVy6v2QUdG-cOMa1D8HGwX-IR). Walls are billed "
+                       "as SEPARATE line items by height (5'6\" 299.75, 8' "
+                       "238.96, 9' 1,304.10, 9'-prime 724.14, 10' 343.90, 11' "
+                       "66.11) AND by color (PT-01 1,258.03, PT-02 190.05) — "
+                       "each priced at $1.50/SF, so additive = 4,425 + cooler "
+                       "epoxy 154.29 = 4,579 SF. Ceilings 1,029.4. Doors 6 HM "
+                       "panel + 2 HM frame-only = 8. WD-01 wood removed from "
+                       "scope. Total $10,855 int + $17,709 ext = $28,564.13 "
+                       "(labor 22,089 + materials 3,343 + lift 3,132). Matches "
+                       "the prior targets.",
         "match_keywords": ["honey farms"],
         "source": "Rider takeoff Honey Farms - Malta, NY.xlsx",
         "targets": {
@@ -212,6 +289,20 @@ REFERENCE_CASES = {
             # Rider total: $10,855 int + $17,709 ext = $28,564.13
             "cost_estimate_subtotal": (28564, 0.10),
         },
+        # IMPORTANT: the billed total_paintable_wall_sqft (4,580) is NOT physical
+        # wall area — it adds a by-COLOR breakdown (PT-01 1,258 + PT-02 190) AND
+        # cooler epoxy (154) ON TOP of the by-height geometry, additively, for
+        # pricing. A pure geometric measure (vector-measure engine) produces only
+        # the by-HEIGHT number (2,977 SF); coats/colors are a downstream pricing
+        # layer, NOT geometry. Validate a geometric extractor against
+        # physical_wall_sqft, not total_paintable_wall_sqft. Heights vary per-WALL
+        # within one story (5'6"-11'), so height must come from the schedule.
+        "wall_geometry": {
+            "physical_wall_sqft": 2977,   # 299.75+238.96+1304.10+724.14+343.90+66.11
+            "billed_equals_physical": False,
+            "billed_wall_sqft": 4580,
+            "note": "physical 2,977 + by-color 1,448 + epoxy 154 = 4,580 billed",
+        },
         "assertions": [
             # Baseline hallucinated 669 LF base trim; Rider has 0 base trim line items
             ("total_base_trim_lf", "<", 100,
@@ -222,9 +313,17 @@ REFERENCE_CASES = {
         "display_name": "TSC Fusion — Highland NY (Tractor Supply)",
         "tier": 2,
         "verified_on": None,
-        "verified_by": "Rider Excel claimed (Painting_Takeoff_TSC_Fusion_FINAL.xlsx, "
-                       "qty only — no $ target). Targets never re-derived. "
-                       "Promote after re-verification.",
+        "verified_by": "DO NOT PROMOTE on the current source. Inspected "
+                       "2026-06-13: Painting_Takeoff_TSC_Fusion_FINAL.xlsx "
+                       "(Drive id 1xysPc8VtfmXGyzU3NyzYzBhykW8tbjE3) is a "
+                       "DRAFT estimating worksheet, not a verified Rider "
+                       "manual takeoff — every quantity is an estimate "
+                       "('approx', 'est. from area', 'height assumed', "
+                       "'allowance'), and all cost columns are 0. These "
+                       "targets are heuristic, exactly the kind hard-numbers "
+                       "rejects. Tier-1 needs a real measured Rider takeoff "
+                       "or a hand takeoff from the plan set "
+                       "(2026-01-23_TSC Fusion_Highland_NY_Revision 2.pdf).",
         "match_keywords": ["tsc", "fusion"],
         "source": "Rider takeoff Painting_Takeoff_TSC_Fusion_FINAL.xlsx (qty only)",
         "targets": {

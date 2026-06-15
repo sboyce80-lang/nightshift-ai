@@ -27,6 +27,38 @@ from pathlib import Path
 import PyPDF2
 from config import CLAUDE_API_KEY, PRICING_MODEL, SMALL_COMMERCIAL_RATES, PCA_CONSTANTS, HARD_NUMBERS_ONLY
 from will_synthesis import run_will_synthesis
+import confidence as _confidence
+
+# Golden calibration table for calibrated confidence (Phase 2.4). Grows as
+# verified takeoffs land; confidence reports calibrated=False until it has
+# confidence.MIN_CALIBRATION rows.
+_CALIBRATION_PATH = str(Path(__file__).parent / "golden" / "calibration_data.json")
+
+
+def _assess_calibrated_confidence(analysis, cost_estimate=None):
+    """Compute + store analysis['calibrated_confidence'] (Phase 2.4).
+    Additive and fully guarded — a confidence error never breaks a run, and
+    it does NOT alter pricing or ready_to_send (Will's gate is unchanged).
+    Env kill-switch: NIGHTSHIFT_CALIBRATED_CONFIDENCE=0."""
+    if os.environ.get("NIGHTSHIFT_CALIBRATED_CONFIDENCE", "1").strip() in (
+            "0", "false", "False"):
+        return analysis
+    try:
+        cc = _confidence.assess_confidence(
+            analysis, cost_estimate=cost_estimate,
+            calibration_path=_CALIBRATION_PATH)
+        analysis["calibrated_confidence"] = cc
+        _cal = "calibrated" if cc.get("calibrated") else "uncalibrated"
+        print(f"   🎯 Calibrated confidence: predicted error ≤ "
+              f"{cc.get('predicted_error_pct')}% at "
+              f"{int(cc.get('ci_level', 0.9) * 100)}% ({_cal}; "
+              f"level {cc.get('confidence_level')})"
+              + (f" — caps: {'; '.join(cc.get('caps_applied'))}"
+                 if cc.get("caps_applied") else ""))
+    except Exception as _cc_err:
+        print(f"   ⚠️  Calibrated confidence failed (non-fatal): "
+              f"{type(_cc_err).__name__}: {str(_cc_err)[:160]}")
+    return analysis
 import anthropic
 import base64
 from datetime import datetime
@@ -42,6 +74,504 @@ import os
 _MULTIMODAL_DENSE_PAGES_ENABLED = (
     os.environ.get("NIGHTSHIFT_DISABLE_MULTIMODAL", "").strip() not in ("1", "true", "True")
 )
+
+
+# ---------------------------------------------------------------------------
+# Structured outputs — schema-enforced extraction responses (Phase 2.0)
+# ---------------------------------------------------------------------------
+# The 2026-06-12 validation runs showed the model occasionally answering the
+# extraction prompt with PROSE ("I'll analyze these architectural drawings
+# systematically...") — 100K characters no parser can save — plus truncated
+# JSON the repair parser had to salvage. output_config.format makes the
+# response schema-valid JSON by construction: the API constrains decoding,
+# so the prose-mode failure class is structurally impossible. The repair
+# parser stays as the safety net for max_tokens truncation (still possible)
+# and for the text-mode fallback below.
+#
+# Schema rules (API): every object must set additionalProperties: false and
+# enumerate its keys. All fields are optional so the model can return either
+# the full extraction shape or the alternate {"no_floor_plans_found": ...}
+# shape the prompt allows.
+
+# Plain (non-nullable) leaf types: the API rejected nullable unions on
+# every field ("compiled grammar is too large") — ~100 type unions double
+# every grammar branch. The prompt's template already shows concrete
+# zero/empty defaults, so the model emits 0 / "" / false for unknowns.
+_SO_NUM = {"type": "number"}
+_SO_STR = {"type": "string"}
+_SO_BOOL = {"type": "boolean"}
+_SO_STR_ARR = {"type": "array", "items": {"type": "string"}}
+
+
+def _so_obj(props, nullable=False):
+    # All keys REQUIRED (nullable where unknown): the API caps OPTIONAL
+    # parameters at 24 per schema for grammar compilation, and this schema
+    # has ~100 fields. required+nullable is the standard pattern — the
+    # model emits null for what it can't read instead of omitting keys.
+    return {"type": ["object", "null"] if nullable else "object",
+            "properties": props,
+            "required": list(props.keys()),
+            "additionalProperties": False}
+
+
+# Room item factored out so the per-sheet verification schema (Phase 2.2)
+# can require the exact same room shape the extraction schema produces.
+_SO_ROOM_ITEM = _so_obj({
+    "room_id": _SO_STR,
+    "room_name": _SO_STR,
+    "source_page": _SO_NUM,
+    "source_sheet": _SO_STR,
+    "unit_multiplier": _SO_NUM,
+    "unit_type": _SO_STR,
+    "in_scope": _SO_BOOL,
+    "scope_exclusion_reason": _SO_STR,
+    "dimensions": _so_obj({
+        "length_feet": _SO_NUM,
+        "width_feet": _SO_NUM,
+        "ceiling_height_feet": _SO_NUM,
+        "floor_area_sqft": _SO_NUM,
+        "perimeter_lf": _SO_NUM,
+        "wall_area_sqft": _SO_NUM,
+        "ceiling_area_sqft": _SO_NUM,
+    }),
+    "materials": _so_obj({
+        "walls": _SO_STR,
+        "ceiling": _SO_STR,
+        "ceiling_painted": _SO_BOOL,
+        "base": _SO_STR,
+    }),
+    "elements": _so_obj({
+        "doors_full_paint": _SO_NUM,
+        "doors_hm_panel": _SO_NUM,
+        "doors_frame_only": _SO_NUM,
+        "windows_total": _SO_NUM,
+        "windows_painted_interior": _SO_NUM,
+        "base_trim_lf": _SO_NUM,
+        "stair_sections": _SO_NUM,
+        "gyp_between_stairs_sqft": _SO_NUM,
+        "level_5_finish_sqft": _SO_NUM,
+        "concrete_floor_sqft": _SO_NUM,
+        "painted_columns_ea": _SO_NUM,
+        "wallcovering_sqft": _SO_NUM,
+        "stained_wood_sqft": _SO_NUM,
+        "soffit_sqft": _SO_NUM,
+        "painted_railing_lf": _SO_NUM,
+    }),
+    "notes": _SO_STR,
+})
+
+_EXTRACTION_OUTPUT_SCHEMA = _so_obj({
+    "project_info": _so_obj({
+        "total_floors_analyzed": _SO_NUM,
+        "total_rooms_found": _SO_NUM,
+        "scale_notation": _SO_STR,
+        "building_type": _SO_STR,
+        "total_stories": _SO_NUM,
+        "total_units": _SO_NUM,
+        "footprint_sqft": _SO_NUM,
+        # prevailing_wage omitted: the dedicated document-level PW scan
+        # populates project_info.prevailing_wage; will_synthesis falls back
+        # gracefully when the main extraction lacks it. (Grammar budget:
+        # the API caps total schema properties at ~70.)
+    }),
+    "floors": {"type": "array", "items": _so_obj({
+        "floor_name": _SO_STR,
+        "rooms": {"type": "array", "items": _SO_ROOM_ITEM},
+    })},
+    # aggregated_totals intentionally OMITTED from the schema: the model's
+    # totals are recomputed from rooms by _recalculate_totals anyway, and
+    # the 23-key object pushed the compiled grammar over the API's size
+    # limit. additionalProperties:false means the model simply won't emit
+    # it; downstream .get("aggregated_totals") defaults handle absence.
+    "exterior": _so_obj({
+        "cornice_lf": _SO_NUM,
+        "window_trim_lf": _SO_NUM,
+        "soffit_sqft": _SO_NUM,
+        "railing_lf": _SO_NUM,
+        "lift_required": _SO_BOOL,
+        "interior_lift_required": _SO_BOOL,
+        "exterior_paint_sqft": _SO_NUM,
+        "hardie_siding_sqft": _SO_NUM,
+        "azek_trim_lf": _SO_NUM,
+        "corner_board_lf": _SO_NUM,
+        "steel_lintel_lf": _SO_NUM,
+        "exterior_siding_type": _SO_STR,
+        "notes": _SO_STR,
+    }),
+    "notes": _SO_STR_ARR,
+    # Alternate shape: the prompt instructs the model to return this when
+    # the PDF contains no floor plans.
+    "no_floor_plans_found": _SO_BOOL,
+    "no_detailed_floor_plans_found": _SO_BOOL,
+    "pages_reviewed": _SO_STR,
+    "has_door_schedule": _SO_BOOL,
+    "has_window_schedule": _SO_BOOL,
+})
+
+# Kill switch: if the API ever rejects the schema (400 naming output_config/
+# schema/format), flip to text mode for the rest of the process instead of
+# failing every call. The repair parser handles text mode as before.
+_STRUCTURED_OUTPUTS_BROKEN = False
+
+
+def _structured_outputs_enabled():
+    if _STRUCTURED_OUTPUTS_BROKEN:
+        return False
+    return os.environ.get("NIGHTSHIFT_STRUCTURED_OUTPUTS", "1").strip() not in (
+        "0", "false", "False")
+
+
+def _extraction_output_kwargs():
+    """Extra kwargs for messages.stream() on extraction calls: schema-
+    enforced JSON output when enabled, nothing otherwise."""
+    if not _structured_outputs_enabled():
+        return {}
+    return {"output_config": {
+        "format": {"type": "json_schema", "schema": _EXTRACTION_OUTPUT_SCHEMA},
+    }}
+
+
+def _maybe_disable_structured_outputs(exc):
+    """If `exc` is the API rejecting our output schema, flip the kill
+    switch (process-wide) and return True so the caller can retry the
+    call in text mode instead of failing the chunk/batch."""
+    global _STRUCTURED_OUTPUTS_BROKEN
+    if _STRUCTURED_OUTPUTS_BROKEN:
+        return False
+    msg = str(exc).lower()
+    if isinstance(exc, anthropic.BadRequestError) and any(
+            t in msg for t in ("output_config", "json_schema", "schema",
+                               "output format", "structured")):
+        _STRUCTURED_OUTPUTS_BROKEN = True
+        print("   ⚠️  API rejected the structured-output schema — falling "
+              "back to text mode for the rest of this run "
+              f"({str(exc)[:160]})")
+        return True
+    return False
+
+
+# Cache the static extraction prompt across calls/passes/retries. The
+# prompt is several thousand tokens and was re-sent at full price on every
+# chunk of every pass (~200 calls/job). 1h TTL covers a full multi-pass
+# run; write cost is 2x but a single re-read pays it back.
+_PROMPT_CACHE_CONTROL = {"type": "ephemeral", "ttl": "1h"}
+
+
+class TruncatedResponseError(Exception):
+    """The model's response hit max_tokens and was cut off mid-output.
+
+    Before this existed, truncated chunk responses were recorded as
+    "succeeded" and silently died at JSON-parse time inside the merge —
+    an entire chunk's floors vanished with no log, no chunks_failed entry,
+    and no manual-review flag. Raised by the streaming call sites when
+    stop_reason == "max_tokens" so the chunk-failure ladder can route the
+    chunk to page-level retry (single pages produce small responses that
+    cannot truncate). Resending the identical chunk is pointless at
+    temperature 0 — it truncates again.
+    """
+
+    def __init__(self, message, partial_text=""):
+        super().__init__(message)
+        # The text received before the cutoff — a repair-parse of this
+        # often recovers most of the batch's rooms (see
+        # _parse_json_response), which beats discarding the whole batch.
+        self.partial_text = partial_text
+
+
+def _collect_stream_text(stream, label=""):
+    """Drain a messages.stream() text stream and return the full text.
+
+    Raises TruncatedResponseError (carrying the partial text) when the
+    response stopped on max_tokens — every call site used to treat a
+    cut-off response as a success and let it die silently at JSON-parse
+    time. Use inside the `with client.messages.stream(...) as stream:`
+    block.
+    """
+    parts = []
+    for text in stream.text_stream:
+        parts.append(text)
+    final_msg = stream.get_final_message()
+    joined = "".join(parts)
+    if getattr(final_msg, "stop_reason", None) == "max_tokens":
+        raise TruncatedResponseError(
+            f"Response truncated at max_tokens"
+            f"{' (' + label + ')' if label else ''} — "
+            f"{len(joined)} chars received",
+            partial_text=joined,
+        )
+    return joined
+
+
+def _repair_truncated_json(candidate):
+    """Best-effort close-out of a JSON object cut off mid-output.
+
+    Walks the text once tracking string/escape/nesting state and records
+    every position where a container ({...} or [...]) closed, along with
+    the closers still open at that point. A truncated response is then
+    repaired by cutting back to the deepest such safe point and appending
+    the missing closers — dangling fragments like a half-written room
+    object or a key with no value are discarded rather than poisoning the
+    parse. Yields candidate repairs from deepest cut to shallowest, or []
+    when the input is hopeless.
+    """
+    start = candidate.find("{")
+    if start < 0:
+        return []
+    s = candidate[start:]
+    stack = []
+    in_str = False
+    escape = False
+    safe_points = []  # (index_after_close, closers_for_open_stack)
+    for i, ch in enumerate(s):
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            if in_str:
+                escape = True
+            continue
+        if ch == '"':
+            in_str = not in_str
+            continue
+        if in_str:
+            continue
+        if ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]":
+            if stack:
+                stack.pop()
+            safe_points.append((i + 1, "".join(reversed(stack))))
+    if not safe_points:
+        return []
+    if not stack:
+        return [s]  # already balanced
+    attempts = []
+    # Deepest cut first; cap the number of fallbacks so a pathological
+    # input can't turn this into an O(n^2) parse loop.
+    for idx_after, closers in reversed(safe_points[-25:]):
+        attempts.append(s[:idx_after].rstrip().rstrip(",") + closers)
+    return attempts
+
+
+def _parse_json_response(text, context=""):
+    """Extract and parse the JSON object from a model response.
+
+    Replaces the bare `re.search(r'\\{.*\\}') + json.loads` pattern that
+    silently dropped entire batches/chunks on any imperfection. Tries, in
+    order: direct parse, fenced ```json block, greedy brace span,
+    trailing-comma repair, and truncation close-out repair. Returns a
+    dict, or None after logging the failure (callers decide whether None
+    is a batch failure).
+    """
+    if not text:
+        return None
+
+    def _try(s):
+        try:
+            obj = json.loads(s)
+            return obj if isinstance(obj, dict) else None
+        except (json.JSONDecodeError, TypeError, ValueError):
+            return None
+
+    # 1. Direct parse (response is pure JSON)
+    obj = _try(text.strip())
+    if obj is not None:
+        return obj
+    # 2. Fenced code block
+    fence = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", text, re.DOTALL)
+    if fence:
+        obj = _try(fence.group(1))
+        if obj is not None:
+            return obj
+    # 3. Greedy brace span (legacy behavior)
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    candidate = m.group() if m else text
+    obj = _try(candidate)
+    if obj is not None:
+        return obj
+    # 4. Trailing-comma repair (the most common model slip)
+    obj = _try(re.sub(r",\s*([}\]])", r"\1", candidate))
+    if obj is not None:
+        return obj
+    # 5. Truncation close-out repair (response cut off mid-output)
+    for repaired in _repair_truncated_json(text):
+        obj = _try(repaired) or _try(re.sub(r",\s*([}\]])", r"\1", repaired))
+        if obj is not None:
+            print(f"   🩹 JSON repair recovered a truncated/malformed "
+                  f"response{' (' + context + ')' if context else ''} "
+                  f"({len(text)} chars in)")
+            return obj
+    print(f"   ⚠️  JSON parse failed after all repair attempts"
+          f"{' (' + context + ')' if context else ''} — "
+          f"{len(text)} chars, head: {text[:80]!r}")
+    return None
+
+
+class CoverageLedger:
+    """Per-page accounting for every uploaded PDF: each page must end the
+    run in exactly one state, and the result carries the proof.
+
+    States (upgrade-only precedence, left to right):
+        unaccounted -> failed -> excluded -> degraded -> measured
+    A page marked failed by one pass that a later retry/pass measures is
+    upgraded to measured; nothing ever silently downgrades. The 2026-06
+    review found ~10 independent code paths that dropped pages with only
+    a console print as the record — this ledger is the machine-readable
+    replacement, and _apply_coverage_gate() blocks auto-send when a page
+    ends the run failed.
+
+    v1 gate policy: FAILED pages block (manual review + RFI naming
+    file:pages). UNACCOUNTED pages are reported in the coverage summary
+    but do not block — not every measuring path is wired yet, and a
+    false block on every job would train users to ignore the gate. The
+    target end-state (Phase 2) is unaccounted == 0 asserted.
+    """
+
+    _RANK = {"unaccounted": 0, "failed": 1, "excluded": 2,
+             "degraded": 3, "measured": 4}
+
+    def __init__(self):
+        self.files = {}  # abspath -> {name, total_pages, pages: {idx0: {state, reason}}}
+
+    def register_file(self, pdf_path):
+        key = os.path.abspath(pdf_path)
+        if key in self.files:
+            return
+        total = 0
+        try:
+            total = len(PyPDF2.PdfReader(pdf_path).pages)
+        except Exception:
+            try:
+                import fitz
+                doc = fitz.open(pdf_path)
+                total = len(doc)
+                doc.close()
+            except Exception:
+                total = 0
+        self.files[key] = {
+            "name": os.path.basename(pdf_path),
+            "total_pages": total,
+            "pages": {i: {"state": "unaccounted", "reason": ""}
+                      for i in range(total)},
+        }
+
+    def _entry(self, pdf_path):
+        key = os.path.abspath(pdf_path)
+        if key not in self.files:
+            # Match stored files by basename too — retries sometimes hand
+            # back a copied/temp path for the same upload.
+            base = os.path.basename(str(pdf_path))
+            for k, v in self.files.items():
+                if v["name"] == base:
+                    return v
+            return None
+        return self.files[key]
+
+    def mark(self, pdf_path, page_idx0, state, reason=""):
+        """Upgrade-only mark of one 0-based ORIGINAL-pdf page index."""
+        entry = self._entry(pdf_path)
+        if entry is None:
+            return
+        try:
+            page_idx0 = int(page_idx0)
+        except (TypeError, ValueError):
+            return
+        rec = entry["pages"].get(page_idx0)
+        if rec is None:
+            return
+        if self._RANK.get(state, -1) > self._RANK.get(rec["state"], 0):
+            rec["state"] = state
+            rec["reason"] = reason
+
+    def mark_pages(self, pdf_path, page_idxs0, state, reason=""):
+        for i in page_idxs0 or []:
+            self.mark(pdf_path, i, state, reason)
+
+    def mark_file(self, pdf_path, state, reason=""):
+        entry = self._entry(pdf_path)
+        if entry is None:
+            return
+        for i in entry["pages"]:
+            self.mark(pdf_path, i, state, reason)
+
+    def summary(self):
+        out = {"files": [], "totals": {s: 0 for s in self._RANK}}
+        for v in self.files.values():
+            counts = {s: 0 for s in self._RANK}
+            failed_pages = []
+            unaccounted_pages = []
+            for idx in sorted(v["pages"]):
+                st = v["pages"][idx]["state"]
+                counts[st] += 1
+                if st == "failed":
+                    failed_pages.append(idx + 1)   # report 1-based
+                elif st == "unaccounted":
+                    unaccounted_pages.append(idx + 1)
+            for s, c in counts.items():
+                out["totals"][s] += c
+            out["files"].append({
+                "file": v["name"],
+                "total_pages": v["total_pages"],
+                "counts": counts,
+                "failed_pages": failed_pages,
+                "unaccounted_pages": unaccounted_pages,
+            })
+        out["total_pages"] = sum(v["total_pages"] for v in self.files.values())
+        return out
+
+
+# Module-level current ledger, set by run_analysis for the duration of a
+# job (the codebase's established pattern for cross-call state — see
+# _pending_chunks / _page_index_map). None outside a run: every mark call
+# is guarded so library use of individual functions stays unaffected.
+_COVERAGE_LEDGER = None
+
+
+def _ledger_mark(pdf_path, page_idxs0, state, reason=""):
+    """Convenience guard: no-op when no ledger is active."""
+    if _COVERAGE_LEDGER is not None and pdf_path:
+        _COVERAGE_LEDGER.mark_pages(pdf_path, page_idxs0, state, reason)
+
+
+def _apply_coverage_gate(analysis, ledger):
+    """Attach the coverage summary to the analysis and BLOCK auto-send
+    when any page ended the run failed.
+
+    The proposal gets one honest line ("120 pages: 96 measured, 21
+    excluded, 3 failed"); failed pages force manual_review_required and
+    an RFI naming the exact file:pages so a short estimate can never ship
+    silently.
+    """
+    if ledger is None or not ledger.files:
+        return analysis
+    s = ledger.summary()
+    analysis["coverage"] = s
+    t = s["totals"]
+    cov_line = (f"{s['total_pages']} page(s) across {len(s['files'])} file(s): "
+                f"{t['measured']} measured, {t['excluded']} excluded "
+                f"(non-paint disciplines), {t['degraded']} degraded, "
+                f"{t['failed']} FAILED, {t['unaccounted']} untracked")
+    analysis.setdefault("notes", []).append(f"[Coverage] {cov_line}.")
+    print(f"   📋 Coverage: {cov_line}")
+
+    if t["failed"] > 0:
+        detail = "; ".join(
+            f"{f['file']} p.{','.join(str(p) for p in f['failed_pages'][:20])}"
+            f"{'…' if len(f['failed_pages']) > 20 else ''}"
+            for f in s["files"] if f["failed_pages"])
+        analysis["manual_review_required"] = True
+        reason = (f"{t['failed']} page(s) could not be analyzed and are "
+                  f"MISSING from this estimate: {detail}")
+        if analysis.get("manual_review_reason"):
+            analysis["manual_review_reason"] = (
+                str(analysis["manual_review_reason"]) + " | " + reason)
+        else:
+            analysis["manual_review_reason"] = reason
+        analysis.setdefault("notes", []).append(
+            f"[Coverage] {reason} RFI REQUIRED: re-run or re-supply these "
+            f"pages before relying on this estimate — no quantities from "
+            f"them are priced.")
+    return analysis
 
 
 def _release_memory(label=""):
@@ -173,10 +703,34 @@ EXPECTED_ROOMS_PER_UNIT = {
     "3br":    {"total_rooms": 11, "secondary": [("closet", 3), ("walk_in_closet", 1), ("entry_hall", 1), ("unit_hall", 1)]},
 }
 
-# Footprint-based estimation constants (calibrated to Rider Painting / Chestnut)
-# Paintable residential unit area as fraction of gross floor area.
-# Excludes corridors, mechanical, structure, retail — which are NOT painted.
-RESIDENTIAL_EFFICIENCY = 0.63
+# Footprint-based estimation constants. Two efficiency values are kept because
+# the painter's scope of work determines which one applies:
+#
+#  * RESIDENTIAL_EFFICIENCY_UNITS_ONLY (0.63) — apartments only, commons
+#    NOT painted. Original Rider Painting / Chestnut calibration, valid for
+#    projects where corridors, lobbies, common rooms are out of scope.
+#
+#  * RESIDENTIAL_EFFICIENCY_FULL_INTERIOR (0.97) — apartments PLUS painted
+#    commons (corridors, lobbies, common rooms, common baths, laundry).
+#    Validated against KonstructIQ's Ridgeview takeoff (42,923 SF ceiling =
+#    100% of GSF since Rider painted all commons there) and Rider's manual
+#    measurement of 42,900 SF on the same project. Use this for supportive
+#    housing, dorms, and projects whose finish schedule shows painted GYP
+#    on corridor/lobby/common-area ceilings.
+#
+# The default is FULL_INTERIOR because (a) most NY supportive housing /
+# multifamily projects we see do paint commons, and (b) the failure mode of
+# the FULL value being wrong (bid runs ~30% high, gets adjusted in review)
+# is recoverable, while the failure mode of UNITS_ONLY being wrong
+# (Ridgeview's 24% under-bid, hard to detect from the proposal alone) is
+# not. Per-org override via project_info['_residential_efficiency'] or
+# pricing_overrides.residential_efficiency.
+RESIDENTIAL_EFFICIENCY_UNITS_ONLY = 0.63
+RESIDENTIAL_EFFICIENCY_FULL_INTERIOR = 0.97
+RESIDENTIAL_EFFICIENCY = RESIDENTIAL_EFFICIENCY_UNITS_ONLY  # legacy alias
+                                                            # (footprint
+                                                            # fallback only)
+# Wall sqft per ceiling/floor sqft — accounts for interior partitions
 # Wall sqft per ceiling/floor sqft — accounts for interior partitions
 # (closets, bathrooms, hallways within units).
 WALL_TO_FLOOR_RATIO = 3.3
@@ -368,7 +922,8 @@ def _split_pdf_from_plan(pdf_path, chunk_plan):
     return results
 
 
-def _retry_chunk_without_bad_pages(chunk_path, call_api_fn, chunk_label=""):
+def _retry_chunk_without_bad_pages(chunk_path, call_api_fn, chunk_label="",
+                                   dropped_pages_out=None):
     """
     When a multi-page chunk fails with 'Could not process PDF', test each
     page individually, discard bad pages, reassemble the good ones, and retry.
@@ -377,10 +932,21 @@ def _retry_chunk_without_bad_pages(chunk_path, call_api_fn, chunk_label=""):
         chunk_path:   Path to the chunk PDF that failed.
         call_api_fn:  Callable(base64_str, label="") -> response_text.
         chunk_label:  Human-readable label for logging.
+        dropped_pages_out: optional list; 1-based (chunk-relative) page
+                      numbers that were permanently removed are appended so
+                      the caller can record them in _chunk_tracking instead
+                      of the drop existing only in console output.
 
     Returns:
         str or None — API response text from the cleaned chunk,
                       or None if no good pages remain.
+
+    Error taxonomy (the old behavior marked a page bad on ANY exception —
+    a 2-second network blip during the probe permanently deleted a page
+    from the takeoff): only BadRequestError means the page content itself
+    is unprocessable. Every other exception is about the connection or the
+    response, not the page — the page is KEPT (untested) and the
+    reassembled-chunk call exercises it again with its own retry logic.
     """
     try:
         reader = PyPDF2.PdfReader(chunk_path)
@@ -391,6 +957,8 @@ def _retry_chunk_without_bad_pages(chunk_path, call_api_fn, chunk_label=""):
     total_pages = len(reader.pages)
     if total_pages <= 1:
         print(f"   ⚠️  Single-page chunk failed — skipping this page")
+        if dropped_pages_out is not None and total_pages == 1:
+            dropped_pages_out.append(1)
         return None
 
     print(f"   🔍 {chunk_label}: Testing {total_pages} pages individually ...")
@@ -421,14 +989,17 @@ def _retry_chunk_without_bad_pages(chunk_path, call_api_fn, chunk_label=""):
             print(f"      Page {i+1}: ✅")
 
         except anthropic.BadRequestError:
+            # The API rejected the page content itself — genuinely bad.
             bad_page_nums.append(i + 1)
             print(f"      Page {i+1}: ❌ skipped (unreadable)")
 
         except Exception as e:
-            # Non-PDF error (rate limit, network, overloaded) — skip page
-            # rather than crashing entire file analysis
-            bad_page_nums.append(i + 1)
-            print(f"      Page {i+1}: ⚠️  skipped ({type(e).__name__}: {str(e)[:80]})")
+            # Transient/connection/truncation error — NOT evidence the page
+            # is bad. Keep it; the reassembled chunk call retries transients
+            # internally. (Old behavior dropped the page here permanently.)
+            good_pages.append((i, reader.pages[i]))
+            print(f"      Page {i+1}: ⚠️  probe inconclusive, keeping page "
+                  f"({type(e).__name__}: {str(e)[:80]})")
 
         finally:
             if single_path:
@@ -439,6 +1010,8 @@ def _retry_chunk_without_bad_pages(chunk_path, call_api_fn, chunk_label=""):
 
     if bad_page_nums:
         print(f"   🗑️  Removed bad pages: {bad_page_nums}")
+        if dropped_pages_out is not None:
+            dropped_pages_out.extend(bad_page_nums)
 
     if not good_pages:
         print(f"   ⚠️  No usable pages remain in {chunk_label}")
@@ -463,11 +1036,16 @@ def _retry_chunk_without_bad_pages(chunk_path, call_api_fn, chunk_label=""):
         result = call_api_fn(clean_b64, label=f"Retrying cleaned {chunk_label} ({len(clean_b64)/1024:.0f} KB)")
         return result
 
-    except anthropic.BadRequestError as e:
+    except (anthropic.BadRequestError, TruncatedResponseError) as e:
+        # BadRequest: cleaned chunk still unprocessable as a whole.
+        # Truncated: combined output overflows max_tokens (the reason the
+        # chunk was routed here in the first place) — per-page responses
+        # are individually small and cannot truncate.
         print(f"   ⚠️  Cleaned chunk still fails — {e}")
         # Last resort: send each page individually and combine results
         print(f"   🔄 Falling back to single-page processing for {chunk_label}")
         page_results = []
+        recovered_page_nums = []
         for i, (page_idx, page_obj) in enumerate(good_pages):
             single_writer = PyPDF2.PdfWriter()
             single_writer.add_page(page_obj)
@@ -481,8 +1059,11 @@ def _retry_chunk_without_bad_pages(chunk_path, call_api_fn, chunk_label=""):
                 result = call_api_fn(single_b64,
                     label=f"  Page {page_idx+1} individually ({len(single_b64)/1024:.0f} KB)")
                 page_results.append(result)
+                recovered_page_nums.append(page_idx + 1)
             except Exception as page_err:
                 print(f"      Page {page_idx+1}: ❌ {page_err}")
+                if dropped_pages_out is not None:
+                    dropped_pages_out.append(page_idx + 1)
             finally:
                 if single_tmp:
                     try:
@@ -491,7 +1072,14 @@ def _retry_chunk_without_bad_pages(chunk_path, call_api_fn, chunk_label=""):
                         pass
         if page_results:
             print(f"   ✅ Recovered {len(page_results)}/{len(good_pages)} pages individually")
-            return "\n".join(page_results)
+            if len(page_results) == 1:
+                return page_results[0]
+            # Merge into ONE valid JSON document. The old "\n".join produced
+            # concatenated JSON objects that the downstream regex+json.loads
+            # could never parse — the whole recovered chunk then silently
+            # dropped at merge time, defeating this entire fallback.
+            return _merge_chunk_responses(page_results,
+                                          page_offsets=recovered_page_nums)
         return None
 
     finally:
@@ -545,6 +1133,11 @@ def _load_pdf_for_api(pdf_path, _client_for_validation=None):
         if excluded and kept > 0:
             print(f"   🔍 Page filter: {kept}/{total} pages are painting-relevant")
             print(f"      Excluded: {len(excluded)} pages ({_summarize_excluded(excluded)})")
+            if _COVERAGE_LEDGER is not None:
+                for c in excluded:
+                    _ledger_mark(pdf_path, [c.get('page_index')], "excluded",
+                                 str(c.get('reason') or c.get('discipline') or
+                                     'discipline filter'))
 
             # Build page index mapping: filtered_index → original_index
             page_indices = [c['page_index'] for c in included]
@@ -774,9 +1367,11 @@ def _detect_index_pages(pdf_path):
 
         is_index = any(kw in text_lower for kw in _INDEX_KEYWORDS)
 
-        # Also check for high density of sheet number patterns (A-101, A-102, etc.)
-        # which indicates a drawing index even without explicit "drawing index" title
-        sheet_refs = re.findall(r'[A-Z]{1,2}\s*[-.]?\s*\d{2,3}', text)
+        # Also check for high density of sheet number patterns (A-101, A1.02, etc.)
+        # which indicates a drawing index even without explicit "drawing index" title.
+        # Accept both the 3-digit convention (A101) and the dotted convention (A1.02);
+        # require the dot for short numbers so bare "A1" mentions aren't counted.
+        sheet_refs = re.findall(r'[A-Z]{1,2}\s*[-.]?\s*(?:\d{2,3}|\d{1,2}\.\d{1,2})', text)
         if len(sheet_refs) >= 10:
             is_index = True
 
@@ -1228,14 +1823,60 @@ def _classify_pdf_pages(pdf_path):
     return classifications
 
 
-def _detect_finish_schedule(pdf_path):
-    """Zero-API-cost detector: scan a PDF's page text for a Room Finish
-    Schedule table.
+# Excluded patterns that mark a hit as a cross-reference, not a schedule
+# sheet title. "A13 Finish Schedule & Details" on a sheet-index list looks
+# like a finish-schedule mention but isn't the schedule itself. The "&
+# details/detail" suffix is the giveaway because Coppola-style schedule
+# sheets are named e.g. "FINISH SCHEDULE & DETAILS" in the title block but
+# the SPAN extracted from the rotated title block contains JUST the title
+# phrase ("FINISH SCHEDULE"), while the T1-style sheet-list reference
+# extracts as a longer span that pulls in the sheet number and ampersand.
+_SCHEDULE_REFERENCE_EXCLUDES = ("& detail", "& details", "see sheet",
+                                "see drawing", "refer to sheet")
 
-    Returns True if one is found, False if the PDF was scanned and none was
-    found, or None if the PDF could not be scanned (PyMuPDF unavailable or a
-    read error). Mirrors the door/window-schedule flags so a project that
-    actually includes a finish schedule is not RFI'd as if one is missing.
+
+def _has_schedule_sheet_title(page, title_phrases, excludes=_SCHEDULE_REFERENCE_EXCLUDES):
+    """Return True if any text span on the page contains a title phrase as
+    a standalone sheet title (not a cross-reference in a list).
+
+    PyMuPDF's "dict" extraction gives us spans, not just concatenated text.
+    A schedule sheet's title block emits a span like 'FINISH SCHEDULE';
+    a sheet-index list entry on T1 emits 'A13 Finish Schedule & Details'.
+    Filtering on excluded suffixes ("& details") cleanly separates them.
+    """
+    title_l = [p.lower() for p in title_phrases]
+    excl_l = [e.lower() for e in excludes]
+    try:
+        d = page.get_text("dict")
+    except Exception:
+        return False
+    for block in d.get("blocks", []):
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                txt = (span.get("text") or "").strip().lower()
+                if not txt:
+                    continue
+                if not any(p in txt for p in title_l):
+                    continue
+                if any(e in txt for e in excl_l):
+                    continue
+                return True
+    return False
+
+
+def _detect_schedule_in_pdf(pdf_path, title_phrases, table_tokens=()):
+    """Generic schedule detector. Two passes per page:
+      1. Span-level: title phrase appears as a standalone sheet title.
+         Works when the schedule table itself is vector art (no extractable
+         text inside the table) — the only thing PyMuPDF sees is the
+         rotated title-block span. Catches Coppola's A12 (DOOR SCHEDULE),
+         A13 (FINISH SCHEDULE), etc.
+      2. Concatenated-text + table_tokens: title phrase appears anywhere
+         AND 2+ column-header tokens appear. Works for projects where the
+         schedule table content is real PDF text. Kept for back-compat
+         with the projects this function was originally tuned for.
+
+    Returns True / False if scanned, None if the PDF could not be opened.
     """
     try:
         import fitz  # PyMuPDF
@@ -1246,25 +1887,55 @@ def _detect_finish_schedule(pdf_path):
     except Exception:
         return None
     try:
-        # A page that NAMES a finish schedule/legend...
-        TITLE_PHRASES = ("room finish schedule", "finish schedule",
-                         "interior finish schedule", "finish legend",
-                         "room finish legend")
-        # ...AND carries finish-table column headers is the schedule itself.
-        # Requiring 2+ strong headers keeps a stray "see finish schedule"
-        # callout on a floor plan from tripping the detector.
-        TABLE_TOKENS = ("wall finish", "ceiling finish", "base finish",
-                        "floor finish", "room finish", "room name",
-                        "room no", "room number")
         for page in doc:
-            t = page.get_text().lower()
-            if not any(p in t for p in TITLE_PHRASES):
-                continue
-            if sum(1 for tok in TABLE_TOKENS if tok in t) >= 2:
+            if _has_schedule_sheet_title(page, title_phrases):
                 return True
+            if table_tokens:
+                t = page.get_text().lower()
+                if any(p.lower() in t for p in title_phrases) \
+                        and sum(1 for tok in table_tokens if tok in t) >= 2:
+                    return True
         return False
     finally:
         doc.close()
+
+
+_FINISH_TITLE_PHRASES = ("room finish schedule", "finish schedule",
+                         "interior finish schedule", "finish legend",
+                         "room finish legend")
+_FINISH_TABLE_TOKENS = ("wall finish", "ceiling finish", "base finish",
+                        "floor finish", "room finish", "room name",
+                        "room no", "room number")
+_DOOR_TITLE_PHRASES = ("door schedule", "door & window schedule",
+                       "door and window schedule", "door schedule:")
+_DOOR_TABLE_TOKENS = ("door no", "door number", "door type", "door size",
+                      "frame type", "hardware set", "fire rating",
+                      "head detail", "jamb detail")
+_WINDOW_TITLE_PHRASES = ("window schedule", "window & door schedule",
+                         "glazing schedule", "window schedule:")
+_WINDOW_TABLE_TOKENS = ("window no", "window number", "window type",
+                        "window mark", "rough opening", "unit size",
+                        "glazing type", "sill height")
+
+
+def _detect_finish_schedule(pdf_path):
+    """Detect a Room Finish Schedule in the PDF (text-only, no API calls).
+    See _detect_schedule_in_pdf for the dual-pass strategy.
+    """
+    return _detect_schedule_in_pdf(pdf_path, _FINISH_TITLE_PHRASES,
+                                   _FINISH_TABLE_TOKENS)
+
+
+def _detect_door_schedule(pdf_path):
+    """Detect a Door Schedule in the PDF (text-only, no API calls)."""
+    return _detect_schedule_in_pdf(pdf_path, _DOOR_TITLE_PHRASES,
+                                   _DOOR_TABLE_TOKENS)
+
+
+def _detect_window_schedule(pdf_path):
+    """Detect a Window Schedule in the PDF (text-only, no API calls)."""
+    return _detect_schedule_in_pdf(pdf_path, _WINDOW_TITLE_PHRASES,
+                                   _WINDOW_TABLE_TOKENS)
 
 
 def _set_finish_schedule_flag(analysis, pdf_paths):
@@ -1294,10 +1965,222 @@ def _set_finish_schedule_flag(analysis, pdf_paths):
               f"{'found in upload' if found else 'none found'}")
 
 
+def _set_door_schedule_flag(analysis, pdf_paths):
+    """Set analysis['has_door_schedule'] from a zero-cost PDF text scan.
+
+    Honors an upstream True from LLM extraction. Only flips False -> True
+    when the text scan finds explicit evidence (the LLM is the source of
+    truth when it has actually read the page). The LLM is wrong often
+    enough on schedule-sheet recognition for Coppola-style projects that
+    a text-based safety net is worth running unconditionally.
+    """
+    if analysis.get("has_door_schedule") is True:
+        return
+    for p in pdf_paths or []:
+        d = _detect_door_schedule(p)
+        if d:
+            analysis["has_door_schedule"] = True
+            print("   🚪 Door schedule detection: found in upload "
+                  "(text-scan override)")
+            return
+
+
+def _set_window_schedule_flag(analysis, pdf_paths):
+    """Set analysis['has_window_schedule'] from a zero-cost PDF text scan.
+    Mirrors _set_door_schedule_flag.
+    """
+    if analysis.get("has_window_schedule") is True:
+        return
+    for p in pdf_paths or []:
+        d = _detect_window_schedule(p)
+        if d:
+            analysis["has_window_schedule"] = True
+            print("   🪟 Window schedule detection: found in upload "
+                  "(text-scan override)")
+            return
+
+
 def _normalize_sheet_token(s):
     """Normalize a sheet number for comparison: uppercase, drop separators.
     'A-101' / 'A 101' / 'A1.01' all normalize to 'A101'."""
     return re.sub(r'[^A-Z0-9]', '', str(s).upper())
+
+
+def _detect_sheet_id_on_page(page, known_prefixes):
+    """Return the most likely sheet ID rendered on this page's title block,
+    or None if undetectable. Picks raw text (not normalized) so the caller
+    can preserve the architect's convention.
+
+    Strategy: look at every text span, keep ones that are either rotated
+    (vertical-running text, typical of architectural title-block sidebars)
+    or rendered at >=24pt (sheet numbers are usually the largest text on
+    a page). Filter to spans matching _SHEET_NUMBER_RE with a known
+    discipline prefix. If multiple candidates remain, pick the largest
+    (the actual sheet number is bigger than any cross-reference callouts).
+
+    Tested against Coppola's Ridgeview set (14 sheets, T1 + A1..A13): the
+    old bottom-strip clip approach missed 5 of 14 pages because Coppola's
+    title block lives in a rotated right-edge strip whose y-coordinates
+    extend past page.height; the new approach identifies all 14.
+    """
+    try:
+        d = page.get_text("dict")
+    except Exception:
+        return None
+    best = None  # (size, raw_id)
+    for block in d.get("blocks", []):
+        for line in block.get("lines", []):
+            dir_ = line.get("dir", (1.0, 0.0))
+            is_rotated = abs(dir_[1]) > 0.5
+            for span in line.get("spans", []):
+                txt = (span.get("text", "") or "").strip()
+                if not txt or len(txt) > 8:
+                    continue
+                size = span.get("size", 0) or 0
+                if not (is_rotated or size >= 24):
+                    continue
+                for m in _SHEET_NUMBER_RE.finditer(txt):
+                    prefix = m.group(1).upper()
+                    if not any(prefix == p or prefix.startswith(p)
+                               for p in known_prefixes):
+                        continue
+                    raw = prefix + m.group(2)
+                    if best is None or size > best[0]:
+                        best = (size, raw)
+    return best[1] if best else None
+
+
+def _build_page_to_sheet_map(pdf_paths):
+    """Return {(pdf_path, page_idx_0based): raw_sheet_id} for every page
+    where a sheet ID is detectable. raw_sheet_id is the EXACT string from
+    the title block (not normalized) so source_sheet substitutions preserve
+    the architect's convention.
+
+    Used by _canonicalize_source_sheets to override LLM-emitted source_sheet
+    values that don't match what's actually printed on the page.
+    """
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        return {}
+    known_prefixes = tuple(dp for dp, _, _ in _DISCIPLINE_MAP)
+    out = {}
+    for path in pdf_paths or []:
+        try:
+            doc = fitz.open(path)
+        except Exception:
+            continue
+        try:
+            for i, page in enumerate(doc):
+                raw = _detect_sheet_id_on_page(page, known_prefixes)
+                if raw:
+                    out[(path, i)] = raw
+        finally:
+            doc.close()
+    return out
+
+
+def _canonicalize_source_sheets(analysis, pdf_paths):
+    """Override room.source_sheet with the actual sheet ID printed on the
+    page indicated by room.source_page.
+
+    The 2026-05-28 Ridgeview run had the model emit rooms tagged
+    'A-101', 'A-102', 'A-103' (ANSI-style) for what were actually pages
+    on sheets 'A2' and 'A3' (Coppola-style). The downstream pipeline
+    treats different source_sheet strings as different sheets, so the
+    same physical floor plan got extracted twice under two sheet IDs,
+    creating phantom floors. The regex dedup catches the symptom; this
+    pass prevents the bad data from being created in the first place.
+
+    For each room with a numeric source_page, look up the sheet ID
+    actually rendered on that page (via the page→sheet map built from
+    the PDF title blocks). If different from room.source_sheet, override
+    it and stash the original under '_source_sheet_llm' for audit.
+
+    Idempotent via analysis['_source_sheets_canonicalized'].
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if analysis.get("_source_sheets_canonicalized"):
+        return analysis
+
+    page_map = _build_page_to_sheet_map(pdf_paths)
+    if not page_map:
+        analysis["_source_sheets_canonicalized"] = True
+        return analysis
+
+    # Multi-PDF case: each room knows its PDF via bbox.source_pdf. Single-
+    # PDF case (most common): just use the only PDF path. Group page_map
+    # by PDF for fast lookup, and also build a single-PDF fallback.
+    by_pdf = {}
+    for (path, idx), sid in page_map.items():
+        by_pdf.setdefault(path, {})[idx] = sid
+    single_pdf = pdf_paths[0] if (pdf_paths and len(pdf_paths) == 1) else None
+
+    overrides = 0
+    unmapped = 0
+    for floor in analysis.get("floors", []) or []:
+        for room in floor.get("rooms", []) or []:
+            sp = room.get("source_page")
+            if sp is None:
+                continue
+            try:
+                page_idx = int(sp) - 1  # source_page is 1-based
+            except (TypeError, ValueError):
+                continue
+            if page_idx < 0:
+                continue
+            # Find which PDF this room came from. Resolution order:
+            #   1. bbox.source_pdf if that exact path is in by_pdf (live run)
+            #   2. by basename match against by_pdf keys (re-processing a
+            #      stored result where bbox.source_pdf points at a stale
+            #      worker /tmp path that no longer exists)
+            #   3. single PDF fallback when only one was supplied
+            room_pdf = None
+            bbox = room.get("bbox") or {}
+            bbox_path = bbox.get("source_pdf") if isinstance(bbox, dict) else None
+            if bbox_path and bbox_path in by_pdf:
+                room_pdf = bbox_path
+            elif bbox_path:
+                bbox_base = os.path.basename(bbox_path)
+                for k in by_pdf:
+                    if os.path.basename(k) == bbox_base:
+                        room_pdf = k
+                        break
+            if room_pdf is None and single_pdf:
+                room_pdf = single_pdf
+            if room_pdf is None:
+                continue
+            true_sheet = by_pdf.get(room_pdf, {}).get(page_idx)
+            if not true_sheet:
+                unmapped += 1
+                continue
+            current = str(room.get("source_sheet", "") or "").strip()
+            if current == true_sheet:
+                continue
+            # Override — stash original for audit.
+            room["_source_sheet_llm"] = current
+            room["source_sheet"] = true_sheet
+            overrides += 1
+
+    if overrides:
+        note = (f"[Source Sheet Canonicalization] Overrode {overrides} "
+                f"room source_sheet values with the actual sheet IDs "
+                f"printed on the PDF pages. Prevents phantom-floor "
+                f"duplication caused by the LLM emitting normalized / "
+                f"convention-substituted sheet IDs (e.g. 'A-102' for a "
+                f"page actually marked 'A2').")
+        if unmapped:
+            note += f" {unmapped} additional rooms had source_page values " \
+                    f"with no detectable sheet ID in the title block."
+        existing_notes = analysis.get("notes") or []
+        if not isinstance(existing_notes, list):
+            existing_notes = [existing_notes] if existing_notes else []
+        analysis["notes"] = list(existing_notes) + [note]
+        print(f"   🪪 {note}", flush=True)
+
+    analysis["_source_sheets_canonicalized"] = True
+    return analysis
 
 
 def _collect_upload_sheet_numbers(pdf_paths):
@@ -2014,6 +2897,7 @@ def _analyze_page_multimodal(client, pdf_path, page_index, prompt_text,
     content_blocks.append({
         "type": "text",
         "text": prompt_text,
+        "cache_control": _PROMPT_CACHE_CONTROL,
     })
 
     if label:
@@ -2028,10 +2912,17 @@ def _analyze_page_multimodal(client, pdf_path, page_index, prompt_text,
                 temperature=0,
                 timeout=300.0,
                 messages=[{"role": "user", "content": content_blocks}],
+                **_extraction_output_kwargs()
             ) as stream:
-                for text in stream.text_stream:
-                    result_parts.append(text)
-            return "".join(result_parts)
+                try:
+                    return _collect_stream_text(stream, label="multimodal retry")
+                except TruncatedResponseError as _te:
+                    # Salvage: the repair parser downstream recovers most
+                    # rooms from a cut-off response — better than dropping
+                    # the whole chunk.
+                    print("   ✂️  Multimodal retry truncated at max_tokens — "
+                          "salvaging partial response")
+                    return _te.partial_text
         except anthropic.RateLimitError:
             if attempt < max_retries - 1:
                 delay = base_delay * (2 ** attempt)
@@ -2107,6 +2998,1089 @@ def _multimodal_chunk_retry(client, chunk_path, prompt_text, chunk_label=""):
     except Exception as e:
         print(f"   ⚠️  Multi-modal merge failed ({e}) — returning first page only")
         return page_responses[0]
+
+
+# ---------------------------------------------------------------------------
+# Per-sheet anchored extraction (Phase 2.2)
+# ---------------------------------------------------------------------------
+# Replaces the 3x-consensus pipeline (extract everything three times, then
+# majority-vote rooms across passes) with: ONE extraction call per plan
+# sheet + ONE verification call per plan sheet, anchored in the
+# deterministic PyMuPDF text layer. Why (2026-06 review, Part 2):
+#
+#   * Chunked whole-set extraction produces huge outputs that truncate and
+#     parse-fail; per-sheet outputs are small by construction and each
+#     sheet is independently retryable and checkpointable.
+#   * 3x consensus is a majority vote across noisy samples — it DELETES
+#     real rooms (Ridgeview: 54 candidate rooms, 0 matched across passes).
+#     The verification pass is additive-with-evidence instead: rooms are
+#     only ever added (with a text-layer anchor named) or flagged, never
+#     silently dropped.
+#   * Merge becomes a deterministic union keyed by canonical room identity
+#     (building, floor, unit/number, quantized geometry) — sheet ID is
+#     provenance, NOT identity, so the floor-plan and RCP instances of the
+#     same room collide by construction instead of via the gated
+#     commercial-only RCP heuristic.
+#
+# Cost: ~2 calls per plan sheet with the static prompt cached (1h TTL)
+# vs ~3 passes x chunks; roughly 1/3 the API spend on a typical set.
+#
+# Rollout: env-gated, default OFF. Any hard failure returns None and the
+# caller falls back to the legacy chunked path unchanged.
+
+_SHEET_CHECKPOINT_VERSION = 1
+
+
+def _per_sheet_extraction_enabled():
+    return os.environ.get("NIGHTSHIFT_PER_SHEET_EXTRACTION", "0").strip() in (
+        "1", "true", "True")
+
+
+def _sheet_verification_enabled():
+    """Verification pass within per-sheet mode (default on)."""
+    return os.environ.get("NIGHTSHIFT_SHEET_VERIFY", "1").strip() not in (
+        "0", "false", "False")
+
+
+def _sheet_checkpoint_enabled():
+    """Per-sheet result checkpointing within per-sheet mode (default on)."""
+    return os.environ.get("NIGHTSHIFT_SHEET_CHECKPOINT", "1").strip() not in (
+        "0", "false", "False")
+
+
+def _title_text_is_plan_sheet(raw_text):
+    """Classify a page as a plan sheet from its (title-block) text.
+
+    Title-block text survives rasterization even when the drawing itself
+    has no extractable text, so this catches scanned plan sheets the
+    dims/labels signal scores 0 (the Five Below under-extraction cause).
+    """
+    txt = str(raw_text or "").lower()
+    if not txt:
+        return False
+    STRONG_PLAN = (
+        "floor plan", "reflected ceiling", "ceiling plan", "finish plan",
+        "enlarged plan", "fixture plan", "dimension plan", "partition plan",
+        "furniture plan", "equipment plan", "roof plan", "slab plan",
+        "life safety plan", "demolition plan", "overall plan",
+    )
+    NON_PLAN = ("elevation", "section", "detail", "schedule")
+    if any(k in txt for k in STRONG_PLAN):
+        return True
+    # Bare "plan" (e.g. a key/code plan) counts only when the sheet isn't
+    # dominated by elevation/section/detail/schedule content.
+    if "plan" in txt and not any(k in txt for k in NON_PLAN):
+        return True
+    return False
+
+
+_SECTION_DETAIL_TITLE_RE = ("elevation", "section", "detail")
+
+
+def _title_text_is_section_or_detail(raw_text):
+    """True when the sheet's title marks it a section / elevation / detail and
+    NOT a plan. These carry dimension text (section heights, detail callouts)
+    that trips the dims-based plan detector, but their 'rooms' are the SAME
+    spaces seen elsewhere in section/elevation view — extracting them double-
+    counts (2026-06-13 Dutchess: 'Building Section A-300' added 12 rooms /
+    4,261 walls duplicating plan units; Fishkill A300/A301 sections likewise).
+    A sheet that is genuinely a plan (Enlarged Plan, Floor Plan) or that also
+    says 'plan' (e.g. 'Stairwell Plans & Sections') is NOT excluded."""
+    txt = str(raw_text or "").lower()
+    if not txt:
+        return False
+    STRONG_PLAN = (
+        "floor plan", "reflected ceiling", "ceiling plan", "finish plan",
+        "enlarged plan", "fixture plan", "dimension plan", "partition plan",
+        "furniture plan", "equipment plan", "roof plan", "slab plan",
+        "life safety plan", "demolition plan", "overall plan",
+    )
+    if any(k in txt for k in STRONG_PLAN):
+        return False
+    if "plan" in txt:
+        return False
+    return any(k in txt for k in _SECTION_DETAIL_TITLE_RE)
+
+
+def _title_text_is_index_sheet(raw_text):
+    """True for a Title/Cover/Index sheet whose 'List of Drawings' enumerates
+    plan-sheet names (e.g. 'FLOOR PLAN', 'REFLECTED CEILING PLAN') as index
+    entries — text that falsely trips _title_text_is_plan_sheet. A drawing
+    index is not itself a plan sheet (it has no measurable geometry). Without
+    this gate an image-only set's Title Sheet (often the one page with a text
+    layer) is the sole 'plan' detected, suppressing the rasterized-plan path
+    and collapsing the estimate to $0 (119 Franklin / estimate 4628)."""
+    txt = str(raw_text or "").lower()
+    if not txt:
+        return False
+    INDEX_MARKERS = ("list of drawings", "drawing index", "sheet index",
+                     "drawing list", "index of drawings", "title sheet",
+                     "cover sheet")
+    return any(k in txt for k in INDEX_MARKERS)
+
+
+def _num_or_zero(v):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return 0.0
+    return f if f == f else 0.0  # NaN guard
+
+
+def _geom_bucket(room):
+    """Coarse quantized-geometry token for canonical room identity.
+
+    Two extractions of the SAME physical room land in the same bucket
+    despite small read differences; two different generic rooms ("Storage"
+    x2) land in different buckets. Uses the first available area signal so
+    a floor-plan instance (floor area) and an RCP instance (ceiling area
+    only) of the same room still collide — for the same room those values
+    are near-equal. Log-scaled: each bucket spans ~1.6x, wide enough to
+    absorb re-measurement noise, narrow enough to separate a closet from
+    a corridor. Empty string when the room carries no geometry at all
+    (zero-dim duplicates merging is harmless — merge keeps max detail).
+    """
+    if not isinstance(room, dict):
+        return ""
+    dims = room.get("dimensions") or {}
+    area = 0.0
+    for k in ("floor_area_sqft", "ceiling_area_sqft"):
+        v = _num_or_zero(dims.get(k))
+        if v > 0:
+            area = v
+            break
+    if area <= 0:
+        # wall area only — different scale than floor area, own namespace
+        w = _num_or_zero(dims.get("wall_area_sqft"))
+        if w > 0:
+            return "w%d" % int(round(math.log(w, 1.6)))
+        return ""
+    return "a%d" % int(round(math.log(area, 1.6)))
+
+
+def _canonical_room_key(floor_name, room):
+    """Canonical room identity (2026-06 review Part 4 fix): the tuple
+    (building, floor_key, unit, room_type_token, geom_bucket).
+
+    Sheet ID is deliberately NOT part of identity — it's provenance. The
+    cross-pass merge key that included source_sheet is what turned
+    'A-102' vs 'A1.02' into two different rooms and deleted both.
+
+    For rooms with a unit or trailing number, the number IS the identity
+    and geometry is ignored (re-reads of dims must not split the room).
+    For generic unnumbered names (Corridor, Storage), quantized geometry
+    separates distinct physical instances that share a name.
+    """
+    if not isinstance(room, dict):
+        room = {}
+    floor_key = _normalize_floor_key(str(floor_name or ""))
+    rid = str(room.get("room_id") or "")
+    rname = str(room.get("room_name") or "")
+    unit_key, type_token = _normalize_room_identity(rid, rname)
+    if not unit_key:
+        unit_key = _extract_unit_from_room_id(rid)
+    building = str(room.get("building") or room.get("building_id") or "").strip().upper()
+    has_number = bool(unit_key) or bool(re.search(r"\d", type_token or ""))
+    geom = "" if has_number else _geom_bucket(room)
+    return (building, floor_key, str(unit_key).upper(), type_token or "", geom)
+
+
+_MERGE_DIM_KEYS = ("length_feet", "width_feet", "ceiling_height_feet",
+                   "floor_area_sqft", "perimeter_lf", "wall_area_sqft",
+                   "ceiling_area_sqft")
+
+
+def _merge_rooms_on_collision(keeper, other):
+    """Merge `other` into a COPY of `keeper` (same canonical identity seen
+    twice — e.g. floor-plan and RCP instances, or extraction + verification).
+
+    Max-detail per field instead of drop-the-loser (review 4.6: the old
+    winner-take-room dedup kept the floor-plan instance whose
+    ceiling_area_sqft was 0 and dropped the RCP instance that had the
+    real ceiling — the ceiling vanished on exactly the jobs the RCP fix
+    targeted). Returns (merged_room, log_entries).
+    """
+    import copy as _copy
+    merged = _copy.deepcopy(keeper if isinstance(keeper, dict) else {})
+    other = other if isinstance(other, dict) else {}
+    log = []
+
+    # dimensions: fill zeros from the other instance; never overwrite a
+    # non-zero reading (keeper has higher detail score — deterministic).
+    mdims = merged.setdefault("dimensions", {})
+    odims = other.get("dimensions") or {}
+    for k in _MERGE_DIM_KEYS:
+        if _num_or_zero(mdims.get(k)) <= 0 and _num_or_zero(odims.get(k)) > 0:
+            mdims[k] = odims.get(k)
+            log.append(f"dim {k} backfilled from duplicate instance")
+
+    # materials: fill empties; ceiling_painted is OR'd (if either instance
+    # confirmed a painted ceiling, the merged room has one).
+    mmat = merged.setdefault("materials", {})
+    omat = other.get("materials") or {}
+    for k in ("walls", "ceiling", "base"):
+        if not str(mmat.get(k) or "").strip() and str(omat.get(k) or "").strip():
+            mmat[k] = omat.get(k)
+    if omat.get("ceiling_painted") and not mmat.get("ceiling_painted"):
+        mmat["ceiling_painted"] = True
+        log.append("ceiling_painted OR'd from duplicate instance")
+
+    # elements: per-field max (consistent with _merge_chunk_responses).
+    melem = merged.setdefault("elements", {})
+    oelem = other.get("elements") or {}
+    for k, v in oelem.items():
+        if _num_or_zero(v) > _num_or_zero(melem.get(k)):
+            melem[k] = v
+
+    # unit_multiplier: reconcile to max with an audit note (review 4.4:
+    # the old dedup could keep the x1 instance and drop the x3).
+    km = _num_or_zero(merged.get("unit_multiplier")) or 1
+    om = _num_or_zero(other.get("unit_multiplier")) or 1
+    if km != om:
+        merged["unit_multiplier"] = max(km, om)
+        note = (f"unit_multiplier conflict across instances ({int(km)} vs "
+                f"{int(om)}) — kept {int(max(km, om))}")
+        log.append(note)
+        merged["notes"] = (str(merged.get("notes") or "") +
+                           (" | " if merged.get("notes") else "") +
+                           f"[merge audit] {note}")
+
+    # provenance: union of source sheets — sheet is provenance, not identity
+    sheets = set()
+    for r in (merged, other):
+        for s in (r.get("_source_sheets") or []):
+            sheets.add(str(s))
+        s = str(r.get("source_sheet") or "").strip()
+        if s:
+            sheets.add(s)
+    merged["_source_sheets"] = sorted(sheets)
+
+    # anchor: keep any anchor either instance matched
+    if not merged.get("_anchor") and other.get("_anchor"):
+        merged["_anchor"] = other.get("_anchor")
+    if other.get("_added_by_verification") and merged.get("_added_by_verification"):
+        pass  # both verification-added — nothing extra to record
+    return merged, log
+
+
+# ── Per-sheet checkpoints ──────────────────────────────────────────────────
+# A 20-sheet job that dies on sheet 14 (worker OOM, reboot, rate-limit
+# exhaustion) used to redo ALL its extraction on retry. Sheet results are
+# immutable given (pdf content, page, prompt, schema version), so they're
+# checkpointed under that key and reloaded on the next attempt.
+
+def _sheet_checkpoint_dir(pdf_path):
+    try:
+        return CACHE_DIR.parent / "sheet_checkpoints" / _pdf_hash(pdf_path)
+    except Exception:
+        return None
+
+
+def _sheet_checkpoint_key(static_prompt, sheet_context, verify_enabled):
+    h = hashlib.sha256()
+    h.update(str(_SHEET_CHECKPOINT_VERSION).encode())
+    h.update(b"|")
+    h.update(str(static_prompt).encode("utf-8", "replace"))
+    h.update(b"|")
+    h.update(str(sheet_context).encode("utf-8", "replace"))
+    h.update(b"|verify=%d" % (1 if verify_enabled else 0))
+    return h.hexdigest()[:16]
+
+
+def _sheet_checkpoint_load(ckpt_dir, page_idx0, key_hash):
+    if not ckpt_dir:
+        return None
+    p = Path(ckpt_dir) / f"p{int(page_idx0):04d}_{key_hash}.json"
+    if not p.exists():
+        return None
+    try:
+        with open(p) as f:
+            payload = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+    if payload.get("version") != _SHEET_CHECKPOINT_VERSION:
+        return None
+    return payload.get("analysis")
+
+
+def _sheet_checkpoint_save(ckpt_dir, page_idx0, key_hash, sheet_id, analysis):
+    if not ckpt_dir:
+        return
+    try:
+        Path(ckpt_dir).mkdir(parents=True, exist_ok=True)
+        p = Path(ckpt_dir) / f"p{int(page_idx0):04d}_{key_hash}.json"
+        with open(p, "w") as f:
+            json.dump({
+                "version": _SHEET_CHECKPOINT_VERSION,
+                "page_idx0": int(page_idx0),
+                "sheet_id": sheet_id,
+                "saved_at": datetime.utcnow().isoformat(),
+                "analysis": analysis,
+            }, f)
+    except Exception as e:
+        print(f"      ⚠️  Sheet checkpoint write failed (non-fatal): {e}")
+
+
+# ── Anchoring in the deterministic text layer ──────────────────────────────
+
+def _match_room_anchor(room, parsed):
+    """Match an extracted room to a text-layer label/ID on its sheet.
+
+    The PyMuPDF text layer is deterministic and zero-cost; a room that
+    matches a printed label is anchored — its existence doesn't depend on
+    the vision encoder's mood. Returns {label, bbox, kind} or None.
+    """
+    if not parsed or not isinstance(room, dict):
+        return None
+    name = str(room.get("room_name") or "").strip().upper()
+    rid = str(room.get("room_id") or "").strip().upper()
+    rid_norm = re.sub(r"[^A-Z0-9]", "", rid)
+    for cand in parsed.get("room_ids", []) or []:
+        c = str(cand.get("id") or "").strip().upper()
+        c_norm = re.sub(r"[^A-Z0-9]", "", c)
+        if not c_norm or len(c_norm) < 2:
+            continue
+        if c_norm == rid_norm or (len(c_norm) >= 3 and c_norm in rid_norm):
+            return {"label": cand.get("id"), "bbox": cand.get("bbox"),
+                    "kind": "room_id"}
+    for cand in parsed.get("room_labels", []) or []:
+        c = str(cand.get("label") or "").strip().upper()
+        if len(c) >= 3 and (c in name or (len(name) >= 3 and name in c)):
+            return {"label": cand.get("label"), "bbox": cand.get("bbox"),
+                    "kind": "label"}
+    return None
+
+
+def _stamp_sheet_provenance(sheet_analysis, sheet_id, page_no_1based, parsed):
+    """Deterministically stamp every room with its true sheet + page and
+    attach text-layer anchors. The LLM's own source_sheet claim is stashed
+    for audit, never trusted (the Ridgeview phantom-floor cause)."""
+    anchored = 0
+    total = 0
+    for fl in (sheet_analysis.get("floors") or []):
+        for room in (fl.get("rooms") or []):
+            if not isinstance(room, dict):
+                continue
+            total += 1
+            llm_sheet = str(room.get("source_sheet") or "").strip()
+            if llm_sheet and _normalize_sheet_token(llm_sheet) != \
+                    _normalize_sheet_token(sheet_id):
+                room["_source_sheet_llm"] = llm_sheet
+            room["source_sheet"] = sheet_id
+            room["source_page"] = page_no_1based
+            anchor = _match_room_anchor(room, parsed)
+            if anchor:
+                room["_anchor"] = anchor
+                anchored += 1
+    return anchored, total
+
+
+# ── Per-sheet API calls ────────────────────────────────────────────────────
+
+def _build_sheet_context(sheet_id, page_no_1based, total_pages, text_layer):
+    """Dynamic (uncached) per-sheet prompt block: which sheet this is and
+    its deterministic text-layer anchors."""
+    lines = [
+        "=" * 60,
+        f"THIS REQUEST COVERS EXACTLY ONE SHEET: {sheet_id} "
+        f"(page {page_no_1based} of {total_pages} in the PDF).",
+        "Extract rooms visible on THIS sheet only. Do not carry over or",
+        "summarize rooms from other sheets you may infer exist.",
+        "Set source_sheet to "
+        f"\"{sheet_id}\" and source_page to {page_no_1based} on every room.",
+        "Match each room to the printed room labels/IDs in the text layer",
+        "below when possible — use the printed name/number verbatim.",
+        "=" * 60,
+    ]
+    text_block = _format_page_text_for_prompt(text_layer, max_chars=12000) \
+        if text_layer else ""
+    if text_block:
+        lines.append(text_block)
+    return "\n".join(lines)
+
+
+def _render_sheet_image_blocks(pdf_path, page_idx0):
+    """Image content blocks for one sheet: a full-page overview plus, for
+    large-format sheets, 2x2 (or 3x3 over 36") tiles so dimension text
+    survives the API's downscale. Budget-guarded: stops adding tiles past
+    ~20 MB of base64 so a single sheet can never 413 the request."""
+    blocks = []
+    budget = 20 * 1024 * 1024
+    used = 0
+
+    rendered = _render_page_to_jpeg_b64(pdf_path, page_idx0, dpi=200, quality=85)
+    if rendered is not None:
+        img_b64, _w, _h = rendered
+        used += len(img_b64)
+        blocks.append({"type": "image", "source": {
+            "type": "base64", "media_type": "image/jpeg", "data": img_b64}})
+
+    try:
+        is_large, w_pt, h_pt = _is_large_format_page(pdf_path, page_idx0, 2000)
+    except Exception:
+        is_large, w_pt, h_pt = False, 0, 0
+    if is_large:
+        grid = (3, 3) if max(w_pt, h_pt) / 72.0 > 36 else (2, 2)
+        try:
+            from config import ENHANCED_TILE_DPI as _tile_dpi
+        except ImportError:
+            _tile_dpi = 300
+        tiles = _tile_page(pdf_path, page_idx0, grid=grid, dpi=_tile_dpi,
+                           overlap_pct=0.05)
+        for tile_data in tiles or []:
+            if len(tile_data) == 3:
+                label, b64, media = tile_data
+            else:
+                label, b64 = tile_data
+                media = "image/png"
+            if used + len(b64) > budget:
+                print(f"      ⚠️  Sheet image budget reached — "
+                      f"omitting remaining tiles from {label}")
+                break
+            used += len(b64)
+            blocks.append({"type": "text",
+                           "text": f"TILE {label} — enlarged region of the "
+                                   f"SAME sheet (overlaps neighbors ~5%):"})
+            blocks.append({"type": "image", "source": {
+                "type": "base64", "media_type": media, "data": b64}})
+    return blocks
+
+
+def _call_sheet_api(client, content_blocks, output_kwargs, label,
+                    max_tokens=32000, max_retries=4, base_delay=30):
+    """One schema-enforced streaming call with the standard retry ladder.
+    Returns response text, a truncation-salvaged partial, or None."""
+    attempt = 0
+    while attempt < max_retries:
+        try:
+            with client.messages.stream(
+                model="claude-sonnet-4-6",
+                max_tokens=max_tokens,
+                temperature=0,
+                timeout=300.0,
+                messages=[{"role": "user", "content": content_blocks}],
+                **output_kwargs
+            ) as stream:
+                try:
+                    return _collect_stream_text(stream, label=label)
+                except TruncatedResponseError as _te:
+                    print(f"      ✂️  {label}: truncated at max_tokens — "
+                          f"salvaging partial response")
+                    return _te.partial_text
+        except anthropic.BadRequestError as e:
+            if _maybe_disable_structured_outputs(e):
+                output_kwargs = {}
+                continue  # immediate retry in text mode, attempt not consumed
+            print(f"      ❌ {label}: bad request — {str(e)[:120]}")
+            return None
+        except (anthropic.RateLimitError, anthropic.InternalServerError,
+                anthropic.APITimeoutError) as e:
+            attempt += 1
+            if attempt >= max_retries:
+                print(f"      ❌ {label}: retries exhausted "
+                      f"({type(e).__name__})")
+                return None
+            delay = base_delay * (2 ** (attempt - 1))
+            print(f"      ⏳ {label}: {type(e).__name__} — waiting {delay}s "
+                  f"(attempt {attempt + 1}/{max_retries})")
+            time.sleep(delay)
+        except Exception as e:
+            print(f"      ❌ {label}: {type(e).__name__}: {str(e)[:120]}")
+            return None
+    return None
+
+
+def _extract_single_sheet(client, pdf_path, page_idx0, sheet_id,
+                          static_prompt, sheet_context):
+    """ONE extraction call for ONE plan sheet. Returns the parsed analysis
+    dict (floors/rooms shape) or None. The static prompt rides first with
+    cache_control so every sheet call after the first reads it from cache."""
+    content = [
+        {"type": "text", "text": static_prompt,
+         "cache_control": _PROMPT_CACHE_CONTROL},
+        {"type": "text", "text": sheet_context},
+    ]
+    image_blocks = _render_sheet_image_blocks(pdf_path, page_idx0)
+    if not image_blocks:
+        print(f"      ⚠️  Sheet {sheet_id}: could not render page "
+              f"{page_idx0 + 1}")
+        return None
+    content.extend(image_blocks)
+
+    text = _call_sheet_api(client, content, _extraction_output_kwargs(),
+                           label=f"sheet {sheet_id}")
+    if not text:
+        return None
+    parsed = _parse_json_response(text)
+    if not isinstance(parsed, dict):
+        print(f"      ⚠️  Sheet {sheet_id}: unparseable response "
+              f"({len(text)} chars)")
+        return None
+    return parsed
+
+
+# ── Verification pass (replaces 3x consensus) ──────────────────────────────
+
+_VERIFICATION_OUTPUT_SCHEMA = _so_obj({
+    # Labeled spaces visible on the sheet that the extraction MISSED —
+    # full room objects, same shape as extraction, with dims read from
+    # this sheet. Additive-with-evidence: this is the only way rooms
+    # enter through verification.
+    "missing_rooms": {"type": "array", "items": _SO_ROOM_ITEM},
+    # Extracted rooms with NO visible label/anchor on this sheet —
+    # flagged for audit, never auto-deleted (majority-vote deletion is
+    # the failure mode this pass replaces).
+    "unanchored_rooms": {"type": "array", "items": _so_obj({
+        "room_id": _SO_STR,
+        "room_name": _SO_STR,
+        "reason": _SO_STR,
+    })},
+    "notes": _SO_STR,
+})
+
+
+def _verification_output_kwargs():
+    if not _structured_outputs_enabled():
+        return {}
+    return {"output_config": {
+        "format": {"type": "json_schema", "schema": _VERIFICATION_OUTPUT_SCHEMA},
+    }}
+
+
+def _build_sheet_verification_prompt(sheet_id, sheet_analysis, parsed):
+    """Deterministic verification prompt: the extracted room list + the
+    text-layer labels, with additive-only instructions."""
+    room_lines = []
+    for fl in (sheet_analysis.get("floors") or []):
+        fname = str(fl.get("floor_name") or "")
+        for room in (fl.get("rooms") or []):
+            if not isinstance(room, dict):
+                continue
+            anchor = room.get("_anchor") or {}
+            room_lines.append(
+                f"  - id={room.get('room_id') or '?'} "
+                f"name={room.get('room_name') or '?'} floor={fname} "
+                f"anchor={anchor.get('label') or 'NONE'}")
+    label_lines = []
+    if parsed:
+        for cand in (parsed.get("room_ids") or [])[:120]:
+            label_lines.append(f"  [ID] {cand.get('id')}")
+        for cand in (parsed.get("room_labels") or [])[:120]:
+            label_lines.append(f"  [LABEL] {cand.get('label')}")
+    return "\n".join([
+        f"VERIFICATION PASS for sheet {sheet_id}.",
+        "",
+        "A first extraction pass produced these rooms from this sheet:",
+        *(room_lines or ["  (none)"]),
+        "",
+        "The sheet's deterministic PDF text layer contains these printed "
+        "room labels/IDs:",
+        *(label_lines or ["  (no text layer available)"]),
+        "",
+        "Look at the attached sheet image(s) and answer with JSON:",
+        "1. missing_rooms: labeled spaces VISIBLE ON THIS SHEET that the "
+        "extraction missed. Full room objects with dimensions you can "
+        "actually read from this sheet — use 0 for anything you cannot "
+        "read (do NOT estimate). Empty array if nothing is missing.",
+        "2. unanchored_rooms: extracted rooms from the list above that "
+        "have NO visible label or room on this sheet (likely "
+        "hallucinated). Empty array if all are visible.",
+        "Do NOT re-list rooms that were correctly extracted.",
+    ])
+
+
+def _apply_sheet_verification(sheet_analysis, verification, sheet_id,
+                              page_no_1based, parsed=None):
+    """Apply a verification result to a sheet analysis IN PLACE.
+
+    Additive-with-evidence semantics (review Part 2 design #5):
+      * missing_rooms are ADDED (stamped _added_by_verification, anchored
+        against the text layer when possible), deduped by canonical key
+        so the model echoing an existing room is a no-op.
+      * unanchored_rooms are FLAGGED (_no_anchor + audit note) — never
+        deleted, never zeroed. Downstream confidence/audit consumes the
+        flag; deletion was the old consensus failure mode.
+
+    Returns (n_added, n_flagged). Pure data transform — offline-testable.
+    """
+    if not isinstance(verification, dict):
+        return (0, 0)
+    floors = sheet_analysis.setdefault("floors", [])
+
+    existing_keys = set()
+    for fl in floors:
+        fname = fl.get("floor_name") or ""
+        for room in (fl.get("rooms") or []):
+            if isinstance(room, dict):
+                existing_keys.add(_canonical_room_key(fname, room))
+
+    # Dominant floor on this sheet receives verification-added rooms
+    target_floor = None
+    best_count = -1
+    for fl in floors:
+        n = len(fl.get("rooms") or [])
+        if n > best_count:
+            best_count = n
+            target_floor = fl
+
+    n_added = 0
+    for room in (verification.get("missing_rooms") or []):
+        if not isinstance(room, dict):
+            continue
+        tf_name = (target_floor or {}).get("floor_name") or f"Sheet {sheet_id}"
+        key = _canonical_room_key(tf_name, room)
+        if key in existing_keys:
+            continue
+        existing_keys.add(key)
+        room["_added_by_verification"] = True
+        room["source_sheet"] = sheet_id
+        room["source_page"] = page_no_1based
+        anchor = _match_room_anchor(room, parsed)
+        if anchor:
+            room["_anchor"] = anchor
+        room["notes"] = (str(room.get("notes") or "") +
+                         (" | " if room.get("notes") else "") +
+                         "[verification] added by per-sheet verification pass")
+        if target_floor is None:
+            target_floor = {"floor_name": f"Sheet {sheet_id}", "rooms": []}
+            floors.append(target_floor)
+        target_floor.setdefault("rooms", []).append(room)
+        n_added += 1
+
+    n_flagged = 0
+    flagged_ids = {}
+    for entry in (verification.get("unanchored_rooms") or []):
+        if not isinstance(entry, dict):
+            continue
+        rid = re.sub(r"[^A-Z0-9]", "", str(entry.get("room_id") or "").upper())
+        rname = str(entry.get("room_name") or "").strip().lower()
+        if rid or rname:
+            flagged_ids[(rid, rname)] = str(entry.get("reason") or "")
+    if flagged_ids:
+        for fl in floors:
+            for room in (fl.get("rooms") or []):
+                if not isinstance(room, dict) or room.get("_no_anchor"):
+                    continue
+                rrid = re.sub(r"[^A-Z0-9]", "",
+                              str(room.get("room_id") or "").upper())
+                rrname = str(room.get("room_name") or "").strip().lower()
+                for (fid, fname), reason in flagged_ids.items():
+                    if (fid and fid == rrid) or \
+                            (not fid and fname and fname == rrname):
+                        room["_no_anchor"] = True
+                        room["notes"] = (
+                            str(room.get("notes") or "") +
+                            (" | " if room.get("notes") else "") +
+                            "[verification] no visible anchor on sheet" +
+                            (f": {reason}" if reason else ""))
+                        n_flagged += 1
+                        break
+    return (n_added, n_flagged)
+
+
+def _verify_single_sheet(client, pdf_path, page_idx0, sheet_id,
+                         sheet_analysis, parsed):
+    """ONE verification call for ONE sheet. Returns the verification dict
+    or None (verification failure is non-fatal — extraction stands)."""
+    prompt = _build_sheet_verification_prompt(sheet_id, sheet_analysis, parsed)
+    content = [{"type": "text", "text": prompt}]
+    image_blocks = _render_sheet_image_blocks(pdf_path, page_idx0)
+    if not image_blocks:
+        return None
+    content.extend(image_blocks)
+    text = _call_sheet_api(client, content, _verification_output_kwargs(),
+                           label=f"verify {sheet_id}", max_tokens=16000)
+    if not text:
+        return None
+    result = _parse_json_response(text)
+    return result if isinstance(result, dict) else None
+
+
+# ── Deterministic union merge across sheets ────────────────────────────────
+
+def _merge_sheet_analyses(sheet_results):
+    """Union-merge per-sheet analyses into one analysis dict.
+
+    sheet_results: list of {page_idx0, sheet_id, analysis} dicts.
+
+    Deterministic by construction: floors keyed by the ordinal-aware
+    normalizer, rooms keyed by canonical identity; collisions merge
+    fields (max-detail) instead of dropping an instance; every merge is
+    logged to _canonical_merge_log. No majority vote, no luck-of-the-draw
+    pass selection — the union of what the sheets show.
+    """
+    floors_by_key = {}    # floor_key -> {floor_name, rooms: {ckey: room}}
+    floor_order = []
+    merge_log = []
+    all_notes = []
+    seen_notes = set()
+    exterior = {}
+    project_info = {}
+    building_types = []
+    has_door_schedule = False
+    has_window_schedule = False
+    sheet_pages = []
+
+    for sr in sheet_results:
+        analysis = sr.get("analysis") or {}
+        sheet_id = sr.get("sheet_id") or ""
+        n_sheet_rooms = 0
+
+        for fl in (analysis.get("floors") or []):
+            if not isinstance(fl, dict):
+                continue
+            fname = str(fl.get("floor_name") or "").strip() or "Unspecified"
+            fkey = _normalize_floor_key(fname)
+            if fkey not in floors_by_key:
+                floors_by_key[fkey] = {"floor_name": fname, "rooms": {}}
+                floor_order.append(fkey)
+            bucket = floors_by_key[fkey]["rooms"]
+            for room in (fl.get("rooms") or []):
+                if not isinstance(room, dict):
+                    continue
+                n_sheet_rooms += 1
+                room.setdefault("_source_sheets",
+                                [s for s in [str(room.get("source_sheet")
+                                                 or "").strip()] if s])
+                ckey = _canonical_room_key(fname, room)
+                if ckey not in bucket:
+                    bucket[ckey] = room
+                    continue
+                a, b = bucket[ckey], room
+                # higher detail score is the keeper — deterministic
+                if _detail_score(b) > _detail_score(a):
+                    a, b = b, a
+                merged, room_log = _merge_rooms_on_collision(a, b)
+                bucket[ckey] = merged
+                merge_log.append({
+                    "key": list(ckey),
+                    "kept": merged.get("room_id") or merged.get("room_name"),
+                    "sheets": merged.get("_source_sheets"),
+                    "changes": room_log,
+                })
+
+        # exterior: MAX-merge numerics, OR booleans, first non-empty strings
+        oext = analysis.get("exterior") or {}
+        for k, v in oext.items():
+            if isinstance(v, bool):
+                exterior[k] = bool(exterior.get(k)) or v
+            elif isinstance(v, (int, float)):
+                if _num_or_zero(v) > _num_or_zero(exterior.get(k)):
+                    exterior[k] = v
+            elif isinstance(v, str):
+                if v.strip() and not str(exterior.get(k) or "").strip():
+                    exterior[k] = v
+
+        opi = analysis.get("project_info") or {}
+        bt = str(opi.get("building_type") or "").strip()
+        if bt:
+            building_types.append(bt)
+        for k in ("total_units", "total_stories", "footprint_sqft"):
+            if _num_or_zero(opi.get(k)) > _num_or_zero(project_info.get(k)):
+                project_info[k] = opi.get(k)
+        if not project_info.get("scale_notation") and opi.get("scale_notation"):
+            project_info["scale_notation"] = opi.get("scale_notation")
+
+        raw_notes = analysis.get("notes")
+        if isinstance(raw_notes, str):
+            raw_notes = [raw_notes] if raw_notes.strip() else []
+        for note in raw_notes or []:
+            tagged = f"[{sheet_id}] {note}" if sheet_id else str(note)
+            if tagged not in seen_notes:
+                seen_notes.add(tagged)
+                all_notes.append(tagged)
+
+        has_door_schedule = has_door_schedule or bool(
+            analysis.get("has_door_schedule"))
+        has_window_schedule = has_window_schedule or bool(
+            analysis.get("has_window_schedule"))
+        sheet_pages.append({"page": sr.get("page_idx0", -1) + 1,
+                            "sheet_id": sheet_id,
+                            "rooms": n_sheet_rooms})
+
+    floors = []
+    total_rooms = 0
+    for fkey in floor_order:
+        entry = floors_by_key[fkey]
+        rooms = list(entry["rooms"].values())
+        total_rooms += len(rooms)
+        floors.append({"floor_name": entry["floor_name"], "rooms": rooms})
+
+    if building_types:
+        # most common wins; ties resolve by first-seen (deterministic)
+        counts = {}
+        for bt in building_types:
+            counts[bt] = counts.get(bt, 0) + 1
+        project_info["building_type"] = max(
+            counts, key=lambda k: (counts[k], -building_types.index(k)))
+
+    project_info["total_floors_analyzed"] = len(floors)
+    project_info["total_rooms_found"] = total_rooms
+
+    merged = {
+        "project_info": project_info,
+        "floors": floors,
+        "notes": all_notes,
+        "has_door_schedule": has_door_schedule,
+        "has_window_schedule": has_window_schedule,
+        "_per_sheet_extraction": True,
+        "_sheet_pages": sheet_pages,
+    }
+    if exterior:
+        merged["exterior"] = exterior
+    if merge_log:
+        merged["_canonical_merge_log"] = merge_log
+    return merged
+
+
+# ── Orchestrator ───────────────────────────────────────────────────────────
+
+def _analyze_pdf_per_sheet(client, pdf_path, scope_notes="",
+                           schedule_hints=None, building_inventory=None,
+                           project_overview=None):
+    """Per-sheet anchored extraction for one PDF (Phase 2.2).
+
+    Returns (pdf_path, analysis_dict) like analyze_and_parse, or None when
+    the per-sheet path can't run (no PyMuPDF, no detectable plan sheets,
+    or every sheet call failed) — the caller falls back to the legacy
+    chunked pipeline.
+    """
+    filename = os.path.basename(pdf_path)
+
+    classifications = _classify_pdf_pages(pdf_path)
+    if not classifications:
+        print(f"   ⏭  Per-sheet: page classification unavailable for "
+              f"{filename} — legacy path")
+        return None
+    total_pages = len(classifications)
+    included = [c for c in classifications if c.get("include")]
+    excluded = [c for c in classifications if not c.get("include")]
+    for c in excluded:
+        _ledger_mark(pdf_path, [c["page_index"]], "excluded",
+                     f"{c.get('discipline', 'excluded discipline')} "
+                     f"({c.get('sheet_number') or 'no sheet id'})")
+    if not included:
+        print(f"   ⏭  Per-sheet: no painting-relevant pages in {filename}")
+        return None
+
+    # Identify plan sheets: text-layer dims/labels signal OR title-block
+    # keywords (rasterized sheets) — same dual signal as enhanced extraction.
+    text_layers = {}
+    parsed_pages = {}
+    plan_pages = []
+    section_skipped = []
+    for c in included:
+        pg = c["page_index"]
+        tl = _extract_page_text_layer(pdf_path, pg)
+        text_layers[pg] = tl
+        raw = (tl or {}).get("raw_text", "")
+        # NEGATIVE gate FIRST: a section/elevation/detail sheet is never a plan
+        # sheet, even when it carries dimension text — its rooms duplicate the
+        # plan-view rooms. This must veto the dims-based detector below.
+        if _title_text_is_section_or_detail(raw):
+            section_skipped.append(pg)
+            continue
+        # NEGATIVE gate: a Title/Cover/Index sheet whose drawing index lists
+        # plan-sheet names is not itself a plan sheet. Veto it before the
+        # dims/keyword detectors so it can't become a lone false-positive
+        # "plan" that suppresses the rasterized-plan path on image-only sets.
+        if _title_text_is_index_sheet(raw):
+            section_skipped.append(pg)
+            continue
+        parsed = _parse_floor_plan_text(tl) if tl else None
+        if parsed:
+            parsed_pages[pg] = parsed
+            n_dims = len(parsed.get("dimensions", []))
+            n_labels = len(parsed.get("room_labels", []))
+            n_ids = len(parsed.get("room_ids", []))
+            if n_dims >= 3 or (n_dims >= 1 and (n_labels >= 1 or n_ids >= 1)):
+                plan_pages.append(pg)
+                continue
+        if _title_text_is_plan_sheet(raw):
+            plan_pages.append(pg)
+    if section_skipped:
+        print(f"   🚫 Per-sheet: excluded {len(section_skipped)} section/"
+              f"elevation/detail sheet(s) from extraction (pages "
+              f"{[p + 1 for p in section_skipped]}) — their rooms duplicate "
+              f"plan-view scope.")
+        _ledger_mark(pdf_path, section_skipped, "excluded",
+                     "section/elevation/detail sheet (per-sheet mode; rooms "
+                     "duplicate plan views)")
+
+    # Large-format included pages with NO usable text layer are scanned plan
+    # sheets the text detectors can't score. Union them in whenever they exist,
+    # not only when plan_pages is empty — a single false positive (e.g. a Title
+    # Sheet whose drawing index lists 'FLOOR PLAN') must not suppress the
+    # rasterized-plan path for an entire image-only set.
+    # (119 Franklin / estimate 4628: 1 title sheet detected, 31 scanned plans
+    #  dropped -> $0.)
+    seen = set(plan_pages) | set(section_skipped)
+    raster_plans = []
+    for c in included:
+        pg = c["page_index"]
+        if pg in seen:
+            continue
+        if (text_layers.get(pg) or {}).get("raw_text", "").strip():
+            continue  # has text the detectors above already judged
+        try:
+            is_large, _, _ = _is_large_format_page(pdf_path, pg, 2000)
+        except Exception:
+            is_large = False
+        if is_large:
+            raster_plans.append(pg)
+    if raster_plans:
+        print(f"   🖼  Per-sheet: adding {len(raster_plans)} image-only "
+              f"large-format page(s) as scanned plan sheets "
+              f"(pages {[p + 1 for p in raster_plans]})")
+        plan_pages.extend(raster_plans)
+    if not plan_pages:
+        # Mirror the enhanced-extraction fallback: large-format included
+        # pages are presumed plan sheets when text gives no signal.
+        for c in included:
+            pg = c["page_index"]
+            try:
+                is_large, _, _ = _is_large_format_page(pdf_path, pg, 2000)
+            except Exception:
+                is_large = False
+            if is_large:
+                plan_pages.append(pg)
+    if not plan_pages:
+        print(f"   ⏭  Per-sheet: no plan sheets identified in {filename} "
+              f"(schedules/notes only) — legacy path")
+        return None
+    plan_pages = sorted(set(plan_pages))
+
+    # Non-plan included pages are intentionally not measured here —
+    # schedules and notes are handled by the dedicated scans.
+    non_plan = [c["page_index"] for c in included
+                if c["page_index"] not in set(plan_pages)]
+    _ledger_mark(pdf_path, non_plan, "excluded",
+                 "not a plan sheet (per-sheet mode; schedules/notes "
+                 "handled by dedicated scans)")
+
+    # Deterministic page -> sheet-ID map from the title blocks
+    page_sheet_map = _build_page_to_sheet_map([pdf_path])
+    cls_by_page = {c["page_index"]: c for c in classifications}
+
+    def _sheet_id_for(pg):
+        sid = page_sheet_map.get((pdf_path, pg))
+        if sid:
+            return sid
+        sid = (cls_by_page.get(pg) or {}).get("sheet_number")
+        return sid or f"PG{pg + 1}"
+
+    static_prompt = _build_extraction_prompt(
+        scope_notes=scope_notes, schedule_hints=schedule_hints,
+        building_inventory=building_inventory,
+        project_overview=project_overview)
+
+    # Checkpoint signature EXCLUDES schedule_hints. The schedule pre-scan is
+    # vision-nondeterministic (Fishkill: 120/6 doors-stairs one run, 160/8 the
+    # next), so embedding its output in the key changed the key every run and
+    # made all sheet checkpoints miss — defeating resume entirely. Door/window/
+    # stair counts are SET authoritatively downstream by _apply_schedule_overrides
+    # regardless of these hints, and the per-sheet ROOM geometry (the cached
+    # payload that matters for walls/ceilings) does not depend on them — so a
+    # hint-free signature is both stable and correct for keying.
+    ckpt_prompt_sig = _build_extraction_prompt(
+        scope_notes=scope_notes, schedule_hints=None,
+        building_inventory=building_inventory,
+        project_overview=project_overview)
+
+    verify_on = _sheet_verification_enabled()
+    ckpt_dir = _sheet_checkpoint_dir(pdf_path) \
+        if _sheet_checkpoint_enabled() else None
+
+    print(f"   📑 PER-SHEET EXTRACTION: {len(plan_pages)} plan sheet(s) of "
+          f"{len(included)} painting-relevant, {total_pages} total"
+          f"{' [verify on]' if verify_on else ''}"
+          f"{' [checkpoints on]' if ckpt_dir else ''}")
+
+    sheet_results = []
+    failed_pages = []
+    n_ckpt_hits = 0
+    for pg in plan_pages:
+        sheet_id = _sheet_id_for(pg)
+        page_no = pg + 1
+        parsed = parsed_pages.get(pg)
+        sheet_context = _build_sheet_context(sheet_id, page_no, total_pages,
+                                             text_layers.get(pg))
+        ckpt_key = _sheet_checkpoint_key(ckpt_prompt_sig, sheet_context,
+                                         verify_on)
+
+        sheet_analysis = _sheet_checkpoint_load(ckpt_dir, pg, ckpt_key)
+        if sheet_analysis is not None:
+            n_ckpt_hits += 1
+            print(f"      ♻️  Sheet {sheet_id} (p{page_no}): checkpoint hit")
+        else:
+            print(f"      📄 Sheet {sheet_id} (p{page_no}): extracting...")
+            sheet_analysis = _extract_single_sheet(
+                client, pdf_path, pg, sheet_id, static_prompt, sheet_context)
+            if sheet_analysis is None:
+                failed_pages.append(pg)
+                _ledger_mark(pdf_path, [pg], "failed",
+                             f"per-sheet extraction failed (sheet {sheet_id})")
+                continue
+            anchored, n_rooms = _stamp_sheet_provenance(
+                sheet_analysis, sheet_id, page_no, parsed)
+            if verify_on and n_rooms >= 0:
+                verification = _verify_single_sheet(
+                    client, pdf_path, pg, sheet_id, sheet_analysis, parsed)
+                if verification:
+                    n_added, n_flagged = _apply_sheet_verification(
+                        sheet_analysis, verification, sheet_id, page_no,
+                        parsed)
+                    if n_added or n_flagged:
+                        print(f"         🔎 verify: +{n_added} missed room(s), "
+                              f"{n_flagged} unanchored flag(s)")
+                else:
+                    print(f"         🔎 verify: no result (non-fatal)")
+            _sheet_checkpoint_save(ckpt_dir, pg, ckpt_key, sheet_id,
+                                   sheet_analysis)
+        n_rooms_total = sum(len(fl.get("rooms") or [])
+                            for fl in (sheet_analysis.get("floors") or []))
+        print(f"         → {n_rooms_total} room(s)")
+        _ledger_mark(pdf_path, [pg], "measured",
+                     f"per-sheet extraction (sheet {sheet_id})")
+        sheet_results.append({"page_idx0": pg, "sheet_id": sheet_id,
+                              "analysis": sheet_analysis})
+
+    if not sheet_results:
+        print(f"   ❌ Per-sheet: all {len(plan_pages)} sheet(s) failed for "
+              f"{filename} — legacy path")
+        return None
+
+    merged = _merge_sheet_analyses(sheet_results)
+    total_rooms = merged.get("project_info", {}).get("total_rooms_found", 0)
+    n_merges = len(merged.get("_canonical_merge_log") or [])
+    if failed_pages:
+        merged.setdefault("notes", []).append(
+            f"[Per-Sheet] {len(failed_pages)} plan sheet(s) FAILED "
+            f"extraction (pages {[p + 1 for p in failed_pages]}) — "
+            f"coverage gate will flag for manual review")
+    print(f"   📑 Per-sheet merge: {total_rooms} rooms across "
+          f"{len(sheet_results)} sheet(s)"
+          f"{f', {n_merges} canonical-identity merge(s)' if n_merges else ''}"
+          f"{f', {n_ckpt_hits} checkpoint hit(s)' if n_ckpt_hits else ''}"
+          f"{f', {len(failed_pages)} sheet(s) FAILED' if failed_pages else ''}")
+
+    # Safety net: a per-sheet run that extracted no measurable geometry must
+    # not ship a $0 estimate. Defer to the legacy multimodal path (same
+    # return-None contract used above when no plan sheets are found) — the
+    # path that produces something beats the path that produced nothing.
+    total_wall_sqft = 0.0
+    for fl in (merged.get("floors") or []):
+        for rm in (fl.get("rooms") or []):
+            total_wall_sqft += _num_or_zero(
+                (rm.get("dimensions") or {}).get("wall_area_sqft"))
+    if total_rooms <= 0 or total_wall_sqft <= 0:
+        print(f"   ⚠️  Per-sheet produced {total_rooms} room(s) / "
+              f"{total_wall_sqft:.0f} wall SF — deferring to legacy "
+              f"multimodal path (no $0 per-sheet estimate)")
+        return None
+
+    _attach_bbox_anchors(merged, pdf_path)
+    return (pdf_path, merged)
 
 
 def _analyze_floor_plan_as_images(client, pdf_path, scope_notes="",
@@ -2229,6 +4203,10 @@ def _analyze_floor_plan_as_images(client, pdf_path, scope_notes="",
         image_batches.append(images[i:i + MAX_IMAGES_PER_CALL])
 
     all_batch_results = []
+    # Per-batch tracking so a dropped image batch is visible downstream
+    # (same rationale as the enhanced/tiled path's _chunk_tracking).
+    _img_total_batches = len(image_batches)
+    _img_ok_batches = []
 
     for batch_idx, batch_images in enumerate(image_batches):
         if len(image_batches) > 1:
@@ -2251,7 +4229,8 @@ def _analyze_floor_plan_as_images(client, pdf_path, scope_notes="",
             })
         content_blocks.append({
             "type": "text",
-            "text": effective_prompt
+            "text": effective_prompt,
+            "cache_control": _PROMPT_CACHE_CONTROL
         })
 
         result_parts = []
@@ -2265,10 +4244,16 @@ def _analyze_floor_plan_as_images(client, pdf_path, scope_notes="",
                     max_tokens=64000,
                     temperature=0,
                     timeout=300.0,
-                    messages=[{"role": "user", "content": content_blocks}]
+                    messages=[{"role": "user", "content": content_blocks}],
+                    **_extraction_output_kwargs()
                 ) as stream:
-                    for text in stream.text_stream:
-                        result_parts.append(text)
+                    try:
+                        result_parts.append(_collect_stream_text(
+                            stream, label="image fallback batch"))
+                    except TruncatedResponseError as _te:
+                        result_parts.append(_te.partial_text)
+                        print("   ✂️  Image fallback batch truncated at "
+                              "max_tokens — salvaging partial response")
                 break
             except anthropic.RateLimitError:
                 if attempt < max_retries - 1:
@@ -2289,6 +4274,8 @@ def _analyze_floor_plan_as_images(client, pdf_path, scope_notes="",
                     print(f"   ❌ Image fallback batch failed: {e}")
                     continue
             except Exception as e:
+                if _maybe_disable_structured_outputs(e):
+                    continue  # retry this attempt in text mode
                 print(f"   ❌ Image fallback error: {e}")
                 break
 
@@ -2296,17 +4283,26 @@ def _analyze_floor_plan_as_images(client, pdf_path, scope_notes="",
         if not result_text:
             continue
 
-        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        _img_batch_pages = sorted({p for p, _ in (batch_images or [])})
+        json_match = _parse_json_response(result_text)
+        _img_batch_rooms = 0
         if json_match:
             try:
-                analysis = json.loads(json_match.group())
-                rooms = analysis.get('project_info', {}).get(
+                analysis = json_match
+                _img_batch_rooms = analysis.get('project_info', {}).get(
                     'total_rooms_found', 0)
-                if rooms > 0:
+                if _img_batch_rooms > 0:
                     all_batch_results.append(analysis)
-                    print(f"   🖼️  Batch {batch_idx + 1}: extracted {rooms} rooms")
+                    _img_ok_batches.append(batch_idx + 1)
+                    print(f"   🖼️  Batch {batch_idx + 1}: extracted {_img_batch_rooms} rooms")
             except json.JSONDecodeError:
                 pass
+        if _img_batch_rooms > 0:
+            _ledger_mark(pdf_path, _img_batch_pages, "measured",
+                         f"image fallback batch {batch_idx + 1}")
+        else:
+            _ledger_mark(pdf_path, _img_batch_pages, "failed",
+                         f"image fallback batch {batch_idx + 1} returned no rooms")
 
     # Merge batch results
     if not all_batch_results:
@@ -2322,6 +4318,15 @@ def _analyze_floor_plan_as_images(client, pdf_path, scope_notes="",
     rooms = final.get('project_info', {}).get('total_rooms_found', 0)
     print(f"   🖼️  Image fallback extracted {rooms} rooms total")
     _attach_bbox_anchors(final, pdf_path)
+    _img_failed = [b for b in range(1, _img_total_batches + 1)
+                   if b not in _img_ok_batches]
+    final["_chunk_tracking"] = {
+        "mode": "image_fallback",
+        "total_chunks": _img_total_batches,
+        "chunks_succeeded": list(_img_ok_batches),
+        "chunks_failed": _img_failed,
+        "chunk_page_ranges": [],
+    }
     return (pdf_path, final)
 
 
@@ -2439,23 +4444,7 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
     def _is_plan_sheet(pg_idx):
         tl = _extract_page_text_layer(pdf_path, pg_idx)
         txt = (tl or {}).get("raw_text", "") if isinstance(tl, dict) else ""
-        txt = str(txt).lower()
-        if not txt:
-            return False
-        STRONG_PLAN = (
-            "floor plan", "reflected ceiling", "ceiling plan", "finish plan",
-            "enlarged plan", "fixture plan", "dimension plan", "partition plan",
-            "furniture plan", "equipment plan", "roof plan", "slab plan",
-            "life safety plan", "demolition plan", "overall plan",
-        )
-        NON_PLAN = ("elevation", "section", "detail", "schedule")
-        if any(k in txt for k in STRONG_PLAN):
-            return True
-        # Bare "plan" (e.g. a key/code plan) counts only when the sheet isn't
-        # dominated by elevation/section/detail/schedule content.
-        if "plan" in txt and not any(k in txt for k in NON_PLAN):
-            return True
-        return False
+        return _title_text_is_plan_sheet(txt)
 
     _plan_sheets = [pg_idx for pg_idx in page_indices if _is_plan_sheet(pg_idx)]
     _added = sorted(set(_plan_sheets) - set(floor_plan_pages))
@@ -2479,14 +4468,26 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
         print(f"   ❌ Enhanced extraction: no floor plan pages identified")
         return None
 
-    # Cap at 12 pages max to keep API payload reasonable (12 × 4 = 48 tiles)
-    MAX_PAGES_PER_CALL = int(os.environ.get("NIGHTSHIFT_MAX_TILE_PAGES", "12"))
-    if len(floor_plan_pages) > MAX_PAGES_PER_CALL:
-        # Prioritize pages with most dimensions (they have the most measurable rooms)
+    # Page cap REMOVED (2026-06 review C4): the old default of 12 silently
+    # cut pages 13+ from the takeoff — both 2026-06-12 validation jobs hit
+    # it (17 and 21 painting-relevant pages). The batching loop below
+    # already splits tiles into API-sized batches, so volume is handled by
+    # MORE BATCHES, not fewer pages. An explicit env cap is still honored
+    # for emergencies, and anything it cuts is recorded as failed coverage
+    # instead of vanishing.
+    _tile_cap_env = os.environ.get("NIGHTSHIFT_MAX_TILE_PAGES", "").strip()
+    if _tile_cap_env.isdigit() and len(floor_plan_pages) > int(_tile_cap_env):
+        cap = int(_tile_cap_env)
         floor_plan_pages.sort(
             key=lambda pg: len(parsed_pages.get(pg, {}).get("dimensions", [])),
             reverse=True)
-        floor_plan_pages = sorted(floor_plan_pages[:MAX_PAGES_PER_CALL])
+        cut_pages = sorted(floor_plan_pages[cap:])
+        floor_plan_pages = sorted(floor_plan_pages[:cap])
+        print(f"   ⚠️  NIGHTSHIFT_MAX_TILE_PAGES={cap}: cutting "
+              f"{len(cut_pages)} plan page(s) from tiling: "
+              f"{[p + 1 for p in cut_pages]}")
+        _ledger_mark(pdf_path, cut_pages, "failed",
+                     f"cut by NIGHTSHIFT_MAX_TILE_PAGES={cap}")
 
     print(f"   🔬 ENHANCED EXTRACTION: Tiling {len(floor_plan_pages)} floor plan page(s) "
           f"(of {len(page_indices)} painting-relevant, {total_pages} total)")
@@ -2553,6 +4554,15 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
     del all_tiles
 
     all_analysis_results = []
+    # Tile-batch tracking — the enhanced (tiled) path is the large-format
+    # equivalent of the chunked-vector path's _chunk_tracking. Without it,
+    # large-format jobs (which route here precisely because native vector
+    # failed) ship chunk_tracking=null, which (a) blinds the >=50%-chunks-
+    # failed manual-review trigger and (b) makes the multi-pass fallback's
+    # "fewest dropped chunks" tiering meaningless. Record which batches yielded
+    # rooms so a dropped tile batch is visible downstream.
+    _enh_total_batches = len(tile_batches)
+    _enh_ok_batches = []
 
     for batch_idx, batch_tiles in enumerate(tile_batches):
         if len(tile_batches) > 1:
@@ -2595,7 +4605,8 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
             })
         content_blocks.append({
             "type": "text",
-            "text": effective_prompt
+            "text": effective_prompt,
+            "cache_control": _PROMPT_CACHE_CONTROL
         })
 
         # Make the API call
@@ -2610,10 +4621,16 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
                     max_tokens=64000,
                     temperature=0,
                     timeout=600.0,
-                    messages=[{"role": "user", "content": content_blocks}]
+                    messages=[{"role": "user", "content": content_blocks}],
+                    **_extraction_output_kwargs()
                 ) as stream:
-                    for text in stream.text_stream:
-                        result_parts.append(text)
+                    try:
+                        result_parts.append(_collect_stream_text(
+                            stream, label="enhanced batch"))
+                    except TruncatedResponseError as _te:
+                        result_parts.append(_te.partial_text)
+                        print("   ✂️  Enhanced batch truncated at max_tokens "
+                              "— salvaging partial response")
                 break
             except anthropic.RateLimitError:
                 if attempt < max_retries - 1:
@@ -2634,6 +4651,8 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
                     print(f"   ❌ Enhanced extraction batch failed: {e}")
                     continue
             except Exception as e:
+                if _maybe_disable_structured_outputs(e):
+                    continue  # retry this attempt in text mode
                 print(f"   ❌ Enhanced extraction error: {e}")
                 break
 
@@ -2652,24 +4671,32 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
                     max_tokens=64000,
                     temperature=0,
                     timeout=600.0,
-                    messages=[{"role": "user", "content": content_blocks}]
+                    messages=[{"role": "user", "content": content_blocks}],
+                    **_extraction_output_kwargs()
                 ) as stream:
-                    for text in stream.text_stream:
-                        result_parts.append(text)
+                    try:
+                        result_parts.append(_collect_stream_text(
+                            stream, label="enhanced empty-retry"))
+                    except TruncatedResponseError as _te:
+                        result_parts.append(_te.partial_text)
+                        print("   ✂️  Enhanced empty-retry truncated — "
+                              "salvaging partial response")
                 result_text = "".join(result_parts)
             except Exception as e:
                 print(f"   ❌ Batch {batch_idx + 1} empty-response retry failed: {e}")
             if not result_text:
                 print(f"   ❌ Batch {batch_idx + 1}: still empty after retry — skipping")
+                _ledger_mark(pdf_path, sorted({t[0] for t in (batch_tiles or [])}),
+                             "failed", f"enhanced batch {batch_idx + 1} empty after retry")
                 tile_batches[batch_idx] = None
                 continue
 
         # Parse JSON response
         analysis = None
-        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        json_match = _parse_json_response(result_text)
         if json_match:
             try:
-                analysis = json.loads(json_match.group())
+                analysis = json_match
             except json.JSONDecodeError:
                 print(f"   ❌ Enhanced extraction batch: could not parse JSON")
 
@@ -2711,15 +4738,21 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
                     max_tokens=64000,
                     temperature=0,
                     timeout=600.0,
-                    messages=[{"role": "user", "content": sharpened_blocks}]
+                    messages=[{"role": "user", "content": sharpened_blocks}],
+                    **_extraction_output_kwargs()
                 ) as stream:
-                    for text in stream.text_stream:
-                        result_parts2.append(text)
+                    try:
+                        result_parts2.append(_collect_stream_text(
+                            stream, label="enhanced sharpened-retry"))
+                    except TruncatedResponseError as _te:
+                        result_parts2.append(_te.partial_text)
+                        print("   ✂️  Sharpened retry truncated — "
+                              "salvaging partial response")
                 result_text2 = "".join(result_parts2)
-                json_match2 = re.search(r'\{.*\}', result_text2, re.DOTALL)
+                json_match2 = _parse_json_response(result_text2)
                 if json_match2:
                     try:
-                        analysis2 = json.loads(json_match2.group())
+                        analysis2 = json_match2
                         rooms2 = analysis2.get('project_info', {}).get(
                             'total_rooms_found', 0)
                         print(f"   🔬 Batch {batch_idx + 1} retry: "
@@ -2733,8 +4766,16 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
             except Exception as e:
                 print(f"   ❌ Batch {batch_idx + 1} sharpened retry failed: {e}")
 
+        _batch_pages = sorted({t[0] for t in (batch_tiles or [])})
         if rooms > 0 and analysis is not None:
             all_analysis_results.append(analysis)
+            _enh_ok_batches.append(batch_idx + 1)
+            _ledger_mark(pdf_path, _batch_pages, "measured",
+                         f"enhanced tiled batch {batch_idx + 1}")
+        else:
+            _ledger_mark(pdf_path, _batch_pages, "failed",
+                         f"enhanced batch {batch_idx + 1} returned no rooms "
+                         f"after retries")
 
         # Free this batch's tile data after sending (saves ~5-10MB per batch)
         tile_batches[batch_idx] = None
@@ -2756,6 +4797,16 @@ def _analyze_with_enhanced_extraction(client, pdf_path, scope_notes="",
     total_rooms = final_analysis.get('project_info', {}).get('total_rooms_found', 0)
     print(f"   🔬 Enhanced extraction found {total_rooms} rooms total")
     _attach_bbox_anchors(final_analysis, pdf_path)
+    # Synthetic chunk tracking for the tiled path (see init comment above).
+    _enh_failed = [b for b in range(1, _enh_total_batches + 1)
+                   if b not in _enh_ok_batches]
+    final_analysis["_chunk_tracking"] = {
+        "mode": "enhanced_tiled",
+        "total_chunks": _enh_total_batches,
+        "chunks_succeeded": list(_enh_ok_batches),
+        "chunks_failed": _enh_failed,
+        "chunk_page_ranges": [],
+    }
     return (pdf_path, final_analysis)
 
 
@@ -2960,9 +5011,9 @@ def analyze_schedule_images(client, pdf_path, schedule_page_nums):
     # Parse JSON from the response
     try:
         # Find JSON in the response (may have markdown fences)
-        json_match = re.search(r'\{[\s\S]*\}', raw)
+        json_match = _parse_json_response(raw)
         if json_match:
-            schedule_data = json.loads(json_match.group())
+            schedule_data = json_match
         else:
             print(f"   ❌ No JSON found in schedule image response")
             return None
@@ -2989,6 +5040,107 @@ def analyze_schedule_images(client, pdf_path, schedule_page_nums):
 
     _release_memory("after schedule extraction")
     return schedule_data
+
+
+def _merge_schedule_reads(reads):
+    """Union-merge N schedule-extraction reads into one deterministic result.
+
+    The schedule scan is vision-nondeterministic: a given read can miss
+    table rows, so door/stair counts swing run-to-run (Fishkill: 120/6 one
+    read, 160/8 the next) — and since _apply_schedule_overrides treats the
+    schedule as AUTHORITATIVE, that swing lands directly in the bid. Door
+    and window rows are NAMED (mark ids), so the union across reads recovers
+    rows any single read dropped: a mark real in either read is real. Counts
+    are recomputed from the unioned rows; stair sections take the max.
+
+    Pure function (no API) — unit-testable. Returns a single schedule_data
+    dict, or None if `reads` is empty.
+    """
+    reads = [r for r in (reads or []) if isinstance(r, dict)]
+    if not reads:
+        return None
+    if len(reads) == 1:
+        return reads[0]
+
+    out = dict(reads[0])
+
+    # --- Doors: union door_marks_counted by mark id; recompute counts ---
+    ds_out = dict(out.get("door_schedule") or {})
+    marks_by_id = {}
+    for r in reads:
+        for m in ((r.get("door_schedule") or {}).get("door_marks_counted") or []):
+            mid = (m.get("mark") if isinstance(m, dict) else str(m))
+            mid = str(mid or "").strip().upper()
+            if not mid:
+                continue
+            # Keep the richest record seen for this mark (most populated dict).
+            prev = marks_by_id.get(mid)
+            if prev is None or (isinstance(m, dict) and len(m) > len(prev)
+                                if isinstance(prev, dict) else True):
+                marks_by_id[mid] = m
+    if marks_by_id:
+        ds_out["door_marks_counted"] = list(marks_by_id.values())
+    # Recompute door totals as the MAX across reads (union can only raise a
+    # complete count; max guards against a read that over-split a row).
+    for k in ("total_doors_full_paint", "total_doors_hm_panel",
+              "total_doors_frame_only"):
+        ds_out[k] = max(_num((r.get("door_schedule") or {}).get(k, 0))
+                        for r in reads)
+    out["door_schedule"] = ds_out
+
+    # --- Windows: union window_types by mark; counts = max across reads ---
+    ws_out = dict(out.get("window_schedule") or {})
+    wtypes_by_id = {}
+    for r in reads:
+        for w in ((r.get("window_schedule") or {}).get("window_types") or []):
+            wid = str((w.get("mark") if isinstance(w, dict) else w) or "").strip().upper()
+            if wid and wid not in wtypes_by_id:
+                wtypes_by_id[wid] = w
+    if wtypes_by_id:
+        ws_out["window_types"] = list(wtypes_by_id.values())
+    for k in ("total_windows", "windows_painted_interior"):
+        ws_out[k] = max(_num((r.get("window_schedule") or {}).get(k, 0))
+                        for r in reads)
+    out["window_schedule"] = ws_out
+
+    # --- Stairs: max sections across reads ---
+    si_out = dict(out.get("stair_info") or {})
+    si_out["total_stair_sections"] = max(
+        _num((r.get("stair_info") or {}).get("total_stair_sections", 0))
+        for r in reads)
+    out["stair_info"] = si_out
+    return out
+
+
+def analyze_schedule_images_consensus(client, pdf_path, schedule_page_nums):
+    """Run the schedule scan N times and union-merge for determinism.
+
+    N = NIGHTSHIFT_SCHEDULE_CONSENSUS (default 1 = single read, unchanged
+    behavior + zero added cost). Set to 2-3 to stabilize the door/window/
+    stair counts that otherwise swing run-to-run. Each read is one small
+    mini-PDF call, so consensus is cheap relative to extraction.
+    """
+    try:
+        n = int(os.environ.get("NIGHTSHIFT_SCHEDULE_CONSENSUS", "1"))
+    except (ValueError, TypeError):
+        n = 1
+    n = max(1, min(3, n))
+    if n == 1:
+        return analyze_schedule_images(client, pdf_path, schedule_page_nums)
+    reads = []
+    for i in range(n):
+        r = analyze_schedule_images(client, pdf_path, schedule_page_nums)
+        if r:
+            reads.append(r)
+    if not reads:
+        return None
+    merged = _merge_schedule_reads(reads)
+    ds = merged.get("door_schedule") or {}
+    print(f"   🔁 Schedule consensus over {len(reads)} read(s): "
+          f"{len(ds.get('door_marks_counted') or [])} door marks (union), "
+          f"{_num(ds.get('total_doors_full_paint',0)) + _num(ds.get('total_doors_hm_panel',0)):.0f} "
+          f"paintable doors")
+    return merged
 
 
 def _normalize_floor_key(name):
@@ -3274,7 +5426,8 @@ def _merge_batch_results(all_results):
     return final
 
 
-def _merge_chunk_responses(texts, page_offsets=None):
+def _merge_chunk_responses(texts, page_offsets=None, chunk_indices=None,
+                           parse_failures=None):
     """
     Merge multiple JSON response texts (from chunked PDF processing) into
     a single combined JSON string.  Each chunk may contain partial floor/room
@@ -3286,27 +5439,53 @@ def _merge_chunk_responses(texts, page_offsets=None):
     with more rooms/data (usually from the actual floor plan sheet rather than
     a demolition or code compliance sheet).
 
-    page_offsets: optional list of 1-based page offsets for each chunk,
-                  used to fix source_page values (which Claude reports relative
+    page_offsets: optional list of 1-based page offsets, indexed by chunk
+                  NUMBER (page_offsets[k] is the offset of chunk k+1), used
+                  to fix source_page values (which Claude reports relative
                   to each chunk rather than the original PDF).
+    chunk_indices: optional list parallel to `texts` giving each text's
+                  1-based chunk number. Without it, offsets used to be
+                  applied POSITIONALLY over the successfully parsed texts —
+                  so one failed/unparseable chunk shifted every later
+                  chunk's rooms onto the wrong source pages, corrupting the
+                  very coverage checks meant to detect the failure.
+    parse_failures: optional list; chunk numbers whose text could not be
+                  parsed as JSON are appended (previously a silent `pass` —
+                  the chunk's rooms vanished and the chunk stayed recorded
+                  as "succeeded").
     """
-    parsed = []
-    for t in texts:
-        m = re.search(r'\{.*\}', t, re.DOTALL)
+    parsed = []             # successfully parsed chunk dicts
+    parsed_chunk_nums = []  # parallel: 1-based chunk number per parsed dict
+    for pos, t in enumerate(texts):
+        if chunk_indices and pos < len(chunk_indices):
+            chunk_num = chunk_indices[pos]
+        else:
+            chunk_num = pos + 1
+        m = _parse_json_response(t)
         if m:
             try:
-                parsed.append(json.loads(m.group()))
+                parsed.append(m)
+                parsed_chunk_nums.append(chunk_num)
+                continue
             except json.JSONDecodeError:
                 pass
+        print(f"   ⚠️  Chunk {chunk_num}: response could not be parsed as JSON "
+              f"({len(t)} chars) — its rooms are NOT in the merged result")
+        if parse_failures is not None:
+            parse_failures.append(chunk_num)
 
     if not parsed:
         return texts[0]  # nothing could be parsed — return first raw text
 
     # Apply page offsets to source_page values (Claude reports page numbers
-    # relative to each chunk; we need them relative to the original PDF)
-    if page_offsets and len(page_offsets) >= len(parsed):
-        for chunk_idx, chunk_data in enumerate(parsed):
-            offset = page_offsets[chunk_idx] - 1  # convert to 0-based addition
+    # relative to each chunk; we need them relative to the original PDF).
+    # Indexed by true chunk number so a failed earlier chunk cannot shift
+    # later chunks onto the wrong pages.
+    if page_offsets:
+        for chunk_num, chunk_data in zip(parsed_chunk_nums, parsed):
+            if not (1 <= chunk_num <= len(page_offsets)):
+                continue
+            offset = page_offsets[chunk_num - 1] - 1  # convert to 0-based addition
             if offset > 0:
                 for floor in chunk_data.get("floors", []):
                     for room in floor.get("rooms", []):
@@ -4388,14 +6567,23 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
                             },
                             {
                                 "type": "text",
-                                "text": effective_prompt
+                                "text": effective_prompt,
+                                # Cache document+prompt for the multi-pass
+                                # re-sends and retry ladder (identical
+                                # prefix). 1h TTL outlives a pass.
+                                "cache_control": _PROMPT_CACHE_CONTROL
                             }
                         ]
-                    }]
+                    }],
+                    # Schema-enforced JSON response — prose-mode answers
+                    # become structurally impossible (Phase 2.0).
+                    **_extraction_output_kwargs()
                 ) as stream:
-                    for text in stream.text_stream:
-                        result_parts.append(text)
-                return "".join(result_parts)
+                    # Raises TruncatedResponseError on max_tokens so the
+                    # caller's chunk-failure ladder routes the chunk to
+                    # page-level retry instead of shipping a partial
+                    # extraction (the 53-vs-15 rooms variance class).
+                    return _collect_stream_text(stream, label=label or "native chunk")
             except anthropic.RateLimitError:
                 if attempt < max_retries - 1:
                     delay = base_delay * (2 ** attempt)  # 30s, 60s, 120s, 240s
@@ -4413,6 +6601,13 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
                     time.sleep(delay)
                 else:
                     raise  # exhausted all retries
+            except anthropic.BadRequestError as _bre:
+                # Schema rejection -> flip to text mode and retry this
+                # attempt; any other 400 belongs to the caller's ladder
+                # (413 too-large handling etc.).
+                if _maybe_disable_structured_outputs(_bre):
+                    continue
+                raise
             except anthropic.APITimeoutError:
                 if attempt < max_retries - 1:
                     delay = base_delay * (2 ** attempt)
@@ -4425,6 +6620,10 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
     try:
         # --- Primary call with the first (or only) chunk ---
         result_text = None
+        # Chunk-relative page numbers permanently removed by page-level
+        # retries, keyed by chunk number. Persisted into _chunk_tracking so
+        # a dropped page exists somewhere other than the console log.
+        pages_dropped_by_chunk = {}
         try:
             result_text = _call_api(pdf_data)
         except anthropic.BadRequestError as e:
@@ -4465,7 +6664,8 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
                         tmp.write(raw_bytes)
                         first_tmp = tmp.name
                     result_text = _retry_chunk_without_bad_pages(
-                        first_tmp, _call_api, chunk_label="chunk 1"
+                        first_tmp, _call_api, chunk_label="chunk 1",
+                        dropped_pages_out=pages_dropped_by_chunk.setdefault(1, [])
                     )
                 finally:
                     if first_tmp:
@@ -4496,10 +6696,10 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
                 total_units = 0
                 floors_seen = []
                 for t in texts:
-                    m = re.search(r'\{.*\}', t, re.DOTALL)
+                    m = _parse_json_response(t)
                     if m:
                         try:
-                            data = json.loads(m.group())
+                            data = m
                             # Gather project info
                             pi = data.get("project_info", {})
                             if pi.get("building_type"):
@@ -4639,7 +6839,8 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
                     elif "Could not process" in err_str or "500" in err_str:
                         print(f"   ⚠️  Chunk {idx}/{total_chunks} failed ({err_str[:120]}) — attempting page-level retry")
                         retry_result = _retry_chunk_without_bad_pages(
-                            chunk_path, _call_api, chunk_label=f"chunk {idx}/{total_chunks}"
+                            chunk_path, _call_api, chunk_label=f"chunk {idx}/{total_chunks}",
+                            dropped_pages_out=pages_dropped_by_chunk.setdefault(idx, [])
                         )
                         if retry_result:
                             all_texts.append(retry_result)
@@ -4649,6 +6850,23 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
                             chunks_failed.append(idx)
                     else:
                         print(f"   ⚠️  Chunk {idx}/{total_chunks} failed: {e}")
+                        chunks_failed.append(idx)
+                except TruncatedResponseError as chunk_err:
+                    # Response overflowed max_tokens — resending the same
+                    # chunk truncates again (temperature 0). Page-level
+                    # retry sends each page alone: small responses, no
+                    # truncation possible.
+                    print(f"   ✂️  Chunk {idx}/{total_chunks} truncated at max_tokens — "
+                          f"retrying page-by-page ({chunk_err})")
+                    retry_result = _retry_chunk_without_bad_pages(
+                        chunk_path, _call_api, chunk_label=f"chunk {idx}/{total_chunks}",
+                        dropped_pages_out=pages_dropped_by_chunk.setdefault(idx, [])
+                    )
+                    if retry_result:
+                        all_texts.append(retry_result)
+                        chunks_succeeded.append(idx)
+                    else:
+                        print(f"   ⚠️  Chunk {idx}/{total_chunks} — page-level retry after truncation recovered nothing")
                         chunks_failed.append(idx)
                 except anthropic.InternalServerError as chunk_err:
                     # Overloaded or 500 after all retries exhausted — try one
@@ -4688,7 +6906,22 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
 
             # Merge all successful chunk responses (with page offsets for source tracking)
             if len(all_texts) > 1:
-                result_text = _merge_chunk_responses(all_texts, page_offsets=_chunk_page_offsets)
+                _parse_failed_chunks = []
+                result_text = _merge_chunk_responses(
+                    all_texts,
+                    page_offsets=_chunk_page_offsets,
+                    chunk_indices=chunks_succeeded,
+                    parse_failures=_parse_failed_chunks,
+                )
+                # A chunk whose response failed to parse contributed zero
+                # rooms — it FAILED, whatever the API status said. Reconcile
+                # the ledgers so downstream warnings/triggers see the loss.
+                if _parse_failed_chunks:
+                    chunks_succeeded = [c for c in chunks_succeeded
+                                        if c not in _parse_failed_chunks]
+                    chunks_failed = sorted(set(chunks_failed) | set(_parse_failed_chunks))
+                    print(f"   ⚠️  {len(_parse_failed_chunks)} chunk(s) reclassified "
+                          f"as FAILED (unparseable response): {_parse_failed_chunks}")
             elif len(all_texts) == 1:
                 result_text = all_texts[0]
             else:
@@ -4699,12 +6932,15 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
             # validation flag pages that returned 0 rooms inside a chunk
             # whose siblings yielded data — i.e., silent truncation.
             try:
-                merged_data = json.loads(re.search(r'\{.*\}', result_text, re.DOTALL).group())
+                merged_data = _parse_json_response(result_text, context='chunk-tracking inject')
+                if merged_data is None:
+                    raise json.JSONDecodeError('unparseable merged response', result_text[:50], 0)
                 merged_data["_chunk_tracking"] = {
                     "total_chunks": total_chunks,
                     "chunks_succeeded": chunks_succeeded,
                     "chunks_failed": chunks_failed,
                     "chunk_page_ranges": list(_chunk_plan_ranges),
+                    "pages_dropped": {k: v for k, v in pages_dropped_by_chunk.items() if v},
                 }
                 result_text = json.dumps(merged_data)
             except (json.JSONDecodeError, AttributeError) as _parse_err:
@@ -4715,13 +6951,51 @@ def analyze_construction_pdf(client, pdf_path, scope_notes="", schedule_hints=No
                       f"({type(_parse_err).__name__}: {str(_parse_err)[:120]}); "
                       f"chunks_succeeded={chunks_succeeded}, chunks_failed={chunks_failed}")
 
+            # --- Coverage ledger: per-page outcome of every chunk ---
+            # Ranges are 1-based inclusive on the FILTERED pdf; translate to
+            # ORIGINAL 0-based via _page_index_map. Pages excised by the
+            # page-level retry stay failed (the succeeded-chunk mark skips
+            # them; the ledger is upgrade-only so order matters here).
+            if _COVERAGE_LEDGER is not None:
+                def _orig0(filtered_1based):
+                    f0 = filtered_1based - 1
+                    return _page_index_map.get(f0, f0) if _page_index_map else f0
+                for rng in _chunk_plan_ranges:
+                    cidx = rng.get("chunk_idx")
+                    pages_f1 = range(rng.get("page_start", 1),
+                                     rng.get("page_end", 0) + 1)
+                    dropped_rel = set(pages_dropped_by_chunk.get(cidx) or [])
+                    for off, p1 in enumerate(pages_f1, start=1):
+                        if off in dropped_rel:
+                            _ledger_mark(pdf_path, [_orig0(p1)], "failed",
+                                         "page dropped during page-level retry")
+                        elif cidx in chunks_succeeded:
+                            _ledger_mark(pdf_path, [_orig0(p1)], "measured",
+                                         f"chunk {cidx} extracted")
+                        elif cidx in chunks_failed:
+                            _ledger_mark(pdf_path, [_orig0(p1)], "failed",
+                                         f"chunk {cidx} failed after retries")
+        elif result_text:
+            # Single-call path: the whole (possibly filtered) PDF went to the
+            # API in one request that succeeded — every included page was
+            # analyzed. Mark via the filter map when one exists.
+            if _COVERAGE_LEDGER is not None:
+                if _page_index_map:
+                    _ledger_mark(pdf_path, list(_page_index_map.values()),
+                                 "measured", "single-call extraction")
+                else:
+                    _COVERAGE_LEDGER.mark_file(pdf_path, "measured",
+                                               "single-call extraction")
+
         if result_text is None:
             raise RuntimeError("PDF analysis produced no results")
 
         # --- Remap source_page from filtered PDF indices → original PDF indices ---
         if _page_index_map:
             try:
-                data = json.loads(re.search(r'\{.*\}', result_text, re.DOTALL).group())
+                data = _parse_json_response(result_text, context='chunk-tracking inject (single)')
+                if data is None:
+                    raise json.JSONDecodeError('unparseable response', result_text[:50], 0)
                 remapped = 0
                 for floor in data.get("floors", []):
                     for room in floor.get("rooms", []):
@@ -4877,9 +7151,9 @@ Be precise — count every entry in each schedule row by row."""
                 result_parts.append(text)
 
         result_text = "".join(result_parts)
-        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        json_match = _parse_json_response(result_text)
         if json_match:
-            schedule_data = json.loads(json_match.group())
+            schedule_data = json_match
             if schedule_data.get("has_schedules"):
                 ds = schedule_data.get("door_schedule", {})
                 ws = schedule_data.get("window_schedule", {})
@@ -5069,9 +7343,9 @@ Be precise — extract every room listed in the schedule, and capture every stru
                 result_parts.append(text)
 
         result_text = "".join(result_parts)
-        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        json_match = _parse_json_response(result_text)
         if json_match:
-            rfs_data = json.loads(json_match.group())
+            rfs_data = json_match
             rooms = rfs_data.get("room_finish_schedule", [])
             bi = rfs_data.get("building_info", {})
             struct_scope = rfs_data.get("structural_finish_scope", []) or []
@@ -5311,12 +7585,12 @@ exterior scope visible.")."""
                 result_parts.append(text)
 
         result_text = "".join(result_parts)
-        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        json_match = _parse_json_response(result_text)
         if not json_match:
             print(f"   ⚠️  Could not parse exterior scope response")
             return None
 
-        ext_data = json.loads(json_match.group())
+        ext_data = json_match
         ext_data["source_pages"] = [i + 1 for i in elevation_indices]
 
         sqft = _num(ext_data.get("exterior_paint_sqft", 0))
@@ -5482,9 +7756,28 @@ def _maybe_run_schedule_recovery_pass(client, pdf_path, analysis_result):
     # _recalculate_totals re-firing because by this point the per-file
     # totals are already aggregated and downstream merge logic doesn't
     # know to re-trigger the safety net.
+    #
+    # HARD_NUMBERS_ONLY: footprint x 0.75 is an assumption, not a
+    # measurement. This block was an ungated COPY of the dryfall safety
+    # net in _recalculate_totals (which has always been gated) — the
+    # callout evidence is real, but the quantity is invented. Under the
+    # policy we capture the callouts (above) and flag the unpriced
+    # exposure; the estimator confirms the area from the RCP instead of
+    # the bid silently carrying ~$15k of assumed scope.
     est_dryfall = round(footprint * 0.75)
     gap = est_dryfall - dryfall
-    if gap > 0:
+    if gap > 0 and HARD_NUMBERS_ONLY:
+        analysis_result.setdefault("notes", []).append(
+            f"[Dryfall Recovery Pass] Finish schedule contains "
+            f"{len(struct_scope)} structural-finish callout(s) "
+            f"(deck/structure/MEP paint-to-deck) but only {dryfall:,.0f} sqft "
+            f"of dryfall was extracted from the drawings. RFI REQUIRED: "
+            f"confirm exposed-deck area (footprint-based estimate would be "
+            f"~{est_dryfall:,.0f} sqft — NOT priced under hard-numbers policy)."
+        )
+        print(f"   🔒 Dryfall recovery: callouts captured, +{gap:,.0f} sqft "
+              f"NOT applied (HARD_NUMBERS_ONLY) — flagged for RFI")
+    elif gap > 0:
         agg["total_dryfall_ceiling_sqft"] = dryfall + gap
         analysis_result["aggregated_totals"] = agg
         analysis_result.setdefault("notes", []).append(
@@ -5756,10 +8049,10 @@ If you cannot determine building counts from these pages, return:
                     "Could not process PDF — empty inventory response after retry"
                 )
 
-        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        json_match = _parse_json_response(result_text)
 
         if json_match:
-            inventory = json.loads(json_match.group())
+            inventory = json_match
             buildings = inventory.get("buildings", [])
 
             # Empty-buildings retry: Claude sometimes returns a parseable
@@ -5798,9 +8091,9 @@ If you cannot determine building counts from these pages, return:
                         for text in stream.text_stream:
                             result_parts2.append(text)
                     result_text2 = "".join(result_parts2)
-                    json_match2 = re.search(r'\{.*\}', result_text2, re.DOTALL)
+                    json_match2 = _parse_json_response(result_text2)
                     if json_match2:
-                        inventory2 = json.loads(json_match2.group())
+                        inventory2 = json_match2
                         buildings2 = inventory2.get("buildings", [])
                         if buildings2:
                             inventory = inventory2
@@ -5872,9 +8165,9 @@ If you cannot determine building counts from these pages, return:
                     for text in stream.text_stream:
                         result_parts.append(text)
                 result_text = "".join(result_parts)
-                json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+                json_match = _parse_json_response(result_text)
                 if json_match:
-                    inventory = json.loads(json_match.group())
+                    inventory = json_match
                     buildings = inventory.get("buildings", [])
                     if buildings:
                         inventory["source_pdf"] = os.path.basename(pdf_path)
@@ -6180,11 +8473,11 @@ If a field is not stated on these pages, use 0 for numbers and "" for strings.""
             for text in stream.text_stream:
                 result_parts.append(text)
         result_text = "".join(result_parts)
-        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        json_match = _parse_json_response(result_text)
         if not json_match:
             print(f"   ⚠️  Could not parse project overview JSON")
             return None
-        overview = json.loads(json_match.group())
+        overview = json_match
         overview["source_pdfs"] = sources_used
         overview["source_pages"] = {
             os.path.basename(p): [i + 1 for i in idxs]
@@ -6887,14 +9180,31 @@ def _apply_schedule_overrides(combined):
                     _supp_pct = 0.35 - (sched_doors_total - 100) / 50 * 0.20
                 max_supplement = round(sched_doors_total * _supp_pct)
                 supplement = min(raw_supplement, max_supplement)
-                agg["total_doors_full_paint"] = agg.get("total_doors_full_paint", 0) + supplement
-                overrides_applied.append(
-                    f"[Door Supplement] Residential building: room-level extraction found "
-                    f"{room_total_doors:.0f} doors vs schedule {sched_doors_total:.0f}. "
-                    f"Added {supplement} interior doors (closets/pantries likely omitted "
-                    f"from architectural door schedule)."
-                    + (f" (capped from {raw_supplement} to {supplement})" if raw_supplement > max_supplement else "")
-                )
+                if HARD_NUMBERS_ONLY:
+                    # The schedule is the authoritative count; the room-level
+                    # count is a noisy measurement this same function's
+                    # docstring admits can double-count. The delta is
+                    # EVIDENCE of possibly-unscheduled closet doors, not a
+                    # quantity — surface it for confirmation, price the
+                    # schedule.
+                    overrides_applied.append(
+                        f"[Door Count Check] Room-level extraction found "
+                        f"{room_total_doors:.0f} doors vs door schedule "
+                        f"{sched_doors_total:.0f}. RFI REQUIRED: confirm "
+                        f"whether typical interior doors (closet/linen/"
+                        f"pantry) are omitted from the door schedule — "
+                        f"~{supplement} doors NOT priced under hard-numbers "
+                        f"policy."
+                    )
+                else:
+                    agg["total_doors_full_paint"] = agg.get("total_doors_full_paint", 0) + supplement
+                    overrides_applied.append(
+                        f"[Door Supplement] Residential building: room-level extraction found "
+                        f"{room_total_doors:.0f} doors vs schedule {sched_doors_total:.0f}. "
+                        f"Added {supplement} interior doors (closets/pantries likely omitted "
+                        f"from architectural door schedule)."
+                        + (f" (capped from {raw_supplement} to {supplement})" if raw_supplement > max_supplement else "")
+                    )
 
     # --- Storefront door mark filter ---
     # LLM sometimes counts storefront/glazing entries (100A-100M, SF101, AD1 types)
@@ -7226,6 +9536,14 @@ def _supplement_missing_secondary_spaces(analysis):
     Safety: Only supplements when rooms-per-unit density confirms under-extraction.
     Caps total supplement at 45% of current extracted totals to prevent runaway.
     """
+    # Per-sheet mode extracts every plan sheet completely (+ a verification
+    # pass that ADDS missed labeled rooms), so there is no under-extraction for
+    # this compensator to correct — it only adds noise that varies run-to-run
+    # with the nondeterministic density read. Skip it (2026-06-13: a per-sheet
+    # Fishkill run swung walls 2%->126% downstream when boosts/supplements
+    # fired inconsistently).
+    if isinstance(analysis, dict) and analysis.get("_per_sheet_extraction"):
+        return analysis
     pi = analysis.get("project_info", {})
     agg = analysis.get("aggregated_totals", {})
 
@@ -7346,6 +9664,36 @@ def _supplement_missing_secondary_spaces(analysis):
             supplement_doors = round(supplement_doors * scale)
             supplement_details.append(f"Capped at {MAX_SUPPLEMENT_RATIO:.0%} of extracted")
 
+    # HARD_NUMBERS_ONLY: the quantities below come from per-room TEMPLATES
+    # ("a closet has 190 sqft of wall, 20 LF of trim, 1 door"), not from
+    # anything measured on this project's drawings — this is exactly the
+    # "prices items because other jobs have had that" failure customers
+    # reported. Under the policy: record the density evidence + the
+    # would-have-been quantities as an RFI, price nothing.
+    if HARD_NUMBERS_ONLY:
+        analysis["_secondary_space_supplement_suppressed"] = {
+            "wall_would_add": supplement_wall,
+            "ceil_would_add": supplement_ceil,
+            "trim_would_add": supplement_trim,
+            "doors_would_add": supplement_doors,
+            "density_ratio": density_ratio,
+            "rooms_per_unit": rooms_per_unit,
+        }
+        analysis.setdefault("notes", []).append(
+            f"[Secondary Space Check] Room extraction density is low "
+            f"({rooms_per_unit:.1f} rooms/unit vs ~{weighted_expected:.1f} "
+            f"expected, {density_ratio:.0%}) — closets/entry halls are likely "
+            f"missing from the extraction. RFI REQUIRED: confirm secondary "
+            f"spaces (closets, entry halls, unit hallways) per unit on the "
+            f"enlarged unit plans. Template-based supplement "
+            f"(~{supplement_wall:,} wall sqft, ~{supplement_trim:,} trim LF, "
+            f"~{supplement_doors} doors) NOT priced under hard-numbers policy."
+        )
+        print(f"   🔒 Secondary space supplement suppressed "
+              f"(HARD_NUMBERS_ONLY): would have added +{supplement_wall:,} "
+              f"wall sqft at {density_ratio:.0%} density — flagged for RFI")
+        return analysis
+
     # --- Apply supplement ---
     agg["total_paintable_wall_sqft"] = current_wall + supplement_wall
     agg["total_paintable_ceiling_sqft"] = current_ceil + supplement_ceil
@@ -7391,6 +9739,15 @@ def _validate_and_boost_walls(analysis):
     2. Footprint-based (fallback): uses building footprint × stories × 1.25 ratio.
        Footprint extraction has ±36% variance.
     """
+    # Per-sheet mode measures walls completely per plan sheet (perimeter ×
+    # height per room, merged by canonical identity), so the aggregation-loss
+    # this boost repairs does not occur — boosting only inflates, and it fires
+    # inconsistently with the nondeterministic perimeter cross-check, which is
+    # the main downstream variance amplifier (2026-06-13: per-sheet walls 2%
+    # one run, 126% the next, when the boost fired). Skip in per-sheet mode.
+    if isinstance(analysis, dict) and analysis.get("_per_sheet_extraction"):
+        return analysis
+
     # Skip boost if unit-count fallback already used footprint-based estimation.
     # The footprint method (ceiling = footprint × stories × 0.63, walls = ceiling × 3.3)
     # is calibrated to Rider actuals and doesn't need additional boosting.
@@ -7437,7 +9794,15 @@ def _validate_and_boost_walls(analysis):
             if boost_factor > 1.05:
                 boosted_wall = round(current_wall * boost_factor)
                 current_trim = _num(agg.get("total_base_trim_lf", 0))
-                boosted_trim = round(current_trim * boost_factor) if current_trim > 0 else current_trim
+                # HARD_NUMBERS_ONLY: the wall correction is derived from
+                # MEASURED per-room perimeter × height (repairing aggregation
+                # loss against the same drawings) and stays. Trim, however,
+                # is measured per-room in LF — multiplying it by a wall-area
+                # ratio is not a measurement, so it is no longer scaled.
+                if HARD_NUMBERS_ONLY:
+                    boosted_trim = current_trim
+                else:
+                    boosted_trim = round(current_trim * boost_factor) if current_trim > 0 else current_trim
 
                 agg["total_paintable_wall_sqft"] = boosted_wall
                 agg["total_base_trim_lf"] = boosted_trim
@@ -7447,7 +9812,8 @@ def _validate_and_boost_walls(analysis):
                     f"[Perimeter Wall Boost] Aggregated walls ({current_wall:,} sqft) "
                     f"< perimeter-derived ({perimeter_wall:,} sqft). "
                     f"Boosted to {boosted_wall:,} sqft ({boost_factor:.2f}x). "
-                    f"Trim {current_trim:,}->{boosted_trim:,} LF. "
+                    f"Trim {current_trim:,}->{boosted_trim:,} LF"
+                    f"{' (trim not scaled — hard-numbers policy)' if HARD_NUMBERS_ONLY else ''}. "
                     f"Ceilings not boosted (no measurement basis)."
                 )
                 print(f"   📐 Perimeter wall boost: {current_wall:,} -> {boosted_wall:,} sqft "
@@ -7500,6 +9866,27 @@ def _validate_and_boost_walls(analysis):
     # extraction variance: same PDF can yield 0.87x one run and 1.05x the next.
     boost_threshold = expected_wall_ratio * 0.92
     if actual_ratio < boost_threshold:
+        # HARD_NUMBERS_ONLY: unlike Mode 1, this mode's target is footprint
+        # × stories × a 1.25 ratio calibrated from ONE reference job (364
+        # Main) — an assumption, not a measurement from this project's
+        # drawings, applied to a footprint with documented ±36% extraction
+        # variance. Under the policy: flag the discrepancy for RFI, price
+        # only what was measured.
+        if HARD_NUMBERS_ONLY:
+            analysis.setdefault("notes", []).append(
+                f"[Wall Cross-Check] Extracted wall area ({current_wall:,.0f} "
+                f"sqft) is {actual_ratio:.2f}x floor area — residential "
+                f"multi-family typically runs ~{expected_wall_ratio}x; walls "
+                f"may be under-extracted. RFI REQUIRED: verify wall scope on "
+                f"the unit/floor plans (footprint-ratio correction to "
+                f"~{expected_wall:,.0f} sqft NOT applied under hard-numbers "
+                f"policy)."
+            )
+            print(f"   🔒 Footprint wall boost suppressed (HARD_NUMBERS_ONLY): "
+                  f"ratio {actual_ratio:.2f}x < {boost_threshold:.2f}x — "
+                  f"flagged for RFI")
+            return analysis
+
         # Boost to expected ratio
         boost_target = expected_wall
         boost_factor = boost_target / current_wall if current_wall > 0 else 1.0
@@ -7544,6 +9931,280 @@ def _validate_and_boost_walls(analysis):
             print(f"   📐 Wall boost: {current_wall:,} -> {boosted_wall:,} sqft "
                   f"({boost_factor:.2f}x factor, was {actual_ratio:.2f}x floor area)")
 
+    return analysis
+
+
+def _validate_unit_multipliers(analysis):
+    """Sanity-check unit-template multipliers against project_info.total_units.
+
+    Three checks, each emits a structured note + sets a project_info flag:
+
+      1. SUM_MISMATCH — sum of all residential-template multipliers differs
+         from total_units by >10%. Either too few templates (missed unit
+         types) or too many (phantom floors slipped past dedup).
+
+      2. SINGLE_TYPE_DOMINANCE — one unit type carries >95% of the total
+         multiplier when 2+ unit types were extracted. Likely a missed
+         second typology.
+
+      3. RATIO_IMPLAUSIBLE — for residential building_type, the implied
+         unit_mix has 2BR/3BR carrying >35% of unit count. Most supportive
+         housing / dorm / senior-living mixes are 1BR-dominant (≥80% 1BR);
+         the 2026-05-28 Ridgeview run reported 24% 2BR when reality was 7%
+         and the bid would have run high on a per-unit doors/trim basis if
+         downstream rates differ between typologies.
+
+    None of these reshape the multipliers — see the function docstring
+    why we don't: the over-/under-counts often compensate for per-room
+    dimension extraction error, so a "rebalance" can make the bid less
+    accurate, not more. The real fix is OCR/vision on the T1 unit-mix
+    table; this validator surfaces the issue for estimator review in the
+    meantime (tracked as task #16 in the Ridgeview release plan).
+
+    Idempotent via project_info['_unit_multipliers_validated'].
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    pi = analysis.get("project_info") or {}
+    if pi.get("_unit_multipliers_validated"):
+        return analysis
+
+    bt = str(pi.get("building_type", "")).lower()
+    is_residential = any(kw in bt for kw in (
+        "residential", "multifamily", "multi-family", "apartment", "condo",
+        "dorm", "supportive housing", "senior living", "assisted living",
+        "mixed-use residential",
+    ))
+    total_units = int(_num(pi.get("total_units", 0)))
+    if not is_residential or total_units < 4:
+        pi["_unit_multipliers_validated"] = True
+        analysis["project_info"] = pi
+        return analysis
+
+    # Collect per-unit-type multipliers from the rooms. A unit type's
+    # multiplier is the MAX multiplier of rooms tagged with that unit_type
+    # (not sum — each room emits the SAME multiplier within a template).
+    type_mults = {}  # unit_type -> max multiplier seen
+    for floor in analysis.get("floors", []) or []:
+        for room in floor.get("rooms", []) or []:
+            ut = str(room.get("unit_type", "") or "").strip()
+            if not ut:
+                continue
+            rn = str(room.get("room_name", "") or "").lower()
+            # Skip non-apartment rooms (corridors, common areas tagged with
+            # a "Typical Floor" label sometimes have unit_type set).
+            if any(kw in rn for kw in ("corridor", "lobby", "hall ", "stair",
+                                       "vestibule", "elevator")):
+                continue
+            mult = int(_num(room.get("unit_multiplier", 1)) or 1)
+            type_mults[ut] = max(type_mults.get(ut, 0), mult)
+
+    if not type_mults:
+        pi["_unit_multipliers_validated"] = True
+        analysis["project_info"] = pi
+        return analysis
+
+    sum_mults = sum(type_mults.values())
+    warnings = []
+
+    # Check 1: sum vs total_units
+    if total_units > 0:
+        gap_pct = abs(sum_mults - total_units) / total_units
+        if gap_pct > 0.10:
+            direction = "over" if sum_mults > total_units else "under"
+            warnings.append(
+                f"SUM_MISMATCH: sum of unit-template multipliers is "
+                f"{sum_mults} but project_info.total_units is {total_units} "
+                f"({direction} by {gap_pct:.0%}). "
+                f"Per-type multipliers: {dict(sorted(type_mults.items()))}."
+            )
+
+    # Check 2: single-type dominance when 2+ types extracted
+    if len(type_mults) >= 2 and sum_mults > 0:
+        top_type, top_mult = max(type_mults.items(), key=lambda x: x[1])
+        if top_mult / sum_mults > 0.95:
+            warnings.append(
+                f"SINGLE_TYPE_DOMINANCE: '{top_type}' carries "
+                f"{top_mult}/{sum_mults} ({top_mult/sum_mults:.0%}) of all "
+                f"unit-template multipliers. A second extracted unit type "
+                f"has near-zero count — possible missed typology."
+            )
+
+    # Check 3: 2BR/3BR share warrants verification. Tuned to fire on the
+    # Ridgeview case (24% 2BR, true 7%) — typical multifamily is 60-90%
+    # 1BR, so >20% 2BR/3BR is high enough to warrant a "verify against
+    # unit-mix table" note even if it's a legitimate family-housing project.
+    # False-positive cost is one extra note; false-negative cost is bidding
+    # several thousand $ off on per-unit doors / trim line items.
+    big_unit_mult = sum(
+        m for ut, m in type_mults.items()
+        if any(kw in ut.lower() for kw in ("2br", "2 br", "two bedroom",
+                                            "3br", "3 br", "three bedroom"))
+    )
+    if sum_mults > 0:
+        big_share = big_unit_mult / sum_mults
+        if big_share > 0.20:
+            warnings.append(
+                f"VERIFY_UNIT_MIX: 2BR/3BR units carry {big_share:.0%} "
+                f"of total multiplier ({big_unit_mult}/{sum_mults}). Typical "
+                f"multifamily is 60-90% 1BR; please confirm against the "
+                f"unit-mix table on the title sheet — vector-rendered tables "
+                f"often misread on first pass. Per-type counts: "
+                f"{dict(sorted(type_mults.items()))}."
+            )
+
+    if warnings:
+        existing_notes = analysis.get("notes") or []
+        if not isinstance(existing_notes, list):
+            existing_notes = [existing_notes] if existing_notes else []
+        for w in warnings:
+            existing_notes.append(f"[Unit Multiplier Check] {w}")
+            print(f"   ⚠️  Unit multiplier: {w}", flush=True)
+        analysis["notes"] = existing_notes
+        pi["_unit_multiplier_warnings"] = warnings
+
+    pi["_unit_multipliers_validated"] = True
+    analysis["project_info"] = pi
+    return analysis
+
+
+def _apply_residential_ceiling_floor(analysis):
+    """Apply a GSF-based floor to residential ceiling SF after extraction.
+
+    Background: per-room ceiling extraction systematically under-counts on
+    dense vector-rendered architectural sets. The 2026-05-28 Ridgeview run
+    extracted 32,601 SF ceiling after all dedup / corridor / supplement
+    fixes, but Rider's manual takeoff and KonstructIQ both measured 42,923
+    SF (= the building's gross floor area). The gap is methodology, not a
+    bug: extraction sums per-room geometry, while Rider's and Konstruct's
+    scope-of-work treat the entire painted-ceiling envelope as the painted
+    quantity.
+
+    This pass computes an expected ceiling SF from footprint × stories ×
+    efficiency, and if extracted < expected by >10%, bumps the aggregated
+    ceiling total to the expected value. Door / trim / wall totals are
+    untouched (those are measured per-room with reasonable accuracy and
+    have their own boost paths).
+
+    Efficiency factor:
+      * Default: RESIDENTIAL_EFFICIENCY_FULL_INTERIOR (0.97) — apartments
+        plus commons painted. Matches most NY supportive housing /
+        multifamily contracts including Rider's Ridgeview scope.
+      * Override via project_info['_residential_efficiency'] (float in
+        [0.5, 1.0]) for projects where commons are excluded — e.g. set to
+        0.63 (UNITS_ONLY) for a tenant-improvement-only scope.
+      * Auto-downshift to UNITS_ONLY when the finish schedule was detected
+        AND it lists ACT on corridor/lobby ceilings (commons not painted
+        in that case). Requires has_finish_schedule == True from the
+        schedule detector AND ACT evidence in any common-area room.
+
+    Gate: only fires for residential buildings with footprint and stories
+    known. Skips when _used_footprint_fallback is already set (the
+    footprint path already produced the GSF-scaled answer).
+
+    Idempotent via analysis['_residential_ceiling_floor_applied'].
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if analysis.get("_residential_ceiling_floor_applied"):
+        return analysis
+    if analysis.get("_used_footprint_fallback"):
+        analysis["_residential_ceiling_floor_applied"] = True
+        return analysis
+    # Per-sheet mode extracts ceilings completely per plan sheet (RCP + floor-
+    # plan instances merged by canonical identity), so this legacy GSF
+    # under-extraction compensator only INFLATES it — and it amplifies any
+    # story-count misread (2026-06-13: a 3-story job mis-read as 5 stories
+    # produced footprint 10,200 × 5 × 0.97 = 49,470 SF, 3.7× the truth).
+    # Skip it when per-sheet produced the analysis.
+    if analysis.get("_per_sheet_extraction"):
+        analysis["_residential_ceiling_floor_applied"] = True
+        analysis.setdefault("notes", []).append(
+            "[Residential Ceiling Floor] Skipped — per-sheet extraction "
+            "measures ceilings completely (RCP + plan merged by identity); "
+            "the GSF compensator would only over-count.")
+        return analysis
+
+    pi = analysis.get("project_info") or {}
+    bt = str(pi.get("building_type", "")).lower()
+    is_residential = any(kw in bt for kw in (
+        "residential", "multifamily", "multi-family", "apartment", "condo",
+        "dorm", "supportive housing", "senior living", "assisted living",
+        "mixed-use residential",
+    ))
+    if not is_residential:
+        analysis["_residential_ceiling_floor_applied"] = True
+        return analysis
+
+    footprint = _num(pi.get("footprint_sqft", 0))
+    stories = _num(pi.get("total_stories", 0))
+    if footprint <= 0 or stories <= 0:
+        analysis["_residential_ceiling_floor_applied"] = True
+        return analysis
+
+    # Resolve efficiency factor.
+    override = pi.get("_residential_efficiency")
+    if isinstance(override, (int, float)) and 0.5 <= float(override) <= 1.0:
+        efficiency = float(override)
+        efficiency_source = "project override"
+    else:
+        # Auto-downshift if the finish schedule says commons are ACT.
+        has_fs = bool(analysis.get("has_finish_schedule"))
+        commons_act = False
+        if has_fs:
+            for floor in analysis.get("floors", []) or []:
+                for room in floor.get("rooms", []) or []:
+                    rn = str(room.get("room_name", "")).lower()
+                    if not any(kw in rn for kw in (
+                            "corridor", "hallway", " hall", "lobby",
+                            "vestibule", "common room", "common area")):
+                        continue
+                    mat = str((room.get("materials") or {}).get("ceiling", "")).upper()
+                    if mat in ("ACT", "ACOUSTIC", "ACOUSTIC TILE",
+                               "DROP", "SUSPENDED"):
+                        commons_act = True
+                        break
+                if commons_act:
+                    break
+        if commons_act:
+            efficiency = RESIDENTIAL_EFFICIENCY_UNITS_ONLY
+            efficiency_source = "finish schedule shows ACT in commons"
+        else:
+            efficiency = RESIDENTIAL_EFFICIENCY_FULL_INTERIOR
+            efficiency_source = "default (commons painted)"
+
+    expected_ceil = round(footprint * stories * efficiency)
+    agg = analysis.setdefault("aggregated_totals", {})
+    current_ceil = _num(agg.get("total_paintable_ceiling_sqft", 0))
+
+    # Only bump when extracted is materially under expected. >10% gap is
+    # the trigger — smaller gaps fall within the noise of per-room
+    # measurement and don't justify overriding actual extraction.
+    if current_ceil >= expected_ceil * 0.90:
+        analysis["_residential_ceiling_floor_applied"] = True
+        return analysis
+
+    added = expected_ceil - current_ceil
+    agg["total_paintable_ceiling_sqft"] = expected_ceil
+
+    note = (f"[Residential Ceiling Floor] Extracted ceiling SF "
+            f"({current_ceil:,}) was below the GSF-based floor "
+            f"({expected_ceil:,}) for this residential building "
+            f"({footprint:,.0f} SF footprint × {stories:.0f} stories × "
+            f"{efficiency:.2f} efficiency from {efficiency_source}). "
+            f"Bumped ceiling total by +{added:,} SF to match the floor. "
+            f"Per-room extraction systematically under-counts dense "
+            f"vector-rendered floor plans; this floor catches the gap "
+            f"without requiring a re-extraction.")
+    existing_notes = analysis.get("notes") or []
+    if not isinstance(existing_notes, list):
+        existing_notes = [existing_notes] if existing_notes else []
+    analysis["notes"] = list(existing_notes) + [note]
+    print(f"   🪟 Residential ceiling floor: {current_ceil:,} → "
+          f"{expected_ceil:,} SF (+{added:,}, efficiency "
+          f"{efficiency:.2f} from {efficiency_source})", flush=True)
+
+    analysis["_residential_ceiling_floor_applied"] = True
     return analysis
 
 
@@ -8179,8 +10840,10 @@ def _audit_room_provenance(analysis, project_overview=None):
                             ),
                         }))
 
-            # 2. Outlier wall area
-            wall_area = _num(room.get("wall_area_sqft", 0))
+            # 2. Outlier wall area. Wall area lives under room["dimensions"]
+            # (the top-level key never exists in the extraction schema — a
+            # prior version read it and the outlier checks below never fired).
+            wall_area = _num((room.get("dimensions") or {}).get("wall_area_sqft", 0))
             rname_l = (room.get("room_name") or "").lower()
             is_closet_or_small = any(
                 kw in rname_l for kw in
@@ -9025,6 +11688,33 @@ _FLOOR_SINGLE_RE = re.compile(
     r'(?:level|levels|floor|floors)\s+(\d+)',
     re.IGNORECASE,
 )
+# Ordinal-numeric in front: "1st Floor", "2nd Floor", "10th Floor".
+# The original two regexes above only matched the word-first form
+# ("Floor 2", "Floors 2-9") used by the Waverly architect. Coppola
+# Associates and many other firms put the ordinal first ("2nd Floor"),
+# which left ~all of Ridgeview unparseable — see incident_2026-05-28.
+_FLOOR_ORDINAL_NUM_RE = re.compile(
+    r'(\d+)(?:st|nd|rd|th)\s+(?:level|floor)',
+    re.IGNORECASE,
+)
+_ORDINAL_WORDS = {
+    "first": 1, "second": 2, "third": 3, "fourth": 4, "fifth": 5,
+    "sixth": 6, "seventh": 7, "eighth": 8, "ninth": 9, "tenth": 10,
+}
+_FLOOR_ORDINAL_WORD_RE = re.compile(
+    r'\b(' + '|'.join(_ORDINAL_WORDS.keys()) + r')\s+(?:level|floor)',
+    re.IGNORECASE,
+)
+# Parenthetical multi-floor template names — e.g.
+#   "Typical Residential Floors (2nd & 3rd)"
+#   "(2nd, 3rd & 4th)"
+# Match any parenthesized chunk that contains at least one ordinal-numeric
+# ("Nth"), then pick out every ordinal-numeric inside it.
+_FLOOR_PAREN_COMPOUND_RE = re.compile(
+    r'\([^)]*?\d+(?:st|nd|rd|th)[^)]*\)',
+    re.IGNORECASE,
+)
+_ORDINAL_NUM_BARE_RE = re.compile(r'(\d+)(?:st|nd|rd|th)', re.IGNORECASE)
 
 
 def _parse_floor_range(name):
@@ -9034,7 +11724,11 @@ def _parse_floor_range(name):
       'Typical Residential Floors (Levels 1-7)' → {1,2,3,4,5,6,7}
       'Typical Residential Levels (Floors 2-9)' → {2,3,4,5,6,7,8,9}
       'Level 0 - Dining'                        → {0}
-      'Penthouse'                               → set()  (unparseable, won't dedupe)
+      '1st Floor', '2nd Floor', '10th Floor'    → {1}, {2}, {10}
+      'First Floor', 'Second Floor'             → {1}, {2}
+      'Typical Residential Floors (2nd & 3rd)'  → {2, 3}
+      '3rd Floor - Typical to 2nd Floor'        → {2, 3}
+      'Penthouse', 'Basement'                   → set()  (unparseable, won't dedupe)
 
     Unparseable floor names return an empty set, which means the dedup
     pass leaves them alone — safer to keep a possibly-unique floor than
@@ -9042,18 +11736,151 @@ def _parse_floor_range(name):
     """
     if not name:
         return set()
+    found = set()
+    # Parenthetical compounds like "(2nd & 3rd)" first — collect every
+    # ordinal-numeric inside any paren chunk that has at least one.
+    for m in _FLOOR_PAREN_COMPOUND_RE.finditer(name):
+        for om in _ORDINAL_NUM_BARE_RE.finditer(m.group()):
+            n = int(om.group(1))
+            if 0 < n <= 50:
+                found.add(n)
+    # Word-first range, e.g. "Floors 2-9"
     if m := _FLOOR_RANGE_RE.search(name):
         a, b = int(m.group(1)), int(m.group(2))
         lo, hi = min(a, b), max(a, b)
         # Sanity: an architectural set with floors 1..50+ is plausible
         # but a parsed range >25 is more likely a misparse (e.g., room
         # numbers being treated as floor numbers). Bail.
-        if hi - lo > 25:
-            return set()
-        return set(range(lo, hi + 1))
+        if hi - lo <= 25:
+            found |= set(range(lo, hi + 1))
+    # Word-first single, e.g. "Floor 2"
     if m := _FLOOR_SINGLE_RE.search(name):
-        return {int(m.group(1))}
-    return set()
+        found.add(int(m.group(1)))
+    # Ordinal-numeric, e.g. "2nd Floor", "10th Floor" — anywhere in the name.
+    # Using finditer so "3rd Floor - Typical to 2nd Floor" yields {2, 3}.
+    for m in _FLOOR_ORDINAL_NUM_RE.finditer(name):
+        n = int(m.group(1))
+        if 0 < n <= 50:
+            found.add(n)
+    # Ordinal-word, e.g. "First Floor", "Second Floor"
+    for m in _FLOOR_ORDINAL_WORD_RE.finditer(name):
+        found.add(_ORDINAL_WORDS[m.group(1).lower()])
+    return found
+
+
+_COMMON_AREA_ROOM_KEYWORDS = (
+    "corridor", "hallway", " hall", "lobby", "vestibule",
+    "common room", "common area", "elevator lobby",
+)
+# Building types that genuinely use ACT in corridors — keep model's call.
+_COMMERCIAL_BUILDING_KEYWORDS = (
+    "office", "retail", "commercial", "healthcare", "hospital", "clinic",
+    "hospitality", "hotel", "warehouse", "industrial",
+)
+
+
+def _fix_residential_corridor_ceilings(analysis):
+    """Flip ACT-defaulted corridor/lobby ceilings back to painted GYP for
+    residential buildings when there is no explicit ACT evidence.
+
+    The 2026-05-28 Ridgeview run lost ~2,900 sqft of corridor ceiling because
+    the per-room extraction prompt told the model that public corridors
+    "ALMOST ALWAYS have ACT ceilings — do NOT assume painted". That guidance
+    is correct for commercial but wrong for residential supportive housing,
+    multifamily, dorms, and similar building types where painted GYP is the
+    corridor norm. The prompt has been corrected to branch on building_type,
+    but this safety net catches:
+      • Re-runs of result JSON produced before the prompt fix.
+      • Any future prompt regression.
+      • The case where the model defaults ACT before reading building_type.
+
+    A corridor/lobby ceiling is "ACT-defaulted" when:
+      1. building_type indicates residential AND
+      2. materials.ceiling is empty/ACT AND ceiling_painted is false AND
+      3. notes do NOT explicitly mention ACT/grid/RCP evidence AND
+      4. dimensions.floor_area_sqft > 0 (so we have something to paint).
+
+    When all four hold, flip ceiling_painted to true, set ceiling material
+    to "GYP", populate ceiling_area_sqft from floor_area_sqft, and append
+    an audit note. Wallcovering, stained wood, etc. are unaffected.
+
+    Idempotent via analysis['_residential_corridor_ceiling_fixed'].
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if analysis.get('_residential_corridor_ceiling_fixed'):
+        return analysis
+
+    pi = analysis.get('project_info') or {}
+    bt = str(pi.get('building_type', '')).lower()
+    is_residential = any(kw in bt for kw in (
+        "residential", "multifamily", "multi-family", "apartment", "condo",
+        "dorm", "supportive housing", "senior living", "assisted living",
+        "mixed-use residential",
+    ))
+    is_commercial = any(kw in bt for kw in _COMMERCIAL_BUILDING_KEYWORDS) \
+                    and not is_residential
+    # Mixed-use that isn't clearly residential or commercial: don't touch.
+    if not is_residential or is_commercial:
+        analysis['_residential_corridor_ceiling_fixed'] = True
+        return analysis
+
+    fixed_count = 0
+    fixed_sqft = 0
+    for floor in analysis.get('floors', []) or []:
+        for room in floor.get('rooms', []) or []:
+            rn = str(room.get('room_name', '')).lower()
+            if not any(kw in rn for kw in _COMMON_AREA_ROOM_KEYWORDS):
+                continue
+            materials = room.setdefault('materials', {})
+            ceiling_mat = str(materials.get('ceiling', '')).upper().strip()
+            already_painted = bool(materials.get('ceiling_painted'))
+            if already_painted:
+                continue
+            # If the model has explicit ACT evidence in the notes, respect it.
+            notes_lc = str(room.get('notes', '') or '').lower()
+            has_explicit_act = (
+                ('act ' in notes_lc and 'grid' in notes_lc)
+                or 'reflected ceiling plan' in notes_lc
+                or 'rcp shows act' in notes_lc
+                or 'act per finish schedule' in notes_lc
+            )
+            if has_explicit_act:
+                continue
+            # Material must be empty / unknown / ACT (not e.g. DRYFALL, exposed).
+            if ceiling_mat and ceiling_mat not in ("", "ACT", "ACOUSTIC",
+                                                    "ACOUSTIC TILE", "DROP",
+                                                    "SUSPENDED"):
+                continue
+            dims = room.setdefault('dimensions', {})
+            floor_area = _num(dims.get('floor_area_sqft', 0))
+            if floor_area <= 0:
+                continue
+
+            # Flip it.
+            materials['ceiling'] = 'GYP'
+            materials['ceiling_painted'] = True
+            if _num(dims.get('ceiling_area_sqft', 0)) == 0:
+                dims['ceiling_area_sqft'] = floor_area
+            mult = room.get('unit_multiplier', 1) or 1
+            fixed_count += 1
+            fixed_sqft += floor_area * mult
+
+    if fixed_count:
+        note = (f"[Residential Corridor Ceiling Fix] {fixed_count} corridor/lobby "
+                f"room(s) had ACT-defaulted ceilings overridden to painted GYP "
+                f"(~{fixed_sqft:,.0f} sqft effective area added). "
+                f"Residential corridors almost always use painted gypsum; "
+                f"the original extraction defaulted to ACT due to a "
+                f"commercial-biased prompt rule.")
+        existing_notes = analysis.get('notes') or []
+        if not isinstance(existing_notes, list):
+            existing_notes = [existing_notes] if existing_notes else []
+        analysis['notes'] = list(existing_notes) + [note]
+        print(f"   🛠  {note}", flush=True)
+
+    analysis['_residential_corridor_ceiling_fixed'] = True
+    return analysis
 
 
 def _dedupe_overlapping_template_floors(analysis):
@@ -9263,6 +12090,307 @@ def _base_confirmed_paintable(room, building_type):
     return True  # residential / unknown — painted wood base is the norm
 
 
+# Floor names that indicate an ENLARGED UNIT PLAN sheet rather than a real
+# building level: "Unit Types x01–x06 (Typical Residential Unit Plans)",
+# "Special Unit Plans — Units x01 through x06", "Enlarged Unit Plans", etc.
+_ENLARGED_PLAN_FLOOR_RE = re.compile(
+    r"(?:unit\s+(?:type|plan)|typical\s+.*\bunit\b|enlarged\s+(?:unit\s+)?plan"
+    r"|special\s+unit|unit\s+types?\b|\bunit\s+x\d|\btemplate\b)",
+    re.IGNORECASE)
+# Broadened 2026-06-13: the model names enlarged unit-plan pseudo-floors many
+# ways run-to-run — "Typical Unit x01 (2BR/2BA Template)", "Typical Unit x05
+# Floor", "Unit Types x01-x06 (...A-105...)". The old pattern required the
+# literal "unit plan"/"unit type", so these escaped dedup and double-counted
+# the per-floor units (~10,500 walls on Fishkill). Now matches "typical ...
+# unit", a literal "unit x<digit>" (template ids never collide with real
+# units like 201), and "template". Real physical floors ("2nd Floor", "3rd
+# Floor (Sheet A103)") contain none of these tokens, so no false match.
+
+
+def _dedupe_enlarged_plan_floors(analysis):
+    """Zero the geometry of pseudo-floors created from enlarged unit-plan
+    sheets when the same rooms were already extracted on real floors.
+
+    2026-06-12 Fishkill validation: the extraction produced real floors
+    ('1st Floor' 87 rooms, '2nd/3rd Floor — Residential' 92 each) PLUS
+    'Unit Types x01–x06 (Typical Residential Unit Plans — A-105/A-106/
+    A-107)' (18 rooms) and 'Special Unit Plans — Units x01 through x06'
+    (27 rooms) — the enlarged unit-plan SHEETS extracted as if they were
+    additional building levels. Their rooms duplicate apartments already
+    counted on the ranged floors, inflating walls ~4-10x. The template-
+    floor dedup can't catch them because their names parse to no floor
+    range, and cross-sheet dedup keys on (floor, unit, name) so the
+    pseudo-floor boundary hides the duplication.
+
+    A floor is treated as an enlarged-plan duplicate ONLY when ALL hold:
+      1. Its name matches the enlarged-plan pattern AND parses to no
+         floor range.
+      2. Real (range-parsed) floors exist and carry a substantive room
+         count (the building wasn't extracted solely from unit plans).
+      3. >=50% of its rooms have a same-type counterpart on the real
+         floors (room names compared with digits/unit tokens stripped).
+      4. Its rooms carry no unit_multiplier > 1 — a multiplied template
+         floor is the LEGITIMATE source of unit scope (the pattern where
+         floor plans show shells and unit plans carry the detail), and
+         zeroing it would delete real rooms.
+
+    Matching floors keep their rooms (provenance preserved) with geometry
+    zeroed, mirroring the cross-sheet dedup convention. Doors/windows are
+    retained (schedule overrides govern those). Idempotent via
+    _enlarged_plan_floors_deduped.
+    """
+    if analysis.get("_enlarged_plan_floors_deduped"):
+        return
+    floors = analysis.get("floors", []) or []
+    if len(floors) < 2:
+        analysis["_enlarged_plan_floors_deduped"] = True
+        return
+
+    def _strip_name(n):
+        # "Unit x01 Type — Bath 1" / "Unit 201 — Bathroom 2" -> "unit bath"
+        s = re.sub(r"[x#]?\d+[a-z]?", " ", str(n or "").lower())
+        s = re.sub(r"[^a-z]+", " ", s)
+        # Normalize the naming variants the enlarged-plan sheets use
+        # ("Type —" infix, Bath vs Bathroom, trailing "Room").
+        s = s.replace("bathroom", "bath").replace("bedroom", "bed")
+        words = [w for w in s.split() if w not in ("type", "room", "rm", "the")]
+        return " ".join(words)
+
+    ranged, candidates = [], []
+    for fl in floors:
+        fname = str(fl.get("floor_name", "") or "")
+        if _parse_floor_range(fname):
+            ranged.append(fl)
+        elif _ENLARGED_PLAN_FLOOR_RE.search(fname):
+            candidates.append(fl)
+    if not ranged or not candidates:
+        analysis["_enlarged_plan_floors_deduped"] = True
+        return
+
+    ranged_rooms = [r for fl in ranged for r in fl.get("rooms", [])
+                    if r.get("in_scope", True)]
+    ranged_names = {_strip_name(r.get("room_name")) for r in ranged_rooms}
+    ranged_names.discard("")
+    if len(ranged_rooms) < 10:
+        # Real floors are thin — the unit plans may be the only source of
+        # unit detail. Don't risk deleting the actual scope.
+        analysis["_enlarged_plan_floors_deduped"] = True
+        return
+
+    # --- Per-floor-vs-template reconciliation (per-sheet mode) ---
+    # The mult>1 carve-out below assumes the ranged floors are SHELLS and the
+    # multiplied unit-plan templates carry the real detail. Per-sheet
+    # extraction breaks that assumption: it measures every unit on its own
+    # floor plan (201-206, 301-306) AND extracts the enlarged x01-x04
+    # templates — so both are full-detail and the building is counted twice
+    # (Fishkill 2026-06: ~18% wall/ceiling overage). When the ranged floors
+    # already carry substantive measured geometry AND their distinct unit
+    # count covers the building, the multiplied templates are the duplicate,
+    # not the source — so the carve-out is suspended for them.
+    pi = analysis.get("project_info", {}) or {}
+    total_units = _num(pi.get("total_units", 0))
+    ranged_units = set()
+    for r in ranged_rooms:
+        uk = _normalize_room_identity(r.get("room_id", ""),
+                                      r.get("room_name", ""))[0]
+        if not uk:
+            uk = _extract_unit_from_room_id(r.get("room_id", ""))
+        if uk:
+            ranged_units.add(str(uk).upper())
+    ranged_wall = sum(_num((r.get("dimensions") or {}).get("wall_area_sqft", 0))
+                      for r in ranged_rooms)
+    # Per-floor plans "cover the building" when they carry real wall geometry
+    # and their distinct unit count meets ~80% of the building's unit total
+    # (so we never drop templates that are filling in genuinely-missing floors).
+    per_floor_covers_building = (
+        ranged_wall > 0 and total_units > 0
+        and len(ranged_units) >= total_units * 0.8)
+
+    zeroed_floors = 0
+    zeroed_rooms = 0
+    zeroed_wall_sqft = 0
+    for fl in candidates:
+        rooms = [r for r in fl.get("rooms", []) if r.get("in_scope", True)]
+        if not rooms:
+            continue
+        force_zero = False
+        if any(int(_num(r.get("unit_multiplier", 1)) or 1) > 1 for r in rooms):
+            if not per_floor_covers_building:
+                analysis.setdefault("notes", []).append(
+                    f"[Enlarged-Plan Check] Floor {fl.get('floor_name')!r} looks "
+                    f"like an enlarged unit-plan sheet but carries unit "
+                    f"multipliers — left intact (it is the template source of "
+                    f"unit scope, not a duplicate).")
+                continue
+            # else: per-floor plans already measure the whole building — this
+            # multiplied template is the duplicate. The unit-count
+            # reconciliation (>=80% of units measured per-floor with geometry)
+            # IS the evidence; the 50% room-name match below is a weaker
+            # heuristic that was silently blocking the zeroing (2026-06-13:
+            # "treating as duplicate" logged but walls not actually removed ->
+            # 126% over). Force the zeroing in this case.
+            force_zero = True
+            analysis.setdefault("notes", []).append(
+                f"[Enlarged-Plan Check] Floor {fl.get('floor_name')!r} carries "
+                f"unit multipliers but the building's {len(ranged_units)} "
+                f"per-floor units (of {total_units:.0f}) are already measured "
+                f"with geometry — treating this enlarged template as a "
+                f"duplicate of the floor-plan units, not the source.")
+        if not force_zero:
+            matched = sum(1 for r in rooms if _strip_name(r.get("room_name")) in ranged_names)
+            if matched / len(rooms) < 0.5:
+                continue
+        for r in rooms:
+            d = r.setdefault("dimensions", {})
+            zeroed_wall_sqft += _num(d.get("wall_area_sqft", 0))
+            for k in ("wall_area_sqft", "perimeter_lf", "ceiling_area_sqft",
+                      "floor_area_sqft"):
+                d[k] = 0
+            r.setdefault("elements", {})["base_trim_lf"] = 0
+            r.setdefault("materials", {})["ceiling_painted"] = False
+            r["notes"] = (str(r.get("notes", "") or "") +
+                          " [Enlarged-plan dedup] room duplicates a unit "
+                          "already measured on the building floor plans; "
+                          "geometry counted once there.").strip()
+            zeroed_rooms += 1
+        zeroed_floors += 1
+
+    if zeroed_floors:
+        note = (f"[Enlarged-Plan Dedup] {zeroed_floors} enlarged unit-plan "
+                f"pseudo-floor(s) duplicated rooms already measured on the "
+                f"building floor plans — zeroed geometry on {zeroed_rooms} "
+                f"room(s) (~{zeroed_wall_sqft:,.0f} wall sqft de-duplicated; "
+                f"doors/windows retained).")
+        analysis.setdefault("notes", []).append(note)
+        print(f"   🪞 {note}")
+
+    analysis["_enlarged_plan_floors_deduped"] = True
+
+
+def _is_small_commercial_building(analysis):
+    """True for a small, single-tenant COMMERCIAL building with no repeated
+    units — the class where a floor is drawn on several plan sheets and the
+    'one authoritative sheet per floor' rule applies. Gated hard so the
+    multifamily path (unit-anchored rooms) is never touched."""
+    pi = (analysis or {}).get("project_info", {}) or {}
+    bt = str(pi.get("building_type", "")).lower()
+    residentialish = any(k in bt for k in (
+        "residential", "mixed", "multi", "apartment", "condo", "senior",
+        "dorm", "assisted", "supportive"))
+    if residentialish:
+        return False
+    if _num(pi.get("total_units", 0)) > 2:
+        return False
+    rooms = [r for fl in (analysis.get("floors") or [])
+             for r in (fl.get("rooms") or []) if isinstance(r, dict)]
+    if not rooms:
+        return False
+    # No meaningful unit anchoring (generic-named building).
+    unit_anchored = sum(
+        1 for r in rooms
+        if _normalize_room_identity(r.get("room_id", ""),
+                                    r.get("room_name", ""))[0]
+        or _extract_unit_from_room_id(r.get("room_id", "")))
+    return unit_anchored <= max(2, 0.15 * len(rooms))
+
+
+_SC_TYPE_SYNONYMS = {
+    "womens": "womens", "women": "womens",
+    "mens": "mens", "men": "mens",
+    "restroom": "restroom", "toilet": "restroom", "bathroom": "restroom",
+    "bath": "restroom", "ada": "restroom", "family": "restroom",
+    "storage": "storage", "stor": "storage", "attic": "storage",
+    "mechanical": "mech", "mech": "mech", "electrical": "elec", "elec": "elec",
+    "shower": "shower", "showers": "shower", "office": "office",
+    "stair": "stair", "stairs": "stair", "lift": "stair", "elevator": "elev",
+    "gathering": "gathering", "meeting": "meeting", "hall": "hall",
+    "corridor": "hall", "lobby": "lobby", "vestibule": "vestibule",
+    "janitor": "jan", "utility": "util", "closet": "closet",
+}
+
+
+def _sc_room_type(name):
+    """LOCAL generic room-type token for small-commercial dedup only (kept
+    OUT of the shared canonical identity so multifamily is unaffected).
+    Men's/Women's stay distinct."""
+    s = re.sub(r"[#/]", " ", str(name or "").lower())
+    s = re.sub(r"\d+", " ", s)
+    s = re.sub(r"\b(room|rm|area|space)\b", " ", s)
+    s = re.sub(r"[^a-z ]+", " ", s)
+    words = [w for w in s.split() if w]
+    if not words:
+        return ""
+    # whole-phrase first word that's a known synonym wins; else first word
+    for w in words:
+        if w in _SC_TYPE_SYNONYMS:
+            return _SC_TYPE_SYNONYMS[w]
+    return words[0]
+
+
+def _dedupe_small_commercial_floors(analysis):
+    """For a small-commercial building (gated), when a floor's rooms come from
+    multiple source pages — the same floor re-drawn on floor/dimension/finish
+    sheets — keep the AUTHORITATIVE page (most in-scope rooms) plus any
+    page-unique room TYPES from the other pages, marking the rest out of scope.
+
+    Fail-safe bias: page-unique types are KEPT (a complementary room over-
+    counts, which is visible) and only clear cross-sheet type duplicates are
+    dropped — never a silent under-count. Double-gated (small-commercial AND
+    per-sheet). Idempotent via _sc_floor_deduped.
+    """
+    if not isinstance(analysis, dict):
+        return
+    if analysis.get("_sc_floor_deduped"):
+        return
+    if not analysis.get("_per_sheet_extraction"):
+        return
+    if not _is_small_commercial_building(analysis):
+        return
+    analysis["_sc_floor_deduped"] = True
+
+    dropped_total = 0
+    walls_dropped = 0.0
+    for fl in (analysis.get("floors") or []):
+        rooms = [r for r in (fl.get("rooms") or [])
+                 if isinstance(r, dict) and r.get("in_scope", True)]
+        if len(rooms) < 2:
+            continue
+        by_page = {}
+        for r in rooms:
+            by_page.setdefault(r.get("source_page"), []).append(r)
+        if len(by_page) < 2:
+            continue  # floor drawn on a single sheet — nothing to reconcile
+        # authoritative page = most rooms (tie-break: most wall area)
+        def _pwalls(rs):
+            return sum(_num((x.get("dimensions") or {}).get("wall_area_sqft", 0))
+                       for x in rs)
+        auth_page = max(by_page, key=lambda p: (len(by_page[p]), _pwalls(by_page[p])))
+        if len(by_page[auth_page]) < 3:
+            continue  # authoritative page too thin to trust as the floor plan
+        auth_types = {_sc_room_type(r.get("room_name")) for r in by_page[auth_page]}
+        auth_types.discard("")
+        for pg, rs in by_page.items():
+            if pg == auth_page:
+                continue
+            for r in rs:
+                if _sc_room_type(r.get("room_name")) in auth_types:
+                    r["in_scope"] = False
+                    r["scope_exclusion_reason"] = (
+                        f"small-commercial: same floor re-drawn on sheet "
+                        f"p{pg}; counted once on the authoritative plan "
+                        f"p{auth_page}")
+                    dropped_total += 1
+                    walls_dropped += _num((r.get("dimensions") or {})
+                                          .get("wall_area_sqft", 0))
+    if dropped_total:
+        note = (f"[Small-Commercial Floor Dedup] {dropped_total} room(s) that "
+                f"re-drew an authoritative floor plan on secondary sheets were "
+                f"counted once (~{walls_dropped:,.0f} duplicate wall sqft "
+                f"removed; page-unique rooms kept).")
+        analysis.setdefault("notes", []).append(note)
+        print(f"   🪞 {note}")
+
+
 def _dedupe_cross_sheet_rooms(analysis):
     """Count each room ONCE when the same room is extracted from multiple sheets
     (floor plan + fixture plan + RCP + code plan).
@@ -9283,36 +12411,51 @@ def _dedupe_cross_sheet_rooms(analysis):
     open). Walls then flow through the geometric perimeter floor +
     _validate_and_boost_walls to recover the real shell perimeter.
 
-    Tightly gated to SINGLE-STORY COMMERCIAL jobs with no unit multipliers,
-    where a repeated room NAME is a genuine cross-sheet duplicate. It must NEVER
-    run on residential / multi-unit work, where many distinct rooms legitimately
-    share a name ("Bedroom", "Bath"). Duplicates are only merged when they span
-    >1 source page, so genuinely distinct same-name rooms drawn on one sheet are
-    left alone. Idempotent via the _cross_sheet_rooms_deduped flag.
+    Two modes:
+      * COMMERCIAL single-tenant (original Five Below mode): no unit
+        multipliers, room NAME is the identity — a repeated name across
+        sheets is a genuine duplicate.
+      * RESIDENTIAL / multi-unit (2026-06-12 Fishkill validation): many
+        distinct rooms legitimately share a name ("Bedroom", "Bath"), so
+        identity requires a UNIT token — rooms only group when the same
+        (floor, unit, room name) appears on multiple sheets (floor plan +
+        RCP + enlarged unit plan). Rooms with no recognizable unit token
+        are never merged in this mode.
+
+    Duplicates are only merged when they span >1 source page, so genuinely
+    distinct same-name rooms drawn on one sheet are left alone. Idempotent
+    via the _cross_sheet_rooms_deduped flag.
     """
     if analysis.get("_cross_sheet_rooms_deduped"):
         return
     pi = analysis.get("project_info", {}) or {}
     bt = str(pi.get("building_type", "")).lower()
+    is_residentialish = any(k in bt for k in (
+        "residential", "mixed", "multi", "apartment", "condo", "senior",
+        "dorm", "assisted", "supportive"))
     is_commercial = any(k in bt for k in (
         "commercial", "retail", "auto", "industrial", "warehouse",
         "dealership", "restaurant", "fitness", "recreational",
-        "institutional", "entertain", "fit-out", "fitout", "tenant"))
-    # Exclude anything residential/mixed — those repeat room names legitimately.
-    if not is_commercial or any(k in bt for k in (
-            "residential", "mixed", "multi", "apartment", "condo", "senior")):
-        return
+        "institutional", "entertain", "fit-out", "fitout", "tenant")) \
+        and not is_residentialish
     rooms = [r for fl in analysis.get("floors", []) for r in fl.get("rooms", [])
              if r.get("in_scope", True)]
     if not rooms:
         return
-    # Hard guard: a single repeated/template unit means this isn't a simple
-    # single-tenant box — bail rather than risk merging real repeats.
-    if _num(pi.get("total_units", 0)) > 1:
-        return
-    for r in rooms:
-        if _extract_multiplier_from_notes(r) > 1 or _num(r.get("unit_multiplier", 1)) > 1:
+
+    unit_mode = False
+    if is_commercial:
+        # Hard guard: a single repeated/template unit means this isn't a
+        # simple single-tenant box — bail rather than risk merging repeats.
+        if _num(pi.get("total_units", 0)) > 1:
             return
+        for r in rooms:
+            if _extract_multiplier_from_notes(r) > 1 or _num(r.get("unit_multiplier", 1)) > 1:
+                return
+    elif is_residentialish:
+        unit_mode = True
+    else:
+        return  # unknown building type — leave alone
 
     import collections
 
@@ -9322,28 +12465,124 @@ def _dedupe_cross_sheet_rooms(analysis):
     def _warea(r):
         return _num((r.get("dimensions", {}) or {}).get("wall_area_sqft", 0))
 
+    _UNIT_TOKEN_RE = re.compile(
+        r"(?:unit|apt|apartment|suite)[\s\-_#]*([a-z]?\d{1,4}[a-z]?)", re.IGNORECASE)
+
+    def _unit_token(r):
+        for field in (r.get("room_id"), r.get("unit_type"), r.get("room_name")):
+            m = _UNIT_TOKEN_RE.search(str(field or ""))
+            if m:
+                return m.group(1).lower()
+        return None
+
+    _FILLER_WORDS = {"type", "room", "rm", "the", "s", "of", "and"}
+
+    def _type_tokens(name):
+        """Order-independent room-identity tokens within a unit.
+
+        'Unit 201 — Master Bedroom', 'Unit 201 Bedroom (Master)', and
+        'Master Bedroom — Unit 201' all reduce to {'master', 'bed'} —
+        the multi-pass-union naming variants of one physical room. Digits
+        survive as tokens so 'Bath 1' vs 'Bath 2' stay distinct.
+        """
+        s = _UNIT_TOKEN_RE.sub(" ", str(name or "").lower())
+        s = s.replace("bathroom", "bath").replace("bedroom", "bed")
+        toks = frozenset(w for w in re.split(r"[^a-z0-9]+", s)
+                         if w and w not in _FILLER_WORDS)
+        return toks
+
+    # Single generic words a unit can legitimately contain several of —
+    # same-page dedupe for these requires near-identical geometry too.
+    _GENERIC_SINGLES = ({"closet"}, {"storage"}, {"hall"}, {"hallway"},
+                        {"bath"}, {"bed"})
+
     groups = collections.defaultdict(list)
-    for r in rooms:
-        nm = _norm(r.get("room_name") or r.get("name"))
-        if nm:
-            groups[nm].append(r)
+    if unit_mode:
+        # Residential: identity = (floor, unit, room-type tokens). Floor
+        # keyed by the ordinal-aware range parse so '2nd Floor' and '2nd
+        # Floor — Residential' collide; rooms without a unit token are
+        # skipped — too ambiguous to merge safely.
+        for fl in analysis.get("floors", []):
+            fkey = tuple(sorted(_parse_floor_range(fl.get("floor_name", "")))) or \
+                _normalize_floor_key(fl.get("floor_name", ""))
+            for r in fl.get("rooms", []):
+                if not r.get("in_scope", True):
+                    continue
+                ut = _unit_token(r)
+                tt = _type_tokens(r.get("room_name") or r.get("name"))
+                if ut and tt:
+                    groups[(fkey, ut, tt)].append(r)
+    else:
+        for r in rooms:
+            nm = _norm(r.get("room_name") or r.get("name"))
+            if nm:
+                groups[nm].append(r)
 
     removed = 0
-    for nm, insts in groups.items():
+    ceilings_backfilled = 0
+    for key, insts in groups.items():
         if len(insts) < 2:
             continue
-        # Only treat as cross-sheet duplicates when they appear on >1 sheet.
+        # Only treat as cross-sheet duplicates when they appear on >1 sheet —
+        # EXCEPT in unit mode, where the same (floor, unit, name) appearing
+        # twice on ONE page with near-identical geometry is a tile-overlap /
+        # multi-pass-union duplicate of the same physical room (a real
+        # second room of the same name in the same unit — e.g. Bath 1 vs
+        # Bath 2 — has different geometry and is left alone).
         pages = {str(r.get("source_page")) for r in insts if r.get("source_page") is not None}
         if len(pages) < 2:
-            continue
+            if not unit_mode:
+                continue
+            # Same (floor, unit, type-tokens) on ONE page. For distinctive
+            # token sets ({'master','bed'}, {'laundry','closet'}) the plans
+            # label real second rooms distinctly ('Bath 1' vs 'Bath 2'
+            # carry the digit as a token), so same-key instances are
+            # multi-pass-union / tile-overlap variants of one room — keep
+            # the most complete. For generic single-word sets a unit can
+            # legitimately contain several of (e.g. unlabeled closets),
+            # require near-identical geometry as well.
+            ordered = sorted(insts, key=_warea, reverse=True)
+            anchor = ordered[0]
+            aw = _warea(anchor)
+            if aw <= 0:
+                continue
+            type_toks = key[2] if isinstance(key, tuple) and len(key) == 3 else None
+            if type_toks is not None and set(type_toks) in [set(g) for g in _GENERIC_SINGLES]:
+                near_dups = [r for r in ordered[1:]
+                             if _warea(r) > 0 and abs(_warea(r) - aw) <= 0.10 * aw]
+            else:
+                near_dups = [r for r in ordered[1:] if _warea(r) > 0]
+            if not near_dups:
+                continue
+            insts = [anchor] + near_dups
         # Keep the most-complete instance (largest measured wall area).
         keeper = max(insts, key=_warea)
         # Majority vote on whether this room's ceiling is painted (tie -> painted).
         painted = sum(1 for r in insts if (r.get("materials", {}) or {}).get("ceiling_painted", False))
         keep_painted = painted >= (len(insts) - painted) and painted > 0
         km = keeper.setdefault("materials", {})
+        kd = keeper.setdefault("dimensions", {})
         if not keep_painted and km.get("ceiling_painted", False):
             km["ceiling_painted"] = False
+        elif keep_painted and not km.get("ceiling_painted", False):
+            # SYMMETRIC vote (Five Below fix gap): the keeper is usually the
+            # floor-plan instance (max wall area) which often carries NO
+            # ceiling data, while the zeroed RCP instance had the real
+            # ceiling. The old one-way vote made the ceiling vanish entirely
+            # on exactly the jobs this dedup targets.
+            km["ceiling_painted"] = True
+        if km.get("ceiling_painted") and _num(kd.get("ceiling_area_sqft", 0)) == 0:
+            best_ceil = max(
+                (_num((r.get("dimensions", {}) or {}).get("ceiling_area_sqft", 0))
+                 for r in insts if r is not keeper), default=0)
+            if best_ceil > 0:
+                kd["ceiling_area_sqft"] = best_ceil
+                ceilings_backfilled += 1
+        # Reconcile multipliers: the keeper must carry the group's max so
+        # dedup can't silently keep an unscaled instance and drop the x3 one.
+        max_mult = max(int(_num(r.get("unit_multiplier", 1)) or 1) for r in insts)
+        if max_mult > int(_num(keeper.get("unit_multiplier", 1)) or 1):
+            keeper["unit_multiplier"] = max_mult
         # Zero only the DIMENSIONAL quantities on the non-keeper instances —
         # each sheet measures the full room geometry, so walls/ceiling/floor are
         # true duplicates. Doors/windows are left intact: each sheet tends to
@@ -9366,8 +12605,159 @@ def _dedupe_cross_sheet_rooms(analysis):
 
     analysis["_cross_sheet_rooms_deduped"] = True
     if removed:
-        print(f"   🪞 [cross-sheet room dedup] de-duplicated geometry on {removed} "
-              f"duplicate room instance(s) across sheets (single-story commercial).")
+        mode = "residential unit-aware" if unit_mode else "single-story commercial"
+        msg = (f"   🪞 [cross-sheet room dedup] de-duplicated geometry on {removed} "
+               f"duplicate room instance(s) across sheets ({mode})")
+        if ceilings_backfilled:
+            msg += f"; backfilled {ceilings_backfilled} keeper ceiling area(s) from RCP instances"
+        print(msg + ".")
+
+
+# ---------------------------------------------------------------------------
+# Quantity-adjustment ledger + provenance pricing gate (Phase 2.3)
+# ---------------------------------------------------------------------------
+# Provenance dies at the aggregation->pricing boundary today: boosts, caps,
+# dedup, footprint reconciliation, and Will edits mutate aggregated_totals
+# with at best a prose note (2026-06 review Part 5). The ledger makes every
+# quantity change machine-readable WITHOUT changing behavior: the
+# orchestrator snapshots aggregated_totals around each named mutation stage
+# and records the per-key delta with a source tag. build_priced_takeoff then
+# classifies each priced quantity as measured / schedule / derived / assumed
+# and, in strict mode, removes the assumed increments and files an "unpriced
+# exposure" RFI — making HARD_NUMBERS_ONLY structurally enforced at one choke
+# point instead of via ~15 scattered guards.
+#
+# source tags:
+#   measured  — summed from per-room measured dimensions (the recalc baseline)
+#   schedule  — set from an authoritative door/window/stair schedule
+#   derived   — computed from measured data (e.g. perimeter x height repair of
+#               aggregation loss) — measurement-backed, kept under hard-numbers
+#   assumed   — heuristic/footprint/template fabrication — dropped to RFI under
+#               the strict gate
+#   correction— a REDUCTION (dedup, exclusion); never an exposure
+
+
+def _agg_snapshot(analysis):
+    """Snapshot every numeric aggregated_totals value (keys discovered
+    dynamically so a renamed/added total can never silently escape the
+    ledger)."""
+    agg = (analysis or {}).get("aggregated_totals", {}) or {}
+    out = {}
+    for k, v in agg.items():
+        try:
+            out[k] = float(v or 0)
+        except (TypeError, ValueError):
+            continue
+    return out
+
+
+def _ledger_stage(analysis, stage, before, source="assumed", basis=""):
+    """Diff aggregated_totals against the `before` snapshot and append one
+    ledger entry per changed key. Returns a fresh snapshot so stages can be
+    chained: snap = _ledger_stage(a, 'boost', snap, source='derived').
+
+    A reduction is always recorded as a 'correction' regardless of `source`
+    (only positive increments can be unpriced exposures)."""
+    if not isinstance(analysis, dict):
+        return before
+    after = _agg_snapshot(analysis)
+    led = analysis.setdefault("_quantity_adjustments", [])
+    for k in set(list(before.keys()) + list(after.keys())):
+        frm = before.get(k, 0.0)
+        to = after.get(k, 0.0)
+        d = to - frm
+        if abs(d) < 0.5:
+            continue
+        led.append({
+            "stage": stage,
+            "item": k,
+            "from": round(frm, 2),
+            "to": round(to, 2),
+            "delta": round(d, 2),
+            "source": source if d > 0 else "correction",
+            "basis": basis,
+        })
+    return after
+
+
+def _provenance_gate_enabled():
+    return os.environ.get("NIGHTSHIFT_PROVENANCE_GATE", "0").strip() in (
+        "1", "true", "True")
+
+
+def build_priced_takeoff(analysis, strict=None):
+    """Single provenance choke point between aggregation and calculate_costs.
+
+    Classifies each aggregated quantity into measured / schedule / derived /
+    assumed portions using the adjustment ledger, stores the breakdown in
+    analysis['_priced_takeoff'], and (strict mode) removes the assumed
+    increments from aggregated_totals + registers an 'unpriced exposure'
+    note so the RFI machinery surfaces it. Idempotent via
+    analysis['_priced_takeoff_built'].
+
+    strict defaults to NIGHTSHIFT_PROVENANCE_GATE (off). HARD_NUMBERS_ONLY
+    already zeroes most fabrication at the source; the gate is the belt-and-
+    suspenders that catches any assumed increment that still reached the
+    priced totals (e.g. the perimeter wall boost), tagged honestly.
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if analysis.get("_priced_takeoff_built"):
+        return analysis
+    if strict is None:
+        strict = _provenance_gate_enabled()
+
+    agg = analysis.get("aggregated_totals", {}) or {}
+    ledger = analysis.get("_quantity_adjustments", []) or []
+    by_item = {}
+    for e in ledger:
+        by_item.setdefault(e.get("item"), []).append(e)
+
+    breakdown = {}
+    exposures = []
+    for k, v in list(agg.items()):
+        try:
+            final = float(v or 0)
+        except (TypeError, ValueError):
+            continue
+        entries = by_item.get(k, [])
+        assumed = sum(e["delta"] for e in entries
+                      if e.get("source") == "assumed" and e.get("delta", 0) > 0)
+        derived = sum(e["delta"] for e in entries
+                      if e.get("source") == "derived" and e.get("delta", 0) > 0)
+        measured = final - assumed - derived
+        rec = {"priced": round(final, 2),
+               "measured": round(max(0.0, measured), 2),
+               "derived": round(derived, 2),
+               "assumed": round(assumed, 2)}
+        if assumed > 0.5 and measured >= -0.5:
+            # measured < 0 means a later _recalculate_totals already wiped the
+            # assumed increment from agg (e.g. the sales-floor ACT re-flip):
+            # nothing left to remove, so it is not a live exposure.
+            exposures.append((k, assumed, max(0.0, measured)))
+            if strict:
+                agg[k] = round(max(0.0, final - assumed), 2)
+                rec["priced"] = agg[k]
+                rec["assumed_removed"] = round(assumed, 2)
+        breakdown[k] = rec
+
+    analysis["aggregated_totals"] = agg
+    analysis["_priced_takeoff"] = {
+        "strict": bool(strict),
+        "breakdown": breakdown,
+        "exposures": [{"item": k, "assumed_qty": round(a, 2),
+                       "measured_qty": round(m, 2)} for k, a, m in exposures],
+    }
+    if strict and exposures:
+        notes = analysis.setdefault("notes", [])
+        for k, a, m in exposures:
+            notes.append(
+                f"[Unpriced Exposure] {k}: {a:,.0f} assumed unit(s) removed "
+                f"under the provenance gate ({m:,.0f} measured priced). "
+                f"RFI REQUIRED: confirm this scope on the drawings before it "
+                f"is added to the bid.")
+    analysis["_priced_takeoff_built"] = True
+    return analysis
 
 
 def _recalculate_totals(analysis):
@@ -9384,6 +12774,20 @@ def _recalculate_totals(analysis):
     # inflate ~3×. Idempotent via _template_floors_deduped flag.
     _dedupe_overlapping_template_floors(analysis)
 
+    # Safety net: residential corridor / lobby ceiling correction.
+    # The extraction prompt previously told the model that public corridors
+    # "ALMOST ALWAYS have ACT ceilings". That's right for commercial but
+    # wrong for residential supportive housing, multifamily, dorms, etc.,
+    # where painted GYP is the corridor norm. The Ridgeview 2026-05-28 run
+    # lost ~2,900 sqft of corridor ceiling this way. Idempotent via
+    # _residential_corridor_ceiling_fixed flag.
+    _fix_residential_corridor_ceilings(analysis)
+
+    # Enlarged unit-plan sheets extracted as pseudo-floors duplicate rooms
+    # already on the ranged floors (Fishkill 2026-06-12: ~4-10x wall
+    # inflation). Must run BEFORE totals are summed.
+    _dedupe_enlarged_plan_floors(analysis)
+
     # Pre-pass: estimate missing wall area from floor area for rooms that have
     # floor_area but zero wall_area/perimeter (common with chunk-processing gaps)
     for floor in analysis.get("floors", []):
@@ -9395,6 +12799,17 @@ def _recalculate_totals(analysis):
             ch = _num(dims.get("ceiling_height_feet", 0))
 
             if floor_area > 0 and wall_area == 0 and perimeter == 0 and ch > 0:
+                if HARD_NUMBERS_ONLY:
+                    # A square-room perimeter (4 × √area) is an assumption,
+                    # not a measurement — and it used to silently set BASE
+                    # TRIM = that invented perimeter too. Leave the room's
+                    # walls/trim at zero and mark it; the Incomplete
+                    # Dimensions RFI machinery surfaces zero-wall rooms.
+                    note = room.get("notes", "")
+                    room["notes"] = (note + " [Dimensions incomplete: floor "
+                                     "area only — walls/trim NOT estimated "
+                                     "under hard-numbers policy]").strip()
+                    continue
                 # Estimate perimeter from floor area assuming square-ish room
                 est_side = floor_area ** 0.5
                 est_perimeter = round(4 * est_side)
@@ -9411,6 +12826,14 @@ def _recalculate_totals(analysis):
     # Collapse rooms extracted from multiple plan sheets so a room isn't counted
     # once per sheet for walls/ceiling/doors (single-story commercial only).
     _dedupe_cross_sheet_rooms(analysis)
+    # Small-commercial: the same floor is often drawn on multiple plan sheets
+    # with DIFFERENT generic names ("Women's 104" vs "Women's Restroom West"),
+    # which name-based cross-sheet dedup can't catch — so a floor gets counted
+    # 2-4x (Dutchess First Floor came from pages 5/9/13/14, walls 230% over).
+    # This pass keeps the authoritative page per floor + page-unique types.
+    # Double-gated (small-commercial AND per-sheet) so multifamily and the
+    # deployed legacy path are untouched.
+    _dedupe_small_commercial_floors(analysis)
 
     total_wall = 0
     total_ceiling = 0
@@ -9514,6 +12937,27 @@ def _recalculate_totals(analysis):
 
             # Base trim
             _room_bt = _num(elems.get("base_trim_lf", 0))
+            # Derive from the MEASURED perimeter when the room has a confirmed/
+            # defaulted-paintable base but the model under-emitted base_trim_lf.
+            # Base runs the wall perimeter, so this is measurement, not
+            # fabrication — and it's gated by _base_confirmed_paintable, so
+            # commercial-unconfirmed base still resolves to 0 (the suppression
+            # below) + RFI. Fills the per-sheet under-emission (2026-06-14
+            # golden regression: 364 base trim 2,950 vs 8,629, Dutchess 84 vs
+            # 391) without touching rooms the model already measured. The legacy
+            # prompt already defaults base_trim≈perimeter, so this rarely fires
+            # there — it mainly recovers per-sheet's missing trim.
+            _bt_perim = _num(dims.get("perimeter_lf", 0))
+            if _room_bt == 0 and _bt_perim > 0 and _base_confirmed_paintable(
+                    room, _bt_building_type):
+                _room_bt = _bt_perim
+                elems["base_trim_lf"] = _bt_perim
+                _bt_existing = str(room.get("notes", "") or "")
+                if "[Base Trim] derived from perimeter" not in _bt_existing:
+                    room["notes"] = (
+                        _bt_existing + " [Base Trim] derived from wall perimeter "
+                        "(paintable base; model under-emitted base_trim_lf)."
+                    ).strip()
             if HARD_NUMBERS_ONLY and _room_bt > 0 and not _base_confirmed_paintable(
                     room, _bt_building_type):
                 # Resilient/unconfirmed base on a commercial job — the perimeter
@@ -10149,7 +13593,23 @@ def _recalculate_totals(analysis):
                 round(expected_ceiling - total_ceiling),
                 round(total_ceiling * 0.15)
             )
-            if supplement > 100:
+            if supplement > 100 and HARD_NUMBERS_ONLY:
+                # The expected value comes from a cross-job wall:ceiling
+                # ratio, not from this project's drawings. Flag instead of
+                # price. (The GSF-based residential ceiling floor — measured
+                # footprint × stories — handles the systematic-undercount
+                # case with a measurement basis.)
+                analysis.setdefault("notes", []).append(
+                    f"[Ceiling Check] Ceiling SF is ~{ceiling_gap_pct:.0%} "
+                    f"below the wall:ceiling ratio expectation — small "
+                    f"spaces (linen/coat closets, pantries) may be missing "
+                    f"from extraction. RFI REQUIRED: confirm closet/small-"
+                    f"space ceilings on the unit plans (~{supplement:,.0f} "
+                    f"sqft NOT priced under hard-numbers policy)."
+                )
+                print(f"   🔒 Ceiling supplement suppressed (HARD_NUMBERS_ONLY): "
+                      f"would have added +{supplement:,.0f} sqft — flagged for RFI")
+            elif supplement > 100:
                 total_ceiling += supplement
                 analysis["aggregated_totals"]["total_paintable_ceiling_sqft"] = total_ceiling
                 analysis.setdefault("notes", []).append(
@@ -10645,6 +14105,32 @@ def generate_rfi_items(analysis):
             ),
         })
 
+    # --- 0b. Hard-numbers suppressed scope ---
+    # Heuristics gated by HARD_NUMBERS_ONLY (dryfall recovery, secondary-
+    # space supplement, door supplement, wall boost, stair note parsing,
+    # ceiling supplement) record the scope they would have added as a note
+    # containing "RFI REQUIRED:". Surface each as an RFI item so the
+    # unpriced exposure is visible to the estimator and customer instead
+    # of existing only as a buried note. Notes (unlike custom underscore
+    # keys) survive the multi-file merge, so this works on combined jobs.
+    _seen_rfi_notes = set()
+    for _n in analysis.get("notes", []) or []:
+        if not (isinstance(_n, str) and "RFI REQUIRED:" in _n):
+            continue
+        _q = _n.split("RFI REQUIRED:", 1)[1].strip()
+        if not _q or _q in _seen_rfi_notes:
+            continue
+        _seen_rfi_notes.add(_q)
+        items.append({
+            "category": "Clarification Needed",
+            "question": _q,
+            "action_required": (
+                "Confirm the quantity from the drawings/schedules — it is "
+                "NOT included in the priced takeoff under the hard-numbers "
+                "policy."
+            ),
+        })
+
     # --- 1. No floor plans found ---
     if analysis.get("no_floor_plans_found") or analysis.get("no_detailed_floor_plans_found"):
         # Contradiction guard: dimensioned, non-synthetic rooms can only be
@@ -11130,6 +14616,39 @@ def _num(val):
     return 0
 
 
+def _recover_area_fields(dims):
+    """Fill missing/zero high-impact area fields from a room's geometry instead
+    of letting a null coerce to a destructive 0.
+
+    A degraded vision pass can return e.g. wall_area_sqft=null while still
+    reporting length/width/height — coercing that null to 0 (the old behavior)
+    permanently undercounts the room. When the geometric inputs exist we
+    reconstruct the area; when they don't, the field stays 0 and the caller
+    counts it toward the degraded-extraction gate.
+
+    Only fills fields that are <=0 (null/absent/zero), so a legitimately
+    extracted positive value is never overwritten — keeps the no-op property
+    on well-formed data. Mutates `dims` in place; returns nothing.
+    """
+    L = _num(dims.get("length_feet"))
+    W = _num(dims.get("width_feet"))
+    H = _num(dims.get("ceiling_height_feet"))
+    P = _num(dims.get("perimeter_lf"))
+    if P <= 0 and L > 0 and W > 0:
+        P = 2 * (L + W)
+        dims["perimeter_lf"] = round(P)
+    floor_area = _num(dims.get("floor_area_sqft"))
+    if floor_area <= 0 and L > 0 and W > 0:
+        floor_area = L * W
+        dims["floor_area_sqft"] = round(floor_area)
+    if _num(dims.get("wall_area_sqft")) <= 0 and P > 0 and H > 0:
+        dims["wall_area_sqft"] = round(P * H)
+    # Ceiling area tracks floor area for a flat ceiling — the standard
+    # takeoff assumption already used elsewhere in the pipeline.
+    if _num(dims.get("ceiling_area_sqft")) <= 0 and floor_area > 0:
+        dims["ceiling_area_sqft"] = round(floor_area)
+
+
 # Numeric fields whose corruption materially changes the estimate. When one of
 # these arrives structurally-wrong (list/dict) or null/garbage, we don't just
 # coerce silently — we route the whole job to manual review so a degraded
@@ -11244,8 +14763,35 @@ def _normalize_analysis(analysis):
             if not isinstance(dims, dict):
                 dims = {}
                 room["dimensions"] = dims
+            # Track which high-impact area fields arrived null/unparseable so we
+            # count only the UNRECOVERABLE ones toward the degraded gate below
+            # (a null we can rebuild from geometry is not a degraded extraction).
+            _recoverable = ("wall_area_sqft", "floor_area_sqft",
+                            "ceiling_area_sqft", "perimeter_lf")
+            # null or garbage-string (but not list/dict, which are severe below)
+            _null_before = {
+                k for k in _recoverable
+                if k in dims and not _is_parseable_number(dims[k])
+                and not isinstance(dims[k], (list, dict))
+            }
+            # Structurally-wrong (list/dict) high-impact values are always severe.
+            for k in _recoverable:
+                if isinstance(dims.get(k), (list, dict)):
+                    severe.append(k)
+            # Coerce every dimension (incl. length/width, needed for recompute)
+            # to a number, then rebuild any missing area from geometry.
             for dk in _ROOM_DIM_NUM:
-                _num_field(dims, dk, high_impact=(dk in _HIGH_IMPACT_NUMERIC))
+                if dk in dims:
+                    dims[dk] = _num(dims[dk])
+            for _g in ("length_feet", "width_feet"):
+                if _g in dims:
+                    dims[_g] = _num(dims[_g])
+            _recover_area_fields(dims)
+            # Count toward the soft (degraded-extraction) gate only the
+            # high-impact area fields that were null AND stayed 0 after recovery.
+            for k in _null_before:
+                if k in _HIGH_IMPACT_NUMERIC and _num(dims.get(k)) <= 0:
+                    soft += 1
             elems = room.get("elements")
             if not isinstance(elems, dict):
                 room["elements"] = {}
@@ -11318,15 +14864,25 @@ def _normalize_room_name_mp(name):
 
 
 def _median_num(values):
-    """Median of a list of numeric values. Skips Nones; returns 0 if empty."""
+    """Median of a list of numeric values. Skips Nones; returns 0 if empty.
+
+    Zero handling: a 0 from a pass usually means "field not extracted",
+    so a MINORITY of zeros is ignored (median of the nonzero values —
+    one pass missing a dimension shouldn't drag the merged value down).
+    But when zeros are the MAJORITY, the passes agree the value is 0 and
+    a single nonzero outlier must not win: the old behavior turned
+    [0, 0, 800] into 800, letting a one-pass hallucination through the
+    consensus merge. Majority-zero now returns 0.
+    """
     import statistics as _stats
     vals = [_num(v) for v in values if v is not None]
-    vals = [v for v in vals if v != 0] or [_num(v) for v in values
-                                            if v is not None]
     if not vals:
         return 0
+    nonzero = [v for v in vals if v != 0]
+    if len(nonzero) * 2 < len(vals):
+        return 0
     try:
-        return _stats.median(vals)
+        return _stats.median(nonzero or vals)
     except _stats.StatisticsError:
         return 0
 
@@ -11382,7 +14938,18 @@ def _merge_passes_with_median(pass_analyses, min_pass_presence=None):
     import math as _math
     N = len(pass_analyses)
     if min_pass_presence is None:
-        min_pass_presence = max(2, _math.ceil(N / 2))  # majority
+        # Default: a room must appear in a MAJORITY of passes to survive.
+        # That structurally discards real rooms that Claude's non-deterministic
+        # vision only happened to catch in one pass — biasing room counts low.
+        # NIGHTSHIFT_MERGE_UNION=1 keeps any room seen in >=1 pass (union),
+        # medianing its dimensions over only the passes that contributed it,
+        # so single-pass real rooms aren't dropped. Default off pending
+        # corpus A/B (it can also let a one-pass hallucination through, which
+        # the downstream footprint/area sanity checks are expected to catch).
+        if os.environ.get("NIGHTSHIFT_MERGE_UNION", "0") == "1":
+            min_pass_presence = 1
+        else:
+            min_pass_presence = max(2, _math.ceil(N / 2))  # majority
 
     # Index every room by (floor_name_norm, sheet, name_norm). The
     # floor_name is normalized the same way as room names (lowercase,
@@ -11508,15 +15075,58 @@ def _merge_passes_with_median(pass_analyses, min_pass_presence=None):
         failed_by_pass = [_pass_failed_chunks(a) for a in pass_analyses]
         fewest_failed = min(failed_by_pass)
         eligible = [i for i in range(N) if failed_by_pass[i] == fewest_failed]
-        if nonzero_pass_counts:
-            target = _stats.median([per_pass_room_counts[i] for i in eligible])
-        else:
-            target = 0
-        # Closest-to-median among the most-complete passes; ties → fewer rooms.
-        best_idx = min(
-            eligible,
-            key=lambda i: (abs(per_pass_room_counts[i] - target),
-                           per_pass_room_counts[i]))
+
+        # PREFER-COMPLETE rule (NIGHTSHIFT_MERGE_PREFER_COMPLETE=1, default off):
+        # within the fewest-dropped-chunks tier, ship the pass with the MOST
+        # rooms rather than the median. With Stage 1a making every pass use the
+        # same extraction mode, the [52,11,12] mode-divergence that produced
+        # under-counts is gone, so the dominant remaining failure is
+        # under-extraction, not over-extraction — prefer coverage. The
+        # Ridgeview overshoot the median rule guarded against is still blocked
+        # by a FOOTPRINT sanity cap: a pass whose footprint_sqft is an outlier
+        # (> overshoot_factor x the median footprint across eligible passes) is
+        # excluded, because that runaway footprint is exactly what fed the
+        # catastrophic footprint-fallback estimate ($335K / 113,400 SF on a
+        # 60,000 SF footprint emitted in only one of three passes). If every
+        # eligible pass is an outlier, we fall back to the median rule below.
+        prefer_complete = (
+            os.environ.get("NIGHTSHIFT_MERGE_PREFER_COMPLETE", "0") == "1")
+        best_idx = None
+        if prefer_complete and eligible:
+            try:
+                overshoot = float(os.environ.get(
+                    "NIGHTSHIFT_MERGE_OVERSHOOT_FACTOR", "1.5"))
+            except (ValueError, TypeError):
+                overshoot = 1.5
+            overshoot = max(1.0, overshoot)
+            elig_fps = [_num(pass_analyses[i].get("project_info", {})
+                             .get("footprint_sqft")) for i in eligible]
+            nz_fps = [x for x in elig_fps if x > 0]
+            med_fp = _stats.median(nz_fps) if nz_fps else 0
+
+            def _fp_sane(i):
+                fp = _num(pass_analyses[i].get("project_info", {})
+                          .get("footprint_sqft"))
+                # 0/absent footprint can't drive the footprint fallback blowup;
+                # treat as sane. Outlier-high footprint is the overshoot signal.
+                return not (med_fp > 0 and fp > overshoot * med_fp)
+
+            sane = [i for i in eligible if _fp_sane(i)] or eligible
+            # Most rooms among the sane, most-complete passes; ties → first.
+            best_idx = max(sane, key=lambda i: per_pass_room_counts[i])
+
+        if best_idx is None:
+            # Default median rule: closest-to-median among the most-complete
+            # passes; ties → fewer rooms (conservative vs. overshoot).
+            if nonzero_pass_counts:
+                target = _stats.median(
+                    [per_pass_room_counts[i] for i in eligible])
+            else:
+                target = 0
+            best_idx = min(
+                eligible,
+                key=lambda i: (abs(per_pass_room_counts[i] - target),
+                               per_pass_room_counts[i]))
         chosen = _copy.deepcopy(pass_analyses[best_idx])
         note = (
             f"[Multi-Pass Median: FALLBACK to pass #{best_idx+1}] "
@@ -11636,19 +15246,28 @@ def _apply_rate_overrides(rate_overrides):
             new_rate = float(val)
             for tier in pm[pm_key]["tiers"]:
                 tier["rate"] = new_rate
+            # Record explicit org overrides so calculate_costs' building-type
+            # rate defaults don't silently clobber a negotiated rate.
+            pm[pm_key]["_rate_overridden"] = True
 
     # Per-item markup overrides (markup_gyp_walls, markup_exterior_cornice, etc.)
+    _markup_overridden = set()
     for key, val in rate_overrides.items():
         if key.startswith("markup_"):
             pm_key = key[len("markup_"):]
             if pm_key in pm:
                 pm[pm_key]["markup"] = float(val)
+                pm[pm_key]["_markup_overridden"] = True
+                _markup_overridden.add(pm_key)
 
     # Global markup override (applies to all items not already overridden above)
     if "markup" in rate_overrides:
         new_markup = float(rate_overrides["markup"])
         for item_key in pm:
+            if item_key in _markup_overridden:
+                continue  # per-item override wins over the global one
             pm[item_key]["markup"] = new_markup
+            pm[item_key]["_markup_overridden"] = True
 
     return pm
 
@@ -11662,13 +15281,19 @@ def _get_tiered_rate(item_config, quantity):
                     {"min_qty": 3500, "max_qty": None, "rate": 0.80}]}
     """
     tiers = item_config.get("tiers", [])
-    for tier in tiers:
-        max_qty = tier.get("max_qty")
-        if tier["min_qty"] <= quantity and (max_qty is None or quantity <= max_qty):
+    # Half-open ranges: a tier matches when min_qty <= q < next tier's
+    # min_qty. The old inclusive-integer bounds (max_qty 3499 / min_qty
+    # 3500) left a gap for fractional quantities — 3,499.5 sqft matched
+    # NO tier and fell through to the last (cheapest, volume) tier.
+    sorted_tiers = sorted(tiers, key=lambda t: t.get("min_qty", 0))
+    for i, tier in enumerate(sorted_tiers):
+        next_min = (sorted_tiers[i + 1].get("min_qty")
+                    if i + 1 < len(sorted_tiers) else None)
+        if tier.get("min_qty", 0) <= quantity and (next_min is None or quantity < next_min):
             return tier["rate"]
-    # Fallback: use last tier if quantity exceeds all ranges
-    if tiers:
-        return tiers[-1]["rate"]
+    # Fallback: below all tiers (negative qty / malformed config) — first tier
+    if sorted_tiers:
+        return sorted_tiers[0]["rate"]
     return 0
 
 
@@ -11819,10 +15444,23 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
         markup_override = None  # None = use per-item default (6%)
 
     def _get_markup(item_key):
-        """Return markup for an item — override for single-family, else use config default."""
+        """Return markup for an item.
+
+        Precedence: explicit org override (set via _apply_rate_overrides,
+        marked _markup_overridden) > building-type default > config default.
+        The building-type default used to win unconditionally, silently
+        discarding negotiated org markups on most jobs.
+        """
+        if pm.get(item_key, {}).get("_markup_overridden"):
+            return pm[item_key]['markup']
         if markup_override is not None:
             return markup_override
         return pm[item_key]['markup']
+
+    def _rate_locked(item_key):
+        """True when the org explicitly overrode this item's rate — the
+        building-type hardcoded defaults below must not clobber it."""
+        return bool(pm.get(item_key, {}).get("_rate_overridden"))
 
     def _line(label, qty, unit_cost, markup_pct):
         cost = qty * unit_cost
@@ -12086,11 +15724,16 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     # Single-family rate overrides: force small-project rates regardless of quantity
     # (A single-family home with 7,000+ sqft walls is still a single-family job)
     if is_single_family:
-        wall_rate = 1.25   # Rider single-family rate
-        ceil_rate = 1.25   # Rider single-family rate
-        trim_rate = 3.25   # Rider single-family rate
-        door_fp_rate = 225.00  # Rider single-family rate
-        win_rate = 120.00  # Rider single-family: pre-primed trim only
+        if not _rate_locked('gyp_walls'):
+            wall_rate = 1.25   # Rider single-family rate
+        if not _rate_locked('gyp_ceilings'):
+            ceil_rate = 1.25   # Rider single-family rate
+        if not _rate_locked('base_trim'):
+            trim_rate = 3.25   # Rider single-family rate
+        if not _rate_locked('doors_full_paint'):
+            door_fp_rate = 225.00  # Rider single-family rate
+        if not _rate_locked('windows'):
+            win_rate = 120.00  # Rider single-family: pre-primed trim only
 
     # Commercial rate overrides: split by building size
     if is_commercial:
@@ -12099,10 +15742,14 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
 
         if is_large_commercial:
             # Large retail/warehouse rates (calibrated from Camping World, Kingston NY)
-            wall_rate = 0.85   # Large open spaces, lower labor density
-            ceil_rate = 0.85
-            door_fp_rate = 155.00  # Commercial HM door+frame rate (Rider Mazda)
-            door_hm_rate = 110.00  # HM panel only stays at config rate
+            if not _rate_locked('gyp_walls'):
+                wall_rate = 0.85   # Large open spaces, lower labor density
+            if not _rate_locked('gyp_ceilings'):
+                ceil_rate = 0.85
+            if not _rate_locked('doors_full_paint'):
+                door_fp_rate = 155.00  # Commercial HM door+frame rate (Rider Mazda)
+            if not _rate_locked('doors_hm_panel'):
+                door_hm_rate = 110.00  # HM panel only stays at config rate
 
             # Wall area cap: large open commercial spaces have non-paintable perimeter
             # (glass storefronts, metal panels, overhead doors).
@@ -12116,10 +15763,14 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
                     wall_sqft = max_wall_sqft
         else:
             # Small commercial / renovation rates (from config.py SMALL_COMMERCIAL_RATES)
-            wall_rate = SMALL_COMMERCIAL_RATES["wall_rate"]
-            ceil_rate = SMALL_COMMERCIAL_RATES["ceil_rate"]
-            door_fp_rate = SMALL_COMMERCIAL_RATES["door_fp_rate"]
-            door_hm_rate = SMALL_COMMERCIAL_RATES["door_hm_rate"]
+            if not _rate_locked('gyp_walls'):
+                wall_rate = SMALL_COMMERCIAL_RATES["wall_rate"]
+            if not _rate_locked('gyp_ceilings'):
+                ceil_rate = SMALL_COMMERCIAL_RATES["ceil_rate"]
+            if not _rate_locked('doors_full_paint'):
+                door_fp_rate = SMALL_COMMERCIAL_RATES["door_fp_rate"]
+            if not _rate_locked('doors_hm_panel'):
+                door_hm_rate = SMALL_COMMERCIAL_RATES["door_hm_rate"]
 
     # Non-apartment residential rate overrides (senior living, care facilities, expansions)
     # These buildings lack the spray-application efficiency of repetitive apartment units.
@@ -12127,9 +15778,12 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     # Windows are typically factory-finished (vinyl/aluminum) → trim paint only at $120/EA.
     # Calibrated from Edgehill IL Expansion vs Rider Estimate #3241: Rider effective rate ~$1.27/SF.
     if is_non_apartment_residential:
-        wall_rate = 1.05   # Higher labor density than apartments, spray efficiency is lower
-        ceil_rate = 1.05
-        win_rate = 120.00  # Factory-finished windows: trim paint only (not full interior paint)
+        if not _rate_locked('gyp_walls'):
+            wall_rate = 1.05   # Higher labor density than apartments, spray efficiency is lower
+        if not _rate_locked('gyp_ceilings'):
+            ceil_rate = 1.05
+        if not _rate_locked('windows'):
+            win_rate = 120.00  # Factory-finished windows: trim paint only (not full interior paint)
 
     # --- PCA Section 5D: Multi-story productivity adjustment ---
     # Productivity diminishes 1-2% per floor above 4th due to material handling,
@@ -12611,6 +16265,11 @@ def _validate_cost_estimate(analysis, cost_estimate):
             warnings.append({
                 "severity": "medium",
                 "item": "CMU/Dryfall",
+                # Under hard-numbers policy a 0 here is the POLICY-CORRECT outcome
+                # when no spec confirms painted CMU / exposed-deck coating — it is
+                # surfaced as an RFI, not fabricated. Don't also dock confidence for
+                # behaving correctly (see scoring loop's policy_zero handling).
+                "policy_zero": bool(HARD_NUMBERS_ONLY),
                 "message": "Commercial building with no CMU walls or dryfall ceiling detected. "
                            "Verify specs for painted CMU or exposed ceiling coating."
             })
@@ -12651,6 +16310,13 @@ def _validate_cost_estimate(analysis, cost_estimate):
             warnings.append({
                 "severity": "high",
                 "item": "Wallcovering",
+                # Policy-driven zero: the hard-numbers policy deliberately did NOT
+                # estimate wallcovering without a finish schedule / WC label, and
+                # an RFI is already generated to obtain it. This is correct
+                # behavior, not a degraded extraction — keep it visible as a
+                # warning but don't deduct from confidence (it fires on nearly
+                # every commercial job and was pinning scores at 50-60).
+                "policy_zero": True,
                 "message": "Scope/notes reference wallcovering or wallpaper but 0 sqft was extracted "
                            "(no finish schedule or explicit WC label confirms which walls). Per hard-numbers "
                            "policy the quantity was NOT estimated. Provide the room finish schedule (or confirm "
@@ -12731,8 +16397,22 @@ def _validate_cost_estimate(analysis, cost_estimate):
             })
 
     # 6. Data quality score (0-100)
+    # Decouple POLICY-driven zeros from extraction QUALITY. A quantity that is 0
+    # because the hard-numbers policy correctly refused to fabricate it (and
+    # raised an RFI instead) should not also tank the confidence score — that
+    # double-counts the same gap (once as an RFI, once as a -20/-10) and was
+    # pinning commercial jobs at 50-60 even when the extraction was sound.
+    # Such warnings are tagged policy_zero and still shown to the user, but are
+    # excluded from the deduction. Genuine failures (zero walls/doors with no
+    # policy explanation) keep their full penalty. Set
+    # NIGHTSHIFT_CONFIDENCE_DECOUPLE=0 to restore the old behavior.
+    decouple = os.environ.get("NIGHTSHIFT_CONFIDENCE_DECOUPLE", "1") == "1"
     quality_score = 100
+    policy_excluded = 0
     for w in warnings:
+        if decouple and w.get("policy_zero"):
+            policy_excluded += 1
+            continue
         if w["severity"] == "high":
             quality_score -= 20
         elif w["severity"] == "medium":
@@ -12743,6 +16423,7 @@ def _validate_cost_estimate(analysis, cost_estimate):
         "warnings": warnings,
         "data_quality_score": quality_score,
         "warning_count": len(warnings),
+        "policy_excluded_warnings": policy_excluded,
     }
 
 
@@ -13393,9 +17074,9 @@ def analyze_and_parse(client, pdf_path, scope_notes="", schedule_hints=None,
                                                 schedule_hints=schedule_hints,
                                                 building_inventory=building_inventory,
                                                 project_overview=project_overview)
-        json_match = re.search(r'\{.*\}', result_text, re.DOTALL)
+        json_match = _parse_json_response(result_text)
         if json_match:
-            analysis = json.loads(json_match.group())
+            analysis = json_match
             _attach_bbox_anchors(analysis, pdf_path)
             return (pdf_path, analysis)
         else:
@@ -13518,6 +17199,23 @@ def merge_versioned_analyses(prior_analysis, delta_analysis, scope_tags=None):
     additive_only = (_SCOPE_TAG_NONE in norm_tags) or (not norm_tags)
 
     merged = _copy.deepcopy(prior_analysis)
+
+    # Clear idempotency flags persisted from the prior run's stored JSON.
+    # The merged analysis contains NEW rooms/floors that have never been
+    # through the dedup / canonicalization / safety-net passes; a stale
+    # True flag makes every one of them silently no-op on the re-run
+    # (v2 quotes double-counting entire floors was the observed failure).
+    for _stale_flag in (
+        "_template_floors_deduped",
+        "_cross_sheet_rooms_deduped",
+        "_enlarged_plan_floors_deduped",
+        "_residential_corridor_ceiling_fixed",
+        "_source_sheets_canonicalized",
+        "_residential_ceiling_floor_applied",
+    ):
+        merged.pop(_stale_flag, None)
+    if isinstance(merged.get("project_info"), dict):
+        merged["project_info"].pop("_unit_multipliers_validated", None)
 
     # ── Floors ────────────────────────────────────────────────────────────
     prior_floors = merged.get("floors", []) or []
@@ -13872,6 +17570,9 @@ def run_analysis_merge(prior_json, new_pdf_paths, scope_tags=None,
         # PRICING_MODEL. This is the rate-stability rule: a v2 quote uses the
         # same rates v1 was priced at, so deltas are pure-quantity changes.
         print(f"💰 Re-pricing with parent snapshot...")
+        # Provenance choke point + calibrated confidence on the merge path too
+        # (Phase 2.5), so v2 quotes carry the same Trust Summary as fresh runs.
+        merged_analysis = build_priced_takeoff(merged_analysis)
         costs = calculate_costs(
             merged_analysis.get("aggregated_totals", {}),
             exterior=merged_analysis.get("exterior", {}),
@@ -13880,6 +17581,8 @@ def run_analysis_merge(prior_json, new_pdf_paths, scope_tags=None,
             analysis=merged_analysis,
             pricing_model_override=pricing_snapshot,
         )
+        merged_analysis = _assess_calibrated_confidence(merged_analysis,
+                                                        cost_estimate=costs)
     else:
         # Notes-only re-run: the prior cost estimate IS the baseline. Pricing
         # from raw aggregated_totals would discard the prior run's Will/manual
@@ -13901,6 +17604,8 @@ def run_analysis_merge(prior_json, new_pdf_paths, scope_tags=None,
     if _prior_an_fs.get("has_finish_schedule") or _prior_an_fs.get("room_finish_schedule"):
         merged_analysis["has_finish_schedule"] = True
     _set_finish_schedule_flag(merged_analysis, new_pdf_paths)
+    _set_door_schedule_flag(merged_analysis, new_pdf_paths)
+    _set_window_schedule_flag(merged_analysis, new_pdf_paths)
 
     # Upload sheet inventory: prior run's sheets plus the newly uploaded files.
     _prior_sheets = set(_prior_an_fs.get("_upload_sheet_numbers") or [])
@@ -14235,6 +17940,11 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                     print(f"\n📊 Rate overrides applied: {', '.join(rate_overrides.keys())}")
 
                 # Re-run cost calculation (uses current pricing from config.py)
+                # Provenance gate + calibrated confidence on the cached path too
+                # (Phase 2.5). build_priced_takeoff is idempotent, so a cached
+                # analysis that already carries _priced_takeoff is untouched;
+                # one that predates the gate gets it now.
+                analysis = build_priced_takeoff(analysis)
                 print("\n💰 Calculating costs...")
                 costs = calculate_costs(
                     analysis.get('aggregated_totals', {}),
@@ -14244,6 +17954,7 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                     analysis=analysis,
                     pricing_model_override=pricing_model_used,
                 )
+                analysis = _assess_calibrated_confidence(analysis, cost_estimate=costs)
                 print_estimate(analysis, costs)
 
                 # Interactive adjustment mode (cached path)
@@ -14377,7 +18088,7 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
 
                 if all_sched_pages:
                     print(f"   Found schedule pages: door={door_pages}, window={win_pages}")
-                    image_schedule_data = analyze_schedule_images(
+                    image_schedule_data = analyze_schedule_images_consensus(
                         client, pdf_path_scan, all_sched_pages
                     )
                     if image_schedule_data:
@@ -14492,6 +18203,19 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         print(f"   ⚠️  Phase 1 project overview scan failed: {e}")
         project_overview = None
 
+    # --- Coverage ledger: every page of every upload must end the run in
+    # exactly one accounted state. Module-global for the duration of the
+    # job so the chunk/tiled/image paths can mark outcomes without
+    # threading a parameter through ten signatures.
+    global _COVERAGE_LEDGER
+    _COVERAGE_LEDGER = CoverageLedger()
+    for _p in pdf_paths:
+        try:
+            _COVERAGE_LEDGER.register_file(_p)
+        except Exception as _reg_err:
+            print(f"   ⚠️  Coverage ledger could not register "
+                  f"{os.path.basename(str(_p))}: {_reg_err}")
+
     # --- Analyse each PDF ---
     all_results = []
     files_analyzed = []
@@ -14532,7 +18256,40 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         result = None
         best_result = None
         best_rooms = 0
-        for file_attempt in range(3):
+
+        # ── Per-sheet anchored extraction (Phase 2.2, env-gated) ──
+        # One extraction + one verification call per plan sheet, anchored
+        # in the text layer, checkpointed per sheet. Replaces the chunked
+        # whole-set extraction AND the multi-pass consensus below. Any
+        # failure falls through to the legacy path unchanged.
+        used_per_sheet = False
+        if _per_sheet_extraction_enabled():
+            try:
+                _ps_result = _analyze_pdf_per_sheet(
+                    client, pdf_path, scope_notes=scope_notes,
+                    schedule_hints=image_schedule_data,
+                    building_inventory=building_inventory,
+                    project_overview=project_overview)
+            except Exception as _ps_exc:
+                import traceback as _tb
+                print(f"   ⚠️  Per-sheet extraction crashed — falling back "
+                      f"to legacy path: {_ps_exc}")
+                print(f"   {_tb.format_exc()}")
+                _ps_result = None
+            if _ps_result:
+                result = best_result = _ps_result
+                _ps_rooms_raw = _ps_result[1].get(
+                    'project_info', {}).get('total_rooms_found', 0)
+                try:
+                    best_rooms = int(_ps_rooms_raw) if _ps_rooms_raw is not None else 0
+                except (ValueError, TypeError):
+                    best_rooms = 0
+                used_per_sheet = True
+            else:
+                print(f"   ⚠️  Per-sheet extraction unavailable for "
+                      f"{filename} — using legacy chunked path")
+
+        for file_attempt in range(0 if used_per_sheet else 3):
             if file_attempt > 0:
                 print(f"\n   🔄 Retrying {filename} (attempt {file_attempt+1}/3) after {FILE_RETRY_COOLDOWN}s cooldown...")
                 time.sleep(FILE_RETRY_COOLDOWN)
@@ -14593,7 +18350,15 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         used_enhanced = False
         attempted_enhanced = False  # True once the enhanced-extraction block ran
         rooms_have_zero_dims = False
-        if best_result and best_rooms > 0:
+        # Per-sheet mode already tiles each plan sheet internally and returns a
+        # COMPLETE result. The enhanced-extraction recovery below re-extracts the
+        # whole set via tiling — running it on top of per-sheet re-reads every
+        # unit a second time (at a different ceiling-height guess) and roughly
+        # DOUBLES the rooms (Fishkill 131 -> 262, walls 2.5x over truth, 2026-06
+        # validation). When per-sheet produced the result, trust it; a genuine
+        # per-sheet failure already returned None and fell through to the legacy
+        # path, which still gets enhanced recovery.
+        if best_result and best_rooms > 0 and not used_per_sheet:
             _, _check_analysis = best_result
             _all_rooms = []
             for _fl in _check_analysis.get("floors", []):
@@ -14611,10 +18376,12 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         # than per-floor data. Treat that as a partial extraction so the
         # large-format rescue path (text-layer + tiling) gets a shot.
         likely_incomplete = bool(
-            best_result and _extraction_likely_incomplete(best_result[1])
+            best_result and not used_per_sheet
+            and _extraction_likely_incomplete(best_result[1])
         )
 
-        if best_rooms == 0 or rooms_have_zero_dims or likely_incomplete:
+        if not used_per_sheet and (
+                best_rooms == 0 or rooms_have_zero_dims or likely_incomplete):
             try:
                 from config import ENABLE_ENHANCED_EXTRACTION, LARGE_FORMAT_THRESHOLD_PT
             except ImportError:
@@ -14766,15 +18533,60 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                 "NIGHTSHIFT_MULTI_PASS_MIN_ROOMS", "20"))
         except (ValueError, TypeError):
             mp_min_rooms = 20
-        should_multi_pass = (multi_pass and not use_cache
-                              and result and best_rooms >= mp_min_rooms)
+        # Gate on DOCUMENT signals, not pass-1 output. The old gate
+        # (best_rooms >= 20) conditioned the variance fix on a sample of
+        # the very random variable it exists to stabilize: a pass-1
+        # under-extraction of 15 rooms skipped consensus entirely and
+        # shipped as the final answer — the exact 53-vs-15 failure mode.
+        # The page classifier is deterministic and zero-API-cost: if the
+        # document objectively contains paint-relevant pages, the variance
+        # fix applies regardless of how many rooms pass 1 happened to see.
+        # The room-count gate survives only as a fallback when
+        # classification is unavailable (no PyMuPDF / unreadable PDF).
+        try:
+            mp_min_plan_pages = int(os.environ.get(
+                "NIGHTSHIFT_MULTI_PASS_MIN_PLAN_PAGES", "1"))
+        except (ValueError, TypeError):
+            mp_min_plan_pages = 1
+        doc_included_pages = None
+        if multi_pass and not use_cache and result:
+            try:
+                _mp_cls = _classify_pdf_pages(pdf_path)
+                if _mp_cls:
+                    doc_included_pages = sum(
+                        1 for c in _mp_cls if c.get("include"))
+            except Exception:
+                doc_included_pages = None
+
+        if doc_included_pages is not None:
+            should_multi_pass = (multi_pass and not use_cache and result
+                                  and best_rooms > 0
+                                  and doc_included_pages >= mp_min_plan_pages)
+        else:
+            should_multi_pass = (multi_pass and not use_cache
+                                  and result and best_rooms >= mp_min_rooms)
+
+        if used_per_sheet and should_multi_pass:
+            # Per-sheet mode replaces consensus with the per-sheet
+            # verification pass; re-running whole-set passes would
+            # reintroduce the cross-pass variance it eliminates.
+            should_multi_pass = False
+            print(f"   ⏭  Multi-pass median skipped: per-sheet extraction "
+                  f"+ verification replaces consensus")
 
         if (multi_pass and not use_cache and result
-                and not should_multi_pass):
+                and not used_per_sheet and not should_multi_pass):
             # Surface the skip reason so worker logs are honest about
             # whether the variance fix actually fired on this job.
-            print(f"   ⏭  Multi-pass median skipped: pass 1 returned "
-                  f"{best_rooms} rooms < threshold {mp_min_rooms}")
+            if doc_included_pages is not None:
+                print(f"   ⏭  Multi-pass median skipped: document has "
+                      f"{doc_included_pages} paint-relevant page(s) < "
+                      f"threshold {mp_min_plan_pages} "
+                      f"(pass 1 rooms: {best_rooms})")
+            else:
+                print(f"   ⏭  Multi-pass median skipped: classification "
+                      f"unavailable and pass 1 returned {best_rooms} rooms "
+                      f"< fallback threshold {mp_min_rooms}")
 
         if should_multi_pass:
             try:
@@ -14786,7 +18598,12 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             if n_passes >= 2:
                 extra_passes = n_passes - 1  # we already have pass 1 in `result`
                 pass_results = [result]
-                mode_label = "image mode" if used_image_fb else "vector mode"
+                if used_image_fb:
+                    mode_label = "image mode"
+                elif used_enhanced:
+                    mode_label = "enhanced (tiled) mode"
+                else:
+                    mode_label = "vector mode"
                 print(f"   🔄 Multi-pass median ({mode_label}): "
                       f"running passes 2..{n_passes} of {n_passes}")
                 for i in range(extra_passes):
@@ -14797,6 +18614,25 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                                 client, pdf_path, scope_notes=scope_notes,
                                 schedule_hints=image_schedule_data,
                                 building_inventory=building_inventory,
+                                project_overview=project_overview)
+                        elif used_enhanced:
+                            # Pass 1 only reached its room count via enhanced
+                            # (tiled large-format) extraction — native vector
+                            # returned ~0. Running the extra passes in plain
+                            # vector mode produces a sparse, incompatible result
+                            # set, so the per-room merge can't reconcile them and
+                            # the median fallback ships the sparse pass. Observed
+                            # 2026-06-08 on both Wingstop jobs: Eastern pass 1
+                            # enhanced=52 rooms, vector passes 2-3 = 11/12, merge
+                            # kept 0/75 → shipped 12; Aliante 31 vs 12/26 →
+                            # shipped 26. Keep every pass on pass 1's extraction
+                            # path so they're comparable and actually mergeable.
+                            extra = _analyze_with_enhanced_extraction(
+                                client, pdf_path,
+                                scope_notes=scope_notes,
+                                schedule_hints=image_schedule_data,
+                                building_inventory=building_inventory,
+                                page_indices=painting_page_indices,
                                 project_overview=project_overview)
                         else:
                             extra = analyze_and_parse(
@@ -14937,6 +18773,9 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                 all_results[-1] = (path, analysis_result)
         else:
             files_skipped.append(filename)
+            if _COVERAGE_LEDGER is not None:
+                _COVERAGE_LEDGER.mark_file(
+                    pdf_path, "failed", "file could not be analyzed after retries")
             print(f"\n   ❌ FAILED: {filename} could not be analyzed after 2 attempts")
             print(f"   ⚠️  This file's data will be MISSING from the estimate")
 
@@ -15013,12 +18852,29 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             f"no quantities from them are priced."
         )
 
+    # --- Coverage gate: every page accounted for, failed pages block ---
+    # Attaches analysis["coverage"] (per-file page states), one honest
+    # summary note for the proposal, and forces manual review + an RFI
+    # naming file:pages when any page ended the run FAILED.
+    try:
+        analysis = _apply_coverage_gate(analysis, _COVERAGE_LEDGER)
+    except Exception as _cov_err:
+        print(f"   ⚠️  Coverage gate error (non-fatal): {_cov_err}")
+
     # --- Finish schedule + upload sheet inventory ---
     # Carry the pre-extracted Room Finish Schedule onto the result so the
     # has_finish_schedule flag and downstream RFIs see it.
     if room_finish_schedule and not analysis.get("room_finish_schedule"):
         analysis["room_finish_schedule"] = room_finish_schedule
     _set_finish_schedule_flag(analysis, pdf_paths)
+    _set_door_schedule_flag(analysis, pdf_paths)
+    _set_window_schedule_flag(analysis, pdf_paths)
+    # Canonicalize source_sheet on every room BEFORE the upload-sheet
+    # inventory is built and BEFORE downstream dedup runs. The LLM
+    # sometimes emits ANSI-style sheet IDs ('A-102') for pages actually
+    # marked in a different convention ('A2'); the dedup pass treats
+    # those as different sheets and ends up with phantom floor templates.
+    analysis = _canonicalize_source_sheets(analysis, pdf_paths)
     analysis["_upload_sheet_numbers"] = sorted(_collect_upload_sheet_numbers(pdf_paths))
 
     # --- Whitebox / Prime Only exclusion (before validation) ---
@@ -15136,14 +18992,47 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             analysis["has_window_schedule"] = True
         print(f"\n   📋 Image-based schedule data injected into analysis")
     # Apply schedule overrides (from either PDF-based or image-based schedule)
+    # Ledger (Phase 2.3): snapshot aggregated_totals here, then attribute each
+    # downstream stage's delta to its source so build_priced_takeoff can split
+    # measured/schedule/derived/assumed. No behavior change — pure observability.
+    _adj_snap = _agg_snapshot(analysis)
     if analysis.get("schedule_data"):
         analysis = _apply_schedule_overrides(analysis)
+        _adj_snap = _ledger_stage(analysis, "schedule_overrides", _adj_snap,
+                                  source="schedule",
+                                  basis="authoritative door/window/stair schedule")
 
     # --- Secondary space supplement (closets, halls, entries) ---
     # Uses rooms-per-unit density to detect missing secondary spaces and
     # supplements wall/ceiling/trim with estimated area. Must run BEFORE
     # perimeter cross-check and wall boost so those operate on supplemented totals.
     analysis = _supplement_missing_secondary_spaces(analysis)
+    _adj_snap = _ledger_stage(analysis, "secondary_space_supplement", _adj_snap,
+                              source="assumed",
+                              basis="rooms-per-unit density heuristic")
+
+    # --- Unit-multiplier sanity validator ---
+    # Catches the Ridgeview-2026-05-28 case: model emits multipliers that
+    # sum correctly to total_units but distribute wildly wrong across unit
+    # types (e.g. 18 1BR + 10 2BR for a building that's actually 28/2).
+    # Cannot deterministically fix without OCR on the T1 unit-mix table
+    # (which is vector art on most architectural sets), but adds an audit
+    # note + RFI flag so the estimator catches the issue manually instead
+    # of bidding blind.
+    analysis = _validate_unit_multipliers(analysis)
+
+    # --- Residential ceiling floor (GSF-based) ---
+    # Per-room ceiling extraction systematically under-counts dense
+    # vector-rendered architectural sets. When extracted ceiling falls
+    # materially below footprint × stories × efficiency, bump to the
+    # GSF-based floor. KonstructIQ comparison on Ridgeview: extracted
+    # 32,601 SF vs truth 42,923 SF (= GSF). Default efficiency assumes
+    # commons are painted (typical for supportive housing / multifamily);
+    # auto-downshifts when the finish schedule shows ACT in commons.
+    analysis = _apply_residential_ceiling_floor(analysis)
+    _adj_snap = _ledger_stage(analysis, "residential_ceiling_floor", _adj_snap,
+                              source="assumed",
+                              basis="footprint x stories x efficiency floor")
 
     # --- Perimeter-based wall cross-check (must run BEFORE wall boost) ---
     # Computes perimeter-derived wall totals and stores in _perimeter_cross_check
@@ -15155,11 +19044,21 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     # Boost cap elevated when secondary space supplement confirmed under-extraction.
     # Must come AFTER _recalculate_totals, secondary supplement, and perimeter cross-check.
     analysis = _validate_and_boost_walls(analysis)
+    # The Mode-1 perimeter boost is DERIVED (measured per-room perimeter x
+    # height repairing aggregation loss) — measurement-backed, kept under the
+    # gate. The Mode-2 footprint boost is already suppressed under
+    # HARD_NUMBERS_ONLY, so under that policy only derived deltas land here.
+    _adj_snap = _ledger_stage(analysis, "wall_boost", _adj_snap,
+                              source="derived",
+                              basis="perimeter x height (Mode 1) / footprint ratio (Mode 2)")
 
     # --- Commercial window exclusion (after all overrides/boosts) ---
     # For commercial (non-residential) buildings, zero all painted windows.
     # Must come AFTER schedule overrides so schedule data doesn't override back.
     analysis = _apply_commercial_window_exclusion(analysis)
+    _adj_snap = _ledger_stage(analysis, "commercial_window_exclusion", _adj_snap,
+                              source="correction",
+                              basis="zero painted windows for commercial")
 
     # --- Wall:Ceiling ratio guard rail (after all boosts/corrections) ---
     # Informational check — does NOT modify totals, only adds warnings/RFIs.
@@ -15230,9 +19129,10 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         # Stairs are missing or seem too low for the building
         est_stairs = 0
 
+        _stairwell_note_seen = False
         if current_stairs == 0:
             # Try to parse stair count from stair-specific notes only
-            for note in analysis.get("notes", []):
+            for note in list(analysis.get("notes", [])):
                 note_lower = note.lower()
                 # Skip notes that aren't about stairs
                 if 'stair' not in note_lower:
@@ -15247,12 +19147,20 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                 m1b = re.search(r'(\d+)\s*stair\s*(?:section|flight)', note_lower)
                 if m1b:
                     est_stairs = max(est_stairs, int(m1b.group(1)))
-                # "N stairwells" — multiply by effective_levels × 2 flights per transition
-                m2 = re.search(r'(\d+)\s*stairwell', note_lower)
-                if m2:
-                    stairwells = int(m2.group(1))
-                    transitions = max(1, effective_levels - 1)
-                    est_stairs = max(est_stairs, stairwells * transitions * 2)
+                # "N stairwells" — multiply by effective_levels × 2 flights
+                # per transition. HARD_NUMBERS_ONLY: the stairwell COUNT may
+                # be stated, but flights-per-transition is an assumption —
+                # a free-text "2 stairwells" turned into 12 priced sections
+                # ($18k on a 4-level building). Explicit section/flight
+                # counts (m, m1b, m3) are stated numbers and stay accepted.
+                if not HARD_NUMBERS_ONLY:
+                    m2 = re.search(r'(\d+)\s*stairwell', note_lower)
+                    if m2:
+                        stairwells = int(m2.group(1))
+                        transitions = max(1, effective_levels - 1)
+                        est_stairs = max(est_stairs, stairwells * transitions * 2)
+                elif re.search(r'(\d+)\s*stairwell', note_lower):
+                    _stairwell_note_seen = True
                 # "= X total" at end of stair note
                 m3 = re.search(r'=\s*(\d+)\s*total', note_lower)
                 if m3:
@@ -15262,6 +19170,15 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             max_reasonable = 4 * effective_levels * 2
             if est_stairs > max_reasonable:
                 est_stairs = 0
+
+            if HARD_NUMBERS_ONLY and est_stairs == 0 and _stairwell_note_seen:
+                analysis.setdefault("notes", []).append(
+                    "[Stair Check] Notes mention a stairwell count but no "
+                    "explicit section/flight count was extracted. RFI "
+                    "REQUIRED: confirm the number of stair sections/flights "
+                    "to paint (stairwell-count extrapolation is NOT priced "
+                    "under hard-numbers policy)."
+                )
 
         # If notes didn't give us a number, use building heuristic.
         # Gated by HARD_NUMBERS_ONLY: a geometry-based stair estimate — and the
@@ -15460,78 +19377,96 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     # details — these are reference material and don't contain room
     # measurements. If they're in the denominator the metric is unhittable
     # (a typical 17-sheet set has only 4-7 rooms-expected sheets).
-    _extracted_arch_sheets = set()
-    for _floor in analysis.get("floors", []) or []:
-        for _room in _floor.get("rooms", []) or []:
-            _sheet = re.sub(r'\s+', '', str(_room.get("source_sheet", "")).upper())
-            if re.match(r'^A[D]?\d', _sheet) or re.match(r'^A[D]?-\d', _sheet):
-                _extracted_arch_sheets.add(_sheet)
-
-    # Parse (sheet_id, title) pairs from the index_text. Architects render
-    # the index as a table; in text-layer extraction it often becomes:
-    #   "A-101 1st Floor Plan"
-    #   "A-101\n1st Floor Plan"
-    # or with various separators. Pair each A-xxx mention with the next ~80
-    # chars of context, then classify by keyword.
+    # Sheet-ID recognition uses the canonical _SHEET_NUMBER_RE + _normalize_sheet_token
+    # so dotted IDs ("A1.02", "A2.01a") and dashed/spaced variants all parse. The old
+    # `\d{2,3}` regex silently missed every dotted-convention sheet and instead matched
+    # ASTM spec callouts (A653, A615, A706…) and reference-symbol examples (1/A101) as
+    # if they were sheets — a phantom denominator that produced a false "low coverage /
+    # DO NOT SEND" alarm (observed on the Tesla Cybercab set: real sheets A1.02/A2.01/
+    # A3.01 compared against phantom {A653,A570,A611,…} → bogus 33% coverage).
+    #
+    # To stay robust we (a) title-anchor each ID — a real sheet has a plan/elevation/
+    # section/schedule/detail keyword next to it in the index; an ASTM spec does not;
+    # (b) intersect with sheets physically present in the upload (title-block scan);
+    # (c) treat any sheet that actually yielded rooms as both covered AND room-bearing,
+    # so numerator and denominator share an attribution basis and the alarm fires only
+    # when real plan sheets present in the set yielded nothing (true truncation).
+    _ARCH_PREFIXES = ("A", "AD")
     _ROOMS_EXPECTED_KW = (
         "floor plan", "foundation plan", "roof plan",
         "apartment plan", "ceiling plan", "rcp",
+        "enlarged floor", "enlarged plan",
     )
     _REFERENCE_ONLY_KW = (
-        "elevation", "section", "schedule", "detail",
+        "elevation", "section", "schedule", "detail", "cover", "index",
+        "general note", "site plan", "demolition", "abbreviation",
         "wall section", "stair section", "canopy", "key plan",
     )
+    _TITLE_KW = _ROOMS_EXPECTED_KW + _REFERENCE_ONLY_KW
 
-    def _classify_sheet_from_index(sheet_id, index_text):
-        """Return 'rooms_expected', 'reference_only', or 'ambiguous' based on
-        the title that appears near the sheet ID in the drawing index."""
-        sid_re = re.compile(re.escape(sheet_id), re.IGNORECASE)
-        for m in sid_re.finditer(index_text):
-            # Look at up to 80 chars AFTER the sheet ID (the title)
-            context = index_text[m.end():m.end() + 80].lower()
-            if any(kw in context for kw in _ROOMS_EXPECTED_KW):
-                return "rooms_expected"
-            if any(kw in context for kw in _REFERENCE_ONLY_KW):
-                return "reference_only"
-        return "ambiguous"
+    def _arch_sheet_id(raw):
+        """Normalize a string to an A/AD architectural sheet token
+        ('A1.02' -> 'A102'), or None if it isn't one. Drops bare fragments
+        like 'A2' (len < 3) that fall out of partial matches."""
+        m = _SHEET_NUMBER_RE.match(str(raw).strip())
+        if not m or m.group(1).upper() not in _ARCH_PREFIXES:
+            return None
+        norm = _normalize_sheet_token(m.group(1) + m.group(2))
+        return norm if len(norm) >= 3 else None
 
+    # Sheets physically present in the uploaded set (authoritative title-block scan).
+    _present_arch = {s for s in (analysis.get("_upload_sheet_numbers") or [])
+                     if s and s[0] == "A"}
+
+    # Sheets the extraction actually attributed rooms to.
+    _extracted_arch_sheets = set()
+    for _floor in analysis.get("floors", []) or []:
+        for _room in _floor.get("rooms", []) or []:
+            _sid = _arch_sheet_id(_room.get("source_sheet", ""))
+            if _sid:
+                _extracted_arch_sheets.add(_sid)
+
+    # Parse the drawing index: each real sheet ID sits next to its title. Titles run
+    # together in linearized index text, so classify room-bearing only when a room
+    # keyword precedes any reference keyword in the adjacent context window.
     _all_arch_sheets = set()
     _rooms_expected_sheets = set()
-    _full_index_text = ""
     for _info in _index_info_per_pdf:
         _txt = _info.get("index_text") or ""
-        _full_index_text += "\n" + _txt
-        for _m in re.finditer(r'\bA[D]?\s*-?\s*\d{2,3}[A-Z]?\b', _txt.upper()):
-            _all_arch_sheets.add(re.sub(r'\s+', '', _m.group()))
+        for _m in _SHEET_NUMBER_RE.finditer(_txt):
+            if _m.group(1).upper() not in _ARCH_PREFIXES:
+                continue
+            _norm = _normalize_sheet_token(_m.group(1) + _m.group(2))
+            if len(_norm) < 3:
+                continue
+            _ctx = _txt[_m.end():_m.end() + 40].lower()
+            if not any(kw in _ctx for kw in _TITLE_KW):
+                continue  # ASTM spec / random number / equipment tag — not a sheet
+            _all_arch_sheets.add(_norm)
+            _first_room = min([_ctx.find(kw) for kw in _ROOMS_EXPECTED_KW if kw in _ctx] or [10 ** 9])
+            _first_ref = min([_ctx.find(kw) for kw in _REFERENCE_ONLY_KW if kw in _ctx] or [10 ** 9])
+            if _first_room < _first_ref:
+                _rooms_expected_sheets.add(_norm)
 
-    for _sid in _all_arch_sheets:
-        if _classify_sheet_from_index(_sid, _full_index_text) == "rooms_expected":
-            _rooms_expected_sheets.add(_sid)
-
-    # Denominator: rooms-expected sheets only. If classification yielded
-    # nothing (very short index, no recognizable plan-type titles), fall back
-    # to the full set so we don't suppress legitimate alarms — but require a
-    # higher absolute miss count before flagging.
-    _denominator = _rooms_expected_sheets if _rooms_expected_sheets else _all_arch_sheets
-    _extracted_in_denom = _extracted_arch_sheets & _denominator if _rooms_expected_sheets else _extracted_arch_sheets
+    # Room-bearing sheets that genuinely exist in the upload, unioned with the sheets
+    # that produced rooms. Coverage < 60% now means "real plan sheets present in the
+    # set yielded nothing" — not "rooms were attributed to the occupant-load/FFE plan
+    # instead of the floor plan."
+    _rooms_present = (_rooms_expected_sheets & _present_arch) if _present_arch else _rooms_expected_sheets
+    _denominator = _rooms_present | _extracted_arch_sheets
+    _extracted_in_denom = _extracted_arch_sheets & _denominator
 
     if (len(_denominator) >= 4
             and _extracted_in_denom
             and len(_extracted_in_denom) / len(_denominator) < 0.60):
-        _coverage_pct = (len(_extracted_in_denom)
-                         / len(_denominator)) * 100
+        _coverage_pct = (len(_extracted_in_denom) / len(_denominator)) * 100
         _missed_sheets = sorted(_denominator - _extracted_in_denom)
-        _classification_note = (
-            "(rooms-expected sheets only; reference sheets like elevations / "
-            "sections / schedules / details excluded from denominator)"
-            if _rooms_expected_sheets else
-            "(could not classify sheets by type; denominator is all architectural sheets)"
-        )
         _flag_partial_extraction(
             f"Extracted rooms came from only {len(_extracted_in_denom)} of "
-            f"{len(_denominator)} architectural sheets that should contain rooms "
+            f"{len(_denominator)} architectural plan sheets present in the set "
             f"({_coverage_pct:.0f}% coverage; ≥60% expected). "
-            f"{_classification_note} "
+            f"(room-bearing sheets physically present in the upload; ASTM specs, "
+            f"reference-symbol callouts, and detail/schedule sheets excluded). "
             f"Missed sheets: {_missed_sheets[:8]}"
             f"{'...' if len(_missed_sheets) > 8 else ''}. "
             f"Extracted: {sorted(_extracted_in_denom)[:8]}."
@@ -15689,25 +19624,79 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         # floor plans for room dimensions." That's a clear "extraction
         # is incomplete, do NOT ship" signal we need to honor.
         if not _footprint or _footprint <= 0:
-            flag_msg = (
-                f"[MANUAL REVIEW REQUIRED] Building footprint could not "
-                f"be determined from the extracted rooms (extracted "
-                f"paintable surface: {_total_paintable:,.0f} sqft). For "
-                f"a commercial building this means the architectural "
-                f"floor plans either weren't included in the extraction "
-                f"or their dimensions couldn't be parsed. Every "
-                f"downstream area/cost estimate has no anchor to verify "
-                f"against. Do NOT send this proposal without a reviewer "
-                f"confirming what's missing — and consider whether the "
-                f"customer needs to resubmit a different drawing set."
-            )
-            analysis["manual_review_required"] = True
-            analysis["manual_review_reason"] = flag_msg
-            analysis.setdefault("notes", []).append(flag_msg)
-            print(f"\n🚨 PRE-FINALIZE SANITY CHECK FAILED — NO FOOTPRINT")
-            print(f"   Extracted paintable: {_total_paintable:,.0f} sqft")
-            print(f"   Footprint:           (missing — set to None/0)")
-            print(f"   ⚠️  Flagged for manual review.")
+            # Distinguish "footprint legitimately not derivable from the plans
+            # but we still extracted a substantial, dimensioned takeoff" from a
+            # genuinely thin/incomplete extraction. The latter MUST block
+            # (Urban Air: 16 rooms, $17k, notes self-reported "obtain A-series
+            # plans"); the former is better served by an RFI so a sound job
+            # isn't needlessly held. NIGHTSHIFT_FOOTPRINT_RFI=1 enables the soft
+            # path; default off preserves the current always-block behavior.
+            _soft_footprint = (
+                os.environ.get("NIGHTSHIFT_FOOTPRINT_RFI", "0") == "1")
+            _rooms_with_dims = sum(
+                1 for _f in (analysis.get("floors", []) or [])
+                for _r in (_f.get("rooms", []) or [])
+                if _r.get("in_scope", True)
+                and _num((_r.get("dimensions") or {}).get(
+                    "wall_area_sqft", 0)) > 0)
+            try:
+                _fp_min_rooms = int(os.environ.get(
+                    "NIGHTSHIFT_FOOTPRINT_RFI_MIN_ROOMS", "20"))
+            except (ValueError, TypeError):
+                _fp_min_rooms = 20
+            _notes_blob = " ".join(
+                str(n) for n in (analysis.get("notes", []) or [])).lower()
+            # The extractor's own "this is incomplete" admissions — if present,
+            # always block regardless of room count (honors the Urban Air signal).
+            _self_incomplete = any(kw in _notes_blob for kw in (
+                "incomplete", "obtain and review", "not included",
+                "next steps", "resubmit", "couldn't be parsed",
+                "could not be parsed"))
+            if (_soft_footprint and not _self_incomplete
+                    and _rooms_with_dims >= _fp_min_rooms
+                    and _total_paintable >= 10000):
+                rfi_text = (
+                    f"Building footprint could not be derived from the plans, "
+                    f"but a substantial dimensioned takeoff was extracted "
+                    f"({_rooms_with_dims} rooms with measured walls; "
+                    f"{_total_paintable:,.0f} sqft paintable). Confirm the gross "
+                    f"building footprint (or provide the A-series plan with a "
+                    f"dimensioned outline) so the takeoff can be cross-checked "
+                    f"against it.")
+                analysis.setdefault("_pre_pricing_rfis", []).append({
+                    "category": "Missing Information",
+                    "question": rfi_text,
+                    "action_required": (
+                        "Provide/confirm gross building footprint to validate "
+                        "the extracted takeoff."),
+                    "severity": "medium",
+                    "source": "footprint_unconfirmed_soft",
+                })
+                analysis.setdefault("notes", []).append(
+                    f"[Footprint Unconfirmed] {rfi_text}")
+                print(f"\n⚠️  No footprint, but {_rooms_with_dims} dimensioned "
+                      f"rooms / {_total_paintable:,.0f} sqft extracted — "
+                      f"surfaced as RFI instead of blocking.")
+            else:
+                flag_msg = (
+                    f"[MANUAL REVIEW REQUIRED] Building footprint could not "
+                    f"be determined from the extracted rooms (extracted "
+                    f"paintable surface: {_total_paintable:,.0f} sqft). For "
+                    f"a commercial building this means the architectural "
+                    f"floor plans either weren't included in the extraction "
+                    f"or their dimensions couldn't be parsed. Every "
+                    f"downstream area/cost estimate has no anchor to verify "
+                    f"against. Do NOT send this proposal without a reviewer "
+                    f"confirming what's missing — and consider whether the "
+                    f"customer needs to resubmit a different drawing set."
+                )
+                analysis["manual_review_required"] = True
+                analysis["manual_review_reason"] = flag_msg
+                analysis.setdefault("notes", []).append(flag_msg)
+                print(f"\n🚨 PRE-FINALIZE SANITY CHECK FAILED — NO FOOTPRINT")
+                print(f"   Extracted paintable: {_total_paintable:,.0f} sqft")
+                print(f"   Footprint:           (missing — set to None/0)")
+                print(f"   ⚠️  Flagged for manual review.")
 
         # Threshold: paintable_surface < footprint × 3 is structurally
         # implausible for a commercial building. A typical retail box:
@@ -15739,6 +19728,13 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             print(f"   ⚠️  Flagged for manual review — proposal will print "
                   f"but should NOT be sent without reviewer sign-off.")
 
+    # --- Provenance choke point (Phase 2.3): classify every priced quantity as
+    # measured / schedule / derived / assumed from the adjustment ledger, store
+    # the breakdown, and (strict mode, NIGHTSHIFT_PROVENANCE_GATE) remove assumed
+    # increments + file an unpriced-exposure RFI. Must be the LAST mutation of
+    # aggregated_totals before pricing. ---
+    analysis = build_priced_takeoff(analysis)
+
     # --- Calculate costs ---
     _update_progress(6, TOTAL_STEPS, "Calculating Costs", "Applying pricing model...")
     print("\n💰 Calculating costs...")
@@ -15750,6 +19746,12 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         analysis=analysis,
         pricing_model_override=pricing_model_used,
     )
+
+    # Calibrated confidence (Phase 2.4): honest predicted-error band from the
+    # deterministic evidence Phases 1-3 now produce. Additive — stored on the
+    # analysis, rendered in the Trust Summary; does not change pricing or the
+    # ready_to_send gate.
+    analysis = _assess_calibrated_confidence(analysis, cost_estimate=costs)
 
     print_estimate(analysis, costs)
 
@@ -15802,6 +19804,18 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         client=client,
     )
     if will_result.get("will_synthesis"):
+        # Reconcile Will's self-reported confidence with the calibrated band
+        # (Phase 2.5b): calibrated confidence can only TIGHTEN ready_to_send,
+        # never loosen it — a job ships only when BOTH agree. Guarded; never
+        # fatal.
+        try:
+            _confidence.reconcile_will_confidence(
+                will_result["will_synthesis"],
+                analysis.get("calibrated_confidence") or {})
+        except Exception as _rc_err:
+            print(f"   ⚠️  Will/confidence reconciliation skipped: "
+                  f"{type(_rc_err).__name__}: {str(_rc_err)[:120]}")
+
         will_rfis = will_result.get("new_rfis", [])
         next_num = (max((r.get("number", 0) for r in rfi_items), default=0) + 1
                     if rfi_items else 1)

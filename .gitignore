@@ -11,6 +11,7 @@ jobs/
 
 # Local test-run harness — holds large customer PDFs/outputs, never deploy
 wingstop_local_run/
+rider_local_run/
 
 # Python
 *.pyc
@@ -46,3 +47,9 @@ submissions/
 nightshift_pre_*.sql
 *.sql.bak
 spike_samples/
+
+# Local validation artifacts (need API credits to run)
+validate_recovery.log
+validate_recovery_summary.json
+*_validate.json
+*_validate.pdf
