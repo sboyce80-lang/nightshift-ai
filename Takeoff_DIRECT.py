@@ -3102,6 +3102,23 @@ def _title_text_is_section_or_detail(raw_text):
     return any(k in txt for k in _SECTION_DETAIL_TITLE_RE)
 
 
+def _title_text_is_index_sheet(raw_text):
+    """True for a Title/Cover/Index sheet whose 'List of Drawings' enumerates
+    plan-sheet names (e.g. 'FLOOR PLAN', 'REFLECTED CEILING PLAN') as index
+    entries — text that falsely trips _title_text_is_plan_sheet. A drawing
+    index is not itself a plan sheet (it has no measurable geometry). Without
+    this gate an image-only set's Title Sheet (often the one page with a text
+    layer) is the sole 'plan' detected, suppressing the rasterized-plan path
+    and collapsing the estimate to $0 (119 Franklin / estimate 4628)."""
+    txt = str(raw_text or "").lower()
+    if not txt:
+        return False
+    INDEX_MARKERS = ("list of drawings", "drawing index", "sheet index",
+                     "drawing list", "index of drawings", "title sheet",
+                     "cover sheet")
+    return any(k in txt for k in INDEX_MARKERS)
+
+
 def _num_or_zero(v):
     try:
         f = float(v)
@@ -3863,6 +3880,13 @@ def _analyze_pdf_per_sheet(client, pdf_path, scope_notes="",
         if _title_text_is_section_or_detail(raw):
             section_skipped.append(pg)
             continue
+        # NEGATIVE gate: a Title/Cover/Index sheet whose drawing index lists
+        # plan-sheet names is not itself a plan sheet. Veto it before the
+        # dims/keyword detectors so it can't become a lone false-positive
+        # "plan" that suppresses the rasterized-plan path on image-only sets.
+        if _title_text_is_index_sheet(raw):
+            section_skipped.append(pg)
+            continue
         parsed = _parse_floor_plan_text(tl) if tl else None
         if parsed:
             parsed_pages[pg] = parsed
@@ -3883,6 +3907,32 @@ def _analyze_pdf_per_sheet(client, pdf_path, scope_notes="",
                      "section/elevation/detail sheet (per-sheet mode; rooms "
                      "duplicate plan views)")
 
+    # Large-format included pages with NO usable text layer are scanned plan
+    # sheets the text detectors can't score. Union them in whenever they exist,
+    # not only when plan_pages is empty — a single false positive (e.g. a Title
+    # Sheet whose drawing index lists 'FLOOR PLAN') must not suppress the
+    # rasterized-plan path for an entire image-only set.
+    # (119 Franklin / estimate 4628: 1 title sheet detected, 31 scanned plans
+    #  dropped -> $0.)
+    seen = set(plan_pages) | set(section_skipped)
+    raster_plans = []
+    for c in included:
+        pg = c["page_index"]
+        if pg in seen:
+            continue
+        if (text_layers.get(pg) or {}).get("raw_text", "").strip():
+            continue  # has text the detectors above already judged
+        try:
+            is_large, _, _ = _is_large_format_page(pdf_path, pg, 2000)
+        except Exception:
+            is_large = False
+        if is_large:
+            raster_plans.append(pg)
+    if raster_plans:
+        print(f"   🖼  Per-sheet: adding {len(raster_plans)} image-only "
+              f"large-format page(s) as scanned plan sheets "
+              f"(pages {[p + 1 for p in raster_plans]})")
+        plan_pages.extend(raster_plans)
     if not plan_pages:
         # Mirror the enhanced-extraction fallback: large-format included
         # pages are presumed plan sheets when text gives no signal.
@@ -4013,6 +4063,21 @@ def _analyze_pdf_per_sheet(client, pdf_path, scope_notes="",
           f"{f', {n_merges} canonical-identity merge(s)' if n_merges else ''}"
           f"{f', {n_ckpt_hits} checkpoint hit(s)' if n_ckpt_hits else ''}"
           f"{f', {len(failed_pages)} sheet(s) FAILED' if failed_pages else ''}")
+
+    # Safety net: a per-sheet run that extracted no measurable geometry must
+    # not ship a $0 estimate. Defer to the legacy multimodal path (same
+    # return-None contract used above when no plan sheets are found) — the
+    # path that produces something beats the path that produced nothing.
+    total_wall_sqft = 0.0
+    for fl in (merged.get("floors") or []):
+        for rm in (fl.get("rooms") or []):
+            total_wall_sqft += _num_or_zero(
+                (rm.get("dimensions") or {}).get("wall_area_sqft"))
+    if total_rooms <= 0 or total_wall_sqft <= 0:
+        print(f"   ⚠️  Per-sheet produced {total_rooms} room(s) / "
+              f"{total_wall_sqft:.0f} wall SF — deferring to legacy "
+              f"multimodal path (no $0 per-sheet estimate)")
+        return None
 
     _attach_bbox_anchors(merged, pdf_path)
     return (pdf_path, merged)
