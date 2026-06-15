@@ -265,6 +265,37 @@ class Submission(Base):
     error: Mapped[Optional[str]] = mapped_column(String(2000))
     subtotal: Mapped[Optional[float]] = mapped_column(Numeric(12, 2))
 
+    # Idempotency claim for the outbound result/manual-review email. Set
+    # via UPDATE ... WHERE emailed_at IS NULL before sending; a re-run of
+    # the job (warm-shutdown requeue, retry) that loses the claim must NOT
+    # send a second estimate — multi-pass extraction is non-deterministic,
+    # so a duplicate email can carry different numbers.
+    emailed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+
+    # Liveness signal: the worker's heartbeat thread touches this every
+    # ~60s while the job is processing. The stuck-job watchdog reaps on
+    # STALE HEARTBEAT + RQ cross-check — never on wall-clock age alone
+    # (legitimate DD-scale takeoffs run 90+ minutes; the old updated_at
+    # sweep would have killed healthy jobs at minute 31).
+    heartbeat_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+
+    # Live progress from the engine's _update_progress checkpoints:
+    # {"step", "total_steps", "label", "detail", "pct", "updated"}.
+    # Surfaced via /api/jobs/<id> so the UI shows real progress instead
+    # of a constant 55% bar.
+    progress: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+
+    # Routing decision persisted at first enqueue so every re-enqueue
+    # path (requeue scripts, prioritize, resubmit) reuses the original
+    # queue and timeout instead of silently shrinking a 4h DD job to the
+    # 2h legacy default.
+    queue_name: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
+    job_timeout: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
     # Versioning for re-runs. v1 has parent_submission_id=NULL; revisions
     # (revised plans, RFI responses, amendments) point at the parent and
     # increment version. The merge worker re-extracts only the new files
