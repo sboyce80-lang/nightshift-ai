@@ -10,7 +10,9 @@
 
 Audit of 9 original bid sets / 563 pages (incl. Rider's NYULH Westchester, WMC Kingston, Wingstop, 119 Franklin, Dutchess, 364, Fishkill): **100% vector, 0 scanned.** The wall lines are exact CAD geometry sitting in the file. The current pipeline conflates "no text layer" with "raster image," rasterizes vector pages, and hands them to a vision model that flattens walls to bounding-box rectangles — the root cause of both the $0 image-only collapse and the residual wall under-counts.
 
-**De-risk spike result (364 Main, golden walls = 85,353 SF):** a purely deterministic 3-step geometry algorithm reproduces the hand takeoff **within 2%** (composite all-floors sheet → 83,656 SF). No vision, no ratios — measuring the lines. This clears the research risk. What remains is normal engineering.
+**De-risk spike result (364 Main, golden walls = 85,353 SF):** a purely deterministic 3-step geometry algorithm (no vision, no ratios) measures wall faces directly from the CAD lines. The approach is sound and the per-sheet primitive + scale auto-detection are validated (see `vector_measure.py` / `test_vector_measure.py`).
+
+> **⚠️ CORRECTION (2026-06-15, M0 build):** the spike's "within 2%" was a **scale artifact, retracted.** It hardcoded 1/8"=9 pts/ft for every sheet; the "composite" sheet is actually **3/32"=1'-0"**, so at its true scale it reads **111,542 SF — 30% OVER golden**, not 2% under. Per-floor sheets at their correct detected scale: basement 16,786 SF, 1st floor 25,946 SF (plausible), but the upper-floor sheet reads ~2× high (multi-floor content + cross-layer duplication). **Net: accuracy is UNPROVEN.** The approach is still the right direction, but **M1 (sheet/floor selection + dedup) and M2 (paintability/poché) are more load-bearing than the spike implied**, and real validation needs the golden set (2.1).
 
 The VME is the path to the "truest number": **trace and measure the hard lines on the plan.**
 

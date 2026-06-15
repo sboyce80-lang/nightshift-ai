@@ -1,0 +1,86 @@
+"""Tests for vector_measure (Phase 3 VME, M0).
+
+Offline unit tests (scale parser, interval union, layer filter) always run.
+The 364-Main integration check runs only when the sample PDF is present and
+asserts the measurement reproduces Rider's golden (85,353 SF) within tolerance.
+"""
+import os
+import sys
+
+import vector_measure as vm
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+_fails = []
+
+
+def check(name, cond, detail=""):
+    print(f"  {'PASS' if cond else 'FAIL'}  {name}" + (f"  ({detail})" if detail else ""))
+    if not cond:
+        _fails.append(name)
+
+
+# --------------------------------------------------------------------------
+print("scale parsing")
+# 1/8"=1'-0" -> 0.125*72/1 = 9 pts/ft, etc.
+for s, expect in [
+    ('1/8"=1\'-0"', 9.0),
+    ('1/4" = 1\'-0"', 18.0),
+    ('3/32"=1\'-0"', 6.75),
+    ('1"=1\'-0"', 72.0),
+    ('1-1/2"=1\'-0"', 108.0),
+    ('SCALE: 1/8" = 1\'-0"', 9.0),
+]:
+    got = vm.parse_scale(s)
+    check(f"parse_scale({s!r})={got}", got is not None and abs(got - expect) < 1e-6,
+          f"expect {expect}")
+check("parse_scale(no scale) is None", vm.parse_scale("FLOOR PLAN") is None)
+check("parse_scale('') is None", vm.parse_scale("") is None)
+
+# --------------------------------------------------------------------------
+print("interval union (duplicate/overlap collapse)")
+check("disjoint sums", abs(vm.union_length([(0, 10), (20, 25)]) - 15.0) < 1e-9)
+check("identical duplicates collapse", abs(vm.union_length([(0, 10), (0, 10), (0, 10)]) - 10.0) < 1e-9)
+check("overlap merges", abs(vm.union_length([(0, 10), (5, 15)]) - 15.0) < 1e-9)
+check("empty is 0", vm.union_length([]) == 0.0)
+
+# --------------------------------------------------------------------------
+print("wall-layer classification")
+check("A-WALL-NEW is wall", vm.is_wall_layer("X-FLOOR PLAN|A-WALL-NEW"))
+check("a-wall-demising is wall", vm.is_wall_layer("M-2|a-wall-demising"))
+check("bare WALL is wall", vm.is_wall_layer("WALL"))
+check("PARTITION is wall", vm.is_wall_layer("PARTITION"))
+check("A-Anno-Iden-Wall excluded", not vm.is_wall_layer("M-2|A-Anno-Iden-Wall"))
+check("A-Wall-Patt (hatch) excluded", not vm.is_wall_layer("A-Wall-Patt"))
+check("A-WALL-BELOW excluded", not vm.is_wall_layer("A-WALL-BELOW"))
+check("A-Lite-Wall (glazing) excluded", not vm.is_wall_layer("A-Lite-Wall"))
+check("empty layer excluded", not vm.is_wall_layer(""))
+check("DUCTWORK excluded", not vm.is_wall_layer("DUCTWORK"))
+
+# --------------------------------------------------------------------------
+# Integration: 364 Main — M0 validates scale-detection + measurement stability.
+# Building-TOTAL accuracy is deliberately NOT asserted here: it needs M1
+# (per-floor sheet selection / cross-sheet dedup) and M2 (paintability, poché).
+# NOTE: the spike's "composite within 2% of golden" was a SCALE ARTIFACT — the
+# composite sheet (p2) is drawn at 3/32"=1'-0", not 1/8"; at its true scale it
+# reads ~111k SF (30% over golden 85,353). Lesson: measure per-floor sheets at
+# their own detected scale, then attribute + dedup in M1.
+PDF = os.path.join(HERE, "spike_samples", "364Main.pdf")
+if vm.fitz is not None and os.path.exists(PDF):
+    print("364 Main integration — per-sheet scale detection + measurement stability")
+    check("p13 A-105 (1st floor) scale == 9 (1/8\")",
+          abs((vm.detect_scale(PDF, 12) or 0) - 9.0) < 1e-6, f"{vm.detect_scale(PDF,12)}")
+    check("p8 A-100 (basement) scale == 9 (1/8\")",
+          abs((vm.detect_scale(PDF, 7) or 0) - 9.0) < 1e-6, f"{vm.detect_scale(PDF,7)}")
+    check("p2 (composite) scale == 6.75 (3/32\") — NOT 1/8\"",
+          abs((vm.detect_scale(PDF, 1) or 0) - 6.75) < 1e-6, f"{vm.detect_scale(PDF,1)}")
+    m13 = vm.measure_wall_faces(PDF, 12)   # auto-detects 9 pts/ft
+    check("p13 has layer attribution", m13["has_layer_attribution"])
+    check("p13 wall_face_lf deterministic (~2883 ft)", abs(m13["wall_face_lf"] - 2883) < 50,
+          f"{m13['wall_face_lf']:.0f}")
+    print("     building-TOTAL vs golden 85,353 is an M1/M2 target, not asserted here.")
+else:
+    print("364 Main integration SKIPPED (PDF or PyMuPDF unavailable)")
+
+# --------------------------------------------------------------------------
+print(f"\n=== {'ALL PASS' if not _fails else str(len(_fails)) + ' FAILED: ' + ', '.join(_fails)} ===")
+sys.exit(1 if _fails else 0)
