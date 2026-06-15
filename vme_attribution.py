@@ -107,6 +107,25 @@ def select_floor_sources(pages) -> dict:
     return claimed
 
 
+def recover_floor_wall_runs(demising_run_lf, unit_type_runs, unit_counts):
+    """M2 part 2 — residential floor wall RUN with unit-partition recovery.
+
+    A residential floor's walls = demising/corridor walls (drawn on the floor
+    OVERVIEW) + each apartment's interior partitions, which are drawn ONCE on
+    the enlarged typical-unit plans and repeated N times on the floor. So:
+
+        floor_run = demising_run + sum_t(unit_type_run[t] * count_on_floor[t])
+
+    `unit_type_runs`: {unit_type: interior-partition run LF} measured from the
+    enlarged plans (centerline). `unit_counts`: {unit_type: instances on this
+    floor} — from the unit schedule the pipeline already extracts ("Units
+    201-206" -> 6), NOT fragile geometry detection. This is exactly Rider's
+    typical-unit x count takeoff, made deterministic.
+    """
+    unit_total = sum(unit_type_runs.get(t, 0.0) * n for t, n in (unit_counts or {}).items())
+    return float(demising_run_lf) + unit_total
+
+
 def measure_building(pdf_path: str, heights: dict) -> dict:
     """Per-floor wall measurement with one canonical source per floor.
 

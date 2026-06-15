@@ -122,6 +122,98 @@ def detect_scale(pdf_path: str, page_index: int):
 
 
 # --------------------------------------------------------------------------
+# M2 — wall-RUN length via centerline clustering
+# --------------------------------------------------------------------------
+def cluster_wall_runs(segments, thickness_pts):
+    """Collapse parallel axis-aligned wall lines into one RUN per wall.
+
+    M0's measure_wall_faces sums face length (~2x run) and is inflated by
+    walls drawn as multi-line assemblies (two faces + cavity/layer lines) and
+    by orthogonal poché fill — each extra parallel line is counted again.
+    cluster_wall_runs groups lines whose perpendicular coordinate is within
+    `thickness_pts` (one wall's thickness) and unions their span, so a wall's
+    2+ parallel lines collapse to a single run measured once.
+
+    `segments`: list of (perp_coord, lo, hi) for one orientation (all H or all
+    V), where perp_coord is y for horizontals / x for verticals.
+    Returns total run length (same units as inputs).
+
+    LIMITATION (M2): a single perpendicular threshold can't tell "two faces of
+    one wall" from "two distinct walls a threshold apart", so dense partition
+    layouts can still under-collapse/merge; and it cannot recover partitions
+    that aren't on the sheet at all (residential unit interiors live on the
+    enlarged typical-unit plans). Pair with unit-partition recovery.
+    """
+    if not segments:
+        return 0.0
+    segments = sorted(segments)
+    total = 0.0
+    band, band_perp = [], None
+    for perp, lo, hi in segments:
+        if band and perp - band_perp <= thickness_pts:
+            band.append((lo, hi))
+        else:
+            total += _union_intervals(band)
+            band = [(lo, hi)]
+        band_perp = perp
+    total += _union_intervals(band)
+    return total
+
+
+def _union_intervals(ivs):
+    if not ivs:
+        return 0.0
+    ivs = sorted(ivs)
+    tot = 0.0
+    cs, ce = ivs[0]
+    for s, e in ivs[1:]:
+        if s <= ce + 0.5:
+            ce = max(ce, e)
+        else:
+            tot += ce - cs
+            cs, ce = s, e
+    return tot + (ce - cs)
+
+
+def measure_wall_runs(pdf_path, page_index, layer_prefix=None, pts_per_ft=None,
+                      thickness_ft=0.85):
+    """Wall RUN linear footage on one sheet via centerline clustering (M2).
+
+    Optionally restrict to layers whose group prefix == layer_prefix (per-floor
+    filtering). Returns {wall_run_lf, pts_per_ft}. Wall paint area = run x
+    height (Rider's convention; see rider-takeoff-convention).
+    """
+    if fitz is None:
+        raise RuntimeError("PyMuPDF (fitz) is required")
+    if pts_per_ft is None:
+        pts_per_ft = detect_scale(pdf_path, page_index)
+    doc = fitz.open(pdf_path)
+    try:
+        page = doc[page_index]
+        H, V = [], []
+        for path in page.get_drawings():
+            layer = path.get("layer") or ""
+            if not is_wall_layer(layer):
+                continue
+            if layer_prefix and not layer.startswith(layer_prefix):
+                continue
+            for it in path["items"]:
+                if it[0] != "l":
+                    continue
+                a, b = it[1], it[2]
+                if abs(a.y - b.y) <= 1.0 and abs(a.x - b.x) > 1.0:
+                    H.append((round((a.y + b.y) / 2.0, 1), min(a.x, b.x), max(a.x, b.x)))
+                elif abs(a.x - b.x) <= 1.0 and abs(a.y - b.y) > 1.0:
+                    V.append((round((a.x + b.x) / 2.0, 1), min(a.y, b.y), max(a.y, b.y)))
+        t = thickness_ft * (pts_per_ft or 9.0)
+        run_pts = cluster_wall_runs(H, t) + cluster_wall_runs(V, t)
+        return {"wall_run_lf": (run_pts / pts_per_ft) if pts_per_ft else None,
+                "pts_per_ft": pts_per_ft}
+    finally:
+        doc.close()
+
+
+# --------------------------------------------------------------------------
 # Geometry
 # --------------------------------------------------------------------------
 def union_length(intervals) -> float:
