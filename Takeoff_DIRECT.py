@@ -5556,8 +5556,13 @@ def _merge_chunk_responses(texts, page_offsets=None, chunk_indices=None,
                                      "stair_sections", "gyp_between_stairs_sqft",
                                      "concrete_floor_sqft", "wallcovering_sqft",
                                      "stained_wood_sqft", "soffit_sqft"):
-                            w_val = w_elems.get(ekey, 0)
-                            l_val = l_elems.get(ekey, 0)
+                            # _num() guards against present-but-null counts:
+                            # .get(ekey, 0) returns None (not 0) when Claude
+                            # emits e.g. "doors_full_paint": null, and None > 0
+                            # raises TypeError. This runs during chunk merge,
+                            # before _normalize_analysis can coerce nulls.
+                            w_val = _num(w_elems.get(ekey, 0))
+                            l_val = _num(l_elems.get(ekey, 0))
                             if l_val > w_val:
                                 w_elems[ekey] = l_val
             else:
