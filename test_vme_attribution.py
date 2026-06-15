@@ -51,4 +51,21 @@ for name, j in JOBS.items():
     # each floor mapped to exactly one page (dict guarantees one source per floor)
     print(f"  one-source-per-floor: {len(r['floors'])} floors -> pages {seen}")
 
+# --------------------------------------------------------------------------
+print("\nM2 part 2 — unit-partition recovery (deterministic core)")
+# floor = demising + sum(unit_type_run * count)
+r = m1.recover_floor_wall_runs(400.0, {"A": 100.0, "B": 50.0}, {"A": 2, "B": 3})
+if abs(r - (400 + 200 + 150)) > 1e-9:
+    fails.append(f"recover_floor_wall_runs math: {r}")
+else:
+    print("  PASS  demising + sum(unit_run * count)")
+if m1.recover_floor_wall_runs(300.0, {}, {}) != 300.0:
+    fails.append("recover_floor_wall_runs empty -> demising only")
+else:
+    print("  PASS  no units -> demising only")
+if m1.recover_floor_wall_runs(0.0, {"A": 100.0}, {"A": 0}) != 0.0:
+    fails.append("recover_floor_wall_runs zero count")
+else:
+    print("  PASS  zero count contributes nothing")
+
 print(f"\n=== {'PASS' if not fails else 'ISSUES: ' + '; '.join(fails)} ===")
