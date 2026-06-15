@@ -376,6 +376,47 @@ def compose_reply(original_msg, result):
     return reply
 
 
+def _calibrated_email_enabled():
+    """Show the evidence-calibrated confidence band to the customer instead of
+    Will's self-reported level (review item 5a). Default OFF — flip on once the
+    calibration table is robust (currently thin: 3 distinct verified jobs)."""
+    return os.environ.get("NIGHTSHIFT_CALIBRATED_EMAIL", "0").strip() in (
+        "1", "true", "True")
+
+
+def _confidence_email_block(result, will_synth):
+    """Customer-facing confidence section.
+
+    review 5a: Will's level_pct is the model grading its own homework. When
+    NIGHTSHIFT_CALIBRATED_EMAIL is on and an evidence-calibrated band exists,
+    lead with the honest "predicted within ±X% at C% confidence" number
+    (golden-bin percentile from verified past jobs); otherwise fall back to
+    Will's self-reported level. Will's recommendation + top risks are kept
+    either way.
+    """
+    confidence = (will_synth or {}).get("confidence", {}) or {}
+    if not confidence:
+        return ""
+    recommendation = confidence.get("bid_recommendation", "")
+    risks_text = "\n".join(f"  - {r}" for r in (confidence.get("top_risks") or [])[:3])
+    cc = ((result.get("analysis") or {}).get("calibrated_confidence")) or {}
+    err = cc.get("predicted_error_pct")
+    if _calibrated_email_enabled() and err is not None:
+        ci = int(round((cc.get("ci_level") or 0.90) * 100))
+        basis = ("calibrated on our verified past jobs" if cc.get("calibrated")
+                 else "preliminary evidence estimate")
+        headline = (f"ESTIMATE CONFIDENCE: quantities predicted within "
+                    f"±{err:.0f}% ({ci}% confidence — {basis})")
+    else:
+        headline = f"ESTIMATOR'S CONFIDENCE: {confidence.get('level_pct', 0)}%"
+    return f"""
+{headline}
+Recommendation: {recommendation}
+Top risks:
+{risks_text}
+"""
+
+
 def _success_body(name, result):
     costs = result.get("cost_estimate", {})
     analysis = result.get("analysis", {})
@@ -422,18 +463,7 @@ SCOPE OF WORK
 {gc_scope}
 """
 
-        confidence = will_synth.get("confidence", {})
-        if confidence:
-            level = confidence.get("level_pct", 0)
-            recommendation = confidence.get("bid_recommendation", "")
-            top_risks = confidence.get("top_risks", [])
-            risks_text = "\n".join(f"  - {r}" for r in top_risks[:3])
-            will_confidence = f"""
-ESTIMATOR'S CONFIDENCE: {level}%
-Recommendation: {recommendation}
-Top risks:
-{risks_text}
-"""
+        will_confidence = _confidence_email_block(result, will_synth)
 
         # Surface Will's adjustments so the GC sees what changed
         adjustments_log = result.get("adjustments_applied", []) or []

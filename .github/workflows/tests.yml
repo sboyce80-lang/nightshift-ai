@@ -40,6 +40,7 @@ jobs:
             test_per_sheet_extraction
             test_vector_measure
             test_vme_attribution
+            test_calibrated_email
           "
           fail=0
           for t in $SUITES; do
