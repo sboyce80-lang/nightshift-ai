@@ -455,6 +455,26 @@ ENHANCED_TILE_OVERLAP_PCT = 0.05           # 5% overlap between tiles
 # heuristic-fill behavior.
 HARD_NUMBERS_ONLY = True
 
+# Allowance Line Items ("Allowances — Confirm Before Bid" section)
+# When enabled, the engine emits clearly-labeled ALLOWANCE lines for scope it
+# DETECTED in the drawings (a general note, a coded note, an exterior RFI) but
+# could not measure to a hard number: exterior CMU/tilt-up, painted columns,
+# misc metals / railings, accent bands. These NEVER mix into the measured
+# subtotal — they render in their own section with their own subtotal and a
+# stated basis on every line. This is consistent with HARD_NUMBERS_ONLY: the
+# quantities are evidence-gated (no trigger note → no line), segregated, and
+# labeled as confirm-before-bid assumptions, not folded silently into the
+# takeoff. Default OFF; opt in via NIGHTSHIFT_ALLOWANCE_LINES=1.
+ALLOWANCE_LINES_ENABLED = os.environ.get(
+    "NIGHTSHIFT_ALLOWANCE_LINES", "0").strip().lower() in ("1", "true", "yes", "on")
+# Hybrid quantity tunables — used only to size an allowance, always shown as
+# the line's stated basis so the estimator can adjust.
+ALLOWANCE_COLUMN_BAY_SQFT = float(os.environ.get("ALLOWANCE_COLUMN_BAY_SQFT", "1500"))   # footprint ÷ bay → column count
+ALLOWANCE_EXT_WALL_HEIGHT_FT = float(os.environ.get("ALLOWANCE_EXT_WALL_HEIGHT_FT", "20"))  # parapet/wall height when no section
+ALLOWANCE_EXT_SIDES = float(os.environ.get("ALLOWANCE_EXT_SIDES", "3"))                   # painted elevations (front + 2 sides typical)
+ALLOWANCE_EXT_ASPECT = float(os.environ.get("ALLOWANCE_EXT_ASPECT", "1.5"))              # L:W to derive perimeter from footprint
+ALLOWANCE_MISC_METALS_LS = float(os.environ.get("ALLOWANCE_MISC_METALS_LS", "2500"))     # flat LS when railing/misc-metal LF unconfirmed
+
 # Schedule-Based Estimation (when floor plans are missing)
 ENABLE_SCHEDULE_ESTIMATION = True          # Estimate wall/ceiling from Room Finish Schedules when no floor plans
 SCHEDULE_ESTIMATION_CONFIDENCE = 0.85      # Apply 85% confidence factor to schedule-derived areas
