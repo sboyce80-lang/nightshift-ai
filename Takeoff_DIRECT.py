@@ -12718,6 +12718,112 @@ def _provenance_gate_enabled():
         "1", "true", "True")
 
 
+def _ceiling_scope_gate_enabled():
+    return os.environ.get("NIGHTSHIFT_CEILING_SCOPE_GATE", "0").strip() in (
+        "1", "true", "True")
+
+
+# Ceiling materials that are never field-painted, regardless of any extracted
+# or merge-OR'd ceiling_painted flag. A paint trigger (gyp/dryfall/etc.) on the
+# same room overrides the demotion (e.g. "GYP below ACT soffit").
+_ACT_CEILING_KEYWORDS = (
+    "act", "acoustic", "lay-in", "lay in", "drop ceiling", "suspended")
+_CEILING_PAINT_TRIGGER_KEYWORDS = (
+    "gyp", "gwb", "gypsum", "drywall", "plaster", "dryfall")
+
+
+def _enforce_ceiling_scope_gate(analysis):
+    """Authoritative final ceiling-scope reconciliation, run inside
+    build_priced_takeoff (the choke point before calculate_costs). Fixes two
+    over-counts that per-sheet extraction exposed, validated on the 2026-06-16
+    TSC/Honey prod run vs Rider takeoffs:
+
+    (1) ACT/acoustic/suspended ceilings re-painted by the cross-sheet merge.
+        _merge_rooms_on_collision OR's ceiling_painted->True across duplicate
+        sheet instances with no material check, so one misread plan-sheet
+        instance repaints the whole acoustic deck (TSC: 24,180 SF of Retail
+        Sales + Stockroom ACT priced as paint). Acoustic tile is not
+        field-painted — hard-demote it here so nothing downstream resurrects
+        it. Applies to ALL building types (always correct).
+
+    (2) Commercial ceiling aggregate exceeding the deduped room set. The billed
+        total can be summed from pre-dedup duplicate instances and never
+        rebuilt (TSC agg 42,494 vs gated rooms ~1,600; Honey 12,339 vs 2,226).
+        On COMMERCIAL buildings — where no legitimate footprint ceiling floor /
+        secondary-space supplement applies — rebuild
+        total_paintable_ceiling_sqft from the gated, deduped, in-scope rooms.
+        ONLY-REDUCE (never inflate) so the gate can't introduce a new
+        over-count. Residential/mixed-use is left untouched so the intentional
+        residential-ceiling-floor + secondary-space supplements survive (364
+        Main's GSF-based floor must not regress).
+
+    Flag-gated via NIGHTSHIFT_CEILING_SCOPE_GATE (default off). Idempotent via
+    analysis['_ceiling_scope_gate'].
+    """
+    if not isinstance(analysis, dict) or not _ceiling_scope_gate_enabled():
+        return analysis
+    if analysis.get("_ceiling_scope_gate"):
+        return analysis
+
+    # (1) ACT hard-demote — every building type.
+    demoted = 0
+    demoted_sqft = 0.0
+    for floor in analysis.get("floors", []) or []:
+        for room in floor.get("rooms", []) or []:
+            mats = room.get("materials")
+            if not isinstance(mats, dict):
+                continue
+            mats["ceiling_painted"] = _as_bool(mats.get("ceiling_painted"))
+            ceil_mat = str(mats.get("ceiling", "")).lower()
+            is_act = any(k in ceil_mat for k in _ACT_CEILING_KEYWORDS)
+            trigger = any(k in ceil_mat for k in _CEILING_PAINT_TRIGGER_KEYWORDS)
+            if is_act and not trigger and mats.get("ceiling_painted"):
+                mats["ceiling_painted"] = False
+                dims = room.setdefault("dimensions", {})
+                demoted_sqft += _num(dims.get("ceiling_area_sqft", 0))
+                dims["ceiling_area_sqft"] = 0
+                demoted += 1
+                note = str(room.get("notes", ""))
+                if "[ACT ceiling not painted" not in note:
+                    room["notes"] = (
+                        note + " [ACT ceiling not painted — scope gate; "
+                        "acoustic/suspended tile is not field-painted]").strip()
+
+    record = {"act_rooms_demoted": demoted,
+              "act_sqft_removed": round(demoted_sqft, 2)}
+
+    # (2) Commercial-only aggregate rebuild from gated rooms (only-reduce).
+    pi = analysis.get("project_info") or {}
+    bt = str(pi.get("building_type", "")).lower()
+    is_residential = any(kw in bt for kw in (
+        "residential", "multifamily", "multi-family", "apartment", "condo",
+        "dorm", "supportive", "senior", "assisted", "mixed-use", "mixed use"))
+    if not is_residential:
+        gated = 0.0
+        for floor in analysis.get("floors", []) or []:
+            for room in floor.get("rooms", []) or []:
+                if not room.get("in_scope", True):
+                    continue
+                mats = room.get("materials") or {}
+                if not _as_bool(mats.get("ceiling_painted")):
+                    continue
+                ceil_mat = str(mats.get("ceiling", "")).lower()
+                if "dryfall" in ceil_mat:
+                    continue  # tracked in total_dryfall_ceiling_sqft, not here
+                dims = room.get("dimensions") or {}
+                mult = _extract_multiplier_from_notes(room)
+                gated += _num(dims.get("ceiling_area_sqft", 0)) * mult
+        agg = analysis.setdefault("aggregated_totals", {})
+        prev = _num(agg.get("total_paintable_ceiling_sqft", 0))
+        gated = round(gated, 2)
+        if gated < prev:
+            agg["total_paintable_ceiling_sqft"] = gated
+            record["commercial_aggregate_rebuilt"] = {"from": prev, "to": gated}
+
+    analysis["_ceiling_scope_gate"] = record
+    return analysis
+
+
 def build_priced_takeoff(analysis, strict=None):
     """Single provenance choke point between aggregation and calculate_costs.
 
@@ -12739,6 +12845,10 @@ def build_priced_takeoff(analysis, strict=None):
         return analysis
     if strict is None:
         strict = _provenance_gate_enabled()
+
+    # Final ceiling-scope reconciliation (ACT demote + commercial aggregate
+    # rebuild) before any quantity is priced. Flag-gated; no-op when off.
+    analysis = _enforce_ceiling_scope_gate(analysis)
 
     agg = analysis.get("aggregated_totals", {}) or {}
     ledger = analysis.get("_quantity_adjustments", []) or []
