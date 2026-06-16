@@ -98,6 +98,16 @@ def _safe_num(val):
     return 0
 
 
+def _as_bool(v):
+    """Truthiness for schema-boolean flags that may arrive as the strings
+    "True"/"False". bool("False") is True, which would price unpainted
+    (ACT/exposed) ceilings; route ceiling_painted reads through this so
+    "False"/"0"/""/None all read False. Mirrors Takeoff_DIRECT._as_bool."""
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "yes", "y", "t")
+    return bool(v)
+
+
 def _extract_multiplier_from_notes_pdf(room):
     """Extract unit multiplier from room data (for PDF report)."""
     import re
@@ -502,7 +512,7 @@ def json_to_pdf(json_path, pdf_path):
 
                 wall_mat_str = str(mats.get('walls', '-'))[:6]
                 ceil_mat_raw = str(mats.get('ceiling', '-'))
-                ceil_ptd = mats.get('ceiling_painted', False)
+                ceil_ptd = _as_bool(mats.get('ceiling_painted'))
                 ceil_mat_str = ceil_mat_raw[:6]
                 if not ceil_ptd and ceil_mat_str != '-':
                     ceil_mat_str = f"{ceil_mat_str}*"  # Asterisk = not painted
@@ -840,7 +850,7 @@ def json_to_pdf(json_path, pdf_path):
                     'floor': floor.get('floor_name', ''),
                     'multiplier': multiplier,
                     'walls': (_safe_num(dims.get('wall_area_sqft', 0)) if is_paintable else 0) * multiplier,
-                    'ceilings': (_safe_num(dims.get('ceiling_area_sqft', 0)) if mats.get('ceiling_painted') else 0) * multiplier,
+                    'ceilings': (_safe_num(dims.get('ceiling_area_sqft', 0)) if _as_bool(mats.get('ceiling_painted')) else 0) * multiplier,
                     'trim': _safe_num(elems.get('base_trim_lf', 0)) * multiplier,
                     'doors_fp': _safe_num(elems.get('doors_full_paint', 0)) * multiplier,
                     'doors_hm': _safe_num(elems.get('doors_hm_panel', 0)) * multiplier,
@@ -1091,6 +1101,73 @@ def json_to_pdf(json_path, pdf_path):
         ]))
         story.append(Spacer(1, 4))
         story.append(t)
+
+    # ── Allowances — Confirm Before Bid ──
+    # Scope the drawings call for but that could not be measured to a hard
+    # number (exterior CMU, columns, misc metals, accent bands). Segregated
+    # from the measured Cost Estimate above with its own subtotal and a stated
+    # basis per line — never folded into the takeoff. Emitted only when
+    # config.ALLOWANCE_LINES_ENABLED is on AND a trigger note was found.
+    allowances = cost_est.get('allowances') or []
+    if allowances:
+        AMBER = HexColor('#B7791F')
+        AMBER_BG = HexColor('#FBF3E2')
+
+        def _pdf_safe(s):
+            return (str(s).replace('×', 'x').replace('÷', '/')
+                    .replace('≈', '~').replace('—', '-')
+                    .replace('&', '&amp;'))
+
+        story.append(Spacer(1, 10))
+        story.append(Paragraph("Allowances — Confirm Before Bid", styles['SectionHead']))
+        story.append(HRFlowable(width="100%", thickness=0.5, color=AMBER))
+        story.append(Spacer(1, 4))
+        story.append(Paragraph(
+            "<i>Scope the drawings call for but that could not be measured to a "
+            "hard number. Each line shows the basis used to size it &mdash; "
+            "confirm or adjust before bidding. These are NOT included in the "
+            "measured Cost Estimate subtotal above.</i>", styles['Note']))
+        story.append(Spacer(1, 4))
+
+        alw_rows = [['Item / Basis', 'Qty', 'Cost', 'Markup', 'Total']]
+        for a in allowances:
+            item_cell = Paragraph(
+                f"<b>{_pdf_safe(a.get('item', ''))}</b><br/>"
+                f"<font size=7 color='#6B6B6B'>{_pdf_safe(a.get('basis', ''))}</font>",
+                styles['BodyText2'])
+            qty_cell = f"{_safe_num(a.get('qty')):,.0f} {a.get('unit', '')}".strip()
+            alw_rows.append([
+                item_cell, qty_cell,
+                fmt_currency(a.get('cost', 0)),
+                fmt_currency(a.get('markup', 0)),
+                fmt_currency(a.get('total', 0)),
+            ])
+        alw_rows.append(['', '', '', 'Allowances Subtotal:',
+                         fmt_currency(cost_est.get('allowance_subtotal', 0))])
+        _grand = (_safe_num(cost_est.get('subtotal', 0))
+                  + _safe_num(cost_est.get('allowance_subtotal', 0)))
+        alw_rows.append(['', '', '', 'Estimate + Allowances:', fmt_currency(_grand)])
+
+        ta = Table(alw_rows, colWidths=[2.4 * inch, 0.7 * inch, 1.0 * inch, 1.0 * inch, 1.0 * inch])
+        ta.setStyle(TableStyle([
+            ('BACKGROUND', (0, 0), (-1, 0), AMBER),
+            ('TEXTCOLOR', (0, 0), (-1, 0), WHITE),
+            ('FONTNAME', (0, 0), (-1, 0), 'Helvetica-Bold'),
+            ('FONTNAME', (3, -2), (4, -1), 'Helvetica-Bold'),
+            ('FONTSIZE', (0, 0), (-1, -1), 9),
+            ('ALIGN', (1, 0), (-1, -1), 'RIGHT'),
+            ('VALIGN', (0, 0), (-1, -1), 'MIDDLE'),
+            ('BOTTOMPADDING', (0, 0), (-1, -1), 5),
+            ('TOPPADDING', (0, 0), (-1, -1), 5),
+            ('LEFTPADDING', (0, 0), (-1, -1), 6),
+            ('RIGHTPADDING', (0, 0), (-1, -1), 6),
+            ('BOX', (0, 0), (-1, -1), 0.5, AMBER),
+            ('INNERGRID', (0, 0), (-1, -3), 0.25, BORDER_GRAY),
+            ('LINEABOVE', (0, -2), (-1, -2), 1, AMBER),
+            ('LINEABOVE', (3, -1), (-1, -1), 1.2, AMBER),
+            ('ROWBACKGROUNDS', (0, 1), (-1, -3), [WHITE, AMBER_BG]),
+        ]))
+        story.append(ta)
 
     # ── Trust Summary (Phase 2.3): provenance of priced quantities ──
     # Renders the build_priced_takeoff breakdown so the estimator can see, per

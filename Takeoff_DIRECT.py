@@ -26,6 +26,7 @@ import hashlib
 from pathlib import Path
 import PyPDF2
 from config import CLAUDE_API_KEY, PRICING_MODEL, SMALL_COMMERCIAL_RATES, PCA_CONSTANTS, HARD_NUMBERS_ONLY
+import config as _cfg
 from will_synthesis import run_will_synthesis
 import confidence as _confidence
 
@@ -3136,6 +3137,22 @@ def _num_or_zero(v):
     return f if f == f else 0.0  # NaN guard
 
 
+def _as_bool(v):
+    """Robust truthiness for schema-boolean fields that may arrive as the
+    STRINGS "True"/"False" instead of real bools.
+
+    The extraction schema declares ceiling_painted as a boolean, but in
+    practice the value reaches the aggregator as a string on most rooms.
+    Python's bool("False") is True, so a raw truthiness gate
+    (`if mats.get("ceiling_painted")`) prices every unpainted (ACT/exposed)
+    ceiling — the dominant over-count on the TSC/Highland job. Route every
+    read of such a flag through this so "False"/"0"/""/None all read False.
+    """
+    if isinstance(v, str):
+        return v.strip().lower() in ("true", "1", "yes", "y", "t")
+    return bool(v)
+
+
 def _geom_bucket(room):
     """Coarse quantized-geometry token for canonical room identity.
 
@@ -3230,7 +3247,7 @@ def _merge_rooms_on_collision(keeper, other):
     for k in ("walls", "ceiling", "base"):
         if not str(mmat.get(k) or "").strip() and str(omat.get(k) or "").strip():
             mmat[k] = omat.get(k)
-    if omat.get("ceiling_painted") and not mmat.get("ceiling_painted"):
+    if _as_bool(omat.get("ceiling_painted")) and not _as_bool(mmat.get("ceiling_painted")):
         mmat["ceiling_painted"] = True
         log.append("ceiling_painted OR'd from duplicate instance")
 
@@ -11850,7 +11867,7 @@ def _fix_residential_corridor_ceilings(analysis):
                 continue
             materials = room.setdefault('materials', {})
             ceiling_mat = str(materials.get('ceiling', '')).upper().strip()
-            already_painted = bool(materials.get('ceiling_painted'))
+            already_painted = _as_bool(materials.get('ceiling_painted'))
             if already_painted:
                 continue
             # If the model has explicit ACT evidence in the notes, respect it.
@@ -12574,7 +12591,7 @@ def _dedupe_cross_sheet_rooms(analysis):
         # Keep the most-complete instance (largest measured wall area).
         keeper = max(insts, key=_warea)
         # Majority vote on whether this room's ceiling is painted (tie -> painted).
-        painted = sum(1 for r in insts if (r.get("materials", {}) or {}).get("ceiling_painted", False))
+        painted = sum(1 for r in insts if _as_bool((r.get("materials", {}) or {}).get("ceiling_painted")))
         keep_painted = painted >= (len(insts) - painted) and painted > 0
         km = keeper.setdefault("materials", {})
         kd = keeper.setdefault("dimensions", {})
@@ -12701,6 +12718,112 @@ def _provenance_gate_enabled():
         "1", "true", "True")
 
 
+def _ceiling_scope_gate_enabled():
+    return os.environ.get("NIGHTSHIFT_CEILING_SCOPE_GATE", "0").strip() in (
+        "1", "true", "True")
+
+
+# Ceiling materials that are never field-painted, regardless of any extracted
+# or merge-OR'd ceiling_painted flag. A paint trigger (gyp/dryfall/etc.) on the
+# same room overrides the demotion (e.g. "GYP below ACT soffit").
+_ACT_CEILING_KEYWORDS = (
+    "act", "acoustic", "lay-in", "lay in", "drop ceiling", "suspended")
+_CEILING_PAINT_TRIGGER_KEYWORDS = (
+    "gyp", "gwb", "gypsum", "drywall", "plaster", "dryfall")
+
+
+def _enforce_ceiling_scope_gate(analysis):
+    """Authoritative final ceiling-scope reconciliation, run inside
+    build_priced_takeoff (the choke point before calculate_costs). Fixes two
+    over-counts that per-sheet extraction exposed, validated on the 2026-06-16
+    TSC/Honey prod run vs Rider takeoffs:
+
+    (1) ACT/acoustic/suspended ceilings re-painted by the cross-sheet merge.
+        _merge_rooms_on_collision OR's ceiling_painted->True across duplicate
+        sheet instances with no material check, so one misread plan-sheet
+        instance repaints the whole acoustic deck (TSC: 24,180 SF of Retail
+        Sales + Stockroom ACT priced as paint). Acoustic tile is not
+        field-painted — hard-demote it here so nothing downstream resurrects
+        it. Applies to ALL building types (always correct).
+
+    (2) Commercial ceiling aggregate exceeding the deduped room set. The billed
+        total can be summed from pre-dedup duplicate instances and never
+        rebuilt (TSC agg 42,494 vs gated rooms ~1,600; Honey 12,339 vs 2,226).
+        On COMMERCIAL buildings — where no legitimate footprint ceiling floor /
+        secondary-space supplement applies — rebuild
+        total_paintable_ceiling_sqft from the gated, deduped, in-scope rooms.
+        ONLY-REDUCE (never inflate) so the gate can't introduce a new
+        over-count. Residential/mixed-use is left untouched so the intentional
+        residential-ceiling-floor + secondary-space supplements survive (364
+        Main's GSF-based floor must not regress).
+
+    Flag-gated via NIGHTSHIFT_CEILING_SCOPE_GATE (default off). Idempotent via
+    analysis['_ceiling_scope_gate'].
+    """
+    if not isinstance(analysis, dict) or not _ceiling_scope_gate_enabled():
+        return analysis
+    if analysis.get("_ceiling_scope_gate"):
+        return analysis
+
+    # (1) ACT hard-demote — every building type.
+    demoted = 0
+    demoted_sqft = 0.0
+    for floor in analysis.get("floors", []) or []:
+        for room in floor.get("rooms", []) or []:
+            mats = room.get("materials")
+            if not isinstance(mats, dict):
+                continue
+            mats["ceiling_painted"] = _as_bool(mats.get("ceiling_painted"))
+            ceil_mat = str(mats.get("ceiling", "")).lower()
+            is_act = any(k in ceil_mat for k in _ACT_CEILING_KEYWORDS)
+            trigger = any(k in ceil_mat for k in _CEILING_PAINT_TRIGGER_KEYWORDS)
+            if is_act and not trigger and mats.get("ceiling_painted"):
+                mats["ceiling_painted"] = False
+                dims = room.setdefault("dimensions", {})
+                demoted_sqft += _num(dims.get("ceiling_area_sqft", 0))
+                dims["ceiling_area_sqft"] = 0
+                demoted += 1
+                note = str(room.get("notes", ""))
+                if "[ACT ceiling not painted" not in note:
+                    room["notes"] = (
+                        note + " [ACT ceiling not painted — scope gate; "
+                        "acoustic/suspended tile is not field-painted]").strip()
+
+    record = {"act_rooms_demoted": demoted,
+              "act_sqft_removed": round(demoted_sqft, 2)}
+
+    # (2) Commercial-only aggregate rebuild from gated rooms (only-reduce).
+    pi = analysis.get("project_info") or {}
+    bt = str(pi.get("building_type", "")).lower()
+    is_residential = any(kw in bt for kw in (
+        "residential", "multifamily", "multi-family", "apartment", "condo",
+        "dorm", "supportive", "senior", "assisted", "mixed-use", "mixed use"))
+    if not is_residential:
+        gated = 0.0
+        for floor in analysis.get("floors", []) or []:
+            for room in floor.get("rooms", []) or []:
+                if not room.get("in_scope", True):
+                    continue
+                mats = room.get("materials") or {}
+                if not _as_bool(mats.get("ceiling_painted")):
+                    continue
+                ceil_mat = str(mats.get("ceiling", "")).lower()
+                if "dryfall" in ceil_mat:
+                    continue  # tracked in total_dryfall_ceiling_sqft, not here
+                dims = room.get("dimensions") or {}
+                mult = _extract_multiplier_from_notes(room)
+                gated += _num(dims.get("ceiling_area_sqft", 0)) * mult
+        agg = analysis.setdefault("aggregated_totals", {})
+        prev = _num(agg.get("total_paintable_ceiling_sqft", 0))
+        gated = round(gated, 2)
+        if gated < prev:
+            agg["total_paintable_ceiling_sqft"] = gated
+            record["commercial_aggregate_rebuilt"] = {"from": prev, "to": gated}
+
+    analysis["_ceiling_scope_gate"] = record
+    return analysis
+
+
 def build_priced_takeoff(analysis, strict=None):
     """Single provenance choke point between aggregation and calculate_costs.
 
@@ -12722,6 +12845,10 @@ def build_priced_takeoff(analysis, strict=None):
         return analysis
     if strict is None:
         strict = _provenance_gate_enabled()
+
+    # Final ceiling-scope reconciliation (ACT demote + commercial aggregate
+    # rebuild) before any quantity is priced. Flag-gated; no-op when off.
+    analysis = _enforce_ceiling_scope_gate(analysis)
 
     agg = analysis.get("aggregated_totals", {}) or {}
     ledger = analysis.get("_quantity_adjustments", []) or []
@@ -12887,6 +13014,15 @@ def _recalculate_totals(analysis):
             elems = room.get("elements", {})
             mats = room.get("materials", {})
 
+            # Defect A — normalize ceiling_painted to a real bool. Extraction
+            # and the cross-sheet merge leave it as the string "True"/"False"
+            # on most rooms, and bool("False") is True, so the raw gates below
+            # (and json_to_pdf's read of the saved JSON) silently price
+            # unpainted ceilings. Coerce once here so every gate reads clean
+            # and the persisted room carries a real bool.
+            if isinstance(mats, dict):
+                mats["ceiling_painted"] = _as_bool(mats.get("ceiling_painted"))
+
             # Extract unit multiplier (1 for normal rooms, N for template rooms)
             multiplier = _extract_multiplier_from_notes(room)
 
@@ -12920,6 +13056,27 @@ def _recalculate_totals(analysis):
 
             # Ceilings — only if explicitly marked painted
             ceil_mat = str(mats.get("ceiling", "")).lower()
+
+            # Defect B — material-based ACT guard. An ACT / acoustic / drop /
+            # suspended / lay-in ceiling is NOT field-painted no matter what the
+            # extracted flag says. The model (and the cross-sheet OR/vote) can
+            # mark a large ACT ceiling — a retail sales floor or stockroom — as
+            # painted, which prices the whole deck (24,180 SF on the TSC job:
+            # Retail Sales + Stockroom). Only an explicit paint trigger
+            # (dryfall / GWB / gypsum / plaster) keeps it painted. Generalizes
+            # the name-matched common-space guard below to every room type.
+            _ceil_is_act = any(kw in ceil_mat for kw in (
+                "act", "acoustic", "lay-in", "lay in", "drop ceiling",
+                "suspended"))
+            _ceil_paint_trigger = any(kw in ceil_mat for kw in (
+                "gyp", "gwb", "gypsum", "drywall", "plaster", "dryfall"))
+            if _ceil_is_act and not _ceil_paint_trigger and mats.get("ceiling_painted", False):
+                mats["ceiling_painted"] = False
+                _existing = str(room.get("notes", ""))
+                if "[ACT ceiling not painted" not in _existing:
+                    room["notes"] = (
+                        _existing + " [ACT ceiling not painted — flag overridden; "
+                        "ACT/acoustic tile is not field-painted]").strip()
 
             # ACT ceiling safety net for common hallways/corridors
             # Public/common spaces almost always have ACT ceilings (not painted)
@@ -15389,6 +15546,36 @@ def _detect_single_family_from_rooms(analysis):
     return False
 
 
+def _dedup_floor_plate_sqft(rooms, stated_footprint):
+    """Estimate a floor's plate area from its rooms WITHOUT double-counting
+    cross-sheet re-draws of the dominant space.
+
+    A reflected-ceiling plan (and enlarged / fixture plans) re-state the main
+    floor plate the architectural floor plan already measured. Naively summing
+    every room's floor_area therefore balloons the plate several-fold on
+    commercial sets — on TSC, A1.0 'Retail Sales' (20,115 SF) + A3.0 RCP 'Main
+    Sales Floor' (16,000 SF) produced a phantom ~36k-SF plate that inflated the
+    footprint to 72,405. The cross-sheet dedup misses it because the two
+    instances carry different names.
+
+    Rule: 'plate-scale' rooms (floor_area > 30% of the stated footprint) that
+    appear on MORE THAN ONE source sheet are the dominant space drawn twice —
+    count the largest once. Everything else sums normally.
+    """
+    def _fa(r):
+        return _num((r.get("dimensions", {}) or {}).get("floor_area_sqft", 0))
+    in_scope = [r for r in (rooms or []) if r.get("in_scope", True)]
+    foot = _num(stated_footprint)
+    plate_thresh = 0.30 * foot if foot > 0 else float("inf")
+    plate_rooms = [r for r in in_scope if _fa(r) > plate_thresh]
+    sheets = {str(r.get("source_sheet", "")) for r in plate_rooms}
+    if len(plate_rooms) > 1 and len(sheets) > 1:
+        largest = max(_fa(r) for r in plate_rooms)
+        rest = sum(_fa(r) for r in in_scope if r not in plate_rooms)
+        return largest + rest
+    return sum(_fa(r) for r in in_scope)
+
+
 def calculate_costs(aggregated_totals, exterior=None, building_type="", project_info=None,
                     analysis=None, pricing_model_override=None):
     """Calculate costs using Rider Painting pricing model from config.py.
@@ -15423,19 +15610,21 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
                        _num(aggregated_totals.get('total_plaster_wall_sqft', 0))
     is_large_commercial = is_commercial and (_footprint > 10000 or _total_wall_area > 10000)
 
-    # Footprint sanity check: if extracted room floor area on any single floor exceeds
-    # the footprint, the LLM mis-estimated footprint (e.g., Mazda: showroom alone=4,104 SF
-    # but footprint_sqft=4,000).  Correct to max(footprint, largest_floor_area).
+    # Footprint sanity check: if a floor's measured plate exceeds the stated
+    # footprint, the LLM mis-estimated footprint (e.g., Mazda: showroom alone=
+    # 4,104 SF but footprint_sqft=4,000). Correct up to the measured plate.
+    # The plate is computed with _dedup_floor_plate_sqft so cross-sheet re-draws
+    # (floor plan + RCP of the same space) don't double-count and balloon the
+    # footprint — the TSC failure that inflated 26,387 → 72,405.
     if analysis and _footprint > 0:
         _floors = analysis.get('floors', [])
         for _fl in _floors:
-            _fl_area = sum(_num(r.get('dimensions', {}).get('floor_area_sqft', 0))
-                          for r in _fl.get('rooms', []))
+            _fl_area = _dedup_floor_plate_sqft(_fl.get('rooms', []), _footprint)
             if _fl_area > _footprint * 1.5:  # >50% over = clearly wrong
                 _old_fp = _footprint
                 _footprint = round(_fl_area)
                 print(f"   📐 Footprint corrected: {_old_fp:,.0f} → {_footprint:,.0f} SF "
-                      f"(floor '{_fl.get('floor_name', '?')}' room area = {_fl_area:,.0f} SF)")
+                      f"(floor '{_fl.get('floor_name', '?')}' deduped plate = {_fl_area:,.0f} SF)")
                 # Re-evaluate large commercial with corrected footprint
                 if is_commercial and _footprint > 10000:
                     is_large_commercial = True
@@ -16150,11 +16339,156 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
         building_type=bt,
     )
 
+    allowances = _build_allowance_lines(
+        analysis=analysis,
+        aggregated_totals=aggregated_totals,
+        exterior=exterior,
+        project_info=project_info,
+        footprint=_footprint,
+        is_commercial=is_commercial,
+        rates={"columns": col_rate, "exterior_cmu": ext_paint_rate,
+               "misc_metals": painted_rail_rate},
+        markups={"columns": _get_markup('painted_columns'),
+                 "exterior_cmu": _get_markup('exterior_painting'),
+                 "misc_metals": _get_markup('painted_railing') if 'painted_railing' in pm else 0.06},
+    )
+
     return {
         "line_items": line_items,
         "subtotal": round(subtotal, 2),
         "exclusions": exclusions,
+        "allowances": allowances,
+        "allowance_subtotal": round(sum(a["total"] for a in allowances), 2),
     }
+
+
+def _build_allowance_lines(analysis=None, aggregated_totals=None, exterior=None,
+                           project_info=None, footprint=0, is_commercial=False,
+                           rates=None, markups=None):
+    """Evidence-gated ALLOWANCE lines for detected-but-unmeasurable scope.
+
+    Returns a list of allowance dicts (same shape as a cost line item, plus
+    `unit`, `basis`, and `category="allowance"`). Each line is emitted ONLY
+    when a trigger is found in the drawings' notes — a general/coded note or
+    the exterior RFI — never on a bare building-type assumption. Quantities are
+    HYBRID: computed from real geometry where it exists (exterior CMU =
+    perimeter × height × sides; columns = footprint ÷ bay grid) and a flat LS
+    placeholder where there is no geometric basis (misc metals / railings).
+    Gated entirely by config.ALLOWANCE_LINES_ENABLED — default OFF.
+
+    This does NOT relax HARD_NUMBERS_ONLY: allowances are segregated into their
+    own section with their own subtotal and a stated basis, so the measured
+    takeoff stays pure and the assumption is visible, not silent.
+    """
+    if not getattr(_cfg, "ALLOWANCE_LINES_ENABLED", False):
+        return []
+    rates = rates or {}
+    markups = markups or {}
+    analysis = analysis or {}
+    aggregated_totals = aggregated_totals or {}
+    exterior = exterior or {}
+    project_info = project_info or {}
+    footprint = _num(footprint)
+
+    # Gather a lowercase notes blob from doc-level + room notes for triggers.
+    _parts = [str(n) for n in (analysis.get("notes", []) or [])]
+    for _fl in analysis.get("floors", []) or []:
+        for _r in _fl.get("rooms", []) or []:
+            if _r.get("notes"):
+                _parts.append(str(_r.get("notes")))
+    blob = " || ".join(_parts).lower()
+
+    def _alw(item, qty, unit, unit_cost, markup_pct, basis):
+        cost = qty * unit_cost
+        markup = cost * markup_pct
+        return {"item": item, "qty": round(qty, 2), "unit": unit,
+                "cost": round(cost, 2), "markup": round(markup, 2),
+                "total": round(cost + markup, 2), "basis": basis,
+                "category": "allowance"}
+
+    out = []
+
+    # 1) Painted columns — trigger: explicit "paint all columns" directive with
+    #    no measured count. Qty = footprint ÷ typical bay grid (geometry-based).
+    _cols_measured = _num(aggregated_totals.get("total_painted_columns_ea", 0))
+    _col_trigger = ("paint all column" in blob
+                    or ("column" in blob and "paint" in blob and "structural" in blob))
+    if _col_trigger and _cols_measured == 0 and footprint > 0:
+        bay = getattr(_cfg, "ALLOWANCE_COLUMN_BAY_SQFT", 1500) or 1500
+        qty = max(1, round(footprint / bay))
+        rate = rates.get("columns", 125.0)
+        out.append(_alw(
+            "Painted Columns (ALLOWANCE — confirm)", qty, "EA", rate,
+            markups.get("columns", 0.06),
+            f"General note directs 'paint all columns' but no structural column "
+            f"grid is in the set. Count ≈ footprint {footprint:,.0f} SF ÷ "
+            f"~{bay:,.0f} SF/bay (typical retail grid). Confirm against the "
+            f"structural plan."))
+
+    # 2) Exterior CMU / tilt-up — trigger: commercial building, exterior scope
+    #    referenced (exterior RFI fired / 'paint ... exterior' note), 0 SF
+    #    measured. Qty = perimeter × wall height × painted sides (geometry).
+    _ext_measured = (_num(exterior.get("exterior_paint_sqft", 0))
+                     + _num(exterior.get("hardie_siding_sqft", 0)))
+    _ext_trigger = (is_commercial and (
+        "rfi: exterior scope" in blob
+        or ("exterior" in blob and "paint" in blob)
+        or ("paint" in blob and ("front" in blob and "exterior" in blob))))
+    if _ext_trigger and _ext_measured == 0 and footprint > 0:
+        aspect = getattr(_cfg, "ALLOWANCE_EXT_ASPECT", 1.5) or 1.5
+        height = getattr(_cfg, "ALLOWANCE_EXT_WALL_HEIGHT_FT", 20) or 20
+        sides = getattr(_cfg, "ALLOWANCE_EXT_SIDES", 3) or 3
+        # footprint = L×W, L = aspect×W  →  W = sqrt(fp/aspect)
+        w = (footprint / aspect) ** 0.5
+        l = aspect * w
+        perim_full = 2 * (l + w)
+        side_len = perim_full / 4.0
+        qty = round(side_len * sides * height)
+        rate = rates.get("exterior_cmu", 1.80)
+        out.append(_alw(
+            "Exterior CMU / Tilt-Up (ALLOWANCE — confirm)", qty, "SF", rate,
+            markups.get("exterior_cmu", 0.06),
+            f"No exterior elevations measurable; commercial CMU box. Area ≈ "
+            f"perimeter {perim_full:,.0f} LF (from footprint {footprint:,.0f} "
+            f"SF @ {aspect:g}:1) × {sides:g} painted sides × {height:g} ft "
+            f"wall height. Confirm painted elevations & height from elevations."))
+
+    # 3) Misc metals / railings — trigger: 'paint all railing' / misc-metal /
+    #    ladder note with unconfirmed LF. No geometric basis → flat LS.
+    _misc_trigger = (("railing" in blob and "paint" in blob)
+                     or "misc metal" in blob
+                     or ("ladder" in blob and "paint" in blob)
+                     or ("exposed" in blob and "conduit" in blob and "paint" in blob))
+    if _misc_trigger:
+        ls = getattr(_cfg, "ALLOWANCE_MISC_METALS_LS", 2500) or 2500
+        out.append(_alw(
+            "Misc Metals / Railings (ALLOWANCE — confirm)", 1, "LS", ls,
+            markups.get("misc_metals", 0.06),
+            "Note directs painting railings / misc metals but linear footage is "
+            "unconfirmed in the set. Flat allowance — confirm scope & quantity "
+            "on site."))
+
+    # 4) Accent / color band — trigger: explicit stripe/band note. Evidence-
+    #    gated: if the drawings don't call out a band, nothing is emitted.
+    _band_trigger = any(k in blob for k in (
+        "accent band", "color band", "racing stripe", "paint stripe",
+        "painted stripe", "stripe band")) or (
+        "stripe" in blob and "paint" in blob)
+    if _band_trigger and footprint > 0:
+        aspect = getattr(_cfg, "ALLOWANCE_EXT_ASPECT", 1.5) or 1.5
+        w = (footprint / aspect) ** 0.5
+        l = aspect * w
+        band_lf = round(2 * (l + w))  # one band around interior perimeter
+        # band ≈ 1 ft tall → SF ≈ LF; priced at the gyp-wall rate proxy.
+        rate = rates.get("exterior_cmu", 1.80)
+        out.append(_alw(
+            "Accent / Color Band (ALLOWANCE — confirm)", band_lf, "SF", rate,
+            markups.get("exterior_cmu", 0.06),
+            f"Note references a painted accent band. Length ≈ interior perimeter "
+            f"{band_lf:,.0f} LF (from footprint), assumed ~12 in tall. Confirm "
+            f"height, color count & masking from the color schedule."))
+
+    return out
 
 
 def _build_standard_exclusions(analysis=None, aggregated_totals=None,
@@ -19531,7 +19865,7 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         if _largest_room and _largest_fa >= 5000:
             _mats = _largest_room.get("materials", {}) or {}
             _ceil = str(_mats.get("ceiling", "")).lower()
-            _ceil_painted = bool(_mats.get("ceiling_painted", False))
+            _ceil_painted = _as_bool(_mats.get("ceiling_painted"))
             _is_act = ("act" in _ceil or "acoustic" in _ceil
                        or "suspended" in _ceil or "drop" in _ceil)
             if _is_act and not _ceil_painted:
