@@ -12343,6 +12343,62 @@ def _sc_room_type(name):
     return words[0]
 
 
+def _small_commercial_fix_enabled():
+    return os.environ.get("NIGHTSHIFT_SMALL_COMMERCIAL_FIX", "0").strip() in (
+        "1", "true", "True")
+
+
+# Sheet titles that name a NON-occupiable drawing — these are not building
+# floors even when extraction promotes them to one.
+_NON_FLOOR_PLAN_SHEET_PATTERNS = (
+    "foundation", "building section", "wall section", "section view",
+    "section ", "sections", "roof plan", "roof framing", "framing plan",
+    "construction detail", "detail", "elevation", "schedule", "site plan",
+    "cover sheet", "general note", "demolition note", "structural",
+    "stair detail",
+)
+
+
+def _drop_non_floor_plan_pseudo_floors(analysis):
+    """Per-sheet / multi-pass extraction sometimes promotes a NON-occupiable
+    sheet (foundation plan, building sections, roof plan, construction details,
+    elevations, schedules) to a 'floor', inflating floor + room counts and
+    breaking footprint / story detection (Dutchess: 6 'floors' for a 2-story
+    building → footprint null → forced manual review). Drop a pseudo-floor
+    whose NAME marks it a non-floor sheet AND whose rooms carry ~zero paintable
+    wall+ceiling area, so a mislabeled REAL floor (which carries measured area)
+    is never silently removed. Flag-gated NIGHTSHIFT_SMALL_COMMERCIAL_FIX;
+    idempotent via _non_floor_sheets_dropped.
+    """
+    if not isinstance(analysis, dict) or not _small_commercial_fix_enabled():
+        return
+    if analysis.get("_non_floor_sheets_dropped"):
+        return
+    analysis["_non_floor_sheets_dropped"] = True
+    floors = analysis.get("floors") or []
+    kept, dropped = [], []
+    for fl in floors:
+        name = str(fl.get("floor_name", "")).lower()
+        looks_non_floor = any(p in name for p in _NON_FLOOR_PLAN_SHEET_PATTERNS)
+        area = sum(
+            _num((r.get("dimensions") or {}).get("wall_area_sqft", 0))
+            + _num((r.get("dimensions") or {}).get("ceiling_area_sqft", 0))
+            for r in (fl.get("rooms") or []) if isinstance(r, dict))
+        if looks_non_floor and area < 50:
+            dropped.append(fl.get("floor_name"))
+        else:
+            kept.append(fl)
+    if dropped:
+        analysis["floors"] = kept
+        pi = analysis.setdefault("project_info", {})
+        pi["total_floors_analyzed"] = len(kept)
+        note = (f"[Non-Floor Sheet Filter] Dropped {len(dropped)} sheet(s) "
+                f"misclassified as floors (no paintable area): "
+                f"{', '.join(str(x) for x in dropped)}.")
+        analysis.setdefault("notes", []).append(note)
+        print(f"   🗂  {note}")
+
+
 def _dedupe_small_commercial_floors(analysis):
     """For a small-commercial building (gated), when a floor's rooms come from
     multiple source pages — the same floor re-drawn on floor/dimension/finish
@@ -12351,14 +12407,17 @@ def _dedupe_small_commercial_floors(analysis):
 
     Fail-safe bias: page-unique types are KEPT (a complementary room over-
     counts, which is visible) and only clear cross-sheet type duplicates are
-    dropped — never a silent under-count. Double-gated (small-commercial AND
-    per-sheet). Idempotent via _sc_floor_deduped.
+    dropped — never a silent under-count. Gated on small-commercial; the
+    per-sheet requirement is waived under NIGHTSHIFT_SMALL_COMMERCIAL_FIX so the
+    legacy/multi-pass path (Dutchess never set _per_sheet_extraction, so this
+    never ran and walls came in ~3x over) is also reconciled. Idempotent via
+    _sc_floor_deduped.
     """
     if not isinstance(analysis, dict):
         return
     if analysis.get("_sc_floor_deduped"):
         return
-    if not analysis.get("_per_sheet_extraction"):
+    if not analysis.get("_per_sheet_extraction") and not _small_commercial_fix_enabled():
         return
     if not _is_small_commercial_building(analysis):
         return
@@ -12842,13 +12901,16 @@ def _recalculate_totals(analysis):
     # Collapse rooms extracted from multiple plan sheets so a room isn't counted
     # once per sheet for walls/ceiling/doors (single-story commercial only).
     _dedupe_cross_sheet_rooms(analysis)
+    # Drop non-floor sheets (foundation/sections/roof/details/elevations) that
+    # extraction promoted to floors before they distort floor/footprint counts
+    # or the small-commercial classifier. Flag-gated.
+    _drop_non_floor_plan_pseudo_floors(analysis)
     # Small-commercial: the same floor is often drawn on multiple plan sheets
     # with DIFFERENT generic names ("Women's 104" vs "Women's Restroom West"),
     # which name-based cross-sheet dedup can't catch — so a floor gets counted
     # 2-4x (Dutchess First Floor came from pages 5/9/13/14, walls 230% over).
     # This pass keeps the authoritative page per floor + page-unique types.
-    # Double-gated (small-commercial AND per-sheet) so multifamily and the
-    # deployed legacy path are untouched.
+    # Gated small-commercial; per-sheet requirement waived under the flag.
     _dedupe_small_commercial_floors(analysis)
 
     total_wall = 0
@@ -19772,26 +19834,6 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     # ready_to_send gate.
     analysis = _assess_calibrated_confidence(analysis, cost_estimate=costs)
 
-    # --- VME shadow (Phase 3 M3, flag-gated NIGHTSHIFT_VECTOR_MEASURE, default
-    # OFF): run the deterministic vector measurement engine alongside extraction
-    # and attach its wall measurement for comparison. NEVER changes pricing or
-    # any output; never fatal. The engine is still maturing (~71% of verified
-    # takeoffs), so this is comparison-only until it's accurate enough to drive
-    # numbers. ---
-    if os.environ.get("NIGHTSHIFT_VECTOR_MEASURE", "0").strip() in ("1", "true", "True"):
-        try:
-            import vme_attribution as _vme
-            single_pdf = pdf_paths[0] if (pdf_paths and len(pdf_paths) == 1) else None
-            shadow = _vme.compute_vme_shadow(single_pdf) if single_pdf else None
-            if shadow:
-                analysis["_vme_shadow"] = shadow
-                print(f"   🧪 VME shadow: {shadow['total_wall_run_lf']:,.0f} LF wall run "
-                      f"across {shadow['n_floor_pages']} floor sheet(s) "
-                      f"(comparison only)")
-        except Exception as _vme_err:
-            print(f"   ⚠️  VME shadow skipped: {type(_vme_err).__name__}: "
-                  f"{str(_vme_err)[:100]}")
-
     print_estimate(analysis, costs)
 
     # --- Interactive adjustment mode ---
@@ -19887,6 +19929,28 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
 
     # Extract chunk tracking from analysis if present (don't leak internals)
     chunk_tracking = analysis.pop("_chunk_tracking", None)
+
+    # --- VME shadow (Phase 3 M3, flag-gated NIGHTSHIFT_VECTOR_MEASURE, default
+    # OFF): run the deterministic vector measurement engine and attach its wall
+    # measurement for comparison. Computed HERE — after Will Synthesis, right
+    # before serialization — because run_will_synthesis() rebuilds the analysis
+    # dict and dropped a _vme_shadow set earlier (the 2026-06-16 prod run logged
+    # "🧪 VME shadow: 5,324 LF" for 364 yet the saved JSON had no _vme_shadow).
+    # NEVER changes pricing or any output; never fatal. Comparison-only until
+    # the engine (~71% of verified takeoffs) is accurate enough to drive numbers.
+    if os.environ.get("NIGHTSHIFT_VECTOR_MEASURE", "0").strip() in ("1", "true", "True"):
+        try:
+            import vme_attribution as _vme
+            single_pdf = pdf_paths[0] if (pdf_paths and len(pdf_paths) == 1) else None
+            shadow = _vme.compute_vme_shadow(single_pdf) if single_pdf else None
+            if shadow:
+                analysis["_vme_shadow"] = shadow
+                print(f"   🧪 VME shadow: {shadow['total_wall_run_lf']:,.0f} LF wall run "
+                      f"across {shadow['n_floor_pages']} floor sheet(s) "
+                      f"(comparison only)")
+        except Exception as _vme_err:
+            print(f"   ⚠️  VME shadow skipped: {type(_vme_err).__name__}: "
+                  f"{str(_vme_err)[:100]}")
 
     result_data = {
         "contact": {"name": contact_name, "email": contact_email},
