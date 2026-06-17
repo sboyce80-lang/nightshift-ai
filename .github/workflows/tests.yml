@@ -42,6 +42,7 @@ jobs:
             test_vme_attribution
             test_calibrated_email
             test_residual_fixes
+            test_small_commercial_fix
           "
           fail=0
           for t in $SUITES; do
