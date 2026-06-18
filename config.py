@@ -317,6 +317,56 @@ PRICING_MODEL = {
         "unit": "sqft", "markup": 0.06,
         "tiers": [{"min_qty": 0, "max_qty": None, "rate": 7.50}],
     },
+    # ── Operator-Activated Options ──────────────────────────────────────────
+    # Surfaced as toggleable rows in the Pricing tab (ADVANCED_RATE_FIELDS).
+    # Net-new scope items default to $0 — the operator enables the line and
+    # enters their own rate per company. NOTE: enabling + setting a rate makes
+    # the OPTION available; the takeoff engine does not yet auto-extract
+    # quantities for these — extraction wiring is a separate follow-up.
+    "gyp_walls_existing": {                      # GWB Walls – Existing (repaint)
+        "unit": "sqft", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 0.0}],
+    },
+    "epoxy_wall_area": {                         # Epoxy wall coating
+        "unit": "sqft", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 0.0}],
+    },
+    "bollards": {                                # Painted bollards
+        "unit": "ea", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 0.0}],
+    },
+    "pipe_handrail": {                           # Pipe handrails
+        "unit": "lf", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 0.0}],
+    },
+    "precast_walls_interior": {                  # Precast walls – interior
+        "unit": "sqft", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 0.0}],
+    },
+    "precast_walls_exterior": {                  # Precast walls – exterior
+        "unit": "sqft", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 0.0}],
+    },
+    "block_masonry_exterior": {                  # Block/masonry walls – exterior
+        "unit": "sqft", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 0.0}],
+    },
+    "hm_door_frame_single": {                    # HM door frames – single
+        "unit": "ea", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 0.0}],
+    },
+    "hm_door_frame_double": {                    # HM door frames – double
+        "unit": "ea", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 0.0}],
+    },
+    "hm_door_frame_sidelite": {                  # HM door frames with sidelite
+        "unit": "ea", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 0.0}],
+    },
+    "borrowed_lite_frame": {                     # Borrowed lite window frames
+        "unit": "ea", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 0.0}],
+    },
 }
 
 # =============================================================================

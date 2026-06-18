@@ -129,6 +129,26 @@ RATE_FIELDS = [
 ADVANCED_RATE_FIELDS = [
     ("lymewash_rate", "Lyme wash", "sqft", "4.50", "Faux"),
     ("plaster_rate",  "Plaster",   "sqft", "7.50", "Faux"),
+    # ── Operator-activated scope options ──
+    # Net-new items default to "0.00" — operator enables + sets their own rate.
+    # Items backed by an existing PRICING_MODEL key carry that key's rate as the
+    # default. Enabling exposes the line option; quantity extraction for these
+    # is a separate follow-up (see config.py "Operator-Activated Options").
+    ("gwb_walls_existing_rate", "GWB Walls – Existing",            "sqft", "0.00",  "Drywall (GWB)"),
+    ("cmu_walls_existing_rate", "CMU Walls – Existing",            "sqft", "0.95",  "Masonry & Concrete"),
+    ("epoxy_rate",              "Epoxy Wall Area",                 "sqft", "0.00",  "Masonry & Concrete"),
+    ("precast_interior_rate",   "Precast Walls – Interior",        "sqft", "0.00",  "Masonry & Concrete"),
+    ("precast_exterior_rate",   "Precast Walls – Exterior",        "sqft", "0.00",  "Masonry & Concrete"),
+    ("block_exterior_rate",     "Block/Masonry Walls – Exterior",  "sqft", "0.00",  "Masonry & Concrete"),
+    ("bollard_rate",            "Bollards",                        "ea",   "0.00",  "Metal & Structural"),
+    ("lintel_rate",             "Lintels",                         "lf",   "32.00", "Metal & Structural"),
+    ("guardrail_rate",          "Guardrail Linear",                "lf",   "18.00", "Railings"),
+    ("pipe_handrail_rate",      "Pipe Handrails",                  "lf",   "0.00",  "Railings"),
+    ("hm_door_rate",            "HM Doors",                        "ea",   "110.00","Doors & Frames"),
+    ("hm_frame_single_rate",    "HM Door Frames – Single",         "ea",   "0.00",  "Doors & Frames"),
+    ("hm_frame_double_rate",    "HM Door Frames – Double",         "ea",   "0.00",  "Doors & Frames"),
+    ("hm_frame_sidelite_rate",  "HM Door Frames with Sidelite",    "ea",   "0.00",  "Doors & Frames"),
+    ("borrowed_lite_rate",      "Borrowed Lite Window Frames",     "ea",   "0.00",  "Windows"),
 ]
 
 
@@ -318,6 +338,22 @@ def _effective_user_overrides(user):
         "column_rate":   "painted_columns",
         "lymewash_rate": "lymewash",
         "plaster_rate":  "plaster",
+        # Operator-activated options
+        "gwb_walls_existing_rate": "gyp_walls_existing",
+        "cmu_walls_existing_rate": "cmu_walls_finish_only",
+        "epoxy_rate":              "epoxy_wall_area",
+        "precast_interior_rate":   "precast_walls_interior",
+        "precast_exterior_rate":   "precast_walls_exterior",
+        "block_exterior_rate":     "block_masonry_exterior",
+        "bollard_rate":            "bollards",
+        "lintel_rate":             "exterior_steel_lintel",
+        "guardrail_rate":          "painted_railing",
+        "pipe_handrail_rate":      "pipe_handrail",
+        "hm_door_rate":            "doors_hm_panel",
+        "hm_frame_single_rate":    "hm_door_frame_single",
+        "hm_frame_double_rate":    "hm_door_frame_double",
+        "hm_frame_sidelite_rate":  "hm_door_frame_sidelite",
+        "borrowed_lite_rate":      "borrowed_lite_frame",
     }
     org = user.current_organization if user else None
     saved = (org.pricing_overrides or {}) if org else {}

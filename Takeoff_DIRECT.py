@@ -3058,6 +3058,28 @@ def _sheet_checkpoint_enabled():
         "0", "false", "False")
 
 
+def _extended_scope_enabled():
+    """Extraction + pricing for the operator-activated scope options that are
+    additive and non-overlapping with existing lines: bollards, pipe handrails,
+    epoxy walls, and interior precast walls. Default OFF — when off, takeoff
+    behavior is byte-identical to before these items were wired (no walls are
+    reclassified, no new line items are emitted). See config.py
+    "Operator-Activated Options" and ADVANCED_RATE_FIELDS in web_app.py."""
+    return os.environ.get("NIGHTSHIFT_EXTENDED_SCOPE", "0").strip() in (
+        "1", "true", "True")
+
+
+def _small_commercial_fix_enabled():
+    """Enable the small-commercial phantom-floor dedup independently of the
+    full per-sheet path. The Dutchess fix (First Floor counted 2-4x from pages
+    5/9/13/14, walls 230% over) lives in _dedupe_small_commercial_floors, which
+    was previously reachable only when NIGHTSHIFT_PER_SHEET_EXTRACTION was on.
+    This flag lets that validated dedup ship on its own. Default OFF. Still
+    requires small-commercial detection + is idempotent + fail-safe biased."""
+    return os.environ.get("NIGHTSHIFT_SMALL_COMMERCIAL_FIX", "0").strip() in (
+        "1", "true", "True")
+
+
 def _title_text_is_plan_sheet(raw_text):
     """Classify a page as a plan sheet from its (title-block) text.
 
@@ -6038,8 +6060,14 @@ Faux / Specialty Wall Finishes (Plaster, Lyme Wash): Check finish schedules and 
     "skim plaster", finish codes like PL-1, VP-1
   - Lyme wash / Lime wash: "lyme wash", "lime wash", "limewash", "mineral wash",
     finish codes like LW-1
-  - When a room's wall finish is plaster or lyme wash, set materials.walls to that finish
-    string EXACTLY as written ("Plaster", "Lyme Wash") — the pricing pipeline routes to
+  - Epoxy: "epoxy", "epoxy paint", "epoxy wall coating", finish codes like EP-1
+    (common in kitchens, labs, clinical/wash-down rooms, food prep). Set
+    materials.walls to "Epoxy".
+  - Precast (interior exposed precast concrete walls receiving paint/sealer):
+    "precast", "precast concrete". Set materials.walls to "Precast".
+  - When a room's wall finish is plaster, lyme wash, epoxy, or precast, set
+    materials.walls to that finish string EXACTLY as written ("Plaster",
+    "Lyme Wash", "Epoxy", "Precast") — the pricing pipeline routes to
     the correct rate by reading materials.walls. Do NOT translate to "Paint" or "GYP".
   - Wall area for the room stays in wall_area_sqft as normal; the material string drives
     the pricing bucket downstream.
@@ -7225,8 +7253,9 @@ Your task: Extract the ROOM FINISH SCHEDULE and BUILDING INFORMATION from this d
    - room_name: The room name/type (e.g., "Living Room", "Bedroom 1", "Kitchen", "Bathroom", "Hallway", "Closet")
    - room_number: The room number if shown
    - wall_finish: What's specified for walls (e.g., "Paint", "PT-1", "Wallcovering", "Tile", "CMU Paint",
-     "Plaster", "Venetian Plaster", "Lyme Wash", "Lime Wash"). Preserve the exact spec wording —
-     specialty finishes like plaster and lyme wash are priced separately from standard paint.
+     "Plaster", "Venetian Plaster", "Lyme Wash", "Lime Wash", "Epoxy", "Epoxy Paint", "Precast").
+     Preserve the exact spec wording — specialty finishes like plaster, lyme wash, epoxy, and
+     precast are priced separately from standard paint.
    - ceiling_finish: What's specified for ceiling (e.g., "GWB - Paint", "ACT", "Exposed")
    - base_finish: What's specified for base/baseboard (e.g., "Wood Base", "WD-1", "Rubber Base", "Tile Base", "None")
    - floor_finish: What's specified for floor (e.g., "Hardwood", "Carpet", "Tile", "Concrete", "VCT")
@@ -7541,6 +7570,9 @@ WHAT TO MEASURE:
    - Cornice / parapet cap LF (perimeter of the painted top edge)
    - Painted exterior window trim LF (head + sill + 2 jambs per window)
    - Painted bollards (count, not LF)
+   - Painted pipe handrails / pipe railings LF (exterior stairs, ramps,
+     loading docks, guardrails). Measure total LF of pipe rail. Record as
+     "pipe_handrail_lf". This is distinct from solid/picket railing_lf.
 
 4. SIDING TYPE:
    - exterior_siding_type = primary cladding name: "hardie", "stucco",
@@ -7572,6 +7604,7 @@ Return ONLY this JSON (one object, no commentary):
   "steel_lintel_lf": 0,
   "exterior_door_count": 0,
   "bollard_count": 0,
+  "pipe_handrail_lf": 0,
   "exterior_siding_type": "",
   "lift_required": false,
   "notes": "<1-2 sentences describing what was painted and why your numbers reflect that>",
@@ -7672,6 +7705,7 @@ def _maybe_run_exterior_pass(client, pdf_path, analysis_result):
             "exterior_paint_sqft", "hardie_siding_sqft", "cornice_lf",
             "window_trim_lf", "soffit_sqft", "railing_lf", "azek_trim_lf",
             "corner_board_lf", "steel_lintel_lf",
+            "bollard_count", "pipe_handrail_lf",
         ):
             if _num(merged.get(key, 0)) == 0 and _num(ext_data.get(key, 0)) > 0:
                 merged[key] = ext_data[key]
@@ -12375,7 +12409,8 @@ def _dedupe_small_commercial_floors(analysis):
         return
     if analysis.get("_sc_floor_deduped"):
         return
-    if not analysis.get("_per_sheet_extraction"):
+    # Reachable via the full per-sheet path OR the standalone fix flag.
+    if not (analysis.get("_per_sheet_extraction") or _small_commercial_fix_enabled()):
         return
     if not _is_small_commercial_building(analysis):
         return
@@ -12718,6 +12753,112 @@ def _provenance_gate_enabled():
         "1", "true", "True")
 
 
+def _ceiling_scope_gate_enabled():
+    return os.environ.get("NIGHTSHIFT_CEILING_SCOPE_GATE", "0").strip() in (
+        "1", "true", "True")
+
+
+# Ceiling materials that are never field-painted, regardless of any extracted
+# or merge-OR'd ceiling_painted flag. A paint trigger (gyp/dryfall/etc.) on the
+# same room overrides the demotion (e.g. "GYP below ACT soffit").
+_ACT_CEILING_KEYWORDS = (
+    "act", "acoustic", "lay-in", "lay in", "drop ceiling", "suspended")
+_CEILING_PAINT_TRIGGER_KEYWORDS = (
+    "gyp", "gwb", "gypsum", "drywall", "plaster", "dryfall")
+
+
+def _enforce_ceiling_scope_gate(analysis):
+    """Authoritative final ceiling-scope reconciliation, run inside
+    build_priced_takeoff (the choke point before calculate_costs). Fixes two
+    over-counts that per-sheet extraction exposed, validated on the 2026-06-16
+    TSC/Honey prod run vs Rider takeoffs:
+
+    (1) ACT/acoustic/suspended ceilings re-painted by the cross-sheet merge.
+        _merge_rooms_on_collision OR's ceiling_painted->True across duplicate
+        sheet instances with no material check, so one misread plan-sheet
+        instance repaints the whole acoustic deck (TSC: 24,180 SF of Retail
+        Sales + Stockroom ACT priced as paint). Acoustic tile is not
+        field-painted — hard-demote it here so nothing downstream resurrects
+        it. Applies to ALL building types (always correct).
+
+    (2) Commercial ceiling aggregate exceeding the deduped room set. The billed
+        total can be summed from pre-dedup duplicate instances and never
+        rebuilt (TSC agg 42,494 vs gated rooms ~1,600; Honey 12,339 vs 2,226).
+        On COMMERCIAL buildings — where no legitimate footprint ceiling floor /
+        secondary-space supplement applies — rebuild
+        total_paintable_ceiling_sqft from the gated, deduped, in-scope rooms.
+        ONLY-REDUCE (never inflate) so the gate can't introduce a new
+        over-count. Residential/mixed-use is left untouched so the intentional
+        residential-ceiling-floor + secondary-space supplements survive (364
+        Main's GSF-based floor must not regress).
+
+    Flag-gated via NIGHTSHIFT_CEILING_SCOPE_GATE (default off). Idempotent via
+    analysis['_ceiling_scope_gate'].
+    """
+    if not isinstance(analysis, dict) or not _ceiling_scope_gate_enabled():
+        return analysis
+    if analysis.get("_ceiling_scope_gate"):
+        return analysis
+
+    # (1) ACT hard-demote — every building type.
+    demoted = 0
+    demoted_sqft = 0.0
+    for floor in analysis.get("floors", []) or []:
+        for room in floor.get("rooms", []) or []:
+            mats = room.get("materials")
+            if not isinstance(mats, dict):
+                continue
+            mats["ceiling_painted"] = _as_bool(mats.get("ceiling_painted"))
+            ceil_mat = str(mats.get("ceiling", "")).lower()
+            is_act = any(k in ceil_mat for k in _ACT_CEILING_KEYWORDS)
+            trigger = any(k in ceil_mat for k in _CEILING_PAINT_TRIGGER_KEYWORDS)
+            if is_act and not trigger and mats.get("ceiling_painted"):
+                mats["ceiling_painted"] = False
+                dims = room.setdefault("dimensions", {})
+                demoted_sqft += _num(dims.get("ceiling_area_sqft", 0))
+                dims["ceiling_area_sqft"] = 0
+                demoted += 1
+                note = str(room.get("notes", ""))
+                if "[ACT ceiling not painted" not in note:
+                    room["notes"] = (
+                        note + " [ACT ceiling not painted — scope gate; "
+                        "acoustic/suspended tile is not field-painted]").strip()
+
+    record = {"act_rooms_demoted": demoted,
+              "act_sqft_removed": round(demoted_sqft, 2)}
+
+    # (2) Commercial-only aggregate rebuild from gated rooms (only-reduce).
+    pi = analysis.get("project_info") or {}
+    bt = str(pi.get("building_type", "")).lower()
+    is_residential = any(kw in bt for kw in (
+        "residential", "multifamily", "multi-family", "apartment", "condo",
+        "dorm", "supportive", "senior", "assisted", "mixed-use", "mixed use"))
+    if not is_residential:
+        gated = 0.0
+        for floor in analysis.get("floors", []) or []:
+            for room in floor.get("rooms", []) or []:
+                if not room.get("in_scope", True):
+                    continue
+                mats = room.get("materials") or {}
+                if not _as_bool(mats.get("ceiling_painted")):
+                    continue
+                ceil_mat = str(mats.get("ceiling", "")).lower()
+                if "dryfall" in ceil_mat:
+                    continue  # tracked in total_dryfall_ceiling_sqft, not here
+                dims = room.get("dimensions") or {}
+                mult = _extract_multiplier_from_notes(room)
+                gated += _num(dims.get("ceiling_area_sqft", 0)) * mult
+        agg = analysis.setdefault("aggregated_totals", {})
+        prev = _num(agg.get("total_paintable_ceiling_sqft", 0))
+        gated = round(gated, 2)
+        if gated < prev:
+            agg["total_paintable_ceiling_sqft"] = gated
+            record["commercial_aggregate_rebuilt"] = {"from": prev, "to": gated}
+
+    analysis["_ceiling_scope_gate"] = record
+    return analysis
+
+
 def build_priced_takeoff(analysis, strict=None):
     """Single provenance choke point between aggregation and calculate_costs.
 
@@ -12739,6 +12880,10 @@ def build_priced_takeoff(analysis, strict=None):
         return analysis
     if strict is None:
         strict = _provenance_gate_enabled()
+
+    # Final ceiling-scope reconciliation (ACT demote + commercial aggregate
+    # rebuild) before any quantity is priced. Flag-gated; no-op when off.
+    analysis = _enforce_ceiling_scope_gate(analysis)
 
     agg = analysis.get("aggregated_totals", {}) or {}
     ledger = analysis.get("_quantity_adjustments", []) or []
@@ -12893,6 +13038,10 @@ def _recalculate_totals(analysis):
     total_stained_wood = 0
     total_soffit = 0
     total_painted_railing = 0
+    # Extended-scope operator options (flag-gated; 0 when NIGHTSHIFT_EXTENDED_SCOPE off)
+    total_epoxy_wall = 0
+    total_precast_interior = 0
+    _ext_scope = _extended_scope_enabled()
 
     for floor in analysis.get("floors", []):
         for room in floor.get("rooms", []):
@@ -12941,6 +13090,13 @@ def _recalculate_totals(analysis):
                 total_lymewash_wall += _adjusted_wall_area * multiplier
             elif "plaster" in wall_mat:
                 total_plaster_wall += _adjusted_wall_area * multiplier
+            # Extended-scope finishes — only when the flag is on. When off these
+            # fall through to the gyp/paintable catch-all (or go uncounted),
+            # i.e. identical to pre-wiring behavior.
+            elif _ext_scope and "epoxy" in wall_mat:
+                total_epoxy_wall += _adjusted_wall_area * multiplier
+            elif _ext_scope and "precast" in wall_mat:
+                total_precast_interior += _adjusted_wall_area * multiplier
             elif any(kw in wall_mat for kw in ("gyp", "gwb", "gypsum", "paintable")):
                 total_wall += _adjusted_wall_area * multiplier
 
@@ -13621,6 +13777,9 @@ def _recalculate_totals(analysis):
         "total_stained_wood_sqft": total_stained_wood,
         "total_soffit_sqft": total_soffit,
         "total_painted_railing_lf": total_painted_railing,
+        # Extended-scope operator options (0 unless NIGHTSHIFT_EXTENDED_SCOPE on)
+        "total_epoxy_wall_sqft": total_epoxy_wall,
+        "total_precast_interior_sqft": total_precast_interior,
     }
 
     # --- Hard-numbers base-trim suppression summary + RFI flag ---
@@ -15297,6 +15456,22 @@ def _apply_rate_overrides(rate_overrides):
         "column_rate":   "painted_columns",
         "lymewash_rate": "lymewash",
         "plaster_rate":  "plaster",
+        # Operator-activated options (Pricing tab → ADVANCED_RATE_FIELDS)
+        "gwb_walls_existing_rate": "gyp_walls_existing",
+        "cmu_walls_existing_rate": "cmu_walls_finish_only",
+        "epoxy_rate":              "epoxy_wall_area",
+        "precast_interior_rate":   "precast_walls_interior",
+        "precast_exterior_rate":   "precast_walls_exterior",
+        "block_exterior_rate":     "block_masonry_exterior",
+        "bollard_rate":            "bollards",
+        "lintel_rate":             "exterior_steel_lintel",
+        "guardrail_rate":          "painted_railing",
+        "pipe_handrail_rate":      "pipe_handrail",
+        "hm_door_rate":            "doors_hm_panel",
+        "hm_frame_single_rate":    "hm_door_frame_single",
+        "hm_frame_double_rate":    "hm_door_frame_double",
+        "hm_frame_sidelite_rate":  "hm_door_frame_sidelite",
+        "borrowed_lite_rate":      "borrowed_lite_frame",
     }
 
     for key, val in rate_overrides.items():
@@ -15617,6 +15792,14 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     corner_lf = _num(exterior.get('corner_board_lf', 0))
     steel_lintel_lf_ext = _num(exterior.get('steel_lintel_lf', 0))
 
+    # Extended-scope operator options (flag-gated lines emitted below).
+    # Room-derived (epoxy / interior precast) come from aggregated_totals;
+    # bollards / pipe handrails come from the exterior elevation pass.
+    epoxy_sqft = _num(aggregated_totals.get('total_epoxy_wall_sqft', 0))
+    precast_int_sqft = _num(aggregated_totals.get('total_precast_interior_sqft', 0))
+    bollards_ea = _num(exterior.get('bollard_count', 0))
+    pipe_handrail_lf = _num(exterior.get('pipe_handrail_lf', 0))
+
     # Painted railings — interior handrails + exterior porch/balcony/deck rails.
     # Sum both buckets into a single line item; stained-wood rails are priced
     # separately under exterior_stain_railing.
@@ -15812,6 +15995,11 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     azek_rate   = _get_tiered_rate(pm['exterior_azek_trim'], azek_lf) if 'exterior_azek_trim' in pm else 9.00
     corner_rate = _get_tiered_rate(pm['exterior_corner_board'], corner_lf) if 'exterior_corner_board' in pm else 9.00
     lintel_rate = _get_tiered_rate(pm['exterior_steel_lintel'], steel_lintel_lf_ext) if 'exterior_steel_lintel' in pm else 32.00
+    # Extended-scope rates (operator sets these in the Pricing tab; default $0)
+    epoxy_rate      = _get_tiered_rate(pm['epoxy_wall_area'], epoxy_sqft) if 'epoxy_wall_area' in pm else 0.0
+    precast_int_rate = _get_tiered_rate(pm['precast_walls_interior'], precast_int_sqft) if 'precast_walls_interior' in pm else 0.0
+    bollard_rate    = _get_tiered_rate(pm['bollards'], bollards_ea) if 'bollards' in pm else 0.0
+    pipe_rail_rate  = _get_tiered_rate(pm['pipe_handrail'], pipe_handrail_lf) if 'pipe_handrail' in pm else 0.0
     # Lift rate scales with building height — a 12-story job needs a different
     # lift class and longer rental than a 3-story. Pass stories (not the binary
     # lift_needed flag) into the tiered-rate lookup. Rate is zeroed when no lift.
@@ -16202,6 +16390,23 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
               _get_markup('painted_railing') if 'painted_railing' in pm else 0.06),
     ]
 
+    # Extended-scope operator options — only emitted when NIGHTSHIFT_EXTENDED_SCOPE
+    # is on. Zero-qty lines are pruned downstream, so enabling the flag with no
+    # matching scope on a job adds nothing. Each prices at the operator's rate
+    # (config default $0 until set in the Pricing tab).
+    if _extended_scope_enabled():
+        line_items.extend([
+            _line(f"Epoxy Walls - {epoxy_sqft:,.0f} sqft @ ${epoxy_rate:.2f}", epoxy_sqft,
+                  epoxy_rate, _get_markup('epoxy_wall_area') if 'epoxy_wall_area' in pm else 0.06),
+            _line(f"Precast Walls (Interior) - {precast_int_sqft:,.0f} sqft @ ${precast_int_rate:.2f}",
+                  precast_int_sqft, precast_int_rate,
+                  _get_markup('precast_walls_interior') if 'precast_walls_interior' in pm else 0.06),
+            _line(f"Bollards - {bollards_ea:.0f} EA @ ${bollard_rate:.2f}", bollards_ea,
+                  bollard_rate, _get_markup('bollards') if 'bollards' in pm else 0.06),
+            _line(f"Pipe Handrails - {pipe_handrail_lf:,.0f} LF @ ${pipe_rail_rate:.2f}", pipe_handrail_lf,
+                  pipe_rail_rate, _get_markup('pipe_handrail') if 'pipe_handrail' in pm else 0.06),
+        ])
+
     # If footprint pricing is active, replace individual interior line items
     # with a single footprint-based line. Keep exterior items as-is.
     if _use_footprint_pricing:
@@ -16209,7 +16414,7 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
                           "Base Trim", "Doors", "Windows", "Stairs", "Gyp. Between",
                           "Level 5", "Concrete Sealer", "Painted Columns",
                           "Wallcovering", "Stained Wood", "Interior Soffits", "Interior Lift",
-                          "Lyme Wash", "Plaster Walls"}
+                          "Lyme Wash", "Plaster Walls", "Epoxy Walls", "Precast Walls (Interior)"}
         # Remove individual interior items
         line_items = [li for li in line_items
                       if not any(li["item"].startswith(k) for k in _interior_keys)]
