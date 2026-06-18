@@ -3102,6 +3102,53 @@ def _per_sheet_collapse_suspected(analysis):
     return gyp_rooms >= 2 and gyp_wall < _PER_SHEET_COLLAPSE_WALL_FLOOR
 
 
+def _work_area_basis_enabled():
+    return os.environ.get("NIGHTSHIFT_WORK_AREA_BASIS", "0").strip() in (
+        "1", "true", "True")
+
+
+# "Work area is approximately 3,955 SF within a 580,317 GSF building" — capture
+# the first SF figure that immediately follows a "work area" phrase. The
+# non-greedy [^.\d] run skips filler ("is approximately ") without crossing into
+# a later sentence or into the building-GSF figure.
+_WORK_AREA_RE = re.compile(
+    r"work\s*area\b[^.\d]{0,40}?([\d][\d,]{1,})\s*(?:sf|s\.f\.|sq)", re.I)
+
+
+def _declared_work_area_sqft(analysis):
+    """Declared renovation WORK AREA (sqft), or 0 if none is stated.
+
+    On a Level 2 / IEBC Work-Area-Method renovation only a small part of a large
+    building is in scope (INNIO Waukesha: a 3,955 SF work area inside a 580,317
+    GSF plant). The paintable surface must then be sanity-checked against the
+    WORK AREA, not the full building footprint — otherwise every such job trips
+    the 'implausibly low vs footprint' manual-review gate. Prefers a structured
+    field if extraction ever provides one, else parses the project overview /
+    notes narrative."""
+    if not isinstance(analysis, dict):
+        return 0.0
+    pi = analysis.get("project_info") or {}
+    po = analysis.get("project_overview") or {}
+    for src in (po, pi):
+        if isinstance(src, dict):
+            for k in ("work_floor_area_sqft", "work_area_sqft"):
+                v = _num(src.get(k, 0))
+                if v > 0:
+                    return v
+    texts = []
+    if isinstance(po, dict):
+        texts += [str(po.get("scope_summary", "")), str(po.get("scope", ""))]
+    texts += [str(n) for n in (analysis.get("notes", []) or [])]
+    for txt in texts:
+        m = _WORK_AREA_RE.search(txt)
+        if m:
+            try:
+                return float(m.group(1).replace(",", ""))
+            except ValueError:
+                continue
+    return 0.0
+
+
 def _sheet_verification_enabled():
     """Verification pass within per-sheet mode (default on)."""
     return os.environ.get("NIGHTSHIFT_SHEET_VERIFY", "1").strip() not in (
@@ -20580,28 +20627,55 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         #   exterior ≈ footprint × 0.4
         # So footprint × 3 is conservative — most jobs land at 4-6×.
         elif _footprint > 1000 and _total_paintable < _footprint * 3:
-            ratio = (_total_paintable / _footprint) if _footprint else 0
-            flag_msg = (
-                f"[MANUAL REVIEW REQUIRED] Total extracted paintable surface "
-                f"({_total_paintable:,.0f} sqft) is implausibly low relative "
-                f"to building footprint ({_footprint:,.0f} sqft) for a "
-                f"commercial job — ratio is {ratio:.1f}× footprint, expected "
-                f"3-6×. This usually means the finish schedule, exposed "
-                f"structure / paint-to-deck scope, or exterior was missed "
-                f"in extraction. Do NOT send this proposal without a senior "
-                f"reviewer confirming the takeoff."
-            )
-            analysis["manual_review_required"] = True
-            analysis["manual_review_reason"] = flag_msg
-            analysis.setdefault("notes", []).append(flag_msg)
-            print(f"\n🚨 PRE-FINALIZE SANITY CHECK FAILED")
-            print(f"   Paintable: {_total_paintable:,.0f} sqft "
-                  f"(walls {_wall:,.0f}, gyp ceil {_ceil_gyp:,.0f}, "
-                  f"dryfall {_ceil_dry:,.0f}, ext {_ext_paint + _ext_hardie:,.0f})")
-            print(f"   Footprint: {_footprint:,.0f} sqft "
-                  f"(ratio {ratio:.1f}×, expected 3-6×)")
-            print(f"   ⚠️  Flagged for manual review — proposal will print "
-                  f"but should NOT be sent without reviewer sign-off.")
+            # Work-area-method renovations only paint a small part of a large
+            # building, so the paintable:footprint expectation (3-6x) is wrong —
+            # validate against the declared WORK AREA instead (INNIO Waukesha:
+            # 3,955 SF work area in a 580,317 GSF plant; 15,160 SF paintable is
+            # 3.8x the work area but 0.0x the footprint, which falsely tripped
+            # manual review on every run). Flag-gated; default off preserves the
+            # whole-building behavior.
+            _basis = _footprint
+            _basis_label = "building footprint"
+            _used_work_area = False
+            _work_area = (_declared_work_area_sqft(analysis)
+                          if _work_area_basis_enabled() else 0)
+            if 1000 < _work_area < _footprint * 0.5:
+                _basis = _work_area
+                _basis_label = "declared work area (Level 2 / work-area-method renovation)"
+                _used_work_area = True
+            if _used_work_area and _total_paintable >= _basis * 3:
+                _r = (_total_paintable / _basis) if _basis else 0
+                analysis.setdefault("notes", []).append(
+                    f"[Work-Area Basis] Extracted paintable "
+                    f"({_total_paintable:,.0f} sqft) validated against the "
+                    f"{_basis_label} ({_basis:,.0f} sqft, {_r:.1f}×) instead of "
+                    f"the full building footprint ({_footprint:,.0f} sqft) — "
+                    f"sanity check passes.")
+                print(f"\n✅ Work-area sanity basis: {_total_paintable:,.0f} sqft "
+                      f"vs {_basis:,.0f} sqft work area ({_r:.1f}×) — OK")
+            else:
+                ratio = (_total_paintable / _basis) if _basis else 0
+                flag_msg = (
+                    f"[MANUAL REVIEW REQUIRED] Total extracted paintable surface "
+                    f"({_total_paintable:,.0f} sqft) is implausibly low relative "
+                    f"to {_basis_label} ({_basis:,.0f} sqft) for a "
+                    f"commercial job — ratio is {ratio:.1f}×, expected "
+                    f"3-6×. This usually means the finish schedule, exposed "
+                    f"structure / paint-to-deck scope, or exterior was missed "
+                    f"in extraction. Do NOT send this proposal without a senior "
+                    f"reviewer confirming the takeoff."
+                )
+                analysis["manual_review_required"] = True
+                analysis["manual_review_reason"] = flag_msg
+                analysis.setdefault("notes", []).append(flag_msg)
+                print(f"\n🚨 PRE-FINALIZE SANITY CHECK FAILED")
+                print(f"   Paintable: {_total_paintable:,.0f} sqft "
+                      f"(walls {_wall:,.0f}, gyp ceil {_ceil_gyp:,.0f}, "
+                      f"dryfall {_ceil_dry:,.0f}, ext {_ext_paint + _ext_hardie:,.0f})")
+                print(f"   Basis ({_basis_label}): {_basis:,.0f} sqft "
+                      f"(ratio {ratio:.1f}×, expected 3-6×)")
+                print(f"   ⚠️  Flagged for manual review — proposal will print "
+                      f"but should NOT be sent without reviewer sign-off.")
 
     # --- Provenance choke point (Phase 2.3): classify every priced quantity as
     # measured / schedule / derived / assumed from the adjustment ledger, store
