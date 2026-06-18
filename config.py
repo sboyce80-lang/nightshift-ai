@@ -525,6 +525,20 @@ ALLOWANCE_EXT_SIDES = float(os.environ.get("ALLOWANCE_EXT_SIDES", "3"))         
 ALLOWANCE_EXT_ASPECT = float(os.environ.get("ALLOWANCE_EXT_ASPECT", "1.5"))              # L:W to derive perimeter from footprint
 ALLOWANCE_MISC_METALS_LS = float(os.environ.get("ALLOWANCE_MISC_METALS_LS", "2500"))     # flat LS when railing/misc-metal LF unconfirmed
 
+# Cross-sheet wall-height back-fill.
+# Per-sheet extraction reads each sheet in isolation. When a floor-plan sheet
+# (e.g. A401) carries room footprints + wall types but NO section/RCP on its own
+# face, the model leaves ceiling_height_feet = 0 and wall_area_sqft collapses to
+# 0 for those rooms — even though the scheduled ceiling height is documented on a
+# companion sheet in the same package (e.g. A403 "ACT @ 9'-0" AFF"). The height
+# is a HARD number on the plans; joining it across sheets is what a human
+# estimator does. When enabled, rooms with a measured perimeter but missing
+# height inherit the project's confirmed scheduled ceiling height, walls are
+# recomputed (perimeter × height), every affected room is tagged with
+# provenance, and a confirm-before-bid RFI is raised. Default OFF.
+CROSS_SHEET_HEIGHT_BACKFILL = os.environ.get(
+    "NIGHTSHIFT_CROSS_SHEET_HEIGHT_BACKFILL", "0").strip().lower() in ("1", "true", "yes", "on")
+
 # Schedule-Based Estimation (when floor plans are missing)
 ENABLE_SCHEDULE_ESTIMATION = True          # Estimate wall/ceiling from Room Finish Schedules when no floor plans
 SCHEDULE_ESTIMATION_CONFIDENCE = 0.85      # Apply 85% confidence factor to schedule-derived areas

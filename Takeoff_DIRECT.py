@@ -10279,6 +10279,139 @@ def _apply_residential_ceiling_floor(analysis):
     return analysis
 
 
+def _backfill_missing_wall_heights(analysis):
+    """Recover wall area for rooms whose source sheet carried no ceiling height.
+
+    Per-sheet extraction reads each sheet in isolation. A floor-plan sheet such
+    as A401 ("Production Break & Toilet Rooms Plan") can carry every room's
+    footprint and wall material while showing NO building section or RCP on its
+    own face — so the model correctly refuses to invent a height and leaves
+    ceiling_height_feet = 0. With height 0, wall_area_sqft collapses to 0 and the
+    perimeter cross-check below skips the room entirely (expected_wall <= 0), so
+    the walls vanish silently. On the INNIO Waukesha job this zeroed every
+    toilet/break-room wall while the scheduled height (ACT @ 9'-0" AFF) sat on
+    the companion sheet A403.
+
+    The scheduled height IS a hard number on the plans; carrying it across
+    sheets of the same package is exactly what a human estimator does. When a
+    project has at least one room with a confirmed positive ceiling height, this
+    pass lends that height to in-scope rooms that have a measured perimeter (or a
+    floor area to derive one from) but no height of their own, recomputes
+    walls = perimeter × height, tags each room's provenance, and raises a single
+    confirm-before-bid RFI. Rooms with no perimeter AND no floor area are left at
+    zero — there is nothing measured to apply the height to.
+
+    Gated behind config.CROSS_SHEET_HEIGHT_BACKFILL (NIGHTSHIFT_CROSS_SHEET_HEIGHT_BACKFILL),
+    default OFF. Idempotent via the _cross_sheet_height_backfilled flag.
+    """
+    if not getattr(_cfg, "CROSS_SHEET_HEIGHT_BACKFILL", False):
+        return analysis
+    if analysis.get("_cross_sheet_height_backfilled"):
+        return analysis
+
+    floors = analysis.get("floors", []) or []
+    if not floors:
+        return analysis
+
+    # --- Establish the project's confirmed ceiling height ---
+    # Use the most common positive height among in-scope rooms. Ties break to
+    # the larger height (conservative for wall area). Only heights the model
+    # actually read off a sheet count — this is never fabricated from nothing.
+    height_counts = {}
+    for floor in floors:
+        for room in floor.get("rooms", []) or []:
+            if not room.get("in_scope", True):
+                continue
+            h = _num(room.get("dimensions", {}).get("ceiling_height_feet", 0))
+            if h > 0:
+                height_counts[h] = height_counts.get(h, 0) + 1
+
+    if not height_counts:
+        # No room anywhere carries a confirmed height — nothing hard to apply.
+        return analysis
+
+    project_height = sorted(height_counts.items(), key=lambda kv: (kv[1], kv[0]))[-1][0]
+
+    # --- Back-fill rooms that have geometry but no height ---
+    backfilled = []
+    for floor in floors:
+        for room in floor.get("rooms", []) or []:
+            if not room.get("in_scope", True):
+                continue
+            dims = room.get("dimensions", {})
+            h = _num(dims.get("ceiling_height_feet", 0))
+            wall_area = _num(dims.get("wall_area_sqft", 0))
+            if h > 0 or wall_area > 0:
+                continue  # already has a height or a wall area — leave it alone
+
+            perimeter = _num(dims.get("perimeter_lf", 0))
+            if perimeter <= 0:
+                L = _num(dims.get("length_feet", 0))
+                W = _num(dims.get("width_feet", 0))
+                if L > 0 and W > 0:
+                    perimeter = 2 * (L + W)
+                    dims["perimeter_lf"] = round(perimeter)
+            if perimeter <= 0:
+                continue  # nothing measured to apply the height to
+
+            new_wall = round(perimeter * project_height)
+            dims["ceiling_height_feet"] = project_height
+            dims["wall_area_sqft"] = new_wall
+            dims["_wall_height_source"] = "cross_sheet_schedule"
+            note = room.get("notes", "")
+            if isinstance(note, list):
+                note = " ".join(str(x) for x in note)
+            room["notes"] = (
+                str(note) + f" [Wall height {project_height:g}' carried from the "
+                f"project scheduled ceiling height (companion sheet) — source sheet "
+                f"showed no section/RCP; confirm before bid]"
+            ).strip()
+            backfilled.append({
+                "room_name": room.get("room_name", "?"),
+                "floor": floor.get("floor_name", ""),
+                "perimeter_lf": round(perimeter),
+                "wall_area_sqft": new_wall,
+            })
+
+    analysis["_cross_sheet_height_backfilled"] = True
+
+    if backfilled:
+        total_added = sum(r["wall_area_sqft"] for r in backfilled)
+        names = ", ".join(f"{r['room_name']} ({r['floor']})" for r in backfilled[:6])
+        analysis.setdefault("notes", []).append(
+            f"[Cross-Sheet Height Back-fill] {len(backfilled)} room(s) had a "
+            f"measured perimeter but no ceiling height on their source sheet; "
+            f"applied the project scheduled height of {project_height:g}' and "
+            f"recovered ~{total_added:,.0f} sqft of wall area: {names}"
+        )
+        analysis.setdefault("_cross_sheet_backfill_rooms", backfilled)
+        # Surface transparently as a confirm-before-bid RFI.
+        rfi_list = analysis.setdefault("rfi_items", [])
+        rfi_list.append({
+            "category": "Incomplete Dimensions",
+            "question": (
+                f"{len(backfilled)} room(s) — {names} — had measurable floor "
+                f"dimensions but no ceiling height on their source sheet (no "
+                f"section or reflected ceiling plan on that page). Their wall "
+                f"heights were carried from the project scheduled ceiling height "
+                f"of {project_height:g}'-0\", recovering ~{total_added:,.0f} sqft "
+                f"of wall area. Confirm these rooms share that ceiling height, or "
+                f"provide the section / RCP that governs them."
+            ),
+            "action_required": (
+                f"Confirm the ceiling height for the listed rooms, or provide the "
+                f"governing building section / reflected ceiling plan."
+            ),
+            "source": "cross_sheet_height_backfill",
+        })
+        print(f"   📐 Cross-sheet height back-fill: {len(backfilled)} room(s), "
+              f"+{total_added:,.0f} sqft walls at {project_height:g}'")
+
+    # Re-aggregate so the recovered wall area flows into pricing.
+    _recalculate_totals(analysis)
+    return analysis
+
+
 def _validate_wall_area_by_perimeter(analysis):
     """
     Cross-check total wall area using per-room perimeter × ceiling height.
@@ -19645,6 +19778,14 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     _adj_snap = _ledger_stage(analysis, "residential_ceiling_floor", _adj_snap,
                               source="assumed",
                               basis="footprint x stories x efficiency floor")
+
+    # --- Cross-sheet wall-height back-fill (must run BEFORE the cross-check) ---
+    # Rooms whose source sheet carried a perimeter but no section/RCP land here
+    # with ceiling_height_feet = 0, which the perimeter cross-check below would
+    # skip. Lend them the project's confirmed scheduled height (a hard number on
+    # a companion sheet) so their walls are recovered instead of silently zeroed.
+    # Flag-gated (NIGHTSHIFT_CROSS_SHEET_HEIGHT_BACKFILL), default OFF.
+    analysis = _backfill_missing_wall_heights(analysis)
 
     # --- Perimeter-based wall cross-check (must run BEFORE wall boost) ---
     # Computes perimeter-derived wall totals and stores in _perimeter_cross_check

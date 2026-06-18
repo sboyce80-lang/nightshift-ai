@@ -248,6 +248,12 @@ Return a single JSON object and nothing else. No preamble, no markdown fences, n
 
 **`pipeline_flags`**: Same routing logic as the rest of Nightshift. `ready_to_send` true only when confidence ≥ 85, no high-severity RFIs, and no rejected adjustments.
 
+## Which sheets were actually submitted — do not contradict this
+
+The input includes `sheets_processed`: the authoritative list of drawing sheets the pipeline READ and anchored rooms to. **Any sheet_id in that list was in the submitted drawing set.** You must never claim — in `missing_information`, `additional_rfis`, `confidence.reasoning`, `top_risks`, `estimator_recap`, or `gc_scope_of_work` — that one of those sheets was "not submitted", "not included", "missing from the set", or "not in the drawing set". Asking the GC to "provide sheet A401" when A401 is in `sheets_processed` is a factual error that destroys the GC's trust in the whole proposal.
+
+A sheet can be present but *thin*: it may carry room footprints yet show no building section or reflected ceiling plan, so wall heights came back as 0 and walls are undercounted. That is a real problem — but the correct framing is **"sheet A401 was read but does not carry a section/RCP, so wall heights could not be derived from it"**, and the RFI asks for the missing *detail* (a section, an RCP, dimensioned heights), NOT for the sheet. Only describe a sheet as missing if its sheet_id is genuinely absent from `sheets_processed`.
+
 ## How to review the estimate
 
 Walk it in this order — same as how you'd review any junior's takeoff:
@@ -411,7 +417,31 @@ def _build_review_payload(analysis, cost_estimate, rfi_items, validation):
 
     pca_signal = _detect_pca_under_extraction(analysis)
 
+    # Authoritative list of sheets the pipeline actually read and anchored rooms
+    # to. Without this, Will has only ambiguous room notes to reason from and has
+    # hallucinated that a sheet was "not submitted" when it was in fact processed
+    # (INNIO Waukesha: Will claimed A401 was missing while the pipeline anchored
+    # all 6 of its rooms). Will must NOT contradict this list.
+    sheets_processed = []
+    for sp in (analysis.get("_sheet_pages") or []):
+        if not isinstance(sp, dict):
+            continue
+        sid = sp.get("sheet_id")
+        if not sid:
+            continue
+        sheets_processed.append({
+            "sheet_id": sid,
+            "page": sp.get("page"),
+            "rooms_anchored": sp.get("rooms", 0),
+        })
+
     payload = {
+        # Sheets the pipeline READ and extracted from. A sheet appearing here was
+        # in the submitted set — never describe it as missing / not submitted /
+        # not included. If such a sheet lacked usable detail (e.g. no section or
+        # RCP, so wall heights were 0), say it "was read but lacks <X>", and ask
+        # for the missing DETAIL, not for the sheet itself.
+        "sheets_processed": sheets_processed,
         "project_info": {
             "building_type": pi.get("building_type", "unknown"),
             "total_stories": pi.get("total_stories", 0),
@@ -597,6 +627,90 @@ def _apply_adjustments_to_estimate(cost_estimate, valid_adjustments, line_items_
     return cost_estimate, log
 
 
+_MISSING_SHEET_PHRASES = (
+    "not submitted",
+    "not included",
+    "not in the drawing set",
+    "not in the set",
+    "missing from the set",
+    "was not in",
+    "wasn't in",
+    "not provided in the set",
+    "absent from the",
+)
+
+
+def _sanitize_missing_sheet_claims(will_output, analysis):
+    """Strip claims that a *processed* sheet was not submitted.
+
+    Will occasionally asserts a sheet is missing when the pipeline actually read
+    it (e.g. claiming A401 was "not submitted" while all 6 of its rooms were
+    anchored). Those claims, sent to a GC who submitted that exact sheet, destroy
+    trust. The prompt instructs Will not to do this; this is the deterministic
+    backstop in case it slips anyway.
+
+    A sheet is treated as present iff its sheet_id appears in `_sheet_pages`. For
+    each present sheet we drop:
+      - `missing_information` entries that name it alongside a missing-phrase
+      - `additional_rfis` entries that name it alongside a missing-phrase (these
+        are the machine-actionable fields that drive the RFI list and routing)
+    Removed items are recorded in will_output["_sanitized_sheet_claims"] so the
+    correction is auditable. Free-text prose fields are left untouched (rewriting
+    them safely is unreliable); the prompt is the primary guard there.
+    """
+    processed_ids = {
+        str(sp.get("sheet_id")).upper()
+        for sp in (analysis.get("_sheet_pages") or [])
+        if isinstance(sp, dict) and sp.get("sheet_id")
+    }
+    if not processed_ids:
+        return will_output
+
+    def _names_present_sheet_as_missing(text):
+        t = str(text or "")
+        tl = t.lower()
+        if not any(p in tl for p in _MISSING_SHEET_PHRASES):
+            return None
+        for sid in processed_ids:
+            # word-ish boundary so "A40" doesn't match "A401"
+            if re.search(rf"\b{re.escape(sid)}\b", t, re.IGNORECASE):
+                return sid
+        return None
+
+    removed = []
+
+    flags = will_output.get("pipeline_flags")
+    if isinstance(flags, dict) and isinstance(flags.get("missing_information"), list):
+        kept = []
+        for entry in flags["missing_information"]:
+            sid = _names_present_sheet_as_missing(entry)
+            if sid:
+                removed.append({"field": "missing_information", "sheet_id": sid, "text": entry})
+            else:
+                kept.append(entry)
+        flags["missing_information"] = kept
+
+    if isinstance(will_output.get("additional_rfis"), list):
+        kept = []
+        for rfi in will_output["additional_rfis"]:
+            blob = f"{rfi.get('question', '')} {rfi.get('action_required', '')}" if isinstance(rfi, dict) else str(rfi)
+            sid = _names_present_sheet_as_missing(blob)
+            if sid:
+                removed.append({"field": "additional_rfis", "sheet_id": sid,
+                                "text": rfi.get("question", "") if isinstance(rfi, dict) else str(rfi)})
+            else:
+                kept.append(rfi)
+        will_output["additional_rfis"] = kept
+
+    if removed:
+        will_output["_sanitized_sheet_claims"] = removed
+        sheets = sorted({r["sheet_id"] for r in removed})
+        print(f"   🧹 Sanitized {len(removed)} false 'sheet missing' claim(s) "
+              f"for processed sheet(s): {', '.join(sheets)}")
+
+    return will_output
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -744,6 +858,10 @@ def run_will_synthesis(analysis, cost_estimate, rfi_items=None, validation=None,
             "new_rfis": [],
             "error": f"Will JSON parse error: {e}",
         }
+
+    # Deterministic backstop: strip any "sheet X not submitted" claim that
+    # contradicts the list of sheets the pipeline actually processed.
+    will_output = _sanitize_missing_sheet_claims(will_output, analysis)
 
     # Apply guardrails to proposed adjustments
     proposed_adjustments = will_output.get("adjustments", [])
