@@ -317,6 +317,56 @@ PRICING_MODEL = {
         "unit": "sqft", "markup": 0.06,
         "tiers": [{"min_qty": 0, "max_qty": None, "rate": 7.50}],
     },
+    # ── Operator-Activated Options ──────────────────────────────────────────
+    # Surfaced as toggleable rows in the Pricing tab (ADVANCED_RATE_FIELDS).
+    # Net-new scope items default to $0 — the operator enables the line and
+    # enters their own rate per company. NOTE: enabling + setting a rate makes
+    # the OPTION available; the takeoff engine does not yet auto-extract
+    # quantities for these — extraction wiring is a separate follow-up.
+    "gyp_walls_existing": {                      # GWB Walls – Existing (repaint)
+        "unit": "sqft", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 0.0}],
+    },
+    "epoxy_wall_area": {                         # Epoxy wall coating
+        "unit": "sqft", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 0.0}],
+    },
+    "bollards": {                                # Painted bollards
+        "unit": "ea", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 0.0}],
+    },
+    "pipe_handrail": {                           # Pipe handrails
+        "unit": "lf", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 0.0}],
+    },
+    "precast_walls_interior": {                  # Precast walls – interior
+        "unit": "sqft", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 0.0}],
+    },
+    "precast_walls_exterior": {                  # Precast walls – exterior
+        "unit": "sqft", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 0.0}],
+    },
+    "block_masonry_exterior": {                  # Block/masonry walls – exterior
+        "unit": "sqft", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 0.0}],
+    },
+    "hm_door_frame_single": {                    # HM door frames – single
+        "unit": "ea", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 0.0}],
+    },
+    "hm_door_frame_double": {                    # HM door frames – double
+        "unit": "ea", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 0.0}],
+    },
+    "hm_door_frame_sidelite": {                  # HM door frames with sidelite
+        "unit": "ea", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 0.0}],
+    },
+    "borrowed_lite_frame": {                     # Borrowed lite window frames
+        "unit": "ea", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 0.0}],
+    },
 }
 
 # =============================================================================
@@ -454,6 +504,26 @@ ENHANCED_TILE_OVERLAP_PCT = 0.05           # 5% overlap between tiles
 # extraction are NOT affected by this flag. Set False to restore the old
 # heuristic-fill behavior.
 HARD_NUMBERS_ONLY = True
+
+# Allowance Line Items ("Allowances — Confirm Before Bid" section)
+# When enabled, the engine emits clearly-labeled ALLOWANCE lines for scope it
+# DETECTED in the drawings (a general note, a coded note, an exterior RFI) but
+# could not measure to a hard number: exterior CMU/tilt-up, painted columns,
+# misc metals / railings, accent bands. These NEVER mix into the measured
+# subtotal — they render in their own section with their own subtotal and a
+# stated basis on every line. This is consistent with HARD_NUMBERS_ONLY: the
+# quantities are evidence-gated (no trigger note → no line), segregated, and
+# labeled as confirm-before-bid assumptions, not folded silently into the
+# takeoff. Default OFF; opt in via NIGHTSHIFT_ALLOWANCE_LINES=1.
+ALLOWANCE_LINES_ENABLED = os.environ.get(
+    "NIGHTSHIFT_ALLOWANCE_LINES", "0").strip().lower() in ("1", "true", "yes", "on")
+# Hybrid quantity tunables — used only to size an allowance, always shown as
+# the line's stated basis so the estimator can adjust.
+ALLOWANCE_COLUMN_BAY_SQFT = float(os.environ.get("ALLOWANCE_COLUMN_BAY_SQFT", "1500"))   # footprint ÷ bay → column count
+ALLOWANCE_EXT_WALL_HEIGHT_FT = float(os.environ.get("ALLOWANCE_EXT_WALL_HEIGHT_FT", "20"))  # parapet/wall height when no section
+ALLOWANCE_EXT_SIDES = float(os.environ.get("ALLOWANCE_EXT_SIDES", "3"))                   # painted elevations (front + 2 sides typical)
+ALLOWANCE_EXT_ASPECT = float(os.environ.get("ALLOWANCE_EXT_ASPECT", "1.5"))              # L:W to derive perimeter from footprint
+ALLOWANCE_MISC_METALS_LS = float(os.environ.get("ALLOWANCE_MISC_METALS_LS", "2500"))     # flat LS when railing/misc-metal LF unconfirmed
 
 # Schedule-Based Estimation (when floor plans are missing)
 ENABLE_SCHEDULE_ESTIMATION = True          # Estimate wall/ceiling from Room Finish Schedules when no floor plans
