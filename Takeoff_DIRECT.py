@@ -7093,11 +7093,22 @@ def analyze_schedule_pdf(client, pdf_path):
 
 Look for these specific items and extract counts:
 
-1. DOOR SCHEDULE (usually sheet A-501 or A-502):
+1. DOOR SCHEDULE (usually sheet A-501 or A-502; may also live on an
+   interior-elevations sheet such as A401/A404 when there is no dedicated
+   schedule sheet):
+   - SUM THE QTY COLUMN: each schedule ROW lists a door MARK and a QTY (leaf
+     count) — a double door is one mark with QTY 2. Totals MUST equal the sum of
+     the Qty column across rows, NOT the number of marks and NOT one-per-room.
    - Count doors by TYPE — ONLY count doors that require FIELD PAINTING:
-     * "doors_full_paint": Hollow Metal (HM) doors where BOTH the panel AND frame are painted on-site
-       (HM1, HM2 types — these are the primary painted doors in commercial buildings)
-     * "doors_hm_panel": HM panel doors where ONLY the panel is painted (frame is factory-finished)
+     * "doors_full_paint": doors where BOTH the panel AND frame are field-painted.
+       This includes HM panel in an HM frame whenever the FRAME is field-painted —
+       e.g. NEW hollow metal frames, or when the project scope/general notes say
+       "paint doors and frames" / "new hollow metal doors and frames". New HM
+       frames ship primed and are painted on-site (they are NOT factory-finished).
+     * "doors_hm_panel": HM panel where ONLY the panel is painted AND the frame is
+       genuinely factory-finished (e.g. panel in an aluminum/storefront frame).
+       Do NOT use this bucket for HM-panel-in-HM-frame when frames are painted —
+       that is doors_full_paint.
      * "doors_frame_only": HM frames where only the FRAME is painted (panel is pre-finished or glass)
    - EXCLUDE these door types — they are NOT field-painted:
      * Storefront doors (AD1, AL1, SD-1) — aluminum, factory-finished
@@ -12754,7 +12765,12 @@ def _provenance_gate_enabled():
 
 
 def _ceiling_scope_gate_enabled():
-    return os.environ.get("NIGHTSHIFT_CEILING_SCOPE_GATE", "0").strip() in (
+    # Default ON as of 2026-06-18: validated on TSC/Honey (06-16) and the INNIO
+    # Waukesha beta job, where a 14,005 SF phantom ceiling aggregate (every room
+    # ceiling_painted=False, yet total_paintable_ceiling_sqft=14,005 → $11,904,
+    # 43% of the bid) was reconciled to 0 by the commercial aggregate rebuild.
+    # only-reduce + commercial-only + idempotent, so safe to default on.
+    return os.environ.get("NIGHTSHIFT_CEILING_SCOPE_GATE", "1").strip() in (
         "1", "true", "True")
 
 
@@ -12859,6 +12875,149 @@ def _enforce_ceiling_scope_gate(analysis):
     return analysis
 
 
+def _door_schedule_scope_fix_enabled():
+    return os.environ.get("NIGHTSHIFT_DOOR_SCHEDULE_FIX", "0").strip() in (
+        "1", "true", "True")
+
+
+# Scope-note phrases that establish FRAMES are field-painted (not just panels).
+# When the door schedule classifies HM doors as hm_panel (panel painted, frame
+# factory-finished) but the project scope explicitly paints new HM frames, those
+# doors are full-paint (panel + frame), not panel-only.
+_FRAMES_PAINTED_PATTERNS = (
+    "hollow metal doors and frames", "hm doors and frames",
+    "doors and frames", "doors & frames", "frames to be painted",
+    "paint doors and frames", "paint frames",
+)
+
+
+def _collect_scope_text(analysis):
+    """Concatenate every scope/notes source into one lowercased blob."""
+    parts = []
+    pi = analysis.get("project_info") or {}
+    for k in ("scope_notes", "scope_of_work", "scope"):
+        v = pi.get(k)
+        if isinstance(v, str):
+            parts.append(v)
+    sc = analysis.get("scope_notes")
+    if isinstance(sc, str):
+        parts.append(sc)
+    elif isinstance(sc, list):
+        parts.extend(str(x) for x in sc)
+    for n in analysis.get("notes", []) or []:
+        parts.append(str(n))
+    return " ".join(parts).lower()
+
+
+def _recover_door_leaf_count_from_notes(ds):
+    """Recover the true leaf count from the door-schedule free-text notes when
+    the structured total desynced from the model's own per-mark reasoning
+    (INNIO Waukesha: notes reasoned '5 leaves' but total_doors_hm_panel emitted
+    6, doors_by_floor 2+4 inconsistent with marks). Parse 'Mark NN ... Qty N'
+    pairs; only trust the recovered sum when the parsed mark set EXACTLY matches
+    door_marks_counted (high-confidence guard — never guesses)."""
+    notes = str(ds.get("notes", ""))
+    found = {}
+    # "Mark 11: Qty 2" / "mark 14 qty=1" — stay within a sentence (no '.' between
+    # the mark id and its qty) so room numbers in other clauses can't bind.
+    for m in re.finditer(r"mark\s*#?\s*(\d+)\b[^.]{0,40}?qty[^\d]{0,6}(\d+)",
+                         notes, re.I):
+        found[m.group(1)] = int(m.group(2))
+    marks = [str(x).strip() for x in (ds.get("door_marks_counted") or [])]
+    if marks and found and set(found) == set(marks):
+        return sum(found.values()), found
+    return None, found
+
+
+def _reconcile_door_schedule_scope(analysis):
+    """Flag-gated door-schedule reconciliation, run at the build_priced_takeoff
+    choke point alongside the ceiling gate. Fixes two defects the INNIO Waukesha
+    beta job exposed when scope is driven by an interior-elevation door schedule
+    (A404) with no dedicated schedule sheet:
+
+    (1) COUNT desync — the schedule extractor reasoned to the correct leaf count
+        in prose ('total = 5 leaves') but emitted a stale structured total (6),
+        with doors_by_floor (2+4) inconsistent with the counted marks (11/14/15).
+        Recover the true leaf count from the per-mark notes when, and only when,
+        the parsed marks exactly match door_marks_counted.
+
+    (2) CLASS misfit — new HM doors in new HM frames were filed as hm_panel
+        (panel painted, frame factory-finished) even though scope explicitly says
+        'New hollow metal doors and frames'. New HM frames are field-painted, so
+        these are full_paint (panel + frame). hm_panel UNDER-prices the frame
+        labor ($110 vs $175/door).
+
+    Conservative: only acts when a door schedule is present and all painted doors
+    sit in the hm_panel bucket (the schedule-driven shape); leaves mixed/already-
+    classified schedules untouched. Flag-gated via NIGHTSHIFT_DOOR_SCHEDULE_FIX
+    (default off). Idempotent via analysis['_door_schedule_scope_fix'].
+    """
+    if not isinstance(analysis, dict) or not _door_schedule_scope_fix_enabled():
+        return analysis
+    if analysis.get("_door_schedule_scope_fix"):
+        return analysis
+
+    agg = analysis.get("aggregated_totals")
+    if not isinstance(agg, dict):
+        return analysis
+    cur_fp = _num(agg.get("total_doors_full_paint", 0))
+    cur_hm = _num(agg.get("total_doors_hm_panel", 0))
+    cur_fr = _num(agg.get("total_doors_frame_only", 0))
+    # Only reconcile the schedule-driven shape: every painted door in hm_panel.
+    if cur_hm <= 0 or cur_fp > 0 or cur_fr > 0:
+        return analysis
+
+    record = {}
+    ds = ((analysis.get("schedule_data") or {}).get("door_schedule")) or {}
+
+    # (1) Recover the true leaf count from the per-mark notes.
+    recovered, per_mark = _recover_door_leaf_count_from_notes(ds)
+    if recovered is not None and recovered != cur_hm:
+        record["leaf_count"] = {"from": cur_hm, "to": recovered,
+                                "per_mark": per_mark}
+        cur_hm = recovered
+
+    # (2) Reclassify hm_panel -> full_paint when scope paints the frames.
+    scope_txt = _collect_scope_text(analysis)
+    frames_painted = any(p in scope_txt for p in _FRAMES_PAINTED_PATTERNS)
+    target = "hm_panel"
+    if frames_painted:
+        cur_fp += cur_hm
+        record["reclassified"] = {"hm_panel_to_full_paint": cur_hm}
+        cur_hm = 0
+        target = "full_paint"
+
+    if not record:
+        return analysis
+
+    agg["total_doors_full_paint"] = cur_fp
+    agg["total_doors_hm_panel"] = cur_hm
+    # Keep schedule_data totals consistent for the Traceability Summary.
+    if ds:
+        ds["total_doors_full_paint"] = cur_fp
+        ds["total_doors_hm_panel"] = cur_hm
+
+    note_bits = []
+    if "leaf_count" in record:
+        note_bits.append(
+            f"corrected leaf count {record['leaf_count']['from']:.0f}"
+            f"→{record['leaf_count']['to']:.0f} from door marks "
+            f"{','.join(per_mark.keys())} (schedule total had desynced from the "
+            f"per-mark quantities)")
+    if "reclassified" in record:
+        note_bits.append(
+            f"reclassified {record['reclassified']['hm_panel_to_full_paint']:.0f} "
+            f"HM door(s) hm_panel→full_paint (scope paints doors AND frames; "
+            f"new HM frames are field-painted)")
+    analysis.setdefault("notes", []).append(
+        "[Door Schedule Scope] " + "; ".join(note_bits) + ".")
+
+    record["final"] = {"full_paint": cur_fp, "hm_panel": cur_hm,
+                       "category": target}
+    analysis["_door_schedule_scope_fix"] = record
+    return analysis
+
+
 def build_priced_takeoff(analysis, strict=None):
     """Single provenance choke point between aggregation and calculate_costs.
 
@@ -12884,6 +13043,11 @@ def build_priced_takeoff(analysis, strict=None):
     # Final ceiling-scope reconciliation (ACT demote + commercial aggregate
     # rebuild) before any quantity is priced. Flag-gated; no-op when off.
     analysis = _enforce_ceiling_scope_gate(analysis)
+
+    # Door-schedule reconciliation (leaf-count recovery + frame-paint
+    # reclassification) for interior-elevation door schedules. Flag-gated;
+    # no-op when off.
+    analysis = _reconcile_door_schedule_scope(analysis)
 
     agg = analysis.get("aggregated_totals", {}) or {}
     ledger = analysis.get("_quantity_adjustments", []) or []
