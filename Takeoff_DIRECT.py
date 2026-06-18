@@ -3046,6 +3046,62 @@ def _per_sheet_extraction_enabled():
         "1", "true", "True")
 
 
+def _per_sheet_retry_enabled():
+    return os.environ.get("NIGHTSHIFT_PER_SHEET_RETRY", "0").strip() in (
+        "1", "true", "True")
+
+
+# Wall-material tokens that mark a room as CMU/masonry/exposed (tracked
+# separately from paintable GYP). Used to isolate the GYP-wall collapse signal.
+_PER_SHEET_CMU_WALL_HINTS = (
+    "cmu", "masonry", "block", "concrete", "exposed", "brick")
+# Below this total GYP wall area (sqft), with >=2 GYP-scope rooms present, the
+# per-sheet pass is treated as a collapse (walls anchored to elevation/RCP
+# views with no perimeter instead of the floor plan).
+_PER_SHEET_COLLAPSE_WALL_FLOOR = 200.0
+
+
+def _per_sheet_geometry_score(analysis):
+    """Total measured wall area across in-scope rooms — a single scalar for
+    picking the least-collapsed per-sheet pass. Higher = more geometry
+    recovered. The catastrophic under-extraction failure (walls vanish to ~0)
+    scores low, so max-score selection rejects it. Reads raw room dimensions,
+    not aggregated_totals (which aren't computed at the per-sheet stage)."""
+    if not isinstance(analysis, dict):
+        return 0.0
+    score = 0.0
+    for f in analysis.get("floors", []) or []:
+        for r in f.get("rooms", []) or []:
+            if r.get("in_scope", True):
+                score += _num((r.get("dimensions") or {}).get("wall_area_sqft", 0))
+    return round(score, 2)
+
+
+def _per_sheet_collapse_suspected(analysis):
+    """Detect the per-sheet under-extraction collapse: paint-scope GYP/drywall
+    rooms exist but their wall geometry came back ~0 — the rooms were anchored
+    to an elevation/RCP view (no perimeter) instead of the floor plan (INNIO
+    Waukesha 2026-06-18: one pass gave 7,942 SF GYP wall, the next 80 SF, same
+    PDF/code; per-sheet mode bypasses the multi-pass median that guards the
+    legacy path). Runs on the raw per-sheet analysis. Conservative by design:
+    a false positive only costs one extra retry pass — the best-geometry pick
+    is still correct — so the gate favors catching real collapses."""
+    if not isinstance(analysis, dict):
+        return False
+    gyp_rooms = 0
+    gyp_wall = 0.0
+    for f in analysis.get("floors", []) or []:
+        for r in f.get("rooms", []) or []:
+            if not r.get("in_scope", True):
+                continue
+            mat = str((r.get("materials") or {}).get("walls", "")).lower()
+            if any(h in mat for h in _PER_SHEET_CMU_WALL_HINTS):
+                continue  # CMU/exposed tracked separately; collapse is GYP-specific
+            gyp_rooms += 1
+            gyp_wall += _num((r.get("dimensions") or {}).get("wall_area_sqft", 0))
+    return gyp_rooms >= 2 and gyp_wall < _PER_SHEET_COLLAPSE_WALL_FLOOR
+
+
 def _sheet_verification_enabled():
     """Verification pass within per-sheet mode (default on)."""
     return os.environ.get("NIGHTSHIFT_SHEET_VERIFY", "1").strip() not in (
@@ -19042,6 +19098,60 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                 except (ValueError, TypeError):
                     best_rooms = 0
                 used_per_sheet = True
+
+                # Conditional retry-on-collapse. Per-sheet mode bypasses the
+                # multi-pass median (see the should_multi_pass logic below), so a
+                # single pass that anchored rooms to elevation/RCP views (walls ->
+                # ~0) has no safety net. When the collapse signature fires, re-run
+                # per-sheet up to NIGHTSHIFT_PER_SHEET_RETRY_N times and keep the
+                # pass with the most measured wall geometry; stop early once a
+                # pass is healthy. Flag-gated (default off); only pays the extra
+                # API cost on jobs that actually collapsed.
+                if _per_sheet_retry_enabled() and _per_sheet_collapse_suspected(_ps_result[1]):
+                    try:
+                        _retry_n = int(os.environ.get("NIGHTSHIFT_PER_SHEET_RETRY_N", "2"))
+                    except (ValueError, TypeError):
+                        _retry_n = 2
+                    _retry_n = max(1, min(4, _retry_n))
+                    _best_score = _per_sheet_geometry_score(_ps_result[1])
+                    print(f"   🔁 Per-sheet collapse suspected for {filename} "
+                          f"(wall geometry {_best_score:,.0f} sqft) — retrying up "
+                          f"to {_retry_n}× and keeping the richest pass")
+                    for _ra in range(_retry_n):
+                        try:
+                            _alt = _analyze_pdf_per_sheet(
+                                client, pdf_path, scope_notes=scope_notes,
+                                schedule_hints=image_schedule_data,
+                                building_inventory=building_inventory,
+                                project_overview=project_overview)
+                        except Exception as _alt_exc:
+                            print(f"   ⚠️  Per-sheet retry {_ra + 1} crashed: {_alt_exc}")
+                            _alt = None
+                        if not _alt:
+                            continue
+                        _alt_score = _per_sheet_geometry_score(_alt[1])
+                        _alt_collapsed = _per_sheet_collapse_suspected(_alt[1])
+                        print(f"   🔁 Retry {_ra + 1}/{_retry_n}: wall geometry "
+                              f"{_alt_score:,.0f} sqft "
+                              f"(collapse={'yes' if _alt_collapsed else 'no'})")
+                        if _alt_score > _best_score:
+                            _best_score = _alt_score
+                            _ps_result = _alt
+                            result = best_result = _alt
+                            _rr = _alt[1].get('project_info', {}).get('total_rooms_found', 0)
+                            try:
+                                best_rooms = int(_rr) if _rr is not None else best_rooms
+                            except (ValueError, TypeError):
+                                pass
+                        if not _per_sheet_collapse_suspected(_ps_result[1]):
+                            break  # recovered a healthy pass — stop early
+                    if _per_sheet_collapse_suspected(_ps_result[1]):
+                        _ps_result[1].setdefault("notes", []).append(
+                            "[Per-sheet retry] Wall extraction collapsed on every "
+                            f"pass (best {_best_score:,.0f} sqft of wall geometry "
+                            "kept). Walls are likely under-counted — manual review "
+                            "required before bidding.")
+                        _ps_result[1]["manual_review_required"] = True
             else:
                 print(f"   ⚠️  Per-sheet extraction unavailable for "
                       f"{filename} — using legacy chunked path")
