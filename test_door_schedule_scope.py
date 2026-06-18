@@ -93,6 +93,25 @@ snapshot = dict(a["aggregated_totals"])
 T._reconcile_door_schedule_scope(a)
 check(a["aggregated_totals"] == snapshot, "second pass mutated totals (not idempotent)")
 
+# 6b) LIVE-condition regression: the frame phrase is ONLY in the user-entered
+#     scope (stashed as project_info._user_scope_notes), absent from scope_notes
+#     and notes — exactly the prod state at the build_priced_takeoff choke point
+#     (2026-06-18 INNIO re-run, where the fix silently no-op'd). Must still fire.
+a = {
+    "project_info": {"building_type": "commercial/industrial",
+                     "_user_scope_notes": INNIO_SCOPE},  # scope_notes intentionally absent
+    "aggregated_totals": {"total_doors_full_paint": 0, "total_doors_hm_panel": 3,
+                          "total_doors_frame_only": 0},
+    "schedule_data": {"door_schedule": {"total_doors_hm_panel": 3,
+                                        "door_marks_counted": ["11", "14", "15"], "notes": ""}},
+    "notes": [],  # per-sheet scope note not yet merged at pricing time
+}
+T._reconcile_door_schedule_scope(a)
+check(a["aggregated_totals"]["total_doors_full_paint"] == 3
+      and a["aggregated_totals"]["total_doors_hm_panel"] == 0,
+      "live-condition (_user_scope_notes only) did not reclassify: got "
+      f"{a['aggregated_totals']['total_doors_full_paint']}/{a['aggregated_totals']['total_doors_hm_panel']}")
+
 # 7) Real saved INNIO JSON (when present) — 6 hm_panel -> 5 full_paint.
 for p in ("/tmp/results_json/INNIO.json",
           os.path.expanduser("~/Downloads/construction_analysis_20260617_CORRECTED.json")):

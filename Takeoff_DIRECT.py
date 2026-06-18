@@ -13025,18 +13025,26 @@ _FRAMES_PAINTED_PATTERNS = (
 
 
 def _collect_scope_text(analysis):
-    """Concatenate every scope/notes source into one lowercased blob."""
+    """Concatenate every scope/notes source into one lowercased blob.
+
+    Includes the user-entered scope (stashed as _user_scope_notes before the
+    build_priced_takeoff choke point). That is the authoritative, always-present
+    signal — the per-sheet notes that echo the same scope text are not reliably
+    merged into analysis['notes'] until after pricing, so reading only notes
+    misses the frame-paint phrase at the moment the door reconciliation runs.
+    """
     parts = []
     pi = analysis.get("project_info") or {}
-    for k in ("scope_notes", "scope_of_work", "scope"):
+    for k in ("scope_notes", "scope_of_work", "scope", "_user_scope_notes"):
         v = pi.get(k)
         if isinstance(v, str):
             parts.append(v)
-    sc = analysis.get("scope_notes")
-    if isinstance(sc, str):
-        parts.append(sc)
-    elif isinstance(sc, list):
-        parts.extend(str(x) for x in sc)
+    for k in ("_user_scope_notes", "scope_notes"):
+        sc = analysis.get(k)
+        if isinstance(sc, str):
+            parts.append(sc)
+        elif isinstance(sc, list):
+            parts.extend(str(x) for x in sc)
     for n in analysis.get("notes", []) or []:
         parts.append(str(n))
     return " ".join(parts).lower()
@@ -18317,6 +18325,8 @@ def run_analysis_merge(prior_json, new_pdf_paths, scope_tags=None,
         print(f"💰 Re-pricing with parent snapshot...")
         # Provenance choke point + calibrated confidence on the merge path too
         # (Phase 2.5), so v2 quotes carry the same Trust Summary as fresh runs.
+        if scope_notes:
+            merged_analysis.setdefault("project_info", {})["_user_scope_notes"] = scope_notes
         merged_analysis = build_priced_takeoff(merged_analysis)
         costs = calculate_costs(
             merged_analysis.get("aggregated_totals", {}),
@@ -18689,6 +18699,8 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                 # (Phase 2.5). build_priced_takeoff is idempotent, so a cached
                 # analysis that already carries _priced_takeoff is untouched;
                 # one that predates the gate gets it now.
+                if scope_notes:
+                    analysis.setdefault("project_info", {})["_user_scope_notes"] = scope_notes
                 analysis = build_priced_takeoff(analysis)
                 print("\n💰 Calculating costs...")
                 costs = calculate_costs(
@@ -20486,6 +20498,11 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     # the breakdown, and (strict mode, NIGHTSHIFT_PROVENANCE_GATE) remove assumed
     # increments + file an unpriced-exposure RFI. Must be the LAST mutation of
     # aggregated_totals before pricing. ---
+    # Stash the user-entered scope so the door-schedule frame-paint
+    # reclassification (inside build_priced_takeoff) sees it — per-sheet notes
+    # that echo it may not be merged into analysis['notes'] yet at this point.
+    if scope_notes:
+        analysis.setdefault("project_info", {})["_user_scope_notes"] = scope_notes
     analysis = build_priced_takeoff(analysis)
 
     # --- Calculate costs ---
