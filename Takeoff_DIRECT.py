@@ -6014,6 +6014,19 @@ Ceiling types — CRITICAL DISTINCTION:
     Public hallways and common corridors ALMOST ALWAYS have ACT ceilings — do NOT assume painted.
     If no RCP is available, DEFAULT to ceiling_painted = false for all corridors/lobbies/hallways.
   • Back-of-house rooms (offices, break rooms) → ceiling_painted = true (typically GYP)
+  CEILING-TYPE PROVENANCE MARKER (REQUIRED): the ceiling TYPE is the single
+  largest swing item on a commercial bid, so we must know whether you CONFIRMED
+  it or ASSUMED it.
+  • If a room's ceiling type is CONFIRMED — the ROOM FINISH SCHEDULE gives a
+    ceiling finish for that room, OR the RCP explicitly shows the ceiling type —
+    write the material plainly: ceiling = "GYP", "ACT", "DRYFALL", etc.
+  • If you are ASSUMING the ceiling type from a default above (no finish-schedule
+    entry and no legible RCP for that room), append " (assumed)" to the material,
+    e.g. ceiling = "GYP (assumed)" or "ACT (assumed)". This marks it for an RFI.
+  • On COMMERCIAL / healthcare rooms, when the type is unconfirmed prefer
+    ceiling_painted = false (ACT is the commercial default) rather than assuming
+    painted GYP. Do NOT assume painted GYP just because you measured a ceiling
+    area — the ceiling TYPE requires positive evidence.
 
 WHITEBOX / PRIME ONLY DETECTION:
 - If a room or tenant space is labeled "whitebox", "white box", "prime only",
@@ -13029,11 +13042,14 @@ def _ceiling_scope_gate_enabled():
 
 
 def _commercial_gyp_ceiling_gate_enabled():
-    # Default OFF pending validation: materially changes the ceiling number by
-    # demoting commercial GYP ceilings that carry no soffit/feature evidence to
-    # ACT/not-painted (Beloit clinic: 3,518 SF of clinic-room ceilings asserted
-    # GYP vs ~500 SF real). Only-reduce, commercial-only, and every demoted room
-    # is surfaced in an RFI so a genuine painted GYP ceiling can be restored.
+    # Default OFF pending a re-run. PROVENANCE-BASED (redesigned 2026-07-01 after
+    # a 32-job sweep showed the earlier soffit/feature keyword whitelist
+    # over-demoted real ceilings on Honey (1,029->0), TSC (~1,596->192) and
+    # Dutchess (2,061->1,084)). Now demotes a commercial painted ceiling ONLY
+    # when the extractor marked its material "<type> (assumed)" — i.e. it could
+    # not confirm the ceiling type from an RCP/finish schedule. Fail-safe: a
+    # ceiling with no assumed-marker is left alone, so this is a strict no-op on
+    # every extraction predating the marker (verified across all 32 saved JSONs).
     return os.environ.get(
         "NIGHTSHIFT_COMMERCIAL_CEILING_GYP_GATE", "0").strip() in (
         "1", "true", "True")
@@ -13067,13 +13083,11 @@ _ACT_CEILING_KEYWORDS = (
 _CEILING_PAINT_TRIGGER_KEYWORDS = (
     "gyp", "gwb", "gypsum", "drywall", "plaster", "dryfall")
 
-# Positive evidence that a commercial room ceiling is a genuinely painted
-# gypsum/hard-lid surface (not the extractor's default when the RCP/finish
-# schedule ceiling type is unreadable). Any of these keeps ceiling_painted.
-_GYP_CEILING_EVIDENCE_KEYWORDS = (
-    "soffit", "bulkhead", "bulk head", "design feature", "feature ceiling",
-    "gyp ceiling", "gwb ceiling", "gyp clg", "gwb clg", "hard lid",
-    "hard ceiling", "hard-lid", "canopy", "cloud", "coffer", "drop soffit")
+# Provenance markers the extractor appends to a ceiling material string when it
+# could NOT confirm the ceiling type from an RCP or finish-schedule entry for
+# that room (e.g. "GYP (assumed)"). The commercial ceiling gate demotes only
+# these; a bare, unmarked material is treated as confirmed and left alone.
+_CEILING_UNCONFIRMED_MARKERS = ("assumed", "unconfirmed", "unverified")
 
 # Room-name signals for a stair enclosure.
 _STAIR_ROOM_KEYWORDS = ("stair", "stairwell", "stair tower", "egress stair")
@@ -13126,8 +13140,10 @@ def _enforce_ceiling_scope_gate(analysis):
 
     Three further sub-gates run here (each independently flag-gated, all default
     OFF pending validation, all commercial-only where noted, all only-reduce):
-    (1b) NIGHTSHIFT_COMMERCIAL_CEILING_GYP_GATE — demote painted-GYP ceilings
-         with no soffit/feature evidence to ACT/not-painted + RFI.
+    (1b) NIGHTSHIFT_COMMERCIAL_CEILING_GYP_GATE — provenance-based: demote a
+         commercial painted ceiling to ACT/not-painted + RFI only when its
+         material is marked "(assumed)" (type not confirmed by RCP/finish
+         schedule). No-op on unmarked ceilings (fail-safe on pre-marker data).
     (1c) NIGHTSHIFT_STAIR_FINISH_GATE — zero stair-room paint scope unless a
          note confirms the stair is finished + RFI.
     (1d) NIGHTSHIFT_WALLCOVERING_RFI — promote a dedicated RFI when a WC-x code
@@ -13174,16 +13190,18 @@ def _enforce_ceiling_scope_gate(analysis):
         "residential", "multifamily", "multi-family", "apartment", "condo",
         "dorm", "supportive", "senior", "assisted", "mixed-use", "mixed use"))
 
-    # (1b) COMMERCIAL GYP-without-evidence demote — flag-gated, commercial only.
-    # A room ceiling asserted as painted GYP is only kept when positive GYP
-    # evidence exists (soffit/bulkhead/feature/hard-lid keyword or a soffit_sqft
-    # callout). Bare "GYP" with no evidence is what the extractor emits when the
-    # RCP/finish-schedule ceiling type is unreadable — which in commercial /
-    # healthcare space is predominantly ACT (Beloit: 3,518 SF of clinic-room
-    # ceilings asserted GYP vs ~500 SF real). Runs BEFORE the (2) aggregate
-    # rebuild so the demotions flow into the rebuilt total automatically. Every
-    # demoted room is listed in an RFI so a genuine painted GYP ceiling can be
-    # restored. Hard-numbers policy: unconfirmed ceiling type -> 0 + RFI.
+    # (1b) COMMERCIAL unconfirmed-ceiling demote — flag-gated, commercial only.
+    # PROVENANCE-BASED (redesigned 2026-07-01). A 32-job sweep showed the earlier
+    # soffit/feature keyword whitelist over-demoted real ceilings (Honey
+    # 1,029->0, TSC ~1,596->192, Dutchess 2,061->1,084) — it pattern-matched
+    # Beloit's outcome rather than encoding a general rule. Instead, the
+    # extractor now marks a ceiling material "<type> (assumed)" when it could NOT
+    # confirm the ceiling type from an RCP/finish-schedule entry for that room;
+    # on commercial jobs those unconfirmed painted ceilings default to ACT /
+    # not-painted + RFI (hard-numbers policy). A ceiling with NO assumed-marker
+    # is left ALONE — so this is a strict no-op on every extraction predating the
+    # marker (fail-safe; verified across all saved JSONs). Runs BEFORE the (2)
+    # aggregate rebuild so demotions flow into the rebuilt total automatically.
     if _commercial_gyp_ceiling_gate_enabled() and not is_residential:
         gyp_demoted = 0
         gyp_demoted_sqft = 0.0
@@ -13199,18 +13217,9 @@ def _enforce_ceiling_scope_gate(analysis):
                 ceil_mat = str(mats.get("ceiling", "")).lower()
                 if "dryfall" in ceil_mat:
                     continue  # tracked in total_dryfall_ceiling_sqft
-                elems = room.get("elements") or {}
-                haystack = " ".join([
-                    str(room.get("room_name", "")),
-                    str(room.get("notes", "")),
-                    ceil_mat,
-                ]).lower()
-                has_evidence = (
-                    _num(elems.get("soffit_sqft", 0)) > 0
-                    or any(k in haystack
-                           for k in _GYP_CEILING_EVIDENCE_KEYWORDS))
-                if has_evidence:
-                    continue
+                if not any(m in ceil_mat
+                           for m in _CEILING_UNCONFIRMED_MARKERS):
+                    continue  # unmarked = confirmed type; leave it alone
                 mats["ceiling_painted"] = False
                 dims = room.setdefault("dimensions", {})
                 gyp_demoted_sqft += _num(dims.get("ceiling_area_sqft", 0))
@@ -13219,21 +13228,21 @@ def _enforce_ceiling_scope_gate(analysis):
                 gyp_rooms.append(
                     str(room.get("room_name", "") or room.get("room_id", "")))
                 note = str(room.get("notes", ""))
-                if "[GYP ceiling unconfirmed" not in note:
+                if "[Ceiling type unconfirmed" not in note:
                     room["notes"] = (
-                        note + " [GYP ceiling unconfirmed — commercial scope "
-                        "gate; no soffit/feature evidence, defaulted to ACT / "
-                        "not-painted; confirm ceiling type (RFI)]").strip()
+                        note + " [Ceiling type unconfirmed — commercial scope "
+                        "gate; ceiling marked assumed (not confirmed by RCP / "
+                        "finish schedule), defaulted to ACT / not-painted; "
+                        "confirm ceiling type (RFI)]").strip()
         if gyp_demoted:
             record["commercial_gyp_demoted"] = gyp_demoted
             record["commercial_gyp_sqft_removed"] = round(gyp_demoted_sqft, 2)
             _gate_add_rfi(
                 analysis, "Ceiling Scope",
                 f"{gyp_demoted} commercial room ceiling(s) totaling "
-                f"{gyp_demoted_sqft:,.0f} SF were extracted as painted gypsum "
-                f"with no soffit/feature evidence on the drawings — the extractor "
-                f"default when the RCP/finish-schedule ceiling type is not "
-                f"legible. Per our hard-numbers policy these default to ACT / "
+                f"{gyp_demoted_sqft:,.0f} SF had a ceiling type our extraction "
+                f"could NOT confirm from an RCP or finish schedule (marked "
+                f"assumed). Per our hard-numbers policy these default to ACT / "
                 f"not-painted (ACT tile is not field-painted) pending "
                 f"confirmation. Ceiling type is the single largest swing item on "
                 f"this bid. If the RCP or finish schedule confirms painted GYP "

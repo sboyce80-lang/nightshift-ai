@@ -1,11 +1,12 @@
 """Regression tests for the Beloit-round-2 scope-gate sub-fixes, all run inside
 _enforce_ceiling_scope_gate and each independently flag-gated (default OFF):
 
-  (1b) NIGHTSHIFT_COMMERCIAL_CEILING_GYP_GATE — a commercial room ceiling
-       asserted as painted GYP with no soffit/feature evidence is the extractor's
-       default when the RCP/finish-schedule ceiling type is unreadable; in
-       commercial/healthcare space that is predominantly ACT. Demote to
-       not-painted + RFI (Beloit clinic: 3,518 SF asserted GYP vs ~500 real).
+  (1b) NIGHTSHIFT_COMMERCIAL_CEILING_GYP_GATE — PROVENANCE-BASED: demote a
+       commercial painted ceiling only when the extractor marked its material
+       "(assumed)" (type not confirmed by RCP/finish schedule). Unmarked ceilings
+       are left alone (fail-safe on pre-marker data). Redesign after a 32-job
+       sweep showed the earlier keyword whitelist over-demoted real GYP on
+       Honey (1,029->0), TSC (~1,596->192) and Dutchess (2,061->1,084).
   (1c) NIGHTSHIFT_STAIR_FINISH_GATE — stair/stairwell rooms extracted with paint
        scope (walls/ceiling/gyp-between/sections) are zeroed unless a note
        confirms the stair is finished (Beloit: two in-scope "Stair" rooms).
@@ -70,48 +71,57 @@ def _reset(a):
 
 
 # ---------------------------------------------------------------------------
-# (1b) Commercial GYP-without-evidence demote
+# (1b) Commercial unconfirmed-ceiling demote — PROVENANCE-BASED.
+# Only ceilings the extractor marked "(assumed)" are demoted; an unmarked
+# (confirmed) ceiling is left alone. This is the redesign after the 32-job sweep
+# showed the earlier keyword whitelist over-demoted real GYP on Honey/TSC/Dutchess.
 # ---------------------------------------------------------------------------
-# Beloit shape: many clinic rooms asserted painted GYP, one genuine feature.
 a = _an("commercial", [
-    _room("Waiting", 875),
-    _room("Check In/Out", 375),
-    _room("Consult", 120),
-    _room("Priv 5 Office", 180),
-    _room("Dr. Gold Design Feature", 300),      # feature -> KEEP
-    _room("Corridor Soffit", 200,
-          elements={"soffit_sqft": 120}),        # soffit callout -> KEEP
+    _room("Waiting", 875, ceiling="GYP (assumed)"),   # assumed -> demote
+    _room("Priv 5 Office", 180, ceiling="GYP (assumed)"),  # assumed -> demote
+    _room("Dr. Gold Design Feature", 300, ceiling="GYP"),  # confirmed -> KEEP
+    _room("Exam", 200, ceiling="GYP"),                # confirmed (unmarked) -> KEEP
 ])
 T._enforce_ceiling_scope_gate(a)
 rooms = {r["room_name"]: r for r in a["floors"][0]["rooms"]}
 check(rooms["Waiting"]["materials"]["ceiling_painted"] is False,
-      "1b: bare-GYP clinic room not demoted")
+      "1b: assumed-GYP room not demoted")
 check(rooms["Waiting"]["dimensions"]["ceiling_area_sqft"] == 0,
       "1b: demoted ceiling area not zeroed")
 check(rooms["Dr. Gold Design Feature"]["materials"]["ceiling_painted"] is True,
-      "1b: design-feature GYP wrongly demoted")
-check(rooms["Corridor Soffit"]["materials"]["ceiling_painted"] is True,
-      "1b: soffit_sqft evidence room wrongly demoted")
+      "1b: confirmed GYP wrongly demoted")
+check(rooms["Exam"]["materials"]["ceiling_painted"] is True,
+      "1b: unmarked (confirmed) GYP wrongly demoted")
 got = a["aggregated_totals"]["total_paintable_ceiling_sqft"]
 check(abs(got - 500) < 1, f"1b: aggregate should be 300+200=500, got {got}")
-check(a["_ceiling_scope_gate"]["commercial_gyp_demoted"] == 4,
-      "1b: expected 4 rooms demoted")
-rfis = a.get("_pre_pricing_rfis", [])
-check(any(r["category"] == "Ceiling Scope" for r in rfis),
+check(a["_ceiling_scope_gate"]["commercial_gyp_demoted"] == 2,
+      "1b: expected 2 assumed rooms demoted")
+check(any(r["category"] == "Ceiling Scope"
+          for r in a.get("_pre_pricing_rfis", [])),
       "1b: no Ceiling Scope RFI queued")
 
-# 1b guard: residential is exempt (no demotion, aggregate preserved).
-a = _an("mixed-use residential", [_room("Apt Living", 1000)], agg={
-    "total_paintable_ceiling_sqft": 34682})
+# 1b FAIL-SAFE: a commercial job with only unmarked ceilings is a strict no-op
+# (this is what protects every extraction predating the marker).
+a = _an("commercial", [_room("Sales", 1500, ceiling="GYP"),
+                       _room("Back", 726, ceiling="GYP")])
+T._enforce_ceiling_scope_gate(a)
+check(a["_ceiling_scope_gate"].get("commercial_gyp_demoted", 0) == 0,
+      "1b: unmarked ceilings must not be demoted (fail-safe)")
+check(a["aggregated_totals"]["total_paintable_ceiling_sqft"] == 2226,
+      "1b: unmarked aggregate must be preserved")
+
+# 1b guard: residential is exempt even when marked assumed.
+a = _an("mixed-use residential", [_room("Apt Living", 1000,
+        ceiling="GYP (assumed)")], agg={"total_paintable_ceiling_sqft": 34682})
 T._enforce_ceiling_scope_gate(a)
 check(a["aggregated_totals"]["total_paintable_ceiling_sqft"] == 34682,
       "1b: residential aggregate must be preserved")
 check(a["floors"][0]["rooms"][0]["materials"]["ceiling_painted"] is True,
       "1b: residential ceiling wrongly demoted")
 
-# 1b guard: flag off -> no demotion.
+# 1b guard: flag off -> no demotion even when marked assumed.
 os.environ["NIGHTSHIFT_COMMERCIAL_CEILING_GYP_GATE"] = "0"
-a = _an("commercial", [_room("Waiting", 875)])
+a = _an("commercial", [_room("Waiting", 875, ceiling="GYP (assumed)")])
 T._enforce_ceiling_scope_gate(a)
 check(a["floors"][0]["rooms"][0]["materials"]["ceiling_painted"] is True,
       "1b: flag-off should not demote")
@@ -199,7 +209,10 @@ check(not any(r["category"] == "Wallcovering"
 os.environ["NIGHTSHIFT_WALLCOVERING_RFI"] = "1"
 
 # ---------------------------------------------------------------------------
-# Real saved Beloit prod JSON (when present) — the live run values.
+# Real saved Beloit prod JSON (when present). It predates the "(assumed)"
+# marker, so the provenance ceiling gate is correctly INERT here (fail-safe) —
+# only the stair gate and wallcovering RFI act. End-to-end 3,518 -> ~300
+# validation requires a re-run that emits the marker.
 # ---------------------------------------------------------------------------
 for p in ("/tmp/results_json/Beloit.json",
           os.path.expanduser(
@@ -210,13 +223,14 @@ for p in ("/tmp/results_json/Beloit.json",
     _reset(an)
     T._enforce_ceiling_scope_gate(an)
     agg = an["aggregated_totals"]
-    check(abs(T._num(agg.get("total_paintable_ceiling_sqft", 0)) - 300) <= 5,
-          f"Beloit prod: ceiling expected ~300, got "
-          f"{agg.get('total_paintable_ceiling_sqft')}")
+    rec = an.get("_ceiling_scope_gate", {})
+    check(rec.get("commercial_gyp_demoted", 0) == 0,
+          "Beloit prod: ceiling gate must be inert on pre-marker data "
+          f"(got {rec.get('commercial_gyp_demoted')})")
     check(T._num(agg.get("total_gyp_between_stairs_sqft", 0)) == 0,
-          "Beloit prod: gyp-between not zeroed")
+          "Beloit prod: gyp-between not zeroed by stair gate")
     check(T._num(agg.get("total_stair_sections", 0)) == 0,
-          "Beloit prod: stair sections not zeroed")
+          "Beloit prod: stair sections not zeroed by stair gate")
     check(any(r["category"] == "Wallcovering"
               for r in an.get("_pre_pricing_rfis", [])),
           "Beloit prod: no wallcovering RFI")
