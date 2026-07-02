@@ -13414,12 +13414,19 @@ def _enforce_ceiling_scope_gate(analysis):
                     f"scope note) and we will price it.")
 
     # (2) Commercial-only aggregate rebuild from gated rooms (only-reduce).
+    # Only reconcile when there IS a room set to reconcile against: an analysis
+    # with zero in-scope rooms (degraded extraction, aggregate-only merge,
+    # synthetic pricing input) would otherwise have its ceiling total clamped
+    # to 0 by a gate whose job is to sync the aggregate with the ROOMS. The
+    # Devine phantom case (rooms present but all unpainted) still clamps.
     if not is_residential:
         gated = 0.0
+        saw_in_scope_room = False
         for floor in analysis.get("floors", []) or []:
             for room in floor.get("rooms", []) or []:
                 if not room.get("in_scope", True):
                     continue
+                saw_in_scope_room = True
                 mats = room.get("materials") or {}
                 if not _as_bool(mats.get("ceiling_painted")):
                     continue
@@ -13432,7 +13439,7 @@ def _enforce_ceiling_scope_gate(analysis):
         agg = analysis.setdefault("aggregated_totals", {})
         prev = _num(agg.get("total_paintable_ceiling_sqft", 0))
         gated = round(gated, 2)
-        if gated < prev:
+        if saw_in_scope_room and gated < prev:
             agg["total_paintable_ceiling_sqft"] = gated
             record["commercial_aggregate_rebuilt"] = {"from": prev, "to": gated}
 
