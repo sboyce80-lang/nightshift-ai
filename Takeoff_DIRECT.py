@@ -9300,6 +9300,12 @@ def _apply_schedule_overrides(combined):
     agg = combined.get("aggregated_totals", {})
     pi = combined.get("project_info", {})
     overrides_applied = []
+    # Keys this function sets authoritatively from schedule data. Their final
+    # values are stashed on the analysis so _recalculate_totals can re-assert
+    # them after any later re-aggregation from room data (see
+    # _reassert_schedule_counts) — otherwise a downstream recalc silently
+    # restores the room-summed counts the schedule replaced.
+    authoritative_keys = set()
 
     # --- Building multiplier for schedule overrides ---
     # When schedule data comes from ONE building but the project has N identical buildings,
@@ -9331,6 +9337,9 @@ def _apply_schedule_overrides(combined):
         agg["total_doors_full_paint"] = sched_doors_fp
         agg["total_doors_hm_panel"] = sched_doors_hm
         agg["total_doors_frame_only"] = sched_doors_frame
+        authoritative_keys.update((
+            "total_doors_full_paint", "total_doors_hm_panel",
+            "total_doors_frame_only"))
 
         # Safety check: for commercial buildings, if the schedule says 0 HM doors
         # but room-level extraction found significant HM doors, the schedule may
@@ -9504,6 +9513,7 @@ def _apply_schedule_overrides(combined):
                                   f"interior rooms)")
 
                 agg["total_doors_full_paint"] = adjusted_fp
+                authoritative_keys.add("total_doors_full_paint")
                 overrides_applied.append(
                     f"Storefront door filter: removed {sf_count} storefront marks "
                     f"({', '.join(sf_filtered[:8])}{'...' if len(sf_filtered) > 8 else ''}) "
@@ -9527,6 +9537,8 @@ def _apply_schedule_overrides(combined):
         # (they're factory-finished, vinyl, etc.)
         agg["total_windows_painted_interior"] = sched_win_painted
         agg["total_windows_all"] = max(sched_win_total, room_win_total)
+        authoritative_keys.update((
+            "total_windows_painted_interior", "total_windows_all"))
         overrides_applied.append(
             f"Windows SET by schedule: {sched_win_painted:.0f} painted interior"
             f" out of {sched_win_total:.0f} total"
@@ -9544,6 +9556,7 @@ def _apply_schedule_overrides(combined):
         room_win_painted = _num(agg.get("total_windows_painted_interior", 0))
         if room_win_painted > 0:
             agg["total_windows_painted_interior"] = 0
+            authoritative_keys.add("total_windows_painted_interior")
             overrides_applied.append(
                 f"Windows ZEROED by schedule: schedule found but reports 0 total windows "
                 f"(all aluminum/factory-finished). Removed {room_win_painted:.0f} phantom "
@@ -9595,6 +9608,7 @@ def _apply_schedule_overrides(combined):
 
     if sched_stairs > room_stairs:
         agg["total_stair_sections"] = sched_stairs
+        authoritative_keys.add("total_stair_sections")
         overrides_applied.append(
             f"Stairs overridden by schedule/details: {sched_stairs:.0f} sections"
             f" (room-level had {room_stairs:.0f})"
@@ -9688,7 +9702,51 @@ def _apply_schedule_overrides(combined):
             print(f"   • {note}")
 
     combined["aggregated_totals"] = agg
+
+    # Stash the final schedule-authoritative values (after every in-function
+    # adjustment: commercial HM safety check, residential supplement, storefront
+    # filter). _recalculate_totals re-asserts these after re-summing from room
+    # data — the 2026-07-01 Purdy Ave run had the cross-sheet height back-fill's
+    # recalc silently revert full-paint doors 14 -> 136 because the override
+    # lived only in aggregated_totals.
+    if authoritative_keys:
+        combined["_schedule_authoritative_counts"] = {
+            k: _num(agg.get(k, 0)) for k in sorted(authoritative_keys)
+        }
     return combined
+
+
+def _schedule_persist_enabled():
+    """Kill switch for re-asserting schedule counts after re-aggregation."""
+    return os.environ.get(
+        "NIGHTSHIFT_SCHEDULE_OVERRIDE_PERSIST", "1").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _reassert_schedule_counts(analysis):
+    """Re-apply schedule-authoritative counts after a room-data re-aggregation.
+
+    _apply_schedule_overrides writes authoritative door/window/stair counts
+    into aggregated_totals only (room-level data is left as extracted, since
+    the schedule can't say WHICH room's doors are wrong). Any later
+    _recalculate_totals re-sums from rooms and would silently restore the
+    room-summed counts. Downstream stages that legitimately change these
+    counts (_reconcile_door_schedule_scope, _apply_commercial_window_exclusion)
+    update the stash so their corrections persist too.
+    """
+    stash = analysis.get("_schedule_authoritative_counts") or {}
+    if not stash:
+        return
+    agg = analysis.get("aggregated_totals") or {}
+    changed = []
+    for k, v in stash.items():
+        cur = _num(agg.get(k, 0))
+        if cur != v:
+            agg[k] = v
+            changed.append(f"{k}: {cur:g} → {v:g}")
+    if changed:
+        print("   🔒 Schedule counts re-asserted after re-aggregation: "
+              + "; ".join(changed))
 
 
 def _detect_unit_mix(analysis):
@@ -13511,6 +13569,13 @@ def _reconcile_door_schedule_scope(analysis):
     if ds:
         ds["total_doors_full_paint"] = cur_fp
         ds["total_doors_hm_panel"] = cur_hm
+    # Keep the authoritative stash in sync so a later _recalculate_totals
+    # re-asserts the reconciled values, not the pre-reconciliation ones.
+    stash = analysis.get("_schedule_authoritative_counts")
+    if stash:
+        for k in ("total_doors_full_paint", "total_doors_hm_panel"):
+            if k in stash:
+                stash[k] = _num(agg.get(k, 0))
 
     note_bits = []
     if "leaf_count" in record:
@@ -14461,6 +14526,14 @@ def _recalculate_totals(analysis):
         "total_precast_interior_sqft": total_precast_interior,
     }
 
+    # Schedule counts are AUTHORITATIVE and must survive re-aggregation. The
+    # room sums above restore extraction-level door/window counts that
+    # _apply_schedule_overrides already replaced (Purdy Ave 2026-07-01: the
+    # cross-sheet height back-fill's recalc reverted full-paint doors 14→136,
+    # ~$18k over). Flag-gated kill switch, default ON.
+    if _schedule_persist_enabled():
+        _reassert_schedule_counts(analysis)
+
     # --- Hard-numbers base-trim suppression summary + RFI flag ---
     if _bt_suppressed_rooms:
         analysis["_hard_numbers_base_trim_suppressed"] = {
@@ -14695,6 +14768,12 @@ def _apply_commercial_window_exclusion(analysis):
         )
         agg["total_windows_painted_interior"] = 0
         analysis["aggregated_totals"] = agg
+        # Keep the authoritative stash in sync — otherwise a later
+        # _recalculate_totals would re-assert the schedule's painted-window
+        # count and resurrect the sashes this exclusion just zeroed.
+        stash = analysis.get("_schedule_authoritative_counts")
+        if stash and "total_windows_painted_interior" in stash:
+            stash["total_windows_painted_interior"] = 0
         # Also zero at room level for consistency (sashes only)
         for floor in analysis.get("floors", []):
             for room in floor.get("rooms", []):
