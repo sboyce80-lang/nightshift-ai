@@ -12795,6 +12795,13 @@ def _dedupe_small_commercial_floors(analysis):
         print(f"   🪞 {note}")
 
 
+def _blank_type_dedup_enabled():
+    """Kill switch for cross-sheet dedup on blank building_type (4d fix)."""
+    return os.environ.get(
+        "NIGHTSHIFT_BLANK_TYPE_DEDUP", "1").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
 def _dedupe_cross_sheet_rooms(analysis):
     """Count each room ONCE when the same room is extracted from multiple sheets
     (floor plan + fixture plan + RCP + code plan).
@@ -12848,6 +12855,7 @@ def _dedupe_cross_sheet_rooms(analysis):
         return
 
     unit_mode = False
+    unknown_type = False
     if is_commercial:
         # Hard guard: a single repeated/template unit means this isn't a
         # simple single-tenant box — bail rather than risk merging repeats.
@@ -12859,7 +12867,15 @@ def _dedupe_cross_sheet_rooms(analysis):
     elif is_residentialish:
         unit_mode = True
     else:
-        return  # unknown building type — leave alone
+        # 4d (June review): a blank/unknown building_type used to bail out
+        # entirely, leaving floor-plan + RCP duplicates fully double-counted
+        # on exactly the jobs where extraction context was weakest. Infer
+        # the mode from the analysis's own unit signals instead — resolved
+        # below, once the unit-token helper exists. Kill switch
+        # NIGHTSHIFT_BLANK_TYPE_DEDUP (default ON) restores the old bail.
+        if not _blank_type_dedup_enabled():
+            return
+        unknown_type = True
 
     import collections
 
@@ -12878,6 +12894,20 @@ def _dedupe_cross_sheet_rooms(analysis):
             if m:
                 return m.group(1).lower()
         return None
+
+    if unknown_type:
+        # Blank/unknown building_type: infer the dedup mode from the
+        # analysis's own unit signals. Any multi-unit signal → residential
+        # unit-identity rules, which only merge rooms sharing a floor + unit
+        # token + name and never touch token-less rooms (safe on template
+        # units). No signals → single-tenant name-identity rules, the same
+        # shape the commercial path allows only after its multi-unit hard
+        # guards — which these jobs pass by construction.
+        unit_mode = (
+            _num(pi.get("total_units", 0)) > 1
+            or any(_extract_multiplier_from_notes(r) > 1
+                   or _num(r.get("unit_multiplier", 1)) > 1 for r in rooms)
+            or any(_unit_token(r) for r in rooms))
 
     _FILLER_WORDS = {"type", "room", "rm", "the", "s", "of", "and"}
 
