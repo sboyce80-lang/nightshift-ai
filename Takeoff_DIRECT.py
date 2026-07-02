@@ -3183,6 +3183,24 @@ def _small_commercial_fix_enabled():
         "1", "true", "True")
 
 
+def _apt_cap_boost_guard_enabled():
+    """Suppress the multi-family wall/ceiling area caps when a perimeter or wall
+    boost fired this run. The caps (footprint x stories x 3.0, and units x 3,000)
+    exist to catch LLM phantom-floor DUPLICATION — an OVER-extraction guard. But a
+    boost only fires when aggregation detected UNDER-extraction (extracted total <
+    measured-perimeter cross-check), the opposite regime, and phantom-floor
+    over-extraction can never trigger a boost. So when a boost fired the caps are
+    provably firing backwards: they slash a legitimately-boosted, geometry-grounded
+    total. On 364 Main the footprint cap cut walls 113,560 -> 31,416 and ceilings
+    24,949 -> 10,472, yet Rider's manual takeoff measured 113,616 wall SF — the
+    boost (113,560) was essentially exact. The boost is itself bounded to 1.30x the
+    per-room sum (MAX_BOOST_FACTOR), so trusting it needs no additional cap. This
+    guard suppresses BOTH caps when a boost fired. Default OFF; fail-safe (only ever
+    raises the priced quantity, never lowers it) and idempotent."""
+    return os.environ.get("NIGHTSHIFT_APT_CAP_BOOST_GUARD", "0").strip() in (
+        "1", "true", "True")
+
+
 def _title_text_is_plan_sheet(raw_text):
     """Classify a page as a plan sheet from its (title-block) text.
 
@@ -13010,6 +13028,37 @@ def _ceiling_scope_gate_enabled():
         "1", "true", "True")
 
 
+def _commercial_gyp_ceiling_gate_enabled():
+    # Default OFF pending validation: materially changes the ceiling number by
+    # demoting commercial GYP ceilings that carry no soffit/feature evidence to
+    # ACT/not-painted (Beloit clinic: 3,518 SF of clinic-room ceilings asserted
+    # GYP vs ~500 SF real). Only-reduce, commercial-only, and every demoted room
+    # is surfaced in an RFI so a genuine painted GYP ceiling can be restored.
+    return os.environ.get(
+        "NIGHTSHIFT_COMMERCIAL_CEILING_GYP_GATE", "0").strip() in (
+        "1", "true", "True")
+
+
+def _stair_finish_gate_enabled():
+    # Default OFF pending validation: zeroes stair/stairwell room paint scope
+    # (walls, ceiling, gyp-between-stairs, stair sections) on commercial jobs
+    # unless the drawings confirm the stair is a finished/painted scope. Beloit:
+    # two in-scope "Stair" rooms carried 480 SF ceiling + 1,116 SF wall + 640 SF
+    # gyp-between + 3 sections that the estimator did not read as finished.
+    return os.environ.get("NIGHTSHIFT_STAIR_FINISH_GATE", "0").strip() in (
+        "1", "true", "True")
+
+
+def _wallcovering_rfi_enabled():
+    # Default OFF pending validation: when a WC-x wallcovering code appears in
+    # the drawings/notes but no wallcovering area was quantified (total = 0),
+    # promote a dedicated RFI so the miss is visible instead of buried in notes.
+    # Beloit: WC-1 was noted on A120 ("extent cannot be determined — RFI
+    # required") yet no formal RFI line surfaced it.
+    return os.environ.get("NIGHTSHIFT_WALLCOVERING_RFI", "0").strip() in (
+        "1", "true", "True")
+
+
 # Ceiling materials that are never field-painted, regardless of any extracted
 # or merge-OR'd ceiling_painted flag. A paint trigger (gyp/dryfall/etc.) on the
 # same room overrides the demotion (e.g. "GYP below ACT soffit").
@@ -13017,6 +13066,37 @@ _ACT_CEILING_KEYWORDS = (
     "act", "acoustic", "lay-in", "lay in", "drop ceiling", "suspended")
 _CEILING_PAINT_TRIGGER_KEYWORDS = (
     "gyp", "gwb", "gypsum", "drywall", "plaster", "dryfall")
+
+# Positive evidence that a commercial room ceiling is a genuinely painted
+# gypsum/hard-lid surface (not the extractor's default when the RCP/finish
+# schedule ceiling type is unreadable). Any of these keeps ceiling_painted.
+_GYP_CEILING_EVIDENCE_KEYWORDS = (
+    "soffit", "bulkhead", "bulk head", "design feature", "feature ceiling",
+    "gyp ceiling", "gwb ceiling", "gyp clg", "gwb clg", "hard lid",
+    "hard ceiling", "hard-lid", "canopy", "cloud", "coffer", "drop soffit")
+
+# Room-name signals for a stair enclosure.
+_STAIR_ROOM_KEYWORDS = ("stair", "stairwell", "stair tower", "egress stair")
+
+# Room-note signals that a stair IS a finished, field-painted scope (overrides
+# the stair-finish gate demotion).
+_STAIR_FINISHED_KEYWORDS = (
+    "finished stair", "painted stair", "stair painted", "stair is finished",
+    "stair to be painted", "confirmed painted")
+
+
+def _gate_add_rfi(analysis, category, question):
+    """Queue a pre-pricing RFI from inside the scope gate. These are merged into
+    the customer-facing rfi_items list after pricing (see the _pre_pricing_rfis
+    consumers). De-duplicated by (category, question)."""
+    if not isinstance(analysis, dict):
+        return
+    bucket = analysis.setdefault("_pre_pricing_rfis", [])
+    for r in bucket:
+        if isinstance(r, dict) and r.get("category") == category and \
+                r.get("question") == question:
+            return
+    bucket.append({"category": category, "question": question})
 
 
 def _enforce_ceiling_scope_gate(analysis):
@@ -13044,7 +13124,16 @@ def _enforce_ceiling_scope_gate(analysis):
         residential-ceiling-floor + secondary-space supplements survive (364
         Main's GSF-based floor must not regress).
 
-    Flag-gated via NIGHTSHIFT_CEILING_SCOPE_GATE (default off). Idempotent via
+    Three further sub-gates run here (each independently flag-gated, all default
+    OFF pending validation, all commercial-only where noted, all only-reduce):
+    (1b) NIGHTSHIFT_COMMERCIAL_CEILING_GYP_GATE — demote painted-GYP ceilings
+         with no soffit/feature evidence to ACT/not-painted + RFI.
+    (1c) NIGHTSHIFT_STAIR_FINISH_GATE — zero stair-room paint scope unless a
+         note confirms the stair is finished + RFI.
+    (1d) NIGHTSHIFT_WALLCOVERING_RFI — promote a dedicated RFI when a WC-x code
+         is present but no wallcovering area was quantified.
+
+    Flag-gated via NIGHTSHIFT_CEILING_SCOPE_GATE (default ON). Idempotent via
     analysis['_ceiling_scope_gate'].
     """
     if not isinstance(analysis, dict) or not _ceiling_scope_gate_enabled():
@@ -13079,12 +13168,185 @@ def _enforce_ceiling_scope_gate(analysis):
     record = {"act_rooms_demoted": demoted,
               "act_sqft_removed": round(demoted_sqft, 2)}
 
-    # (2) Commercial-only aggregate rebuild from gated rooms (only-reduce).
     pi = analysis.get("project_info") or {}
     bt = str(pi.get("building_type", "")).lower()
     is_residential = any(kw in bt for kw in (
         "residential", "multifamily", "multi-family", "apartment", "condo",
         "dorm", "supportive", "senior", "assisted", "mixed-use", "mixed use"))
+
+    # (1b) COMMERCIAL GYP-without-evidence demote — flag-gated, commercial only.
+    # A room ceiling asserted as painted GYP is only kept when positive GYP
+    # evidence exists (soffit/bulkhead/feature/hard-lid keyword or a soffit_sqft
+    # callout). Bare "GYP" with no evidence is what the extractor emits when the
+    # RCP/finish-schedule ceiling type is unreadable — which in commercial /
+    # healthcare space is predominantly ACT (Beloit: 3,518 SF of clinic-room
+    # ceilings asserted GYP vs ~500 SF real). Runs BEFORE the (2) aggregate
+    # rebuild so the demotions flow into the rebuilt total automatically. Every
+    # demoted room is listed in an RFI so a genuine painted GYP ceiling can be
+    # restored. Hard-numbers policy: unconfirmed ceiling type -> 0 + RFI.
+    if _commercial_gyp_ceiling_gate_enabled() and not is_residential:
+        gyp_demoted = 0
+        gyp_demoted_sqft = 0.0
+        gyp_rooms = []
+        for floor in analysis.get("floors", []) or []:
+            for room in floor.get("rooms", []) or []:
+                if not room.get("in_scope", True):
+                    continue
+                mats = room.get("materials")
+                if not isinstance(mats, dict) or not _as_bool(
+                        mats.get("ceiling_painted")):
+                    continue
+                ceil_mat = str(mats.get("ceiling", "")).lower()
+                if "dryfall" in ceil_mat:
+                    continue  # tracked in total_dryfall_ceiling_sqft
+                elems = room.get("elements") or {}
+                haystack = " ".join([
+                    str(room.get("room_name", "")),
+                    str(room.get("notes", "")),
+                    ceil_mat,
+                ]).lower()
+                has_evidence = (
+                    _num(elems.get("soffit_sqft", 0)) > 0
+                    or any(k in haystack
+                           for k in _GYP_CEILING_EVIDENCE_KEYWORDS))
+                if has_evidence:
+                    continue
+                mats["ceiling_painted"] = False
+                dims = room.setdefault("dimensions", {})
+                gyp_demoted_sqft += _num(dims.get("ceiling_area_sqft", 0))
+                dims["ceiling_area_sqft"] = 0
+                gyp_demoted += 1
+                gyp_rooms.append(
+                    str(room.get("room_name", "") or room.get("room_id", "")))
+                note = str(room.get("notes", ""))
+                if "[GYP ceiling unconfirmed" not in note:
+                    room["notes"] = (
+                        note + " [GYP ceiling unconfirmed — commercial scope "
+                        "gate; no soffit/feature evidence, defaulted to ACT / "
+                        "not-painted; confirm ceiling type (RFI)]").strip()
+        if gyp_demoted:
+            record["commercial_gyp_demoted"] = gyp_demoted
+            record["commercial_gyp_sqft_removed"] = round(gyp_demoted_sqft, 2)
+            _gate_add_rfi(
+                analysis, "Ceiling Scope",
+                f"{gyp_demoted} commercial room ceiling(s) totaling "
+                f"{gyp_demoted_sqft:,.0f} SF were extracted as painted gypsum "
+                f"with no soffit/feature evidence on the drawings — the extractor "
+                f"default when the RCP/finish-schedule ceiling type is not "
+                f"legible. Per our hard-numbers policy these default to ACT / "
+                f"not-painted (ACT tile is not field-painted) pending "
+                f"confirmation. Ceiling type is the single largest swing item on "
+                f"this bid. If the RCP or finish schedule confirms painted GYP "
+                f"for any of these rooms ({', '.join(gyp_rooms[:8])}"
+                f"{'…' if len(gyp_rooms) > 8 else ''}), advise and we will "
+                f"restore them.")
+
+    # (1c) STAIR finish gate — flag-gated, commercial only. Stair/stairwell
+    # rooms extracted with paint scope (walls, ceiling, gyp-between-stairs, stair
+    # sections) are zeroed unless a room note confirms the stair is a finished /
+    # field-painted scope. Beloit: two in-scope "Stair" rooms carried finished
+    # scope the estimator did not read from the plans. Runs BEFORE (2) so the
+    # zeroed stair ceilings flow into the rebuilt ceiling total automatically.
+    if _stair_finish_gate_enabled() and not is_residential:
+        stair_demoted = 0
+        removed = {"wall": 0.0, "ceiling": 0.0, "gyp_between": 0.0,
+                   "sections": 0.0}
+        stair_rooms = []
+        for floor in analysis.get("floors", []) or []:
+            for room in floor.get("rooms", []) or []:
+                if not room.get("in_scope", True):
+                    continue
+                rname = str(room.get("room_name", "")).lower()
+                if not any(k in rname for k in _STAIR_ROOM_KEYWORDS):
+                    continue
+                note = str(room.get("notes", "")).lower()
+                if any(k in note for k in _STAIR_FINISHED_KEYWORDS):
+                    continue
+                mats = room.setdefault("materials", {})
+                dims = room.setdefault("dimensions", {})
+                elems = room.setdefault("elements", {})
+                mult = _extract_multiplier_from_notes(room)
+                wall_mat = str(mats.get("walls", "")).lower()
+                wall_sqft = _num(dims.get("wall_area_sqft", 0))
+                if wall_sqft > 0 and any(
+                        k in wall_mat for k in
+                        ("gyp", "gwb", "gypsum", "paint", "plaster")):
+                    removed["wall"] += wall_sqft * mult
+                    dims["wall_area_sqft"] = 0
+                if _as_bool(mats.get("ceiling_painted")):
+                    removed["ceiling"] += _num(
+                        dims.get("ceiling_area_sqft", 0)) * mult
+                    dims["ceiling_area_sqft"] = 0
+                    mats["ceiling_painted"] = False
+                gyp_btwn = _num(elems.get("gyp_between_stairs_sqft", 0))
+                if gyp_btwn > 0:
+                    removed["gyp_between"] += gyp_btwn * mult
+                    elems["gyp_between_stairs_sqft"] = 0
+                secs = _num(elems.get("stair_sections", 0))
+                if secs > 0:
+                    removed["sections"] += secs * mult
+                    elems["stair_sections"] = 0
+                stair_demoted += 1
+                stair_rooms.append(
+                    str(room.get("room_name", "") or room.get("room_id", "")))
+                n = str(room.get("notes", ""))
+                if "[Stair finish unconfirmed" not in n:
+                    room["notes"] = (
+                        n + " [Stair finish unconfirmed — scope gate; stair "
+                        "walls/ceiling/gyp-between/sections set to 0 pending "
+                        "confirmation the stair is a finished/painted scope "
+                        "(RFI)]").strip()
+        if stair_demoted:
+            agg = analysis.setdefault("aggregated_totals", {})
+            if removed["wall"]:
+                agg["total_paintable_wall_sqft"] = max(0, _num(
+                    agg.get("total_paintable_wall_sqft", 0))
+                    - round(removed["wall"], 2))
+            if removed["gyp_between"]:
+                agg["total_gyp_between_stairs_sqft"] = max(0, _num(
+                    agg.get("total_gyp_between_stairs_sqft", 0))
+                    - round(removed["gyp_between"], 2))
+            if removed["sections"]:
+                agg["total_stair_sections"] = max(0, _num(
+                    agg.get("total_stair_sections", 0)) - removed["sections"])
+            record["stair_rooms_demoted"] = stair_demoted
+            record["stair_removed"] = {k: round(v, 2) for k, v in
+                                       removed.items()}
+            _gate_add_rfi(
+                analysis, "Stair Scope",
+                f"{stair_demoted} stair/stairwell room(s) "
+                f"({', '.join(stair_rooms[:6])}) were extracted with finished "
+                f"paint scope (walls / ceiling / gyp between stairs / stair "
+                f"sections). The drawings do not confirm these stairs are a "
+                f"finished, field-painted scope, so they were set to 0 pending "
+                f"confirmation. If any stair is in the painting scope, advise "
+                f"and we will restore it.")
+
+    # (1d) WALLCOVERING RFI — flag-gated. When a WC-x code appears in the
+    # drawings/notes but no wallcovering area was quantified, promote a dedicated
+    # RFI so the miss is visible (Beloit: WC-1 noted on A120, total = 0, but no
+    # formal RFI surfaced it). Never fabricates area (hard-numbers policy).
+    if _wallcovering_rfi_enabled():
+        agg = analysis.get("aggregated_totals") or {}
+        if _num(agg.get("total_wallcovering_sqft", 0)) <= 0:
+            blob = " ".join(str(n) for n in (analysis.get("notes") or []))
+            for floor in analysis.get("floors", []) or []:
+                for room in floor.get("rooms", []) or []:
+                    blob += " " + str(room.get("notes", ""))
+            codes = sorted(set(re.findall(r'[Ww][Cc]-?\d+', blob)))
+            if codes:
+                record["wallcovering_codes_unquantified"] = codes
+                _gate_add_rfi(
+                    analysis, "Wallcovering",
+                    f"Wallcovering finish code(s) {', '.join(codes[:6])} were "
+                    f"identified in the drawings/notes but no wallcovering area "
+                    f"could be quantified (no finish-schedule mapping of WC to "
+                    f"specific rooms/walls with dimensions), so wallcovering is "
+                    f"$0 in this bid. Provide the rooms/walls receiving "
+                    f"wallcovering and their extent (or add it to the project "
+                    f"scope note) and we will price it.")
+
+    # (2) Commercial-only aggregate rebuild from gated rooms (only-reduce).
     if not is_residential:
         gated = 0.0
         for floor in analysis.get("floors", []) or []:
@@ -15892,7 +16154,24 @@ def _apply_rate_overrides(rate_overrides):
         # Resolve to PRICING_MODEL key
         pm_key = _rate_map.get(key, key)  # try shorthand first, else use key directly
         if pm_key in pm:
-            new_rate = float(val)
+            # A blank / zero / non-numeric rate override means "not specified" —
+            # a left-blank Pricing-tab field or an org profile with no negotiated
+            # rate coerces to 0, and a $0 paint rate is never a real price. Treat
+            # it as "leave the catalog default in place" rather than zeroing the
+            # whole line (Beloit Clinic 2026-06: a 0 door_rate zeroed 36 doors at
+            # $0 and silently dropped ~$5k from the bid). Scope is suppressed by
+            # zeroing the QUANTITY, never the rate.
+            try:
+                new_rate = float(val)
+            except (TypeError, ValueError):
+                print(f"   ⚠️  Ignoring non-numeric rate override "
+                      f"{key}={val!r} — keeping catalog default for {pm_key}.")
+                continue
+            if new_rate <= 0:
+                print(f"   ⚠️  Ignoring rate override {key}={val!r} (<= 0) — "
+                      f"keeping catalog default for {pm_key}. To remove this "
+                      f"scope, set the quantity to 0, not the rate.")
+                continue
             for tier in pm[pm_key]["tiers"]:
                 tier["rate"] = new_rate
             # Record explicit org overrides so calculate_costs' building-type
@@ -16344,14 +16623,31 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
 
     # If any exterior scope exists, require exterior lift (unless single-family ≤3 stories)
     # Cornice work on 2+ story buildings requires a lift — ladders only suffice at residential scale.
+    # Complete list of priced exterior quantities (painted_railing is excluded —
+    # it is frequently interior stair railing, as on the Beloit Clinic reno).
+    # Stain quantities are resolved into locals further down; read them straight
+    # from the exterior dict here so the lift check doesn't depend on ordering.
     has_any_ext = (
         ext_paint_sqft > 0 or hardie_sqft > 0 or azek_lf > 0 or cornice_lf > 0
+        or window_trim_lf > 0 or corner_lf > 0 or steel_lintel_lf_ext > 0
+        or _num(exterior.get('stain_siding_sqft', 0)) > 0
+        or _num(exterior.get('stain_trim_lf', 0)) > 0
+        or _num(exterior.get('stain_railing_lf', 0)) > 0
     )
     if has_any_ext and lift_needed == 0:
         # Single-family homes ≤3 stories use ladders, not lifts
         _sf_stories_ext = _num(project_info.get('total_stories', 0))
         if not (is_single_family and _sf_stories_ext <= 3) and _sf_stories_ext >= 2:
             lift_needed = 1
+
+    # An exterior lift is an exterior-only resource — never charge it when there
+    # is no exterior scope at all. The extractor sets lift_required=True on
+    # building height alone (3+ stories), which fired a phantom $8,000 exterior
+    # lift on interior-only renovations of tall buildings (Beloit Clinic
+    # 4th-floor reno, 2026-06: 5-story building, zero exterior paint scope).
+    # Interior lift needs are tracked separately via interior_lift_required.
+    if lift_needed and not has_any_ext:
+        lift_needed = 0
 
     pm = pricing_model_override if pricing_model_override else PRICING_MODEL
 
@@ -16510,17 +16806,39 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
         _cap_units = max(_total_units, _bi_units) if _bi_units > 0 else _total_units
         _wall_caps = []
         _ceil_caps = []
-        if _footprint > 0:
-            _wall_caps.append(round(_footprint * _stories_cap * 3.0))
-            _ceil_caps.append(round(_footprint * _stories_cap * 1.0))
-        if _cap_units >= 4:
-            # 3,000 SF walls per unit + 50% of footprint for commercial/basement floors
-            # Calibrated: Fishkill manual 43,003 walls / 12 units = 3,584/unit;
-            # using 3,000 as cap allows for unit count over-estimation by building inventory.
-            _extra_floors = max(0, _stories_cap - 2)  # floors beyond 2 residential
-            _unit_wall_cap = round(_cap_units * 3000 + _extra_floors * _footprint * 0.5) if _footprint > 0 else round(_cap_units * 3300)
-            _wall_caps.append(_unit_wall_cap)
-            _ceil_caps.append(round(_cap_units * 1100))
+        # A perimeter/wall boost this run means aggregation detected UNDER-extraction
+        # (extracted < measured-perimeter cross-check). Phantom-floor over-extraction —
+        # the case these caps defend against — can never trigger a boost, so when a
+        # boost fired the caps are provably firing backwards and would slash a
+        # geometry-grounded total. The boost is already bounded to 1.30x, so suppress
+        # BOTH caps and trust it. (364 Main: caps cut walls 113,560->31,416; Rider's
+        # manual takeoff measured 113,616 — the boost was essentially exact.)
+        _wall_boost_fired = False
+        try:
+            _notes_blob = " ".join(str(_n) for _n in (analysis.get('notes') or [])) if analysis else ""
+            _wall_boost_fired = ('[Perimeter Wall Boost]' in _notes_blob) or ('[Wall Boost]' in _notes_blob)
+        except Exception:
+            _wall_boost_fired = False
+        _suppress_caps = _apt_cap_boost_guard_enabled() and _wall_boost_fired
+        if not _suppress_caps:
+            if _footprint > 0:
+                _wall_caps.append(round(_footprint * _stories_cap * 3.0))
+                _ceil_caps.append(round(_footprint * _stories_cap * 1.0))
+            if _cap_units >= 4:
+                # 3,000 SF walls per unit + 50% of footprint for commercial/basement floors
+                # Calibrated: Fishkill manual 43,003 walls / 12 units = 3,584/unit;
+                # using 3,000 as cap allows for unit count over-estimation by building inventory.
+                _extra_floors = max(0, _stories_cap - 2)  # floors beyond 2 residential
+                _unit_wall_cap = round(_cap_units * 3000 + _extra_floors * _footprint * 0.5) if _footprint > 0 else round(_cap_units * 3300)
+                _wall_caps.append(_unit_wall_cap)
+                _ceil_caps.append(round(_cap_units * 1100))
+        elif analysis is not None:
+            analysis.setdefault("notes", []).append(
+                f"[Apt Cap Boost Guard] Multi-family wall/ceiling area caps suppressed "
+                f"because a perimeter/wall boost fired this run — extraction was under-counted, "
+                f"so the caps (footprint {_footprint:,.0f} SF x {_stories_cap:g} stories) would "
+                f"fire backwards and slash a boost that is already bounded to 1.30x. Pricing the "
+                f"boosted wall/ceiling totals directly.")
         if _wall_caps:
             _max_wall_sqft = min(_wall_caps)
             if wall_sqft > _max_wall_sqft:
