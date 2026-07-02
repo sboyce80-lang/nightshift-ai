@@ -13084,6 +13084,118 @@ def _ledger_stage(analysis, stage, before, source="assumed", basis=""):
     return after
 
 
+# Precedence rank for ledger sources. Higher outranks lower; equal-or-higher
+# later entries take over authority (a later correction supersedes an earlier
+# one). Note _ledger_stage records every REDUCTION as "correction", so a
+# schedule override that lowered a count carries rank 3 either way.
+_LEDGER_SOURCE_RANK = {
+    "correction": 3, "schedule": 3, "measured": 2, "derived": 1, "assumed": 0}
+
+
+def _ledger_enforce_enabled():
+    """Kill switch for ledger precedence enforcement (default ON)."""
+    return os.environ.get(
+        "NIGHTSHIFT_LEDGER_ENFORCE", "1").strip().lower() in (
+        "1", "true", "yes", "on")
+
+
+def _enforce_ledger_precedence(analysis):
+    """Promote the quantity ledger from observer to enforcer.
+
+    The pricing pipeline mutates aggregated_totals in ~10 sequential stages
+    with last-writer-wins semantics, which has produced the same defect class
+    three times (Devine ceiling phantom, 364 Main caps-after-boost, Purdy
+    door-schedule revert): a weaker-source stage overwrites a value an
+    authoritative stage already set. The ledger has recorded every one of
+    these conflicts — this replays it per key and re-asserts the last
+    authoritative (schedule/correction) value over any later derived/assumed
+    write that is still in effect.
+
+    Conservative by construction:
+    - Only acts when an authoritative (rank-3) entry exists for the key AND a
+      strictly weaker entry wrote it later AND the weaker value is what the
+      aggregate still holds. If the aggregate moved again outside the ledger,
+      it records a warning instead of fighting (observe, don't clobber).
+    - Reverted weaker entries are marked reverted_by_precedence so the
+      provenance breakdown in build_priced_takeoff no longer counts them as
+      live derived/assumed portions.
+    - Appends its own correction entry to the ledger, so the enforcement is
+      itself traceable. Idempotent: after enforcement the aggregate equals
+      the authoritative value and the weaker entries are marked, so a second
+      pass is a no-op.
+    """
+    if not isinstance(analysis, dict) or not _ledger_enforce_enabled():
+        return analysis
+    ledger = analysis.get("_quantity_adjustments") or []
+    agg = analysis.get("aggregated_totals")
+    if not ledger or not isinstance(agg, dict):
+        return analysis
+
+    auth = {}    # key -> {"rank", "to", "stage"} last equal-or-higher entry
+    weaker = {}  # key -> chronological weaker entries after the authority
+    for e in ledger:
+        if not isinstance(e, dict) or e.get("reverted_by_precedence"):
+            continue
+        k = e.get("item")
+        rank = _LEDGER_SOURCE_RANK.get(str(e.get("source")), 0)
+        a = auth.get(k)
+        if a is None or rank >= a["rank"]:
+            auth[k] = {"rank": rank, "to": e.get("to"), "stage": e.get("stage")}
+            weaker.pop(k, None)
+        elif a["rank"] >= 3:
+            weaker.setdefault(k, []).append(e)
+
+    enforced = []
+    for k, entries in weaker.items():
+        want = _num(auth[k]["to"])
+        cur = _num(agg.get(k, 0))
+        if abs(cur - want) < 0.5:
+            continue  # already authoritative
+        last = entries[-1]
+        if abs(cur - _num(last.get("to"))) >= 0.5:
+            # The aggregate moved again after the weaker write, outside the
+            # ledger — don't guess which value is right; surface it.
+            analysis.setdefault("_ledger_precedence_warnings", []).append({
+                "item": k,
+                "authoritative": {"stage": auth[k]["stage"], "value": want},
+                "weaker": {"stage": last.get("stage"),
+                           "value": _num(last.get("to"))},
+                "current": cur,
+                "action": "none — current value matches neither side",
+            })
+            continue
+        agg[k] = round(want, 2)
+        for e in entries:
+            e["reverted_by_precedence"] = True
+        ledger.append({
+            "stage": "ledger_precedence_enforce",
+            "item": k,
+            "from": round(cur, 2),
+            "to": round(want, 2),
+            "delta": round(want - cur, 2),
+            "source": "correction",
+            "basis": (f"re-asserted authoritative {auth[k]['stage']} value "
+                      f"over later {last.get('stage')} write"),
+        })
+        enforced.append({"item": k, "from": cur, "to": want,
+                         "authoritative_stage": auth[k]["stage"],
+                         "overridden_stage": last.get("stage")})
+
+    if enforced:
+        analysis["_ledger_precedence_enforced"] = (
+            analysis.get("_ledger_precedence_enforced") or []) + enforced
+        notes = analysis.setdefault("notes", [])
+        for x in enforced:
+            notes.append(
+                f"[Ledger Precedence] {x['item']}: restored "
+                f"{x['to']:g} (set by {x['authoritative_stage']}) — a later "
+                f"{x['overridden_stage']} stage had overwritten it to "
+                f"{x['from']:g} with weaker provenance.")
+        print("   ⚖️  Ledger precedence enforced: " + "; ".join(
+            f"{x['item']} {x['from']:g}→{x['to']:g}" for x in enforced))
+    return analysis
+
+
 def _provenance_gate_enabled():
     return os.environ.get("NIGHTSHIFT_PROVENANCE_GATE", "0").strip() in (
         "1", "true", "True")
@@ -13627,6 +13739,13 @@ def build_priced_takeoff(analysis, strict=None):
     if strict is None:
         strict = _provenance_gate_enabled()
 
+    # Ledger precedence enforcement (observer → enforcer): re-assert
+    # authoritative schedule/correction values over any later weaker-source
+    # write the ledger recorded. Runs FIRST so the gates below reduce from
+    # authoritative quantities. Kill switch NIGHTSHIFT_LEDGER_ENFORCE,
+    # default ON.
+    analysis = _enforce_ledger_precedence(analysis)
+
     # Final ceiling-scope reconciliation (ACT demote + commercial aggregate
     # rebuild) before any quantity is priced. Flag-gated; no-op when off.
     analysis = _enforce_ceiling_scope_gate(analysis)
@@ -13649,7 +13768,8 @@ def build_priced_takeoff(analysis, strict=None):
             final = float(v or 0)
         except (TypeError, ValueError):
             continue
-        entries = by_item.get(k, [])
+        entries = [e for e in by_item.get(k, [])
+                   if not e.get("reverted_by_precedence")]
         assumed = sum(e["delta"] for e in entries
                       if e.get("source") == "assumed" and e.get("delta", 0) > 0)
         derived = sum(e["delta"] for e in entries
