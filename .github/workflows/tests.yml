@@ -27,26 +27,18 @@ jobs:
           pip install -r requirements.txt
 
       - name: Run offline test suites
+        # Auto-discover every test_*.py at the repo root — a hardcoded list let
+        # 13 committed suites (door-schedule scope, Beloit fixes, ceiling gate,
+        # …) silently skip CI, and a red main went unnoticed for two weeks.
+        # Every suite is offline/deterministic by convention; a suite that
+        # needs credentials must not be named test_*.py at the root.
         run: |
           set -e
-          SUITES="
-            test_watchdog_classify
-            test_coverage_ledger
-            test_json_repair
-            test_residential_dedup
-            test_confidence_calibration
-            test_confidence_room_recovery
-            test_provenance_gate
-            test_per_sheet_extraction
-            test_vector_measure
-            test_vme_attribution
-            test_calibrated_email
-            test_residual_fixes
-          "
           fail=0
-          for t in $SUITES; do
+          for f in test_*.py; do
+            t="${f%.py}"
             echo "::group::$t"
-            if python "$t.py"; then echo "PASS $t"; else echo "FAIL $t"; fail=1; fi
+            if python "$f"; then echo "PASS $t"; else echo "FAIL $t"; fail=1; fi
             echo "::endgroup::"
           done
           exit $fail
