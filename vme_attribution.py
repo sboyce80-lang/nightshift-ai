@@ -404,3 +404,111 @@ def compute_vme_shadow_v2(pdf_paths, default_height_ft=9.0):
                 "engine": "tier2-geometric+title-attribution"}
     except Exception:
         return None
+
+
+# ---------------------------------------------------------------------------
+# M4 — viewport segmentation (multiple drawings per sheet)
+# ---------------------------------------------------------------------------
+# Permit sets cram several viewports onto one sheet (364 A-1.14: 2nd + 3rd
+# floor plans AND both RCPs). Measuring the whole page mixes plan walls with
+# RCP linework and applies one scale to viewports that may differ. Segment
+# the sheet: cluster drawing geometry into spatial regions, read each
+# region's caption (CAD convention: "<n> <Title>  SCALE: 1/8"=1'-0"" sits
+# BELOW its viewport), classify, and measure plan viewports independently.
+
+def segment_viewports(page, grid=28, min_cells=4):
+    """Spatial clusters of drawing geometry -> list of fitz.Rect regions."""
+    rect = page.rect
+    cw, ch = rect.width / grid, rect.height / grid
+    occupied = set()
+    for path in page.get_drawings():
+        r = path.get("rect")
+        if r is None or r.width * r.height > rect.width * rect.height * 0.6:
+            continue
+        cx = min(grid - 1, max(0, int((r.x0 + r.x1) / 2 / cw)))
+        cy = min(grid - 1, max(0, int((r.y0 + r.y1) / 2 / ch)))
+        occupied.add((cx, cy))
+    # connected components over the occupancy grid (8-neighborhood)
+    seen, comps = set(), []
+    for cell in occupied:
+        if cell in seen:
+            continue
+        stack, comp = [cell], []
+        seen.add(cell)
+        while stack:
+            cx, cy = stack.pop()
+            comp.append((cx, cy))
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    nb = (cx + dx, cy + dy)
+                    if nb in occupied and nb not in seen:
+                        seen.add(nb)
+                        stack.append(nb)
+        if len(comp) >= min_cells:
+            comps.append(comp)
+    regions = []
+    for comp in comps:
+        xs = [c[0] for c in comp]
+        ys = [c[1] for c in comp]
+        regions.append(fitz.Rect(min(xs) * cw, min(ys) * ch,
+                                 (max(xs) + 1) * cw, (max(ys) + 1) * ch))
+    regions.sort(key=lambda r: (-r.width * r.height))
+    return regions
+
+
+def viewport_caption(page, region):
+    """Caption text for a viewport: the text lines inside the region's lower
+    band or just below it (title + scale note)."""
+    band = fitz.Rect(region.x0, region.y0 + region.height * 0.72,
+                     region.x1, min(page.rect.y1, region.y1 + region.height * 0.18))
+    try:
+        return page.get_text(clip=band) or ""
+    except Exception:
+        return ""
+
+
+def measure_plan_viewports(pdf_path, page_index, fallback_scale=None):
+    """Measure wall runs per PLAN viewport on one sheet.
+
+    Returns list of {region, title_line, floors, scale, scale_source,
+    wall_run_lf}. RCP/section/detail viewports are excluded by caption;
+    a viewport with no resolvable scale is returned with wall_run_lf None.
+    """
+    doc = fitz.open(pdf_path)
+    try:
+        page = doc[page_index]
+        out = []
+        for region in segment_viewports(page):
+            cap = viewport_caption(page, region)
+            cap_lines = [l.strip() for l in cap.splitlines() if l.strip()]
+            title_line = None
+            for l in cap_lines:
+                if _PLAN_RE.search(_norm(l)) and not _NOT_PLAN_RE.search(_norm(l)):
+                    title_line = l
+                    break
+            if not title_line:
+                continue
+            floors = _floors_in(_norm(title_line)) or ["all"]
+            scale = vm.parse_scale(cap) or fallback_scale
+            src = "caption" if vm.parse_scale(cap) else ("fallback" if fallback_scale else "none")
+            lf = None
+            if scale:
+                H, V = vm._axis_segments(page)
+                Hc = [(p, lo, hi) for (p, lo, hi) in H
+                      if region.y0 <= p <= region.y1 and lo >= region.x0 - 5 and hi <= region.x1 + 5]
+                Vc = [(p, lo, hi) for (p, lo, hi) in V
+                      if region.x0 <= p <= region.x1 and lo >= region.y0 - 5 and hi <= region.y1 + 5]
+                min_gap = vm._WALL_MIN_THICK_FT * scale
+                max_gap = vm._WALL_MAX_THICK_FT * scale
+                min_ov = vm._WALL_MIN_RUN_FT * scale
+                ch_ = vm._pair_centerlines(Hc, min_gap, max_gap, min_ov)
+                cv_ = vm._pair_centerlines(Vc, min_gap, max_gap, min_ov)
+                run_pts = vm.cluster_wall_runs(ch_, max_gap) + vm.cluster_wall_runs(cv_, max_gap)
+                lf = run_pts / scale
+            out.append({"region": tuple(round(v) for v in region),
+                        "title_line": title_line[:60], "floors": floors,
+                        "scale": scale, "scale_source": src,
+                        "wall_run_lf": None if lf is None else round(lf, 1)})
+        return out
+    finally:
+        doc.close()
