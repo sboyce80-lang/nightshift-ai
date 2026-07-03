@@ -548,3 +548,79 @@ def measure_plan_viewports(pdf_path, page_index, fallback_scale=None):
         return out
     finally:
         doc.close()
+
+
+# ---------------------------------------------------------------------------
+# M2 — per-room scope filtering (geometry measures, reading decides billing)
+# ---------------------------------------------------------------------------
+_UNPAINTABLE_WALL_KW = ("tile", "frp", "storefront", "glass", "curtain",
+                        "prefinish", "unpainted", "existing to remain")
+
+
+def room_anchors(analysis, page_number=None, sheet_token=None):
+    """Room label anchors for one plan page: [(x_norm, y_norm, painted,
+    height_ft)]. Rooms are matched by extraction source_page (single-file
+    sets) or source_sheet token in the filename (sheet-per-file sets).
+    'painted' comes from READ scope: in_scope + paintable wall material."""
+    out = []
+    for fl in (analysis.get("floors") or []):
+        for room in (fl.get("rooms") or []):
+            bb = (room.get("bbox") or {}).get("label_bbox_norm")
+            if not bb:
+                continue
+            if page_number is not None and room.get("source_page") != page_number:
+                continue
+            if sheet_token:
+                st = str(room.get("source_sheet") or "").replace("-", "").replace(".", "").upper()
+                if st and st not in sheet_token:
+                    continue
+            mats = str((room.get("materials") or {}).get("walls", "")).lower()
+            painted = bool(room.get("in_scope", True)) and not any(
+                k in mats for k in _UNPAINTABLE_WALL_KW)
+            h = (room.get("dimensions") or {}).get("ceiling_height_feet")
+            try:
+                h = float(h) if h else None
+            except (TypeError, ValueError):
+                h = None
+            if h is not None and not (6 <= h <= 45):
+                h = None
+            out.append(((bb[0] + bb[2]) / 2.0, (bb[1] + bb[3]) / 2.0,
+                        painted, h))
+    return out
+
+
+def scope_filtered_walls(pdf_path, page_index, pts_per_ft, anchors,
+                         default_height_ft=9.0, min_anchors=3):
+    """Billable wall LF/SF on one page: each clustered run is assigned to the
+    nearest room label anchor; runs in unpainted rooms are dropped; painted
+    runs bill at their room's read height.
+
+    Returns (billable_lf, billable_sf, total_lf, n_runs, n_anchors). With
+    fewer than min_anchors anchors the filter abstains: billable == total
+    at default height (caller may apply a global fraction instead)."""
+    runs = vm.wall_runs_with_positions(pdf_path, page_index, pts_per_ft)
+    doc = fitz.open(pdf_path)
+    try:
+        rect = doc[page_index].rect
+    finally:
+        doc.close()
+    W, Hh = rect.width, rect.height
+    total_lf = sum((hi - lo) for (_, _, lo, hi) in runs) / pts_per_ft
+    if len(anchors) < min_anchors:
+        return total_lf, total_lf * default_height_ft, total_lf, len(runs), len(anchors)
+    pts = [(ax * W, ay * Hh, painted, h) for (ax, ay, painted, h) in anchors]
+    bill_lf = bill_sf = 0.0
+    for orient, perp, lo, hi in runs:
+        mx, my = ((lo + hi) / 2.0, perp) if orient == "H" else (perp, (lo + hi) / 2.0)
+        best = None
+        bd = None
+        for (ax, ay, painted, h) in pts:
+            d = (ax - mx) ** 2 + (ay - my) ** 2
+            if bd is None or d < bd:
+                bd = d
+                best = (painted, h)
+        if best and best[0]:
+            lf = (hi - lo) / pts_per_ft
+            bill_lf += lf
+            bill_sf += lf * (best[1] or default_height_ft)
+    return bill_lf, bill_sf, total_lf, len(runs), len(pts)

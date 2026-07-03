@@ -563,3 +563,58 @@ def wall_area_sqft(pdf_path: str, page_index: int, height_ft: float,
     if m["wall_face_lf"] is None:
         return None
     return m["wall_face_lf"] * height_ft
+
+
+def cluster_wall_runs_list(segments, thickness_pts):
+    """Like cluster_wall_runs but returns the merged run intervals
+    [(perp, lo, hi)] instead of only the total length — callers that need
+    per-run positions (room-scope assignment) use this."""
+    if not segments:
+        return []
+    segments = sorted(segments)
+    out = []
+
+    def flush(band, perp):
+        if not band:
+            return
+        ivs = sorted(band)
+        cs, ce = ivs[0]
+        for s, e in ivs[1:]:
+            if s <= ce + 0.5:
+                ce = max(ce, e)
+            else:
+                out.append((perp, cs, ce))
+                cs, ce = s, e
+        out.append((perp, cs, ce))
+
+    band, band_perp = [], None
+    for perp, lo, hi in segments:
+        if band and perp - band_perp <= thickness_pts:
+            band.append((lo, hi))
+        else:
+            flush(band, band_perp)
+            band = [(lo, hi)]
+        band_perp = perp
+    flush(band, band_perp)
+    return out
+
+
+def wall_runs_with_positions(pdf_path, page_index, pts_per_ft):
+    """Tier-2 wall runs as positioned intervals: (orient, perp, lo, hi).
+    orient 'H': perp=y, span on x; 'V': perp=x, span on y. Same pairing and
+    clustering as measure_wall_runs_geometric."""
+    if fitz is None:
+        raise RuntimeError("PyMuPDF (fitz) is required")
+    doc = fitz.open(pdf_path)
+    try:
+        H, V = _axis_segments(doc[page_index])
+    finally:
+        doc.close()
+    min_gap = _WALL_MIN_THICK_FT * pts_per_ft
+    max_gap = _WALL_MAX_THICK_FT * pts_per_ft
+    min_ov = _WALL_MIN_RUN_FT * pts_per_ft
+    ch = _pair_centerlines(H, min_gap, max_gap, min_ov)
+    cv = _pair_centerlines(V, min_gap, max_gap, min_ov)
+    runs = [("H", p, lo, hi) for (p, lo, hi) in cluster_wall_runs_list(ch, max_gap)]
+    runs += [("V", p, lo, hi) for (p, lo, hi) in cluster_wall_runs_list(cv, max_gap)]
+    return runs
