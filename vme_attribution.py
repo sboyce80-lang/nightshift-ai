@@ -370,6 +370,26 @@ def select_floor_plan_pages(pdf_paths):
         allp.sort(key=lambda p: p.get("src", "font") != "font")
         if allp:
             out = [allp[0]]
+    # foundation-plan-as-basement: when a set has no basement plan page but
+    # the building has a basement, its walls are drawn on the foundation plan
+    # (364 A-100). Claim it rather than dropping the floor.
+    claimed_floors = {f for p in out for f in p["floors"]}
+    if "basement" not in claimed_floors and not filename_only:
+        for pdf in pdf_paths:
+            doc = fitz.open(pdf)
+            try:
+                for i in range(len(doc)):
+                    if any(_re.search(r"foundation\s+plan", l, _re.I)
+                           for l in _top_font_lines(doc[i], 8)):
+                        out.append({"pdf": pdf, "page": i,
+                                    "floors": ["basement"], "sheet": None,
+                                    "arch": False, "src": "foundation"})
+                        raise StopIteration
+            except StopIteration:
+                break
+            finally:
+                doc.close()
+
     # ordinal gap-fill: floors "1" and "3" claimed on consecutive sheets with
     # the page between them unclaimed -> that page is the missing floor whose
     # caption text is unextractable (364 p10: title plotted as curves)
@@ -624,3 +644,67 @@ def scope_filtered_walls(pdf_path, page_index, pts_per_ft, anchors,
             bill_lf += lf
             bill_sf += lf * (best[1] or default_height_ft)
     return bill_lf, bill_sf, total_lf, len(runs), len(pts)
+
+
+def walls_by_basis(pdf_path, page_index, pts_per_ft, anchors,
+                   default_height_ft=9.0):
+    """Wall quantities under every billing basis Rider uses, per page.
+
+    For each clustered run, the room on EACH SIDE is sampled (nearest anchor
+    to a point offset perpendicular from the run's midpoint). A face bills
+    when its side's room is painted; a run bills when either side is painted.
+
+        runs_lf       — total centerline runs (raw geometry)
+        run_bill_lf   — runs with >=1 painted side
+        face_bill_lf  — sum of painted faces (2x for both-sides-painted)
+        run_bill_sf / face_bill_sf — billed at each side's room height
+                        (read height, default when unknown)
+
+    With no usable anchors the scope is unknowable here: billable == raw and
+    the caller decides (reliability gate).
+    """
+    runs = vm.wall_runs_with_positions(pdf_path, page_index, pts_per_ft)
+    doc = fitz.open(pdf_path)
+    try:
+        rect = doc[page_index].rect
+    finally:
+        doc.close()
+    W, Hh = rect.width, rect.height
+    pts = [(ax * W, ay * Hh, painted, h) for (ax, ay, painted, h) in anchors]
+    off = vm._WALL_MAX_THICK_FT * pts_per_ft * 1.5
+    runs_lf = run_bill_lf = face_bill_lf = 0.0
+    run_bill_sf = face_bill_sf = 0.0
+
+    def nearest(mx, my):
+        best, bd = None, None
+        for (ax, ay, painted, h) in pts:
+            d = (ax - mx) ** 2 + (ay - my) ** 2
+            if bd is None or d < bd:
+                bd, best = d, (painted, h)
+        return best
+
+    for orient, perp, lo, hi in runs:
+        lf = (hi - lo) / pts_per_ft
+        runs_lf += lf
+        if not pts:
+            continue
+        mid = (lo + hi) / 2.0
+        if orient == "H":
+            sides = [nearest(mid, perp - off), nearest(mid, perp + off)]
+        else:
+            sides = [nearest(perp - off, mid), nearest(perp + off, mid)]
+        painted_sides = [s for s in sides if s and s[0]]
+        if painted_sides:
+            run_bill_lf += lf
+            h_run = max((s[1] or default_height_ft) for s in painted_sides)
+            run_bill_sf += lf * h_run
+            face_bill_lf += lf * len(painted_sides)
+            face_bill_sf += sum(lf * (s[1] or default_height_ft)
+                                for s in painted_sides)
+    if not pts:
+        run_bill_lf = face_bill_lf = runs_lf
+        run_bill_sf = face_bill_sf = runs_lf * default_height_ft
+    return {"runs_lf": runs_lf, "run_bill_lf": run_bill_lf,
+            "face_bill_lf": face_bill_lf, "run_bill_sf": run_bill_sf,
+            "face_bill_sf": face_bill_sf, "n_anchors": len(pts),
+            "n_runs": len(runs)}
