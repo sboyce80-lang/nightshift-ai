@@ -194,3 +194,213 @@ def measure_building(pdf_path: str, heights: dict) -> dict:
     return {"floors": floors, "excluded_pages": sorted(excluded),
             "total_area_sqft": round(total_area, 0), "total_runs_lf": round(total_runs, 1),
             "primary_scale": primary}
+
+
+# ---------------------------------------------------------------------------
+# M4/M5 — TITLE-based page classification (no layer tags required)
+# ---------------------------------------------------------------------------
+# Sheet titles are the LARGEST text on a page. Classify each page from its
+# top-font lines (plus the filename for sheet-per-file sets): floor-plan
+# sheets are identified and each claims the floor(s) it names — one sheet may
+# legitimately carry several floors ("FLOOR PLANS", "2nd and 3rd Floor
+# Plans"). Reading titles is reliable; nothing here measures.
+
+import re as _re
+
+_FLOOR_WORDS = (
+    (r"basement|cellar", "basement"),
+    (r"ground", "ground"),
+    (r"first|1st|level\s*(?:1|one)\b", "1"),
+    (r"second|2nd|level\s*(?:2|two)\b", "2"),
+    (r"third|3rd|level\s*(?:3|three)\b", "3"),
+    (r"fourth|4th|level\s*(?:4|four)\b", "4"),
+    (r"fifth|5th|level\s*(?:5|five)\b", "5"),
+    (r"mezz", "mezz"),
+)
+_NOT_PLAN_RE = _re.compile(
+    r"demolition|demo\s|reflected|ceiling|roof|site|foundation|framing|"
+    r"electrical|mechanical|plumbing|fire|sprinkler|lighting|power|hvac|"
+    r"piping|enlarged|furniture|finish|signage|erosion|landscape|utility|"
+    r"grading|slab|equipment|casework|section|elevation|detail|schedule|"
+    r"code|life\s*safety|accessib|structural|drainage", _re.I)
+_PLAN_RE = _re.compile(r"floor\s+plans?\b|\bplan\b", _re.I)
+
+
+def _top_font_lines(page, k=14):
+    """Largest-font text lines on the page, biggest first."""
+    lines = []
+    try:
+        d = page.get_text("dict")
+    except Exception:
+        return []
+    for block in d.get("blocks", []):
+        for line in block.get("lines", []):
+            txt = "".join(sp.get("text", "") for sp in line.get("spans", []))
+            if not txt.strip():
+                continue
+            size = max((sp.get("size", 0) for sp in line.get("spans", [])), default=0)
+            lines.append((size, txt.strip()))
+    lines.sort(key=lambda t: -t[0])
+    return [t for _, t in lines[:k]]
+
+
+def _floors_in(text):
+    out = []
+    for pat, label in _FLOOR_WORDS:
+        if _re.search(pat, text, _re.I):
+            out.append(label)
+    return out
+
+
+def _norm(t):
+    return _re.sub(r"[-_]+", " ", t or "")
+
+
+_BARE_FLOOR_RE = _re.compile(
+    r"^(?:basement|ground|first|second|third|fourth|fifth|"
+    r"1st|2nd|3rd|4th|5th)\s+floor\s*$", _re.I)
+
+
+def classify_title_lines(lines, filename="", filename_only=False):
+    """{kind, floors, sheet} from title candidates (largest text first).
+
+    Route A: a line naming a "floor plan" (not disqualified).
+    Route B: bare viewport titles ("FIRST  FLOOR") on an architectural
+             plan sheet (A-1xx) — several may appear on one sheet
+             (Livestock A-102 carries FIRST and SECOND FLOOR viewports).
+    Multi-file sets classify by FILENAME only: sheets embed unrelated plan
+    diagrams (code-summary pages show life-safety floor plans) that would
+    misclassify by page text.
+    """
+    fname = _norm(filename.rsplit("/", 1)[-1]) if filename else ""
+    sheet = None
+    m = _SHEET_ID_RE.search(fname)
+    if not m:
+        for l in lines[:4]:
+            m = _SHEET_ID_RE.search(l)
+            if m:
+                break
+    if m:
+        sheet = m.group(1).upper().replace(".", "-")
+    cands = ([fname] if fname else [])
+    if not filename_only:
+        cands += [_norm(l) for l in lines]
+    floors = []
+    is_plan = False
+    is_arch_plan_sheet = bool(sheet and _re.match(r"A-?D?-?1", sheet))
+    for l in cands:
+        if _PLAN_RE.search(l) and not _NOT_PLAN_RE.search(l):
+            is_plan = True
+            floors.extend(f for f in _floors_in(l) if f not in floors)
+        elif (not filename_only and is_arch_plan_sheet
+              and _BARE_FLOOR_RE.match(l.strip())):
+            is_plan = True
+            floors.extend(f for f in _floors_in(l) if f not in floors)
+    if not is_plan:
+        return {"kind": "other", "floors": [], "sheet": sheet}
+    return {"kind": "floor_plan", "floors": floors or ["all"], "sheet": sheet}
+
+
+_SHEET_ID_RE = _re.compile(r"\b(A[D]?[-.]?\d{1,3}(?:\.\d{1,2})?[A-Za-z]?)\b")
+
+
+def select_floor_plan_pages(pdf_paths):
+    """Canonical floor-plan pages for a job (single- or multi-file).
+
+    Returns [{pdf, page, floors, sheet}] deduped so each floor is claimed
+    once; arch sheets (A-1xx) win over sketches/others. A bare "FLOOR
+    PLANS"/["all"] page is used only when no floor-specific pages exist.
+    """
+    if fitz is None:
+        raise RuntimeError("PyMuPDF (fitz) is required")
+    filename_only = len(pdf_paths) > 3   # sheet-per-file set
+    plan_pages = []
+    for pdf in pdf_paths:
+        fname = pdf.rsplit("/", 1)[-1]
+        doc = fitz.open(pdf)
+        try:
+            for i in range(len(doc)):
+                lines = [] if filename_only else _top_font_lines(doc[i])
+                info = classify_title_lines(lines, fname,
+                                            filename_only=filename_only)
+                if info["kind"] == "floor_plan":
+                    arch = bool(info["sheet"]
+                                and _re.match(r"A-?D?-?\d", info["sheet"]))
+                    plan_pages.append({"pdf": pdf, "page": i,
+                                       "floors": info["floors"],
+                                       "sheet": info["sheet"], "arch": arch})
+                if filename_only:
+                    break   # one classification per file
+        finally:
+            doc.close()
+    # arch sheets first, then file/page order
+    plan_pages.sort(key=lambda p: (not p["arch"],))
+    specific = [p for p in plan_pages if p["floors"] != ["all"]]
+    claimed, out = set(), []
+    for p in specific:
+        new = [f for f in p["floors"] if f not in claimed]
+        if new:
+            claimed.update(new)
+            out.append({**p, "floors": new})
+    if not out:
+        allp = [p for p in plan_pages if p["floors"] == ["all"]]
+        if allp:
+            out = [allp[0]]
+    return out
+
+
+def compute_vme_shadow_v2(pdf_paths, default_height_ft=9.0):
+    """M4/M5 shadow: title-based page selection + tier-2 geometric walls.
+
+    Works on single- AND multi-file jobs, tagged or untagged. Returns
+    {total_wall_run_lf, est_wall_sf, n_floor_pages, by_page:[...],
+    unmeasured:[...]} or None. Comparison-only until the accuracy bar is
+    met; never load-bearing, never guesses a scale.
+    """
+    if fitz is None:
+        return None
+    try:
+        paths = [p for p in (pdf_paths or []) if p]
+        if not paths:
+            return None
+        # single-page single-file sets ARE the floor plan (CenHud)
+        if len(paths) == 1:
+            try:
+                _doc = fitz.open(paths[0])
+                single_page = len(_doc) == 1
+                _doc.close()
+            except Exception:
+                single_page = False
+        else:
+            single_page = False
+        if single_page:
+            pages = [{"pdf": paths[0], "page": 0, "floors": ["all"]}]
+        else:
+            pages = select_floor_plan_pages(paths)
+        if not pages:
+            return None
+        total_lf, by_page, unmeasured = 0.0, [], []
+        for p in pages:
+            r = vm.measure_wall_runs_geometric(p["pdf"], p["page"])
+            lf = r.get("wall_run_lf")
+            if lf is None:
+                unmeasured.append({"pdf": p["pdf"].rsplit("/", 1)[-1],
+                                   "page": p["page"] + 1,
+                                   "reason": "no scale"})
+                continue
+            total_lf += lf
+            by_page.append({"pdf": p["pdf"].rsplit("/", 1)[-1],
+                            "page": p["page"] + 1, "floors": p["floors"],
+                            "wall_run_lf": round(lf, 1),
+                            "scale": r["pts_per_ft"],
+                            "scale_source": r["scale_source"]})
+        if not by_page:
+            return None
+        return {"total_wall_run_lf": round(total_lf, 1),
+                "est_wall_sf": round(total_lf * default_height_ft),
+                "n_floor_pages": len(by_page),
+                "by_page": by_page,
+                "unmeasured": unmeasured,
+                "engine": "tier2-geometric+title-attribution"}
+    except Exception:
+        return None
