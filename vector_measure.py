@@ -42,7 +42,14 @@ PTS_PER_INCH = 72.0
 # AIA-standard wall layers carry these tokens; the negatives strip annotation,
 # room-id text, hatch *patterns*, dashed below-walls, and glazing ("lite").
 _WALL_POS = ("a-wall", "wall-demising", "partition")
-_WALL_NEG = ("anno", "iden", "patt", "hatch", "-blow", "below", "-lite")
+# 'eifs' — exterior substrate; interior wall runs must not absorb exterior
+# skin lines (exterior is scoped separately). NOTE: 'belw' (A-WALL-BELW) is
+# deliberately NOT excluded — CenHud Fishkill draws real above-grade
+# partitions on it (drafters misuse layer names), which is exactly why layer
+# names alone cannot classify walls; the geometric wall test (M5) validates
+# every candidate layer's segments regardless of name.
+_WALL_NEG = ("anno", "iden", "patt", "hatch", "-blow", "below", "-lite",
+             "eifs")
 
 
 def is_wall_layer(layer: str) -> bool:
@@ -119,6 +126,122 @@ def detect_scale(pdf_path: str, page_index: int):
             if s:
                 return s
     return parse_scale(txt)
+
+
+# --------------------------------------------------------------------------
+# M4 — geometry-based scale inference (door-swing arc calibration)
+# --------------------------------------------------------------------------
+# Many CAD exports plot text as curves: the page has NO extractable text, so
+# title-block scale detection is impossible (CenHud Fishkill). But door swings
+# are drawn as quarter-circle arcs whose real-world radius equals the door
+# leaf width — overwhelmingly 2'-6", 2'-8", or 3'-0". Architectural plot
+# scales come from a small discrete set, so instead of estimating a continuous
+# scale we SCORE each standard candidate by how many arc radii land on a
+# plausible door leaf under that candidate, and require an unambiguous winner.
+# No winner -> None (never guess silently; the caller flags the sheet).
+
+# pts-per-foot for the standard imperial plot scales:
+# 1/16"  3/32"  1/8"  3/16"  1/4"  3/8"  1/2"  3/4"  1"  = 1'-0"
+_STANDARD_SCALES = (4.5, 6.75, 9.0, 13.5, 18.0, 27.0, 36.0, 54.0, 72.0)
+# Door leaf widths (feet) that anchor the arc-radius scoring. 2'-0" is
+# deliberately EXCLUDED: standard scales sit in 1.5x ratios (9 -> 13.5), and a
+# 3'-0" leaf at scale s aliases exactly to a 2'-0" leaf at 1.5s, poisoning the
+# vote. Leafs below 2'-4" are rare enough to give up for disambiguation.
+_DOOR_LEAF_FT = (2.5, 2.67, 3.0)
+_LEAF_TOL_FT = 0.07
+
+
+def _arc_radii_pts(page, max_paths=40000):
+    """Radii (points) of circular-ish arcs on the page.
+
+    A door swing exported to PDF is a chain of cubic beziers. For each bezier
+    we estimate a radius from the chord + sagitta of the curve (control points
+    give the sagitta direction); segments whose two control-point distances
+    from the chord agree (circular, not spline-y) are kept.
+    """
+    import math
+    radii = []
+    for path in page.get_drawings()[:max_paths]:
+        for item in path["items"]:
+            if item[0] != "c":
+                continue
+            p0, p1, p2, p3 = item[1], item[2], item[3], item[4]
+            chord = math.hypot(p3.x - p0.x, p3.y - p0.y)
+            if chord < 4:
+                continue
+            # exact cubic midpoint: B(0.5) = (p0 + 3p1 + 3p2 + p3) / 8
+            mx = (p0.x + 3 * p1.x + 3 * p2.x + p3.x) / 8.0
+            my = (p0.y + 3 * p1.y + 3 * p2.y + p3.y) / 8.0
+            # circumcircle through (p0, mid, p3) — exact for a circular arc
+            ax, ay, bx, by, cx, cy = p0.x, p0.y, mx, my, p3.x, p3.y
+            d = 2 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+            if abs(d) < 1e-6:
+                continue  # collinear — a straight "curve", not an arc
+            ux = ((ax * ax + ay * ay) * (by - cy) + (bx * bx + by * by) * (cy - ay)
+                  + (cx * cx + cy * cy) * (ay - by)) / d
+            uy = ((ax * ax + ay * ay) * (cx - bx) + (bx * bx + by * by) * (ax - cx)
+                  + (cx * cx + cy * cy) * (bx - ax)) / d
+            r = math.hypot(ax - ux, ay - uy)
+            # circularity check: the two control points must sit near the
+            # same circle (splines/ellipses drift)
+            r1 = math.hypot(p1.x - ux, p1.y - uy)
+            r2 = math.hypot(p2.x - ux, p2.y - uy)
+            if abs(r1 - r) > 0.12 * r or abs(r2 - r) > 0.12 * r:
+                continue
+            if 6 <= r <= 400:   # sane door-swing radii in points at any scale
+                radii.append(r)
+    return radii
+
+
+def infer_scale_from_arcs(pdf_path: str, page_index: int,
+                          min_hits: int = 4, min_margin: float = 2.0):
+    """Infer pts-per-foot by scoring standard scales against door-swing arcs.
+
+    Returns (pts_per_ft, diagnostics) — pts_per_ft is None when no candidate
+    wins unambiguously (fewer than `min_hits` door-like arcs, or the best
+    candidate doesn't beat the runner-up by `min_margin`x).
+    """
+    if fitz is None:
+        raise RuntimeError("PyMuPDF (fitz) is required")
+    doc = fitz.open(pdf_path)
+    try:
+        radii = _arc_radii_pts(doc[page_index])
+    finally:
+        doc.close()
+    if not radii:
+        return None, {"arcs": 0}
+    scores = {}
+    for cand in _STANDARD_SCALES:
+        hits = 0
+        for r in radii:
+            ft = r / cand
+            if any(abs(ft - leaf) <= _LEAF_TOL_FT for leaf in _DOOR_LEAF_FT):
+                hits += 1
+        scores[cand] = hits
+    ranked = sorted(scores.items(), key=lambda kv: -kv[1])
+    best, second = ranked[0], ranked[1]
+    diag = {"arcs": len(radii), "scores": scores}
+    if best[1] < min_hits:
+        return None, diag
+    if second[1] and best[1] < min_margin * second[1]:
+        return None, diag  # ambiguous between two scales
+    return best[0], diag
+
+
+def detect_scale_robust(pdf_path: str, page_index: int):
+    """Scale via title-block text, falling back to door-arc geometry.
+
+    Returns (pts_per_ft or None, source) where source is 'text' | 'arcs' |
+    'none'. This is the M4 entry point — callers must treat None as
+    unmeasured (flag/RFI), never substitute a guessed scale.
+    """
+    s = detect_scale(pdf_path, page_index)
+    if s:
+        return s, "text"
+    s, _diag = infer_scale_from_arcs(pdf_path, page_index)
+    if s:
+        return s, "arcs"
+    return None, "none"
 
 
 # --------------------------------------------------------------------------
