@@ -13747,6 +13747,488 @@ def _reconcile_door_schedule_scope(analysis):
     return analysis
 
 
+# ---------------------------------------------------------------------------
+# Scope Sweep (flag-gated) — low-cost LLM pass over pages nothing measured
+# ---------------------------------------------------------------------------
+# Root cause it addresses (Beloit WC-1, 2026-07): every pre-measurement read
+# (door/window schedule scan, finish-schedule pre-extraction, index scan,
+# project overview) is gated by keyword text-scans, and per-sheet mode
+# EXCLUDES non-plan pages from measurement on the assumption those scans
+# fired. When a gate misses (off-list title, raster page, schedule in a
+# later volume), the page is never read by anything and its scope silently
+# vanishes. The sweep is the reconciliation net: a cheap vision pass over
+# every painting-relevant page that ended the run unmeasured, asking only
+# "what on this page affects painting scope?" — then a deterministic diff
+# against the priced analysis. Findings surface as notes, detection-flag
+# upgrades, and pre-pricing RFIs ONLY. It never adds quantities
+# (hard-numbers policy: missing scope -> $0 + RFI, not a fabricated number).
+
+def _scope_sweep_enabled():
+    return os.environ.get("NIGHTSHIFT_SCOPE_SWEEP", "0").strip() in (
+        "1", "true", "True")
+
+
+def _scope_sweep_max_pages():
+    try:
+        n = int(os.environ.get("NIGHTSHIFT_SCOPE_SWEEP_MAX_PAGES", "12"))
+    except (ValueError, TypeError):
+        n = 12
+    return max(1, min(40, n))
+
+
+# Keyword -> weight for prioritizing which unmeasured pages get swept when
+# the set has more candidates than the page cap. Weighted toward the pages
+# that historically carried silently-lost scope (schedules, legends, notes).
+_SCOPE_SWEEP_KEYWORDS = (
+    ("finish schedule", 10), ("room finish", 10), ("finish legend", 10),
+    ("finish plan", 8), ("material legend", 8), ("finish notes", 8),
+    ("wallcovering", 10), ("wall covering", 10), ("wc-", 6),
+    ("paint", 5), ("epoxy", 6), ("dryfall", 8), ("intumescent", 6),
+    ("plaster", 5), ("lime wash", 6), ("lyme wash", 6), ("stain", 4),
+    ("door schedule", 8), ("window schedule", 8), ("glazing schedule", 6),
+    ("scope of work", 8), ("general notes", 6), ("alternate", 6),
+    ("allowance", 6), ("specification", 4), ("legend", 3),
+    ("schedule", 3), ("exposed structure", 8), ("exposed deck", 8),
+)
+
+
+def _scope_sweep_candidate_pages(pdf_paths, ledger=None):
+    """Select the unmeasured-but-painting-relevant pages to sweep.
+
+    A page is a candidate when its discipline classification says include=True
+    (A-series / General / Title / interiors — the same filter measurement
+    uses) but the coverage ledger says the run ended without measuring it
+    (state 'excluded' or 'unaccounted'; 'failed' pages already hard-block via
+    the coverage gate and 'measured' pages were read at full attention).
+
+    Returns a list of dicts sorted by descending keyword score, capped at
+    _scope_sweep_max_pages():
+        {"pdf_path", "page_idx0", "sheet", "score", "text"}
+    Pages with NO text layer score 1 — they are invisible to every keyword
+    gate (the exact blind spot the sweep exists for) but are also the least
+    likely to be schedules, so text-bearing scope pages outrank them.
+    """
+    if ledger is None:
+        ledger = _COVERAGE_LEDGER
+    if ledger is None or not getattr(ledger, "files", None):
+        return []
+
+    candidates = []
+    for pdf_path in pdf_paths or []:
+        entry = ledger._entry(pdf_path)
+        if entry is None:
+            continue
+        try:
+            classifications = _classify_pdf_pages(pdf_path)
+        except Exception:
+            classifications = []
+        if not classifications:
+            continue
+        for c in classifications:
+            if not c.get("include"):
+                continue
+            pg = c.get("page_index")
+            rec = entry["pages"].get(pg)
+            if rec is None or rec.get("state") not in ("excluded",
+                                                       "unaccounted"):
+                continue
+            try:
+                tl = _extract_page_text_layer(pdf_path, pg)
+            except Exception:
+                tl = None
+            raw = ((tl or {}).get("raw_text") or "").strip()
+            if raw:
+                low = raw.lower()
+                score = sum(w for kw, w in _SCOPE_SWEEP_KEYWORDS
+                            if kw in low)
+                if score <= 0:
+                    continue  # text-bearing page with zero scope signal
+            else:
+                score = 1  # no text layer: invisible to every keyword gate
+            candidates.append({
+                "pdf_path": pdf_path,
+                "page_idx0": pg,
+                "sheet": c.get("sheet_number") or f"PG{pg + 1}",
+                "score": score,
+                "text": raw[:3000],
+            })
+
+    candidates.sort(key=lambda d: (-d["score"], d["pdf_path"],
+                                   d["page_idx0"]))
+    return candidates[:_scope_sweep_max_pages()]
+
+
+_SCOPE_SWEEP_PROMPT = """You are a senior painting estimator doing a SCOPE \
+COMPLETENESS REVIEW.
+The page images above were NOT measured by the takeoff pipeline — they were
+set aside as schedules, legends, notes, index, or detail sheets, or could not
+be machine-read. Your ONLY job is to list anything on these pages that
+AFFECTS PAINTING SCOPE so it can be checked against the priced takeoff.
+
+DO NOT measure. DO NOT estimate quantities. Observations only.
+
+Report, per page:
+- Whether the page IS a finish schedule / finish legend, door schedule, or
+  window schedule (page_kind).
+- Wallcovering: WC-x codes, "vinyl wallcovering", VWC — and which rooms/walls
+  if the page states it.
+- Specialty finishes: epoxy, plaster / venetian plaster, lime wash, stains,
+  intumescent coating, dryfall.
+- Callouts to paint exposed structure / exposed deck / MEP / bar joists.
+- Exterior painting scope (elevations or notes calling for exterior paint).
+- Alternates, allowances, or unit prices that touch painting.
+- Scope-of-work notes: inclusions, exclusions, phasing, owner-supplied items,
+  "paint all ..." directives.
+
+Use the PRE-EXTRACTED TEXT blocks (when present) as the primary source; the
+images may be lower resolution.
+
+Return ONLY this JSON, no other commentary:
+{
+  "pages": [
+    {
+      "image_index": 1,
+      "page_kind": "finish_schedule|door_schedule|window_schedule|general_notes|specification|legend|elevation|detail|index|other",
+      "findings": [
+        {
+          "category": "wallcovering|specialty_finish|dryfall_exposed_structure|ceiling|doors|windows|exterior|alternates|scope_note|other",
+          "item": "short name, e.g. 'WC-1 vinyl wallcovering'",
+          "detail": "what the page says and where it applies",
+          "codes": ["WC-1"]
+        }
+      ]
+    }
+  ]
+}
+image_index is the 1-based order of the images above. A page with nothing
+painting-relevant gets an empty findings list. Do not invent items."""
+
+
+def _run_scope_sweep(client, pdf_paths, analysis):
+    """Run the sweep LLM calls and attach raw findings to the analysis.
+
+    Batches candidate pages (5 per call) into a low-cost model with the page
+    image + its text layer, parses the structured findings, and stores them
+    with page provenance in analysis['_scope_sweep']. Reconciliation against
+    the priced totals happens separately in _reconcile_scope_sweep() so it
+    stays deterministic and unit-testable. Never raises; a failed batch is
+    reported and skipped.
+    """
+    candidates = _scope_sweep_candidate_pages(pdf_paths)
+    if not candidates:
+        print("   🧹 Scope sweep: no unmeasured painting-relevant pages — "
+              "nothing to sweep")
+        return None
+
+    model = os.environ.get("NIGHTSHIFT_SCOPE_SWEEP_MODEL",
+                           "claude-haiku-4-5-20251001").strip()
+    try:
+        dpi = int(os.environ.get("NIGHTSHIFT_SCOPE_SWEEP_DPI", "170"))
+    except (ValueError, TypeError):
+        dpi = 170
+    BATCH = 5
+
+    print(f"   🧹 Scope sweep: {len(candidates)} unmeasured page(s) to "
+          f"review ({model}, {dpi} DPI)")
+
+    all_findings = []
+    pages_swept = []
+    for b0 in range(0, len(candidates), BATCH):
+        batch = candidates[b0:b0 + BATCH]
+
+        # Render this batch's pages, grouped per PDF
+        b64_by_page = {}
+        by_pdf = {}
+        for cand in batch:
+            by_pdf.setdefault(cand["pdf_path"], []).append(cand["page_idx0"])
+        for pdf_path, pages in by_pdf.items():
+            try:
+                for pg, b64 in _render_pages_to_images(
+                        pdf_path, pages, dpi=dpi, output_format="jpeg",
+                        jpeg_quality=72):
+                    b64_by_page[(pdf_path, pg)] = b64
+            except Exception as e:
+                print(f"   ⚠️  Scope sweep: could not render "
+                      f"{os.path.basename(pdf_path)} pages {pages}: {e}")
+
+        content = []
+        rendered_batch = []
+        for cand in batch:
+            b64 = b64_by_page.get((cand["pdf_path"], cand["page_idx0"]))
+            if not b64:
+                continue
+            rendered_batch.append(cand)
+            idx = len(rendered_batch)
+            header = (f"IMAGE {idx}: {os.path.basename(cand['pdf_path'])} "
+                      f"page {cand['page_idx0'] + 1} "
+                      f"(sheet {cand['sheet']})")
+            if cand["text"]:
+                header += ("\nPRE-EXTRACTED TEXT (primary source):\n"
+                           + cand["text"])
+            content.append({"type": "text", "text": header})
+            content.append({"type": "image", "source": {
+                "type": "base64", "media_type": "image/jpeg", "data": b64}})
+        if not rendered_batch:
+            continue
+        content.append({"type": "text", "text": _SCOPE_SWEEP_PROMPT})
+
+        try:
+            parts = []
+            with client.messages.stream(
+                model=model,
+                max_tokens=4000,
+                temperature=0,
+                timeout=120.0,
+                messages=[{"role": "user", "content": content}],
+            ) as stream:
+                for t in stream.text_stream:
+                    parts.append(t)
+            resp = _parse_json_response("".join(parts),
+                                        context="scope sweep")
+        except Exception as e:
+            print(f"   ⚠️  Scope sweep batch failed (non-fatal): {e}")
+            continue
+        if not isinstance(resp, dict):
+            continue
+
+        for page_entry in resp.get("pages") or []:
+            if not isinstance(page_entry, dict):
+                continue
+            try:
+                idx = int(page_entry.get("image_index", 0))
+            except (ValueError, TypeError):
+                continue
+            if not (1 <= idx <= len(rendered_batch)):
+                continue
+            cand = rendered_batch[idx - 1]
+            prov = {"file": os.path.basename(cand["pdf_path"]),
+                    "page": cand["page_idx0"] + 1,
+                    "sheet": cand["sheet"]}
+            kind = str(page_entry.get("page_kind", "other") or "other")
+            findings = [f for f in (page_entry.get("findings") or [])
+                        if isinstance(f, dict)]
+            pages_swept.append(dict(prov, page_kind=kind,
+                                    n_findings=len(findings)))
+            for f in findings:
+                all_findings.append(dict(f, **prov))
+
+    if not pages_swept:
+        print("   ⚠️  Scope sweep: no batch returned usable results")
+        return None
+
+    analysis["_scope_sweep"] = {
+        "model": model,
+        "pages_swept": pages_swept,
+        "findings": all_findings,
+    }
+    print(f"   🧹 Scope sweep: {len(pages_swept)} page(s) reviewed, "
+          f"{len(all_findings)} scope observation(s)")
+    return analysis["_scope_sweep"]
+
+
+_SPECIALTY_FINISH_KEYWORDS = (
+    "epoxy", "plaster", "venetian", "lime wash", "lyme wash",
+    "intumescent", "stain", "cementitious", "elastomeric", "dryfall")
+
+
+def _positive_number_in(obj):
+    """True if any numeric leaf in a nested dict/list structure is > 0."""
+    if isinstance(obj, dict):
+        return any(_positive_number_in(v) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return any(_positive_number_in(v) for v in obj)
+    return isinstance(obj, (int, float)) and not isinstance(obj, bool) \
+        and obj > 0
+
+
+def _reconcile_scope_sweep(analysis):
+    """Deterministic diff of sweep findings against the priced analysis.
+
+    Emits ONLY notes, has_*_schedule flag upgrades, and pre-pricing RFIs —
+    never quantities. An RFI fires only for a genuinely NEW discovery: an
+    item the sweep saw on an unmeasured page that appears nowhere in the
+    extracted analysis (notes, room notes/materials, finish schedule) and
+    has no priced total. Items already visible to the estimator are noted
+    but not re-asked.
+    """
+    sweep = analysis.get("_scope_sweep") if isinstance(analysis, dict) \
+        else None
+    if not sweep or not isinstance(sweep, dict):
+        return analysis
+    findings = [f for f in (sweep.get("findings") or [])
+                if isinstance(f, dict)]
+    pages = [p for p in (sweep.get("pages_swept") or [])
+             if isinstance(p, dict)]
+    if not findings and not pages:
+        return analysis
+
+    agg = analysis.get("aggregated_totals") or {}
+    recon = {"rfis_added": 0, "flags_upgraded": [], "notes_added": 0}
+
+    def _note(text):
+        analysis.setdefault("notes", []).append(f"[Scope Sweep] {text}")
+        recon["notes_added"] += 1
+
+    def _prov(f):
+        return f"{f.get('file', '?')} p.{f.get('page', '?')} " \
+               f"(sheet {f.get('sheet', '?')})"
+
+    # Everything the extraction already saw, lowercased — the "known" side
+    # of the diff. Sweep findings matching this blob are not re-asked.
+    blob_parts = [str(n) for n in (analysis.get("notes") or [])]
+    for fl in analysis.get("floors") or []:
+        for rm in (fl or {}).get("rooms") or []:
+            blob_parts.append(str(rm.get("notes", "")))
+            for v in (rm.get("materials") or {}).values():
+                blob_parts.append(str(v))
+    for r in analysis.get("room_finish_schedule") or []:
+        blob_parts.append(json.dumps(r) if isinstance(r, (dict, list))
+                          else str(r))
+    known = " ".join(blob_parts).lower()
+
+    by_cat = {}
+    for f in findings:
+        by_cat.setdefault(str(f.get("category", "other") or "other"),
+                          []).append(f)
+
+    # (1) Schedule pages the text-scan gates missed: upgrade the detection
+    # flags so downstream RFIs stop claiming "no schedule provided", and ask
+    # for the machine-unreadable one instead.
+    kind_flags = (("finish_schedule", "has_finish_schedule"),
+                  ("door_schedule", "has_door_schedule"),
+                  ("window_schedule", "has_window_schedule"))
+    for kind, flag in kind_flags:
+        hits = [p for p in pages if p.get("page_kind") == kind]
+        if not hits or analysis.get(flag) is True:
+            continue
+        analysis[flag] = True
+        recon["flags_upgraded"].append(flag)
+        where = ", ".join(f"{p.get('file', '?')} p.{p.get('page', '?')}"
+                          for p in hits[:4])
+        _note(f"{kind.replace('_', ' ')} present on {where} but was not "
+              f"machine-read by the schedule pre-scans (title/text gate "
+              f"miss). Detection flag upgraded; contents NOT extracted.")
+        if kind == "finish_schedule":
+            _gate_add_rfi(
+                analysis, "Finish Schedule",
+                f"A room finish schedule was found on {where} but could not "
+                f"be machine-read, so per-room finishes (wallcovering, "
+                f"specialty coatings, ceiling types) are NOT reflected in "
+                f"this bid. Confirm the finish schedule contents or provide "
+                f"a readable copy and we will reprice.")
+            recon["rfis_added"] += 1
+
+    # (2) Wallcovering codes seen on unmeasured pages while the bid carries
+    # $0 wallcovering (the Beloit WC-1 signature).
+    wc_hits = by_cat.get("wallcovering", [])
+    wc_codes = set()
+    for f in wc_hits:
+        for c in f.get("codes") or []:
+            wc_codes.update(re.findall(r"[Ww][Cc]-?\d+", str(c)))
+        wc_codes.update(re.findall(
+            r"[Ww][Cc]-?\d+",
+            f"{f.get('item', '')} {f.get('detail', '')}"))
+    if wc_hits and _num(agg.get("total_wallcovering_sqft", 0)) <= 0:
+        codes_s = ", ".join(sorted(wc_codes)) if wc_codes \
+            else "wallcovering"
+        where = "; ".join(_prov(f) for f in wc_hits[:4])
+        _note(f"Wallcovering ({codes_s}) observed on unmeasured page(s): "
+              f"{where}. No wallcovering was quantified in this takeoff.")
+        new_codes = [c for c in sorted(wc_codes)
+                     if c.lower() not in known]
+        if new_codes or (not wc_codes and "wallcovering" not in known):
+            _gate_add_rfi(
+                analysis, "Wallcovering",
+                f"Wallcovering ({codes_s}) is specified on {where}, but "
+                f"those pages were not measured and no wallcovering area "
+                f"could be quantified, so wallcovering is $0 in this bid. "
+                f"Provide the rooms/walls receiving wallcovering and their "
+                f"extent and we will price it.")
+            recon["rfis_added"] += 1
+
+    # (3) Specialty finishes never mentioned anywhere in the extraction.
+    new_specialty = []
+    for f in by_cat.get("specialty_finish", []):
+        txt = f"{f.get('item', '')} {f.get('detail', '')}".lower()
+        kws = [k for k in _SPECIALTY_FINISH_KEYWORDS if k in txt]
+        if kws and not any(k in known for k in kws):
+            new_specialty.append(f)
+    if new_specialty:
+        items = "; ".join(
+            f"{f.get('item', '?')} ({_prov(f)})" for f in new_specialty[:5])
+        _note(f"Specialty finish(es) on unmeasured page(s) not present in "
+              f"the extraction: {items}.")
+        _gate_add_rfi(
+            analysis, "Specialty Finishes",
+            f"The following specialty finishes appear on pages that were "
+            f"not measured and are NOT priced in this bid: {items}. "
+            f"Confirm whether they are in the painting scope and their "
+            f"extent, and we will price them.")
+        recon["rfis_added"] += 1
+
+    # (4) Paint-exposed-structure / dryfall callouts with no dryfall priced
+    # and no structural scope captured.
+    df_hits = by_cat.get("dryfall_exposed_structure", [])
+    if df_hits and _num(agg.get("total_dryfall_ceiling_sqft", 0)) <= 0 \
+            and not analysis.get("structural_finish_scope"):
+        where = "; ".join(_prov(f) for f in df_hits[:4])
+        _note(f"Exposed-structure/dryfall paint callout(s) on unmeasured "
+              f"page(s): {where}. No dryfall or structural finish scope "
+              f"was priced.")
+        _gate_add_rfi(
+            analysis, "Ceiling Scope",
+            f"Notes on {where} call for painting exposed structure / deck "
+            f"(dryfall), but no such scope was captured or priced in this "
+            f"bid. Confirm the areas receiving dryfall/exposed-structure "
+            f"paint and we will price them.")
+        recon["rfis_added"] += 1
+
+    # (5) Exterior scope seen while the analysis has no exterior quantities.
+    ext_hits = by_cat.get("exterior", [])
+    if ext_hits and not _positive_number_in(analysis.get("exterior") or {}):
+        where = "; ".join(_prov(f) for f in ext_hits[:4])
+        _note(f"Exterior painting scope referenced on unmeasured page(s): "
+              f"{where}. No exterior quantities are in this takeoff.")
+        _gate_add_rfi(
+            analysis, "Exterior Scope",
+            f"Pages {where} reference exterior painting scope, but no "
+            f"exterior surfaces were measured or priced in this bid. "
+            f"Confirm whether exterior painting is in scope.")
+        recon["rfis_added"] += 1
+
+    # (6) Alternates / allowances touching painting.
+    alt_hits = by_cat.get("alternates", [])
+    new_alts = [f for f in alt_hits
+                if str(f.get('item', '')).lower() not in known]
+    if new_alts:
+        items = "; ".join(
+            f"{f.get('item', '?')} ({_prov(f)})" for f in new_alts[:5])
+        _note(f"Alternate/allowance item(s) affecting painting on "
+              f"unmeasured page(s): {items}.")
+        _gate_add_rfi(
+            analysis, "Alternates",
+            f"The bid documents list alternates/allowances affecting "
+            f"painting that are not reflected in this base bid: {items}. "
+            f"Advise which alternates to include.")
+        recon["rfis_added"] += 1
+
+    # (7) Plain scope notes: surface as notes only (no RFI spam).
+    for f in by_cat.get("scope_note", [])[:6]:
+        item = str(f.get("item", "")).strip()
+        detail = str(f.get("detail", "")).strip()
+        if item or detail:
+            _note(f"Scope note on {_prov(f)}: "
+                  f"{(item + ' — ' + detail).strip(' —')[:240]}")
+
+    sweep["reconciliation"] = recon
+    if recon["rfis_added"] or recon["flags_upgraded"]:
+        print(f"   🧹 Scope sweep reconciliation: {recon['rfis_added']} "
+              f"RFI(s) queued, flags upgraded: "
+              f"{recon['flags_upgraded'] or 'none'}, "
+              f"{recon['notes_added']} note(s)")
+    return analysis
+
+
 def build_priced_takeoff(analysis, strict=None):
     """Single provenance choke point between aggregation and calculate_costs.
 
@@ -20346,6 +20828,21 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     _set_finish_schedule_flag(analysis, pdf_paths)
     _set_door_schedule_flag(analysis, pdf_paths)
     _set_window_schedule_flag(analysis, pdf_paths)
+
+    # --- Scope sweep (flag-gated): cheap LLM pass over unmeasured pages ---
+    # Reconciliation net for the keyword-gated pre-scans: any painting-
+    # relevant page the ledger says nothing measured gets a low-cost vision
+    # read for scope items (wallcovering, specialty finishes, dryfall,
+    # schedules the gates missed), diffed against the analysis. Emits notes
+    # + detection-flag upgrades + pre-pricing RFIs only — never quantities.
+    # Runs AFTER the text-scan flag setters (it only upgrades them) and
+    # BEFORE validation/pricing so its RFIs ship with the proposal.
+    if _scope_sweep_enabled():
+        try:
+            _run_scope_sweep(client, pdf_paths, analysis)
+            _reconcile_scope_sweep(analysis)
+        except Exception as _sweep_err:
+            print(f"   ⚠️  Scope sweep failed (non-fatal): {_sweep_err}")
     # Canonicalize source_sheet on every room BEFORE the upload-sheet
     # inventory is built and BEFORE downstream dedup runs. The LLM
     # sometimes emits ANSI-style sheet IDs ('A-102') for pages actually
@@ -21279,12 +21776,21 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     if os.environ.get("NIGHTSHIFT_VECTOR_MEASURE", "0").strip() in ("1", "true", "True"):
         try:
             import vme_attribution as _vme
+            # v2 (M4/M5): title-based page attribution + tier-2 geometric
+            # walls — works on multi-file and layerless sets. The legacy
+            # layer-tagged path still runs on single-PDF jobs as a
+            # cross-check while v2 matures.
+            shadow_v2 = _vme.compute_vme_shadow_v2(pdf_paths)
+            if shadow_v2:
+                analysis["_vme_shadow_v2"] = shadow_v2
             single_pdf = pdf_paths[0] if (pdf_paths and len(pdf_paths) == 1) else None
             shadow = _vme.compute_vme_shadow(single_pdf) if single_pdf else None
             if shadow:
                 analysis["_vme_shadow"] = shadow
-                print(f"   🧪 VME shadow: {shadow['total_wall_run_lf']:,.0f} LF wall run "
-                      f"across {shadow['n_floor_pages']} floor sheet(s) "
+            shown = shadow_v2 or shadow
+            if shown:
+                print(f"   🧪 VME shadow: {shown['total_wall_run_lf']:,.0f} LF wall run "
+                      f"across {shown['n_floor_pages']} floor sheet(s) "
                       f"(comparison only)")
         except Exception as _vme_err:
             print(f"   ⚠️  VME shadow skipped: {type(_vme_err).__name__}: "

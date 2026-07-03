@@ -105,5 +105,50 @@ if vm.fitz is not None and os.path.exists(FISH):
           f"{r['wall_run_lf']:.0f} LF (Rider 747)")
 
 # --------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# M5 Tier-2: geometric wall detection (no layers) — synthetic fixture
+# ---------------------------------------------------------------------------
+def test_tier2_geometric_walls():
+    import fitz
+    import tempfile, os
+    import vector_measure as vm
+    # Build a synthetic layerless plan at 9 pts/ft (1/8"): a 40ft x 30ft room
+    # drawn as parallel face pairs 0.5ft (4.5pt) apart, plus decoys: a grid
+    # line (no pair), a dimension pair 3ft apart (outside thickness band),
+    # and a short door-leaf line.
+    doc = fitz.open()
+    page = doc.new_page(width=800, height=600)
+    s = 9.0
+    x0, y0 = 100, 100
+    w, h = 40 * s, 30 * s
+    t = 0.5 * s
+    sh = page.new_shape()
+    for (a, b) in (((x0, y0), (x0 + w, y0)), ((x0, y0 + h), (x0 + w, y0 + h))):
+        sh.draw_line(fitz.Point(*a), fitz.Point(*b))                    # outer H
+        sh.draw_line(fitz.Point(a[0], a[1] + t), fitz.Point(b[0], b[1] + t))  # inner H
+    for (a, b) in (((x0, y0), (x0, y0 + h)), ((x0 + w, y0), (x0 + w, y0 + h))):
+        sh.draw_line(fitz.Point(*a), fitz.Point(*b))
+        sh.draw_line(fitz.Point(a[0] + t, a[1]), fitz.Point(b[0] + t, b[1]))
+    sh.draw_line(fitz.Point(50, 50), fitz.Point(750, 50))       # grid/dim decoy (unpaired)
+    sh.draw_line(fitz.Point(50, 50 + 3 * s), fitz.Point(750, 50 + 3 * s))  # 3ft gap decoy
+    sh.draw_line(fitz.Point(x0 + 60, y0 + 5), fitz.Point(x0 + 60, y0 + 5 + 0.9 * s))  # leaf
+    sh.finish()
+    sh.commit()
+    fd, path = tempfile.mkstemp(suffix=".pdf")
+    os.close(fd)
+    doc.save(path)
+    doc.close()
+    r = vm.measure_wall_runs_geometric(path, 0, pts_per_ft=s)
+    os.remove(path)
+    lf = r["wall_run_lf"]
+    # true run = 2x40 + 2x30 = 140 LF; allow clustering slop
+    check(f"tier2 synthetic room ~140 LF (got {lf:.1f})", abs(lf - 140) <= 8)
+    check("tier2 scale source propagated", r["scale_source"] == "given")
+
+
+test_tier2_geometric_walls()
+
+
 print(f"\n=== {'ALL PASS' if not _fails else str(len(_fails)) + ' FAILED: ' + ', '.join(_fails)} ===")
 sys.exit(1 if _fails else 0)

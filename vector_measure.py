@@ -42,7 +42,14 @@ PTS_PER_INCH = 72.0
 # AIA-standard wall layers carry these tokens; the negatives strip annotation,
 # room-id text, hatch *patterns*, dashed below-walls, and glazing ("lite").
 _WALL_POS = ("a-wall", "wall-demising", "partition")
-_WALL_NEG = ("anno", "iden", "patt", "hatch", "-blow", "below", "-lite")
+# 'eifs' — exterior substrate; interior wall runs must not absorb exterior
+# skin lines (exterior is scoped separately). NOTE: 'belw' (A-WALL-BELW) is
+# deliberately NOT excluded — CenHud Fishkill draws real above-grade
+# partitions on it (drafters misuse layer names), which is exactly why layer
+# names alone cannot classify walls; the geometric wall test (M5) validates
+# every candidate layer's segments regardless of name.
+_WALL_NEG = ("anno", "iden", "patt", "hatch", "-blow", "below", "-lite",
+             "eifs")
 
 
 def is_wall_layer(layer: str) -> bool:
@@ -119,6 +126,122 @@ def detect_scale(pdf_path: str, page_index: int):
             if s:
                 return s
     return parse_scale(txt)
+
+
+# --------------------------------------------------------------------------
+# M4 — geometry-based scale inference (door-swing arc calibration)
+# --------------------------------------------------------------------------
+# Many CAD exports plot text as curves: the page has NO extractable text, so
+# title-block scale detection is impossible (CenHud Fishkill). But door swings
+# are drawn as quarter-circle arcs whose real-world radius equals the door
+# leaf width — overwhelmingly 2'-6", 2'-8", or 3'-0". Architectural plot
+# scales come from a small discrete set, so instead of estimating a continuous
+# scale we SCORE each standard candidate by how many arc radii land on a
+# plausible door leaf under that candidate, and require an unambiguous winner.
+# No winner -> None (never guess silently; the caller flags the sheet).
+
+# pts-per-foot for the standard imperial plot scales:
+# 1/16"  3/32"  1/8"  3/16"  1/4"  3/8"  1/2"  3/4"  1"  = 1'-0"
+_STANDARD_SCALES = (4.5, 6.75, 9.0, 13.5, 18.0, 27.0, 36.0, 54.0, 72.0)
+# Door leaf widths (feet) that anchor the arc-radius scoring. 2'-0" is
+# deliberately EXCLUDED: standard scales sit in 1.5x ratios (9 -> 13.5), and a
+# 3'-0" leaf at scale s aliases exactly to a 2'-0" leaf at 1.5s, poisoning the
+# vote. Leafs below 2'-4" are rare enough to give up for disambiguation.
+_DOOR_LEAF_FT = (2.5, 2.67, 3.0)
+_LEAF_TOL_FT = 0.07
+
+
+def _arc_radii_pts(page, max_paths=40000):
+    """Radii (points) of circular-ish arcs on the page.
+
+    A door swing exported to PDF is a chain of cubic beziers. For each bezier
+    we estimate a radius from the chord + sagitta of the curve (control points
+    give the sagitta direction); segments whose two control-point distances
+    from the chord agree (circular, not spline-y) are kept.
+    """
+    import math
+    radii = []
+    for path in page.get_drawings()[:max_paths]:
+        for item in path["items"]:
+            if item[0] != "c":
+                continue
+            p0, p1, p2, p3 = item[1], item[2], item[3], item[4]
+            chord = math.hypot(p3.x - p0.x, p3.y - p0.y)
+            if chord < 4:
+                continue
+            # exact cubic midpoint: B(0.5) = (p0 + 3p1 + 3p2 + p3) / 8
+            mx = (p0.x + 3 * p1.x + 3 * p2.x + p3.x) / 8.0
+            my = (p0.y + 3 * p1.y + 3 * p2.y + p3.y) / 8.0
+            # circumcircle through (p0, mid, p3) — exact for a circular arc
+            ax, ay, bx, by, cx, cy = p0.x, p0.y, mx, my, p3.x, p3.y
+            d = 2 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+            if abs(d) < 1e-6:
+                continue  # collinear — a straight "curve", not an arc
+            ux = ((ax * ax + ay * ay) * (by - cy) + (bx * bx + by * by) * (cy - ay)
+                  + (cx * cx + cy * cy) * (ay - by)) / d
+            uy = ((ax * ax + ay * ay) * (cx - bx) + (bx * bx + by * by) * (ax - cx)
+                  + (cx * cx + cy * cy) * (bx - ax)) / d
+            r = math.hypot(ax - ux, ay - uy)
+            # circularity check: the two control points must sit near the
+            # same circle (splines/ellipses drift)
+            r1 = math.hypot(p1.x - ux, p1.y - uy)
+            r2 = math.hypot(p2.x - ux, p2.y - uy)
+            if abs(r1 - r) > 0.12 * r or abs(r2 - r) > 0.12 * r:
+                continue
+            if 6 <= r <= 400:   # sane door-swing radii in points at any scale
+                radii.append(r)
+    return radii
+
+
+def infer_scale_from_arcs(pdf_path: str, page_index: int,
+                          min_hits: int = 4, min_margin: float = 2.0):
+    """Infer pts-per-foot by scoring standard scales against door-swing arcs.
+
+    Returns (pts_per_ft, diagnostics) — pts_per_ft is None when no candidate
+    wins unambiguously (fewer than `min_hits` door-like arcs, or the best
+    candidate doesn't beat the runner-up by `min_margin`x).
+    """
+    if fitz is None:
+        raise RuntimeError("PyMuPDF (fitz) is required")
+    doc = fitz.open(pdf_path)
+    try:
+        radii = _arc_radii_pts(doc[page_index])
+    finally:
+        doc.close()
+    if not radii:
+        return None, {"arcs": 0}
+    scores = {}
+    for cand in _STANDARD_SCALES:
+        hits = 0
+        for r in radii:
+            ft = r / cand
+            if any(abs(ft - leaf) <= _LEAF_TOL_FT for leaf in _DOOR_LEAF_FT):
+                hits += 1
+        scores[cand] = hits
+    ranked = sorted(scores.items(), key=lambda kv: -kv[1])
+    best, second = ranked[0], ranked[1]
+    diag = {"arcs": len(radii), "scores": scores}
+    if best[1] < min_hits:
+        return None, diag
+    if second[1] and best[1] < min_margin * second[1]:
+        return None, diag  # ambiguous between two scales
+    return best[0], diag
+
+
+def detect_scale_robust(pdf_path: str, page_index: int):
+    """Scale via title-block text, falling back to door-arc geometry.
+
+    Returns (pts_per_ft or None, source) where source is 'text' | 'arcs' |
+    'none'. This is the M4 entry point — callers must treat None as
+    unmeasured (flag/RFI), never substitute a guessed scale.
+    """
+    s = detect_scale(pdf_path, page_index)
+    if s:
+        return s, "text"
+    s, _diag = infer_scale_from_arcs(pdf_path, page_index)
+    if s:
+        return s, "arcs"
+    return None, "none"
 
 
 # --------------------------------------------------------------------------
@@ -211,6 +334,122 @@ def measure_wall_runs(pdf_path, page_index, layer_prefix=None, pts_per_ft=None,
                 "pts_per_ft": pts_per_ft}
     finally:
         doc.close()
+
+
+# --------------------------------------------------------------------------
+# M5 Tier-2 — geometric wall detection (no layer tags required)
+# --------------------------------------------------------------------------
+# Flattened-vector exports (Livestock, Honey, most GC-issued sets) carry no
+# CAD layer names, and even tagged sets misuse them (CenHud draws real
+# partitions on A-WALL-BELW). The reliable definition of a wall is geometric:
+# TWO PARALLEL LINES (the faces) at wall-thickness spacing, overlapping for a
+# meaningful length. Dimension lines pair at far larger gaps, grid lines don't
+# pair at all, door leafs are too short, poché hatch is diagonal, and
+# casework is deeper than any wall — the thickness band + overlap length do
+# almost all of the filtering.
+
+_WALL_MIN_THICK_FT = 0.28   # 3.5" stud partition (bare)
+_WALL_MAX_THICK_FT = 1.15   # 12" CMU + furring
+_WALL_MIN_RUN_FT = 1.5      # ignore pairs overlapping less than a door jamb
+
+
+def _axis_segments(page, min_len_pts=2.0, include_layers=None):
+    """All axis-aligned line segments (+ thin filled rects as face pairs).
+
+    Returns (H, V): H = [(y, x0, x1)], V = [(x, y0, y1)]. When
+    `include_layers` is not None, only paths whose layer passes the filter
+    are used; None means every path (tier-2, layerless).
+    """
+    H, V = [], []
+    for path in page.get_drawings():
+        if include_layers is not None and not include_layers(path.get("layer") or ""):
+            continue
+        for it in path["items"]:
+            if it[0] == "l":
+                a, b = it[1], it[2]
+                if abs(a.y - b.y) <= 1.0 and abs(a.x - b.x) > min_len_pts:
+                    H.append((round((a.y + b.y) / 2.0, 1),
+                              min(a.x, b.x), max(a.x, b.x)))
+                elif abs(a.x - b.x) <= 1.0 and abs(a.y - b.y) > min_len_pts:
+                    V.append((round((a.x + b.x) / 2.0, 1),
+                              min(a.y, b.y), max(a.y, b.y)))
+            elif it[0] == "re":
+                r = it[1]
+                # a thin filled rectangle IS a wall chunk: emit both faces
+                if r.width > min_len_pts and r.height <= 12:
+                    H.append((round(r.y0, 1), r.x0, r.x1))
+                    H.append((round(r.y1, 1), r.x0, r.x1))
+                elif r.height > min_len_pts and r.width <= 12:
+                    V.append((round(r.x0, 1), r.y0, r.y1))
+                    V.append((round(r.x1, 1), r.y0, r.y1))
+    return H, V
+
+
+def _pair_centerlines(segments, min_gap_pts, max_gap_pts, min_overlap_pts):
+    """Wall centerline intervals from parallel face pairs (one orientation).
+
+    For each pair of segments whose perpendicular gap is inside the wall
+    thickness band and whose spans overlap >= min_overlap_pts, emit
+    (centerline_coord, overlap_lo, overlap_hi). Multi-line wall assemblies
+    (face+face+cavity lines) produce several nearby centerlines for the same
+    wall — the caller collapses them with cluster_wall_runs, so each wall is
+    counted once.
+    """
+    out = []
+    by_coord = {}
+    for perp, lo, hi in segments:
+        by_coord.setdefault(perp, []).append((lo, hi))
+    coords = sorted(by_coord)
+    for i, c1 in enumerate(coords):
+        for j in range(i + 1, len(coords)):
+            c2 = coords[j]
+            gap = c2 - c1
+            if gap > max_gap_pts:
+                break
+            if gap < min_gap_pts:
+                continue
+            for (a1, b1) in by_coord[c1]:
+                for (a2, b2) in by_coord[c2]:
+                    lo, hi = max(a1, a2), min(b1, b2)
+                    if hi - lo >= min_overlap_pts:
+                        out.append((round((c1 + c2) / 2.0, 1), lo, hi))
+    return out
+
+
+def measure_wall_runs_geometric(pdf_path, page_index, pts_per_ft=None,
+                                include_layers=None):
+    """Tier-2 wall RUN measurement: parallel-pair detection, no layers needed.
+
+    Returns {wall_run_lf, n_face_segments, n_pair_intervals, pts_per_ft,
+    scale_source}. wall_run_lf is None when no scale can be established —
+    callers must treat that as unmeasured (RFI), never guess.
+    """
+    if fitz is None:
+        raise RuntimeError("PyMuPDF (fitz) is required")
+    scale_source = "given"
+    if pts_per_ft is None:
+        pts_per_ft, scale_source = detect_scale_robust(pdf_path, page_index)
+    if not pts_per_ft:
+        return {"wall_run_lf": None, "pts_per_ft": None,
+                "scale_source": "none"}
+    doc = fitz.open(pdf_path)
+    try:
+        H, V = _axis_segments(doc[page_index], include_layers=include_layers)
+    finally:
+        doc.close()
+    min_gap = _WALL_MIN_THICK_FT * pts_per_ft
+    max_gap = _WALL_MAX_THICK_FT * pts_per_ft
+    min_ov = _WALL_MIN_RUN_FT * pts_per_ft
+    ch = _pair_centerlines(H, min_gap, max_gap, min_ov)
+    cv = _pair_centerlines(V, min_gap, max_gap, min_ov)
+    # Collapse the multiple centerlines of one wall assembly into single runs.
+    band = max_gap  # centerlines of one wall sit within its thickness
+    run_pts = cluster_wall_runs(ch, band) + cluster_wall_runs(cv, band)
+    return {"wall_run_lf": run_pts / pts_per_ft,
+            "n_face_segments": len(H) + len(V),
+            "n_pair_intervals": len(ch) + len(cv),
+            "pts_per_ft": pts_per_ft,
+            "scale_source": scale_source}
 
 
 # --------------------------------------------------------------------------
