@@ -323,12 +323,34 @@ def select_floor_plan_pages(pdf_paths):
                 lines = [] if filename_only else _top_font_lines(doc[i])
                 info = classify_title_lines(lines, fname,
                                             filename_only=filename_only)
+                if info["kind"] != "floor_plan" and not filename_only:
+                    # strict caption fallback: viewport captions are exact
+                    # lines like "2nd Floor Plan" (364 p10's title block is
+                    # unlabeled, but its caption line is present in text)
+                    cap_re = _re.compile(
+                        r"^\s*\d{0,2}\s*(basement|ground|first|second|third|"
+                        r"fourth|fifth|1st|2nd|3rd|4th|5th)?\s*"
+                        r"(?:and\s+(?:\d\w\w|\w+)\s*)?floor\s+plans?\s*$",
+                        _re.I)
+                    try:
+                        for tl in doc[i].get_text().splitlines():
+                            tln = _norm(tl).strip()
+                            if cap_re.match(tln) and not _NOT_PLAN_RE.search(tln):
+                                fls = _floors_in(tln)
+                                info = {"kind": "floor_plan",
+                                        "floors": fls or ["all"],
+                                        "sheet": info.get("sheet"),
+                                        "src": "caption"}
+                                break
+                    except Exception:
+                        pass
                 if info["kind"] == "floor_plan":
                     arch = bool(info["sheet"]
                                 and _re.match(r"A-?D?-?\d", info["sheet"]))
                     plan_pages.append({"pdf": pdf, "page": i,
                                        "floors": info["floors"],
-                                       "sheet": info["sheet"], "arch": arch})
+                                       "sheet": info["sheet"], "arch": arch,
+                                       "src": info.get("src", "font")})
                 if filename_only:
                     break   # one classification per file
         finally:
@@ -344,8 +366,22 @@ def select_floor_plan_pages(pdf_paths):
             out.append({**p, "floors": new})
     if not out:
         allp = [p for p in plan_pages if p["floors"] == ["all"]]
+        # font-classified titles beat strict-caption fallbacks
+        allp.sort(key=lambda p: p.get("src", "font") != "font")
         if allp:
             out = [allp[0]]
+    # ordinal gap-fill: floors "1" and "3" claimed on consecutive sheets with
+    # the page between them unclaimed -> that page is the missing floor whose
+    # caption text is unextractable (364 p10: title plotted as curves)
+    have = {f: p for p in out for f in p["floors"]}
+    for miss, lo, hi in (("2", "1", "3"), ("3", "2", "4"), ("4", "3", "5")):
+        if miss not in have and lo in have and hi in have:
+            p_lo, p_hi = have[lo], have[hi]
+            if (p_lo["pdf"] == p_hi["pdf"]
+                    and p_hi["page"] - p_lo["page"] == 2):
+                out.append({"pdf": p_lo["pdf"], "page": p_lo["page"] + 1,
+                            "floors": [miss], "sheet": None, "arch": True,
+                            "src": "gap-fill"})
     return out
 
 
