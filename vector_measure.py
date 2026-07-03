@@ -337,6 +337,122 @@ def measure_wall_runs(pdf_path, page_index, layer_prefix=None, pts_per_ft=None,
 
 
 # --------------------------------------------------------------------------
+# M5 Tier-2 — geometric wall detection (no layer tags required)
+# --------------------------------------------------------------------------
+# Flattened-vector exports (Livestock, Honey, most GC-issued sets) carry no
+# CAD layer names, and even tagged sets misuse them (CenHud draws real
+# partitions on A-WALL-BELW). The reliable definition of a wall is geometric:
+# TWO PARALLEL LINES (the faces) at wall-thickness spacing, overlapping for a
+# meaningful length. Dimension lines pair at far larger gaps, grid lines don't
+# pair at all, door leafs are too short, poché hatch is diagonal, and
+# casework is deeper than any wall — the thickness band + overlap length do
+# almost all of the filtering.
+
+_WALL_MIN_THICK_FT = 0.28   # 3.5" stud partition (bare)
+_WALL_MAX_THICK_FT = 1.15   # 12" CMU + furring
+_WALL_MIN_RUN_FT = 1.5      # ignore pairs overlapping less than a door jamb
+
+
+def _axis_segments(page, min_len_pts=2.0, include_layers=None):
+    """All axis-aligned line segments (+ thin filled rects as face pairs).
+
+    Returns (H, V): H = [(y, x0, x1)], V = [(x, y0, y1)]. When
+    `include_layers` is not None, only paths whose layer passes the filter
+    are used; None means every path (tier-2, layerless).
+    """
+    H, V = [], []
+    for path in page.get_drawings():
+        if include_layers is not None and not include_layers(path.get("layer") or ""):
+            continue
+        for it in path["items"]:
+            if it[0] == "l":
+                a, b = it[1], it[2]
+                if abs(a.y - b.y) <= 1.0 and abs(a.x - b.x) > min_len_pts:
+                    H.append((round((a.y + b.y) / 2.0, 1),
+                              min(a.x, b.x), max(a.x, b.x)))
+                elif abs(a.x - b.x) <= 1.0 and abs(a.y - b.y) > min_len_pts:
+                    V.append((round((a.x + b.x) / 2.0, 1),
+                              min(a.y, b.y), max(a.y, b.y)))
+            elif it[0] == "re":
+                r = it[1]
+                # a thin filled rectangle IS a wall chunk: emit both faces
+                if r.width > min_len_pts and r.height <= 12:
+                    H.append((round(r.y0, 1), r.x0, r.x1))
+                    H.append((round(r.y1, 1), r.x0, r.x1))
+                elif r.height > min_len_pts and r.width <= 12:
+                    V.append((round(r.x0, 1), r.y0, r.y1))
+                    V.append((round(r.x1, 1), r.y0, r.y1))
+    return H, V
+
+
+def _pair_centerlines(segments, min_gap_pts, max_gap_pts, min_overlap_pts):
+    """Wall centerline intervals from parallel face pairs (one orientation).
+
+    For each pair of segments whose perpendicular gap is inside the wall
+    thickness band and whose spans overlap >= min_overlap_pts, emit
+    (centerline_coord, overlap_lo, overlap_hi). Multi-line wall assemblies
+    (face+face+cavity lines) produce several nearby centerlines for the same
+    wall — the caller collapses them with cluster_wall_runs, so each wall is
+    counted once.
+    """
+    out = []
+    by_coord = {}
+    for perp, lo, hi in segments:
+        by_coord.setdefault(perp, []).append((lo, hi))
+    coords = sorted(by_coord)
+    for i, c1 in enumerate(coords):
+        for j in range(i + 1, len(coords)):
+            c2 = coords[j]
+            gap = c2 - c1
+            if gap > max_gap_pts:
+                break
+            if gap < min_gap_pts:
+                continue
+            for (a1, b1) in by_coord[c1]:
+                for (a2, b2) in by_coord[c2]:
+                    lo, hi = max(a1, a2), min(b1, b2)
+                    if hi - lo >= min_overlap_pts:
+                        out.append((round((c1 + c2) / 2.0, 1), lo, hi))
+    return out
+
+
+def measure_wall_runs_geometric(pdf_path, page_index, pts_per_ft=None,
+                                include_layers=None):
+    """Tier-2 wall RUN measurement: parallel-pair detection, no layers needed.
+
+    Returns {wall_run_lf, n_face_segments, n_pair_intervals, pts_per_ft,
+    scale_source}. wall_run_lf is None when no scale can be established —
+    callers must treat that as unmeasured (RFI), never guess.
+    """
+    if fitz is None:
+        raise RuntimeError("PyMuPDF (fitz) is required")
+    scale_source = "given"
+    if pts_per_ft is None:
+        pts_per_ft, scale_source = detect_scale_robust(pdf_path, page_index)
+    if not pts_per_ft:
+        return {"wall_run_lf": None, "pts_per_ft": None,
+                "scale_source": "none"}
+    doc = fitz.open(pdf_path)
+    try:
+        H, V = _axis_segments(doc[page_index], include_layers=include_layers)
+    finally:
+        doc.close()
+    min_gap = _WALL_MIN_THICK_FT * pts_per_ft
+    max_gap = _WALL_MAX_THICK_FT * pts_per_ft
+    min_ov = _WALL_MIN_RUN_FT * pts_per_ft
+    ch = _pair_centerlines(H, min_gap, max_gap, min_ov)
+    cv = _pair_centerlines(V, min_gap, max_gap, min_ov)
+    # Collapse the multiple centerlines of one wall assembly into single runs.
+    band = max_gap  # centerlines of one wall sit within its thickness
+    run_pts = cluster_wall_runs(ch, band) + cluster_wall_runs(cv, band)
+    return {"wall_run_lf": run_pts / pts_per_ft,
+            "n_face_segments": len(H) + len(V),
+            "n_pair_intervals": len(ch) + len(cv),
+            "pts_per_ft": pts_per_ft,
+            "scale_source": scale_source}
+
+
+# --------------------------------------------------------------------------
 # Geometry
 # --------------------------------------------------------------------------
 def union_length(intervals) -> float:
