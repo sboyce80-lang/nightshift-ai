@@ -91,4 +91,59 @@ if m1.fitz is not None and _os.path.exists(_fish):
         print(f"  PASS  Fishkill shadow well-formed ({s['total_wall_run_lf']:.0f} LF, "
               f"{s['n_floor_pages']} sheets)")
 
+print("\nM2 part 3 — room_regions envelope seal (synthetic)")
+if m1.fitz is not None:
+    import fitz, tempfile
+    # A 40x30ft building whose EXTERIOR is drawn as UNPAIRED single lines (so
+    # it produces no wall `runs`), one interior partition drawn as a face pair,
+    # and a sheet-border decoy spanning >85% of the page. This is exactly the
+    # Livestock leak: seeding the flood grid from runs alone leaves the
+    # exterior without a cell boundary -> the whole interior floods to the page
+    # edge as one leaky blob. The fix (seed from clustered wall lines + drop
+    # border-scale lines) must seal it into bounded rooms.
+    s = 9.0
+    doc = fitz.open(); page = doc.new_page(width=800, height=600)
+    x0, y0, w, h = 150, 120, 40 * s, 30 * s
+    t = 0.5 * s
+    sh = page.new_shape()
+    def rect_lines(a, b, c, d):   # 4 explicit single lines (draw_rect -> re is skipped)
+        sh.draw_line(fitz.Point(a, b), fitz.Point(c, b))
+        sh.draw_line(fitz.Point(a, d), fitz.Point(c, d))
+        sh.draw_line(fitz.Point(a, b), fitz.Point(a, d))
+        sh.draw_line(fitz.Point(c, b), fitz.Point(c, d))
+    # exterior envelope: single lines, no pair
+    rect_lines(x0, y0, x0 + w, y0 + h)
+    # interior partition (vertical, mid) as a face pair -> a real run + splits
+    xm = x0 + w / 2
+    sh.draw_line(fitz.Point(xm, y0), fitz.Point(xm, y0 + h))
+    sh.draw_line(fitz.Point(xm + t, y0), fitz.Point(xm + t, y0 + h))
+    # sheet-border decoy near the page edge (spans ~95% of page each way)
+    rect_lines(20, 20, 780, 580)
+    # small corner marks (north arrow / scale bar / dims) beyond the building,
+    # as on any real sheet, so the grid extends past the envelope and the
+    # sealed interior rooms are correctly interior (not grid-edge "leaky").
+    for (cx, cy) in ((45, 45), (740, 45), (45, 540), (740, 540)):
+        sh.draw_line(fitz.Point(cx, cy), fitz.Point(cx + 3 * s, cy))
+        sh.draw_line(fitz.Point(cx, cy), fitz.Point(cx, cy + 3 * s))
+    sh.finish(); sh.commit()
+    fd, path = tempfile.mkstemp(suffix=".pdf"); os.close(fd)
+    doc.save(path); doc.close()
+    regs = m1.room_regions(path, 0, s, anchors=[])
+    os.remove(path)
+    tight = [r for r in regs if not r["leaky"]]
+    tight_sum = sum(r["area_ft2"] for r in tight)
+    page_ft2 = (800 * 600) / (s * s)
+    # building interior ~1200 ft^2 split into two ~600 ft^2 rooms
+    if len(tight) < 2:
+        fails.append(f"envelope leak: only {len(tight)} sealed rooms (want >=2)")
+    elif not (800 <= tight_sum <= 1300):
+        fails.append(f"envelope seal area {tight_sum:.0f} ft2 off (want ~1200)")
+    elif any(r["area_ft2"] > 0.7 * page_ft2 for r in tight):
+        fails.append("border decoy created a full-page pseudo-room")
+    elif not any(r["leaky"] for r in regs):
+        fails.append("outside not tagged leaky")
+    else:
+        print(f"  PASS  envelope sealed: {len(tight)} rooms, {tight_sum:.0f} ft2, "
+              f"outside leaky, no pseudo-room")
+
 print(f"\n=== {'PASS' if not fails else 'ISSUES: ' + '; '.join(fails)} ===")

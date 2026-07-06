@@ -738,31 +738,17 @@ def room_regions(pdf_path, page_index, pts_per_ft, anchors,
     # the paired runs; here we only need the space partition to be tight.
     doc = fitz.open(pdf_path)
     try:
-        rawH, rawV = vm._axis_segments(doc[page_index],
-                                       min_len_pts=2.5 * pts_per_ft)
+        page0 = doc[page_index]
+        pageW, pageH = page0.rect.width, page0.rect.height
+        rawH, rawV = vm._axis_segments(page0, min_len_pts=2.5 * pts_per_ft)
     finally:
         doc.close()
     slop = 0.6 * pts_per_ft   # walls block slightly beyond their endpoints
     door_gap = 6.5 * pts_per_ft  # openings up to a double-leaf door still
     # separate rooms — bridge them for the BLOCKING test only, or the flood
     # fill walks through every doorway and merges the whole floor.
-    xs, ys = set(), set()
-    for orient, perp, lo, hi in runs:
-        if orient == "H":
-            ys.add(round(perp, 1))
-            xs.update((round(lo, 1), round(hi, 1)))
-        else:
-            xs.add(round(perp, 1))
-            ys.update((round(lo, 1), round(hi, 1)))
     H = [(y, lo - slop, hi + slop) for (y, lo, hi) in rawH]
     V = [(x, lo - slop, hi + slop) for (x, lo, hi) in rawV]
-
-    xs = sorted(xs)
-    ys = sorted(ys)
-    if len(xs) < 2 or len(ys) < 2:
-        return []
-    if (len(xs) - 1) * (len(ys) - 1) > 250_000:
-        return []
 
     def build_lines(spans):
         """Group spans into wall lines (perp within a thickness band), union
@@ -791,6 +777,45 @@ def room_regions(pdf_path, page_index, pts_per_ft, anchors,
 
     H_lines = build_lines(H)
     V_lines = build_lines(V)
+
+    # Sheet-border / title-block-scale lines are not room walls; keeping them
+    # as blockers seals the OUTSIDE into a false enclosing "room". Drop any
+    # clustered line whose covered span exceeds 85% of the page dimension so
+    # the true outside stays page-edge-connected (leaky) and callers discard it.
+    def _drop_border(lines, page_dim):
+        return [(perp, ivs) for (perp, ivs) in lines
+                if sum(hi - lo for lo, hi in ivs) <= 0.85 * page_dim]
+    H_lines = _drop_border(H_lines, pageW)
+    V_lines = _drop_border(V_lines, pageH)
+
+    # Grid coordinates: seed from the paired runs AND from the clustered wall
+    # lines. Runs alone leave exterior/unpaired walls with no cell boundary, so
+    # the flood fill escapes through them (the envelope leak). Seeding every
+    # wall LINE as a grid coordinate makes each wall a cell edge that the
+    # blocking test can seal against, while staying O(#walls) small.
+    xs, ys = set(), set()
+    for orient, perp, lo, hi in runs:
+        if orient == "H":
+            ys.add(round(perp, 1))
+            xs.update((round(lo, 1), round(hi, 1)))
+        else:
+            xs.add(round(perp, 1))
+            ys.update((round(lo, 1), round(hi, 1)))
+    for perp, ivs in V_lines:            # vertical walls -> x cell boundaries
+        xs.add(round(perp, 1))
+        for lo, hi in ivs:
+            ys.update((round(lo + slop, 1), round(hi - slop, 1)))
+    for perp, ivs in H_lines:            # horizontal walls -> y cell boundaries
+        ys.add(round(perp, 1))
+        for lo, hi in ivs:
+            xs.update((round(lo + slop, 1), round(hi - slop, 1)))
+
+    xs = sorted(xs)
+    ys = sorted(ys)
+    if len(xs) < 2 or len(ys) < 2:
+        return []
+    if (len(xs) - 1) * (len(ys) - 1) > 250_000:
+        return []
 
     def blocked(lines, line_coord, a, b):
         """Edge [a,b] on line_coord is blocked when wall spans cover >=90%."""
