@@ -132,6 +132,24 @@ check(len(sent) == 1 and "FINISH SCHEDULE" in sent[0].get_text(),
 sent.close()
 os.unlink(tmp.name)
 
+# ── Fix 2b: schedule injection must not suppress room measurement ───────────
+# PNC rerun regression: with the 54-room schedule injected, A111 extraction
+# collapsed 49 rooms/19.2k SF -> 10 rooms/5.3k SF (the extractor anchored on
+# the schedule's room list). The hint must state it is finishes-only.
+print("\nFix 2b — finish-schedule hint carries the measure-everything guard")
+hints = {"room_finish_schedule": [
+    {"room_number": "1501", "room_name": "Reception", "wall_finish": "PT-1",
+     "ceiling_finish": "ACT", "base_finish": "WB-1"}]}
+prompt = T._build_extraction_prompt(schedule_hints=hints)
+check("FINISHES ONLY" in prompt and "NOT" in prompt,
+      "hint says the schedule is finishes-only, not the room inventory")
+check("INCLUDING rooms that do not appear in this schedule" in prompt,
+      "hint requires measuring rooms absent from the schedule")
+check("1501" in prompt, "schedule rows still injected")
+prompt_no_rfs = T._build_extraction_prompt(schedule_hints={"door_schedule": {}})
+check("FINISHES ONLY" not in prompt_no_rfs,
+      "guard only appears when a finish schedule is injected")
+
 # ── Fix 3: door material reconcile (schedule authoritative over plan) ───────
 print("\nFix 3 — _reconcile_door_materials_vs_plan")
 
