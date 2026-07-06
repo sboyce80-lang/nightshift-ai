@@ -1469,6 +1469,9 @@ _DISCIPLINE_MAP = [
     ('SK', 'Sketch / Field Coord', True),         # 2026-05-29 add — often the actual issued plan
     ('WP', 'Waterproofing', True),                # 2026-05-29 add — has room boundaries
     ('AV', 'Audio-Visual', True),                 # 2026-05-29 add — has room boundaries
+    ('I',  'Interiors', True),                    # 2026-07-06 add — PNC Milwaukee: I601 finish
+                                                  # schedule fell back to a stray "A1" grid label
+                                                  # because bare I-series sheets weren't recognized
     ('A',  'Architectural', True),
     ('G',  'General', True),
     ('T',  'Title', True),
@@ -1932,6 +1935,70 @@ def _detect_finish_schedule(pdf_path):
     """
     return _detect_schedule_in_pdf(pdf_path, _FINISH_TITLE_PHRASES,
                                    _FINISH_TABLE_TOKENS)
+
+
+def _find_finish_schedule_pages(pdf_path, max_pages=8):
+    """Return the 0-based page indices where the finish schedule lives.
+
+    Same dual-pass logic as _detect_schedule_in_pdf, but per-page: a page
+    matches when the title phrase appears as a standalone span (vector-art
+    schedule tables emit only the title), or when a title phrase plus 2+
+    column-header tokens appear in its text. Root cause this serves (PNC
+    Milwaukee): _extract_room_finish_schedule fed the model chunk 1 of the
+    whole set, and I601 — 18 pages in — never reached it. Targeting the
+    matched page(s) makes the schedule extraction independent of where the
+    sheet sits in the set.
+
+    Font-aware: sheet-note callouts like "REFER TO FINISH SCHEDULE." emit
+    6-9pt spans on many pages (PNC had five such pages), while the actual
+    schedule sheet's drawing title is 12pt+. When any page matches at title
+    size, only those pages are returned; the small-font matches are kept
+    solely as a fallback for sets whose schedule title is genuinely small.
+
+    Returns a sorted list, capped at max_pages; empty list on any failure
+    (callers fall back to the whole-document path).
+    """
+    TITLE_FONT_PT = 12.0
+    excl = [e.lower() for e in _SCHEDULE_REFERENCE_EXCLUDES]
+    try:
+        import fitz  # PyMuPDF
+        doc = fitz.open(pdf_path)
+    except Exception:
+        return []
+    hits = {}  # page_idx -> max matching span font size
+    try:
+        for idx in range(len(doc)):
+            page = doc[idx]
+            best = None
+            try:
+                d = page.get_text("dict")
+            except Exception:
+                d = {"blocks": []}
+            for block in d.get("blocks", []):
+                for line in block.get("lines", []):
+                    for span in line.get("spans", []):
+                        txt = (span.get("text") or "").strip().lower()
+                        if not txt or any(e in txt for e in excl):
+                            continue
+                        if any(p in txt for p in _FINISH_TITLE_PHRASES):
+                            sz = float(span.get("size", 0))
+                            best = sz if best is None else max(best, sz)
+            if best is None:
+                # Token pass: title phrase anywhere + 2+ column headers.
+                t = (page.get_text() or "").lower()
+                if any(p in t for p in _FINISH_TITLE_PHRASES) \
+                        and sum(1 for tok in _FINISH_TABLE_TOKENS if tok in t) >= 2:
+                    best = 0.0
+            if best is not None:
+                hits[idx] = best
+    except Exception:
+        return []
+    finally:
+        doc.close()
+    if not hits:
+        return []
+    titled = sorted(i for i, sz in hits.items() if sz >= TITLE_FONT_PT)
+    return (titled or sorted(hits))[:max_pages]
 
 
 def _detect_door_schedule(pdf_path):
@@ -7396,18 +7463,38 @@ Be precise — count every entry in each schedule row by row."""
         return None
 
 
-def _extract_room_finish_schedule(client, pdf_path):
+def _extract_room_finish_schedule(client, pdf_path, page_indices=None):
     """
     Extract Room Finish Schedule data from PDFs that have schedules but no floor plans.
     Unlike analyze_schedule_pdf() which gets door/window/stair counts, this function
     extracts room-level detail from Room Finish Schedules (A1.04, etc.) to enable
     schedule-based wall/ceiling estimation when floor plans are missing.
 
+    page_indices: optional 0-based pages known to hold the schedule (from
+    _find_finish_schedule_pages). When given, only those pages are sent —
+    the whole-document path returns just chunk 1 of a large set, so a
+    schedule deep in the set (PNC's I601, page 21) never reaches the model.
+
     Returns dict with 'room_finish_schedule' list and 'building_info' dict, or None.
     """
     print(f"\n📊 Extracting Room Finish Schedule: {os.path.basename(pdf_path)}")
 
-    pdf_data = _load_pdf_for_api(pdf_path, _client_for_validation=client)
+    pdf_data = None
+    if page_indices:
+        try:
+            targeted = _create_filtered_pdf(pdf_path, page_indices)
+            # Claude's request cap is 32 MB; leave generous headroom.
+            if targeted and len(targeted) * 4 / 3 < 20 * 1024 * 1024:
+                pdf_data = base64.b64encode(targeted).decode()
+                print(f"   🎯 Targeting schedule page(s) "
+                      f"{[p + 1 for p in page_indices]} "
+                      f"({len(targeted) / 1024:.0f} KB)")
+        except Exception as exc:
+            print(f"   ⚠️  Targeted schedule PDF failed "
+                  f"({type(exc).__name__}: {exc}) — falling back to full doc")
+            pdf_data = None
+    if pdf_data is None:
+        pdf_data = _load_pdf_for_api(pdf_path, _client_for_validation=client)
 
     room_finish_prompt = """You are analyzing ARCHITECTURAL DRAWING SHEETS that contain SCHEDULES (not floor plans).
 
@@ -13614,6 +13701,11 @@ def _door_schedule_scope_fix_enabled():
         "1", "true", "True")
 
 
+def _door_material_reconcile_enabled():
+    return os.environ.get("NIGHTSHIFT_DOOR_MATERIAL_RECONCILE", "0").strip() in (
+        "1", "true", "True")
+
+
 # Scope-note phrases that establish FRAMES are field-painted (not just panels).
 # When the door schedule classifies HM doors as hm_panel (panel painted, frame
 # factory-finished) but the project scope explicitly paints new HM frames, those
@@ -13671,6 +13763,79 @@ def _recover_door_leaf_count_from_notes(ds):
     return None, found
 
 
+def _reconcile_door_materials_vs_plan(analysis):
+    """Flag-gated (NIGHTSHIFT_DOOR_MATERIAL_RECONCILE, default off): make the
+    door schedule authoritative over floor-plan symbol counts.
+
+    PNC Milwaukee (2026-07): per-room extraction counted 71 full-paint doors
+    from plan door swings, while the A601 door schedule read "aluminum
+    storefront / demountable partition, factory finished" and returned 0
+    paintable doors. Plan symbols carry no material information; the schedule
+    does. When a door schedule was found and it reports FEWER paintable doors
+    than the plan count, adopt the schedule totals and RFI the delta —
+    hard-numbers policy: unconfirmed scope prices at zero plus an RFI, it is
+    not guessed. ($155 × 66 phantom doors = $10,230 on that job.)
+
+    Never adjusts upward (a schedule reporting more doors than the plans is
+    left for the schedule-count path), and never runs when the schedule
+    extraction produced no structured totals at all.
+    """
+    if not isinstance(analysis, dict) or not _door_material_reconcile_enabled():
+        return analysis
+    if analysis.get("_door_material_reconcile"):
+        return analysis
+    if not analysis.get("has_door_schedule"):
+        return analysis
+
+    agg = analysis.get("aggregated_totals")
+    ds = (analysis.get("schedule_data") or {}).get("door_schedule")
+    if not isinstance(agg, dict) or not isinstance(ds, dict):
+        return analysis
+    total_keys = ("total_doors_full_paint", "total_doors_hm_panel",
+                  "total_doors_frame_only")
+    if not any(k in ds for k in total_keys):
+        return analysis  # schedule extraction returned no structured totals
+
+    plan = {k: _num(agg.get(k, 0)) for k in total_keys}
+    sched = {k: _num(ds.get(k, 0)) for k in total_keys}
+    plan_total = sum(plan.values())
+    sched_total = sum(sched.values())
+    if plan_total <= 0 or sched_total >= plan_total:
+        return analysis
+
+    for k in total_keys:
+        agg[k] = sched[k]
+    stash = analysis.get("_schedule_authoritative_counts")
+    if isinstance(stash, dict):
+        for k in total_keys:
+            stash[k] = sched[k]
+
+    delta = plan_total - sched_total
+    analysis.setdefault("notes", []).append(
+        f"[Door Schedule Scope] Adopted door-schedule paint counts over "
+        f"floor-plan symbol counts: full_paint "
+        f"{plan['total_doors_full_paint']:.0f}→"
+        f"{sched['total_doors_full_paint']:.0f}, hm_panel "
+        f"{plan['total_doors_hm_panel']:.0f}→"
+        f"{sched['total_doors_hm_panel']:.0f}, frame_only "
+        f"{plan['total_doors_frame_only']:.0f}→"
+        f"{sched['total_doors_frame_only']:.0f}. Plan door symbols carry no "
+        f"material info; the door schedule is the material authority.")
+    analysis.setdefault("notes", []).append(
+        f"[RFI: Door Scope] The door schedule reports {sched_total:.0f} "
+        f"paintable door(s) but the floor plans show {plan_total:.0f} door "
+        f"symbol(s) — {delta:.0f} door(s) are excluded as factory-finished/"
+        f"aluminum or unconfirmed. Confirm the count and material of "
+        f"field-painted doors (wood/HM) from the door schedule before "
+        f"finalizing.")
+    analysis["_door_material_reconcile"] = {
+        "plan": plan, "schedule": sched, "excluded_delta": delta}
+    print(f"   🚪 Door material reconcile: {plan_total:.0f} plan-counted → "
+          f"{sched_total:.0f} schedule-confirmed paintable door(s) "
+          f"({delta:.0f} excluded, RFI added)")
+    return analysis
+
+
 def _reconcile_door_schedule_scope(analysis):
     """Flag-gated door-schedule reconciliation, run at the build_priced_takeoff
     choke point alongside the ceiling gate. Fixes two defects the INNIO Waukesha
@@ -13693,8 +13858,14 @@ def _reconcile_door_schedule_scope(analysis):
     sit in the hm_panel bucket (the schedule-driven shape); leaves mixed/already-
     classified schedules untouched. Flag-gated via NIGHTSHIFT_DOOR_SCHEDULE_FIX
     (default off). Idempotent via analysis['_door_schedule_scope_fix'].
+
+    Also hosts the independently-flagged material reconcile (shape 2, plan
+    counts vs schedule materials) so both run at the same choke point.
     """
-    if not isinstance(analysis, dict) or not _door_schedule_scope_fix_enabled():
+    if not isinstance(analysis, dict):
+        return analysis
+    analysis = _reconcile_door_materials_vs_plan(analysis)
+    if not _door_schedule_scope_fix_enabled():
         return analysis
     if analysis.get("_door_schedule_scope_fix"):
         return analysis
@@ -20038,16 +20209,24 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     # actually present; the result is injected into the extraction prompt.
     room_finish_schedule = None
     try:
+        # Kill switch: NIGHTSHIFT_TARGETED_FINISH_SCHEDULE=0 reverts to the
+        # whole-document (chunk-1-only) behavior.
+        _targeted_fs = os.environ.get(
+            "NIGHTSHIFT_TARGETED_FINISH_SCHEDULE", "1").strip() != "0"
         for pdf_path_scan in pdf_paths:
             if _detect_finish_schedule(pdf_path_scan):
-                rfs_pre = _extract_room_finish_schedule(client, pdf_path_scan)
+                fs_pages = (_find_finish_schedule_pages(pdf_path_scan)
+                            if _targeted_fs else [])
+                rfs_pre = _extract_room_finish_schedule(
+                    client, pdf_path_scan, page_indices=fs_pages)
                 if rfs_pre and rfs_pre.get("room_finish_schedule"):
                     room_finish_schedule = rfs_pre["room_finish_schedule"]
                     print(f"   📋 Room finish schedule pre-extracted: "
                           f"{len(room_finish_schedule)} rooms — injecting into extraction")
                     break
     except Exception as e:
-        print(f"   ⚠️  Finish schedule pre-extraction failed: {e}")
+        print(f"   ⚠️  Finish schedule pre-extraction failed: "
+              f"{e or type(e).__name__}")
         room_finish_schedule = None
 
     if room_finish_schedule:
