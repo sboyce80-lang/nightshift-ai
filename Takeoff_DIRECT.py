@@ -8830,9 +8830,14 @@ def _estimate_from_room_finish_schedule(room_schedule_data, schedule_data=None):
         if not wall_finish:
             return True  # Default to paintable
         wf = wall_finish.lower()
-        # Non-paintable finishes
+        # Non-paintable finishes. FRP / Trusscore / fiberglass-reinforced panels
+        # are factory-finished wet-wall cladding (restroom/kitchen), not field-
+        # painted — Livestock's 1st-floor wet rooms are Trusscore on the enlarged
+        # plans yet defaulted to GYP on the composite sheet.
         if any(kw in wf for kw in ("tile", "stone", "brick", "glass", "metal panel",
-                                     "wallcovering", "wall covering", "wc-", "vinyl")):
+                                     "wallcovering", "wall covering", "wc-", "vinyl",
+                                     "frp", "trusscore", "fiberglass reinforced",
+                                     "fiberglass-reinforced", "fiberglass panel")):
             return False
         return True
 
@@ -13275,6 +13280,20 @@ def _wallcovering_rfi_enabled():
         "1", "true", "True")
 
 
+def _enlarged_finish_reconcile_enabled():
+    # Default OFF pending validation: when the same physical room is extracted
+    # on both a small composite floor-plan sheet (where the wall finish isn't
+    # legible, so it defaults to GYP + in-scope) AND an enlarged detail sheet
+    # that legibly shows a non-paint wet-wall finish (FRP/Trusscore/tile), the
+    # composite's generic-GYP walls are billed. Propagate the confirmed
+    # unpaintable finish to the composite instance and drop its WALL scope only
+    # (ceiling/base survive). Livestock: 1st-floor wet + storage rooms are
+    # Trusscore on A110/A111 but GYP on the A102 composite -> ~4,200 SF of
+    # wall wrongly painted.
+    return os.environ.get("NIGHTSHIFT_ENLARGED_FINISH_RECONCILE", "0").strip() in (
+        "1", "true", "True")
+
+
 # Ceiling materials that are never field-painted, regardless of any extracted
 # or merge-OR'd ceiling_painted flag. A paint trigger (gyp/dryfall/etc.) on the
 # same room overrides the demotion (e.g. "GYP below ACT soffit").
@@ -13651,6 +13670,143 @@ def _recover_door_leaf_count_from_notes(ds):
     return None, found
 
 
+# Wet-wall cladding that is factory-finished, not field-painted. A confirmed
+# match here on ANY sheet is authoritative over a generic-GYP default read off
+# a small composite floor plan.
+_UNPAINTABLE_WALL_FINISH_KW = (
+    "tile", "frp", "trusscore", "fiberglass reinforced",
+    "fiberglass-reinforced", "fiberglass panel", "stone", "brick",
+    "glass", "storefront", "curtain wall", "wallcovering", "wall covering",
+    "vinyl")
+# Generic paintable-wall defaults a small composite sheet falls back to when the
+# real finish isn't legible (so they may be overridden by an enlarged-sheet read).
+_GENERIC_WALL_FINISH = ("gyp", "gwb", "drywall", "gypsum", "paint",
+                        "unconfirmed", "unknown", "n/a", "")
+_ENLARGED_FINISH_FILLER = {
+    "type", "room", "rm", "the", "s", "of", "and",
+    "first", "second", "third", "fourth", "ground", "floor", "level"}
+
+
+def _finish_type_tokens(name):
+    """Digit-stripped identity tokens for a room name, so the same physical
+    room reads the same across a composite floor plan and an enlarged detail
+    sheet ('Women's 104' / 'Women's' / "Women's Restroom" -> {'women'})."""
+    s = re.sub(r"[x#]?\d+[a-z]?", " ", str(name or "").lower())
+    s = s.replace("bathroom", "bath").replace("restroom", "rest")
+    return frozenset(w for w in re.split(r"[^a-z]+", s)
+                     if w and w not in _ENLARGED_FINISH_FILLER)
+
+
+def _reconcile_enlarged_wall_finish(analysis):
+    """Propagate a confirmed non-paint wall finish from an enlarged detail
+    sheet to the same room's generic-GYP instance on a composite floor plan,
+    dropping the composite instance's WALL paint scope (ceiling/base survive).
+
+    The bug (Livestock 2026-07-06): sheet A-102 carries both floor plans at a
+    small scale where the wet-wall finish isn't legible, so rooms 101-113
+    default to walls='GYP', in_scope=True and their walls are billed. The
+    enlarged plans A-110/A-111 legibly show the same wet + storage rooms as
+    Trusscore (FRP) — but those instances are already out-of-scope, carry
+    different names ('Women's' vs 'Women's 104'), and so never reach the
+    composite instance through cross-sheet dedup. ~4,200 SF of wall is painted
+    that Rider (correctly) excludes.
+
+    Within EACH floor, rooms are grouped by digit-stripped identity tokens.
+    When a group spans >1 source sheet AND any instance carries a confirmed
+    unpaintable finish, every in-scope generic-GYP instance in the group adopts
+    that finish, has its wall geometry (and level_5 wall finish) zeroed, and an
+    RFI + audit note recorded. Ceiling, base, and doors are untouched.
+
+    Only-reduce and fail-safe: no confirmed unpaintable finish anywhere -> no-op
+    (never demotes on generic data). Floor-scoped so a painted room never
+    matches a same-token wet room on another floor (e.g. Bathroom 202 vs the
+    1st-floor FRP baths). Flag-gated NIGHTSHIFT_ENLARGED_FINISH_RECONCILE
+    (default OFF). Idempotent via analysis['_enlarged_wall_finish_reconciled'].
+    """
+    if not isinstance(analysis, dict) or not _enlarged_finish_reconcile_enabled():
+        return analysis
+    if analysis.get("_enlarged_wall_finish_reconciled"):
+        return analysis
+
+    def _mat(r):
+        return str(((r.get("materials") or {}).get("walls")) or "")
+
+    def _is_unpaint(mat):
+        m = mat.lower()
+        return any(k in m for k in _UNPAINTABLE_WALL_FINISH_KW)
+
+    def _is_generic(mat):
+        m = mat.strip().lower()
+        if _is_unpaint(mat):
+            return False
+        return m == "" or any(m == g or (g and m.startswith(g))
+                              for g in _GENERIC_WALL_FINISH)
+
+    def _wall_sf(r):
+        return _num((r.get("dimensions") or {}).get("wall_area_sqft", 0))
+
+    demoted, removed_sf, rfi_rooms = 0, 0.0, []
+    for floor in analysis.get("floors", []) or []:
+        groups = {}
+        for room in floor.get("rooms", []) or []:
+            t = _finish_type_tokens(room.get("room_name") or room.get("name"))
+            if t:
+                groups.setdefault(t, []).append(room)
+        for t, rs in groups.items():
+            sheets = {str(r.get("source_sheet") or "") for r in rs}
+            sheets.discard("")
+            if len(sheets) < 2:
+                continue
+            unpaint = next((r for r in rs if _is_unpaint(_mat(r))), None)
+            if unpaint is None:
+                continue
+            finish = _mat(unpaint).strip()
+            for room in rs:
+                if not room.get("in_scope", True):
+                    continue
+                if not _is_generic(_mat(room)) or _wall_sf(room) <= 0:
+                    continue
+                mats = room.setdefault("materials", {})
+                dims = room.setdefault("dimensions", {})
+                removed = _wall_sf(room)
+                removed_sf += removed
+                demoted += 1
+                mats["walls"] = finish
+                dims["wall_area_sqft"] = 0
+                elems = room.get("elements")
+                if isinstance(elems, dict) and _num(elems.get("level_5_finish_sqft")) > 0:
+                    elems["level_5_finish_sqft"] = 0
+                nm = room.get("room_name", room.get("room_id", "room"))
+                rfi_rooms.append(nm)
+                note = str(room.get("notes", ""))
+                tag = f"[wall finish {finish} per enlarged plan — not field-painted"
+                if tag not in note:
+                    room["notes"] = (
+                        note + f" {tag}; walls removed from paint scope "
+                        f"(enlarged-finish reconciliation)]").strip()
+
+    record = {"rooms_demoted": demoted, "wall_sqft_removed": round(removed_sf, 2)}
+    analysis["_enlarged_wall_finish_reconciled"] = True
+    analysis["_enlarged_finish_reconcile"] = record
+    if demoted:
+        room_list = ", ".join(sorted(set(rfi_rooms))[:8])
+        if len(set(rfi_rooms)) > 8:
+            room_list += f", and {len(set(rfi_rooms)) - 8} more"
+        analysis.setdefault("rfi_items", []).append({
+            "category": "Material Specifications",
+            "question": (
+                f"The following rooms show a non-paint wet-wall finish "
+                f"(FRP/tile) on the enlarged plans but read as gypsum on the "
+                f"composite floor plan: {room_list}. Their walls were removed "
+                f"from the paint scope. Please confirm the wall finish."),
+            "action_required": (
+                "Confirm which rooms have field-painted gypsum walls vs. "
+                "factory-finished FRP/tile cladding.")})
+        print(f"   🧱 Enlarged-finish reconcile: {demoted} room(s), "
+              f"{removed_sf:.0f} SF wall removed from paint scope")
+    return analysis
+
+
 def _reconcile_door_schedule_scope(analysis):
     """Flag-gated door-schedule reconciliation, run at the build_priced_takeoff
     choke point alongside the ceiling gate. Fixes two defects the INNIO Waukesha
@@ -13936,20 +14092,23 @@ def _run_scope_sweep(client, pdf_paths, analysis):
     for b0 in range(0, len(candidates), BATCH):
         batch = candidates[b0:b0 + BATCH]
 
-        # Render this batch's pages, grouped per PDF
+        # Render this batch's pages. _render_page_to_jpeg_b64 downscales to
+        # a 7800 px long edge — large-format sheets at sweep DPI would
+        # otherwise blow Anthropic's 8000 px image dimension cap (validated
+        # on Beloit: 48-inch sheets at 170 DPI = 8160 px -> API 400).
         b64_by_page = {}
-        by_pdf = {}
         for cand in batch:
-            by_pdf.setdefault(cand["pdf_path"], []).append(cand["page_idx0"])
-        for pdf_path, pages in by_pdf.items():
             try:
-                for pg, b64 in _render_pages_to_images(
-                        pdf_path, pages, dpi=dpi, output_format="jpeg",
-                        jpeg_quality=72):
-                    b64_by_page[(pdf_path, pg)] = b64
+                rendered = _render_page_to_jpeg_b64(
+                    cand["pdf_path"], cand["page_idx0"], dpi=dpi, quality=72)
             except Exception as e:
                 print(f"   ⚠️  Scope sweep: could not render "
-                      f"{os.path.basename(pdf_path)} pages {pages}: {e}")
+                      f"{os.path.basename(cand['pdf_path'])} page "
+                      f"{cand['page_idx0'] + 1}: {e}")
+                rendered = None
+            if rendered:
+                b64_by_page[(cand["pdf_path"], cand["page_idx0"])] = \
+                    rendered[0]
 
         content = []
         rendered_batch = []
@@ -14266,6 +14425,12 @@ def build_priced_takeoff(analysis, strict=None):
     # reclassification) for interior-elevation door schedules. Flag-gated;
     # no-op when off.
     analysis = _reconcile_door_schedule_scope(analysis)
+
+    # Enlarged-plan wall-finish reconciliation: propagate a confirmed non-paint
+    # wet-wall finish (FRP/Trusscore/tile) from an enlarged detail sheet to the
+    # same room's generic-GYP composite instance, dropping only its wall paint
+    # scope. Flag-gated NIGHTSHIFT_ENLARGED_FINISH_RECONCILE; no-op when off.
+    analysis = _reconcile_enlarged_wall_finish(analysis)
 
     agg = analysis.get("aggregated_totals", {}) or {}
     ledger = analysis.get("_quantity_adjustments", []) or []
