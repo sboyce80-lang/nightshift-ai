@@ -5967,6 +5967,13 @@ def _build_extraction_prompt(scope_notes="", schedule_hints=None,
                 "finishes). Match each room below to its floor-plan room by "
                 "number/name and set that room's finishes from this data:")
             hint_parts.append(
+                "- CRITICAL: this schedule describes FINISHES ONLY — it is NOT "
+                "the room inventory. Extract and MEASURE every room visible on "
+                "the floor plans as you normally would, INCLUDING rooms that do "
+                "not appear in this schedule. Never skip, drop, or leave "
+                "dimensions at 0 for a room just because it is absent from (or "
+                "listed in) this schedule.")
+            hint_parts.append(
                 "- A wall finish of WC-x / 'wallcovering' / 'vinyl wallcovering' "
                 "means those walls get wallcovering_sqft, NOT paint — reduce "
                 "wall_area_sqft accordingly (see the Wallcovering instructions below).")
