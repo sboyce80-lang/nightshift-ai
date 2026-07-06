@@ -73,6 +73,17 @@ _BLOCKED_TRANSITIONS = {
 }
 
 
+def _describe_exc(exc):
+    """Human-readable one-liner for an exception.
+
+    Some exceptions stringify to "" (e.g. PyPDF2's bare AssertionError on
+    PDFs with dangling object references) — that empty string used to flow
+    into the customer error email and the DB error column verbatim.
+    """
+    msg = str(exc).strip()
+    return msg if msg else f"Unexpected error ({type(exc).__name__})"
+
+
 def update_status(submission_id, status, error=None, subtotal=None):
     """Patch the submission row's status (and optionally error/subtotal).
 
@@ -822,10 +833,11 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
                                 submission_id)
                     raise
 
-            logger.error("Submission %s failed: %s", submission_id, exc, exc_info=True)
-            update_status(submission_id, "failed", error=str(exc))
+            logger.error("Submission %s failed: %s", submission_id,
+                         _describe_exc(exc), exc_info=True)
+            update_status(submission_id, "failed", error=_describe_exc(exc))
             try:
-                send_error_email(contact_info, str(exc))
+                send_error_email(contact_info, _describe_exc(exc))
             except Exception as email_exc:
                 logger.error("Failed to send error email: %s", email_exc)
             raise
@@ -1036,10 +1048,11 @@ def merge_submission(submission_id, parent_id, new_pdf_keys, contact_info,
                                 submission_id)
                     raise
 
-            logger.error("Merge submission %s failed: %s", submission_id, exc, exc_info=True)
-            update_status(submission_id, "failed", error=str(exc))
+            logger.error("Merge submission %s failed: %s", submission_id,
+                         _describe_exc(exc), exc_info=True)
+            update_status(submission_id, "failed", error=_describe_exc(exc))
             try:
-                send_error_email(contact_info, str(exc))
+                send_error_email(contact_info, _describe_exc(exc))
             except Exception as email_exc:
                 logger.error("Failed to send error email: %s", email_exc)
             raise
@@ -1298,6 +1311,9 @@ def send_error_email(contact_info, error_msg):
     if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD:
         logger.warning("SMTP not configured — skipping error email")
         return
+
+    error_msg = (error_msg or "").strip() or (
+        "An unexpected error occurred while analyzing the documents.")
 
     body = f"""Hi {contact_info['name']},
 
