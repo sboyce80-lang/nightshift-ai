@@ -708,3 +708,170 @@ def walls_by_basis(pdf_path, page_index, pts_per_ft, anchors,
             "face_bill_lf": face_bill_lf, "run_bill_sf": run_bill_sf,
             "face_bill_sf": face_bill_sf, "n_anchors": len(pts),
             "n_runs": len(runs)}
+
+
+# ---------------------------------------------------------------------------
+# M2 — room regions via rectangular decomposition + flood fill
+# ---------------------------------------------------------------------------
+# The wall-run network partitions the plan into rooms without needing true
+# polygonization: distinct V-run x-coordinates and H-run y-coordinates form a
+# grid; a wall run BLOCKS passage between the two cells it separates along
+# its span; flood-filling unblocked adjacency merges cells into room regions.
+# Each region then carries its label anchors (scope, height) and yields
+# per-room floor area, ceiling area, and its bounding wall faces — the exact
+# per-room accounting Rider's takeoffs use.
+
+def room_regions(pdf_path, page_index, pts_per_ft, anchors,
+                 min_room_ft2=15.0, max_room_ft2=20000.0):
+    """Partition a plan page into room regions from its wall-run network.
+
+    Returns list of regions: {cells:[(x0,y0,x1,y1)pts], area_ft2, anchors:
+    [(painted,height,label_xy)], bbox}. Regions with no anchor are still
+    returned (unlabeled closets/chases) — callers decide their scope.
+    """
+    runs = vm.wall_runs_with_positions(pdf_path, page_index, pts_per_ft,
+                                       min_width="auto")
+    if not runs:
+        return []
+    # TOPOLOGY blocks on ALL linework — a glazing/storefront line bounds a
+    # room even though it is not a billable wall pair. Billing stays with
+    # the paired runs; here we only need the space partition to be tight.
+    doc = fitz.open(pdf_path)
+    try:
+        rawH, rawV = vm._axis_segments(doc[page_index],
+                                       min_len_pts=2.5 * pts_per_ft)
+    finally:
+        doc.close()
+    slop = 0.6 * pts_per_ft   # walls block slightly beyond their endpoints
+    door_gap = 6.5 * pts_per_ft  # openings up to a double-leaf door still
+    # separate rooms — bridge them for the BLOCKING test only, or the flood
+    # fill walks through every doorway and merges the whole floor.
+    xs, ys = set(), set()
+    for orient, perp, lo, hi in runs:
+        if orient == "H":
+            ys.add(round(perp, 1))
+            xs.update((round(lo, 1), round(hi, 1)))
+        else:
+            xs.add(round(perp, 1))
+            ys.update((round(lo, 1), round(hi, 1)))
+    H = [(y, lo - slop, hi + slop) for (y, lo, hi) in rawH]
+    V = [(x, lo - slop, hi + slop) for (x, lo, hi) in rawV]
+
+    xs = sorted(xs)
+    ys = sorted(ys)
+    if len(xs) < 2 or len(ys) < 2:
+        return []
+    if (len(xs) - 1) * (len(ys) - 1) > 250_000:
+        return []
+
+    def build_lines(spans):
+        """Group spans into wall lines (perp within a thickness band), union
+        each line's spans closing gaps <= door_gap. Returns
+        [(perp, [(lo,hi),...unioned])]."""
+        lines = []
+        for perp, lo, hi in sorted(spans):
+            if lines and perp - lines[-1][0] <= 0.9 * pts_per_ft:
+                lines[-1][1].append((lo, hi))
+            else:
+                lines.append((perp, [(lo, hi)]))
+        out = []
+        for perp, ivs in lines:
+            ivs.sort()
+            merged = []
+            cs, ce = ivs[0]
+            for lo, hi in ivs[1:]:
+                if lo - ce <= door_gap:
+                    ce = max(ce, hi)
+                else:
+                    merged.append((cs, ce))
+                    cs, ce = lo, hi
+            merged.append((cs, ce))
+            out.append((perp, merged))
+        return out
+
+    H_lines = build_lines(H)
+    V_lines = build_lines(V)
+
+    def blocked(lines, line_coord, a, b):
+        """Edge [a,b] on line_coord is blocked when wall spans cover >=90%."""
+        need = (b - a) * 0.9
+        for perp, ivs in lines:
+            if abs(perp - line_coord) > 1.2:
+                continue
+            cov = 0.0
+            for lo, hi in ivs:
+                cov += max(0.0, min(hi, b) - max(lo, a))
+            if cov >= need:
+                return True
+        return False
+
+    def h_blocked(y_line, x_a, x_b):
+        return blocked(H_lines, y_line, x_a, x_b)
+
+    def v_blocked(x_line, y_a, y_b):
+        return blocked(V_lines, x_line, y_a, y_b)
+
+    nx, ny = len(xs) - 1, len(ys) - 1
+    # union-find over cells
+    parent = list(range(nx * ny))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[rb] = ra
+
+    for j in range(ny):
+        for i in range(nx):
+            c = j * nx + i
+            if i + 1 < nx and not v_blocked(xs[i + 1], ys[j], ys[j + 1]):
+                union(c, c + 1)
+            if j + 1 < ny and not h_blocked(ys[j + 1], xs[i], xs[i + 1]):
+                union(c, c + nx)
+
+    groups = {}
+    boundary_roots = set()
+    for j in range(ny):
+        for i in range(nx):
+            r = find(j * nx + i)
+            groups.setdefault(r, []).append((xs[i], ys[j], xs[i + 1], ys[j + 1]))
+            if i == 0 or j == 0 or i == nx - 1 or j == ny - 1:
+                boundary_roots.add(r)
+    # regions connected to the page edge are outside space OR rooms whose
+    # envelope leaks; keep them but tag so callers can treat separately
+    outside = boundary_roots
+
+    sq = pts_per_ft * pts_per_ft
+    regions = []
+    for root, cells in groups.items():
+        area = sum((x1 - x0) * (y1 - y0) for (x0, y0, x1, y1) in cells) / sq
+        if not (min_room_ft2 <= area <= max_room_ft2):
+            continue
+        bx0 = min(c[0] for c in cells)
+        by0 = min(c[1] for c in cells)
+        bx1 = max(c[2] for c in cells)
+        by1 = max(c[3] for c in cells)
+        regions.append({"cells": cells, "area_ft2": round(area, 1),
+                        "bbox": (bx0, by0, bx1, by1), "anchors": [],
+                        "leaky": root in outside})
+
+    # attach anchors (page-normalized -> pts)
+    if anchors:
+        doc = fitz.open(pdf_path)
+        try:
+            rect = doc[page_index].rect
+        finally:
+            doc.close()
+        for (ax, ay, painted, h) in anchors:
+            px, py = ax * rect.width, ay * rect.height
+            for reg in regions:
+                if any(x0 <= px <= x1 and y0 <= py <= y1
+                       for (x0, y0, x1, y1) in reg["cells"]):
+                    reg["anchors"].append((painted, h, (round(px), round(py))))
+                    break
+    return regions
