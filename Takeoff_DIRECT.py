@@ -2304,15 +2304,35 @@ def _create_filtered_pdf(pdf_path, page_indices):
     filtered PDF is compatible with Claude's PDF parser.  PyMuPDF's
     insert_pdf can produce larger/incompatible files that cause
     'Could not process PDF' errors.
+
+    Falls back to PyMuPDF when PyPDF2 cannot clone the pages — PDFs with
+    dangling indirect references ("Object N 0 not defined") make PyPDF2's
+    page clone raise a bare AssertionError. The fallback keeps the exact
+    same page set, so the caller's filtered→original index map stays valid.
     """
-    reader = PyPDF2.PdfReader(pdf_path)
-    writer = PyPDF2.PdfWriter()
-    for idx in sorted(page_indices):
-        if idx < len(reader.pages):
-            writer.add_page(reader.pages[idx])
-    buf = io.BytesIO()
-    writer.write(buf)
-    return buf.getvalue()
+    try:
+        reader = PyPDF2.PdfReader(pdf_path)
+        writer = PyPDF2.PdfWriter()
+        for idx in sorted(page_indices):
+            if idx < len(reader.pages):
+                writer.add_page(reader.pages[idx])
+        buf = io.BytesIO()
+        writer.write(buf)
+        return buf.getvalue()
+    except Exception as exc:
+        print(f"      ⚠️  PyPDF2 page filter failed "
+              f"({type(exc).__name__}: {exc}) — retrying with PyMuPDF")
+
+    import fitz  # PyMuPDF
+    src = fitz.open(pdf_path)
+    try:
+        keep = [idx for idx in sorted(page_indices) if idx < len(src)]
+        src.select(keep)
+        # garbage=3 + deflate rebuilds the xref, dropping the dangling
+        # references that broke PyPDF2 and keeping the file API-parseable.
+        return src.tobytes(garbage=3, deflate=True)
+    finally:
+        src.close()
 
 
 def _summarize_excluded(excluded):
@@ -20645,7 +20665,13 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                 print(f"   ⚠️  No detailed floor plans in this file")
                 print(f"   Pages: {analysis_result.get('pages_reviewed', 'N/A')}")
                 # Step 1: Existing door/window/stair schedule extraction
-                schedule_data = analyze_schedule_pdf(client, pdf_path)
+                try:
+                    schedule_data = analyze_schedule_pdf(client, pdf_path)
+                except Exception as sched_exc:
+                    print(f"   ⚠️  Schedule extraction failed "
+                          f"({type(sched_exc).__name__}: {sched_exc}) — "
+                          f"continuing without schedule data")
+                    schedule_data = None
 
                 # Step 2: Room Finish Schedule extraction for wall/ceiling estimation
                 try:
@@ -20704,7 +20730,15 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                     if missing_win_sched:
                         missing.append("window")
                     print(f"   📋 {'/'.join(missing)} schedule(s) not detected — running targeted schedule re-analysis...")
-                    schedule_data = analyze_schedule_pdf(client, pdf_path)
+                    # Recovery pass only — a crash here must never sink a job
+                    # whose room extraction already succeeded.
+                    try:
+                        schedule_data = analyze_schedule_pdf(client, pdf_path)
+                    except Exception as sched_exc:
+                        print(f"      ⚠️  Schedule re-analysis failed "
+                              f"({type(sched_exc).__name__}: {sched_exc}) — "
+                              f"continuing without schedule data")
+                        schedule_data = None
                     if schedule_data:
                         for key in ("door_schedule", "window_schedule", "stair_info", "wall_types"):
                             if schedule_data.get(key):
