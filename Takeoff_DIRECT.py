@@ -13974,6 +13974,176 @@ def _scope_sweep_max_pages():
     return max(1, min(40, n))
 
 
+def _schedule_count_floor_enabled():
+    return os.environ.get("NIGHTSHIFT_SCHEDULE_COUNT_FLOOR", "0").strip() in (
+        "1", "true", "True")
+
+
+def _room_num_token(value):
+    """Last multi-digit run in a room id/number — 'F15-1509' -> '1509'."""
+    hits = re.findall(r"\d{2,}", str(value or ""))
+    return hits[-1] if hits else ""
+
+
+def _reconcile_schedule_room_count(analysis):
+    """Flag-gated (NIGHTSHIFT_SCHEDULE_COUNT_FLOOR, default off): the
+    pre-extracted room finish schedule is the room INVENTORY floor.
+
+    PNC Milwaukee (2026-07-06): the I601 schedule lists 54 numbered rooms,
+    but extraction emits identical offices UNNUMBERED, the canonical merge
+    fuses them (name+geometry identity), and the floor dedup drops more —
+    two runs shipped ~12k SF of walls against a verified 25.5k takeoff.
+    Splitting merge collisions heuristically overcounts instead (tile
+    overlaps re-list the same room), so the schedule's hard room list is
+    the only reliable count.
+
+    For every schedule row with a room number:
+      - number already extracted in scope        -> untouched
+      - number extracted but excluded by the
+        small-commercial redraw dedup            -> restored (real room,
+        confirmed by the schedule; other exclusion reasons are respected)
+      - number never extracted -> a replica of the median-wall same-type
+        in-scope room (dims + wall/ceiling materials only; wallcovering,
+        doors and windows are NOT copied). No same-type template
+        -> zero-dim room + one RFI (hard numbers: the room exists, its
+        size is unconfirmed).
+
+    Aggregates are bumped explicitly for restored/replicated walls and
+    painted ceilings. Idempotent via analysis['_schedule_count_floor'].
+    """
+    if not isinstance(analysis, dict) or not _schedule_count_floor_enabled():
+        return analysis
+    if analysis.get("_schedule_count_floor"):
+        return analysis
+    rfs = (analysis.get("room_finish_schedule")
+           or (analysis.get("schedule_data") or {}).get("room_finish_schedule")
+           or [])
+    sched_rows = [(_room_num_token(r.get("room_number")), r)
+                  for r in rfs if isinstance(r, dict)]
+    sched_rows = [(n, r) for n, r in sched_rows if n]
+    if len(sched_rows) < 5:
+        return analysis  # too thin to be an authoritative inventory
+    floors = analysis.get("floors") or []
+    if not floors:
+        return analysis
+
+    all_rooms = [(fl, rm) for fl in floors for rm in (fl.get("rooms") or [])
+                 if isinstance(rm, dict)]
+    by_num = {}
+    for fl, rm in all_rooms:
+        n = _room_num_token(rm.get("room_id")) or _room_num_token(
+            rm.get("room_number"))
+        if n:
+            by_num.setdefault(n, []).append(rm)
+
+    def _walls(rm):
+        return _num((rm.get("dimensions") or {}).get("wall_area_sqft", 0))
+
+    def _tmpl_pool(type_token):
+        pool = [rm for _, rm in all_rooms
+                if rm.get("in_scope", True) and _walls(rm) > 0
+                and _sc_room_type(rm.get("room_name")) == type_token]
+        pool.sort(key=_walls)
+        return pool
+
+    main_floor = max(floors, key=lambda f: len(f.get("rooms") or []))
+    restored, added, zero_dim = [], [], []
+    wall_bump = ceil_bump = 0.0
+    import copy as _copy
+    for num, srow in sched_rows:
+        matches = by_num.get(num)
+        if matches:
+            if any(rm.get("in_scope", True) for rm in matches):
+                continue
+            sc_dupes = [rm for rm in matches
+                        if str(rm.get("scope_exclusion_reason") or "")
+                        .startswith("small-commercial:")]
+            if not sc_dupes:
+                continue  # excluded for a respected reason (demo, NOT IN SCOPE)
+            best = max(sc_dupes, key=_walls)
+            best["in_scope"] = True
+            best.pop("scope_exclusion_reason", None)
+            best["_schedule_count_restored"] = True
+            restored.append(num)
+            wall_bump += _walls(best)
+            if _as_bool((best.get("materials") or {}).get("ceiling_painted")):
+                ceil_bump += _num((best.get("dimensions") or {})
+                                  .get("ceiling_area_sqft", 0))
+            continue
+        ttok = _sc_room_type(srow.get("room_name"))
+        pool = _tmpl_pool(ttok) if ttok else []
+        new_room = {
+            "room_id": f"SCH-{num}",
+            "room_number": num,
+            "room_name": str(srow.get("room_name") or f"Room {num}"),
+            "in_scope": True,
+            "_schedule_count_replica": True,
+            "source_sheet": "finish schedule",
+        }
+        if pool:
+            tmpl = pool[len(pool) // 2]  # median wall area
+            new_room["dimensions"] = _copy.deepcopy(tmpl.get("dimensions") or {})
+            new_room["dimensions"]["wallcovering_sqft"] = 0
+            mats = _copy.deepcopy(tmpl.get("materials") or {})
+            new_room["materials"] = mats
+            new_room["elements"] = {}  # never replicate doors/windows
+            added.append(num)
+            wall_bump += _walls(new_room)
+            if _as_bool(mats.get("ceiling_painted")):
+                ceil_bump += _num(new_room["dimensions"]
+                                  .get("ceiling_area_sqft", 0))
+        else:
+            new_room["dimensions"] = {"wall_area_sqft": 0,
+                                      "ceiling_area_sqft": 0}
+            zero_dim.append(num)
+        main_floor.setdefault("rooms", []).append(new_room)
+
+    if not (restored or added or zero_dim):
+        analysis["_schedule_count_floor"] = {"noop": True}
+        return analysis
+
+    agg = analysis.setdefault("aggregated_totals", {})
+    if wall_bump:
+        agg["total_paintable_wall_sqft"] = _num(
+            agg.get("total_paintable_wall_sqft", 0)) + round(wall_bump, 2)
+    if ceil_bump:
+        agg["total_paintable_ceiling_sqft"] = _num(
+            agg.get("total_paintable_ceiling_sqft", 0)) + round(ceil_bump, 2)
+    pi = analysis.setdefault("project_info", {})
+    pi["total_rooms_found"] = _num(pi.get("total_rooms_found", 0)) + len(
+        added) + len(zero_dim)
+
+    bits = []
+    if restored:
+        bits.append(f"restored {len(restored)} schedule-confirmed room(s) "
+                    f"the redraw dedup had excluded")
+    if added:
+        bits.append(f"added {len(added)} schedule-listed room(s) extraction "
+                    f"missed (dims replicated from the median same-type "
+                    f"measured room)")
+    if zero_dim:
+        bits.append(f"{len(zero_dim)} schedule-listed room(s) have no "
+                    f"measured same-type template — included at 0 sqft")
+    analysis.setdefault("notes", []).append(
+        "[Schedule Count Floor] " + "; ".join(bits) +
+        f" (+{wall_bump:,.0f} wall sqft, +{ceil_bump:,.0f} ceiling sqft).")
+    if zero_dim:
+        analysis.setdefault("notes", []).append(
+            f"[RFI: Room Inventory] The room finish schedule lists "
+            f"{len(zero_dim)} room(s) ({', '.join(zero_dim[:12])}"
+            f"{'…' if len(zero_dim) > 12 else ''}) that the floor plans "
+            f"did not yield measurements for. Confirm their sizes — they "
+            f"are included at 0 sqft pending dimensions.")
+    analysis["_schedule_count_floor"] = {
+        "restored": restored, "added": added, "zero_dim": zero_dim,
+        "wall_sqft_added": round(wall_bump, 2),
+        "ceiling_sqft_added": round(ceil_bump, 2)}
+    print(f"   📋 Schedule count floor: +{len(restored)} restored, "
+          f"+{len(added)} replicated, {len(zero_dim)} zero-dim "
+          f"(+{wall_bump:,.0f} wall sqft)")
+    return analysis
+
+
 # Keyword -> weight for prioritizing which unmeasured pages get swept when
 # the set has more candidates than the page cap. Weighted toward the pages
 # that historically carried silently-lost scope (schedules, legends, notes).
@@ -14464,6 +14634,11 @@ def build_priced_takeoff(analysis, strict=None):
     # reclassification) for interior-elevation door schedules. Flag-gated;
     # no-op when off.
     analysis = _reconcile_door_schedule_scope(analysis)
+
+    # Room-inventory floor from the pre-extracted finish schedule (restores
+    # merge-fused / dedup-dropped rooms the schedule confirms). Flag-gated;
+    # no-op when off.
+    analysis = _reconcile_schedule_room_count(analysis)
 
     agg = analysis.get("aggregated_totals", {}) or {}
     ledger = analysis.get("_quantity_adjustments", []) or []
