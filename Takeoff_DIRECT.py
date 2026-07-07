@@ -6027,6 +6027,28 @@ Ceiling types — CRITICAL DISTINCTION:
     ceiling_painted = false (ACT is the commercial default) rather than assuming
     painted GYP. Do NOT assume painted GYP just because you measured a ceiling
     area — the ceiling TYPE requires positive evidence.
+  • SERVICE / INDUSTRIAL SPACES (service bays, service departments, garages,
+    drive-throughs, warehouses, shops, loading areas): these ceilings are
+    almost always OPEN TO STRUCTURE (exposed deck/joists — dryfall spray
+    territory), NOT painted GYP. Classify their ceiling as painted GYP ONLY
+    when the RCP or finish schedule explicitly shows a gypsum ceiling for that
+    room; otherwise write ceiling = "OPEN/EXPOSED" (add " (assumed)" if no RCP
+    was legible) and set ceiling_painted = false. A 15,000+ SF "GYP ceiling"
+    over a service department is almost certainly a misread.
+
+WALL-SUBSTRATE PROVENANCE MARKER (REQUIRED — same rules as ceilings):
+  the wall SUBSTRATE (GYP vs CMU vs plaster) sets the rate, so we must know
+  whether you READ it or GUESSED it.
+  • LEGEND FIRST: the WALL TYPE LEGEND / wall-type tags / finish schedule are
+    the authority on wall substrate — read them BEFORE judging from appearance.
+    Big-box retail and industrial buildings typically have CMU (concrete
+    masonry) perimeter and sales-floor walls with metal-stud/GYP only at
+    offices, restrooms and front-of-house — check the legend rather than
+    defaulting large open-area walls to GYP.
+  • If a room's wall substrate is CONFIRMED — wall-type tag, wall legend, or
+    finish schedule entry — write it plainly: walls = "GYP", "CMU", "PLASTER".
+  • If you are ASSUMING it (no legible legend/tag for that wall), append
+    " (assumed)": walls = "GYP (assumed)". This marks it for an RFI.
 
 WHITEBOX / PRIME ONLY DETECTION:
 - If a room or tenant space is labeled "whitebox", "white box", "prime only",
@@ -13280,6 +13302,29 @@ def _wallcovering_rfi_enabled():
         "1", "true", "True")
 
 
+def _vme_primary_enabled():
+    # Default OFF pending validation: when the deterministic vector
+    # measurement engine measures a job's walls with full reliability (every
+    # plan page scaled + room-anchored), its measured wall SF REPLACES the
+    # vision estimate ('measured' provenance) instead of shadowing it.
+    # Release 2 of the 2026-07 accuracy plan.
+    return os.environ.get("NIGHTSHIFT_VME_PRIMARY", "0").strip() in (
+        "1", "true", "True")
+
+
+def _substrate_gate_enabled():
+    # Default OFF pending validation: fail-safe review flags (never quantity
+    # changes) for the two substrate misreads the 2026-07 Rider batch proved:
+    # (1) TSC — big-box sales-floor walls billed GYP when the wall legend says
+    #     CMU (inverts the gyp/CMU rate split);
+    # (2) Mercedes — 25k+ SF of service-department "GYP ceilings" that are
+    #     open-to-structure dryfall (+741% ceilings, -97% dryfall).
+    # Rooms matching either pattern get an RFI + manual-review flag so the
+    # estimator confirms the substrate before the bid goes out.
+    return os.environ.get("NIGHTSHIFT_SUBSTRATE_GATE", "0").strip() in (
+        "1", "true", "True")
+
+
 def _enlarged_finish_reconcile_enabled():
     # Default OFF pending validation: when the same physical room is extracted
     # on both a small composite floor-plan sheet (where the wall finish isn't
@@ -13316,6 +13361,174 @@ _STAIR_ROOM_KEYWORDS = ("stair", "stairwell", "stair tower", "egress stair")
 _STAIR_FINISHED_KEYWORDS = (
     "finished stair", "painted stair", "stair painted", "stair is finished",
     "stair to be painted", "confirmed painted")
+
+
+# Room names whose ceilings are near-always open-to-structure (dryfall spray
+# scope, not painted GYP) in commercial/industrial buildings.
+_SERVICE_CEILING_ROOM_KW = (
+    "service", "garage", "drive thru", "drive-thru", "drive through",
+    "warehouse", "wash", "loading", "receiving", "shop", "mezzanine parts",
+    "vehicle")
+
+
+def _substrate_provenance_gate(analysis):
+    """Fail-safe substrate review gate (NIGHTSHIFT_SUBSTRATE_GATE, default
+    OFF). Two patterns from the 2026-07 Rider batch, flagged for human
+    confirmation — quantities are NEVER changed here:
+
+      (1) rooms whose wall substrate is "(assumed)" carrying >=1,500 SF of
+          wall — an assumed GYP-vs-CMU call at that size swings the rate
+          split (TSC: sales floor billed GYP, wall legend says CMU);
+      (2) service/industrial rooms billing >=2,000 SF of painted GYP ceiling
+          — near-always open-to-structure dryfall (Mercedes: 25k SF of
+          service-department "GYP ceilings"; Rider carries them as dryfall).
+    """
+    if not _substrate_gate_enabled() or not isinstance(analysis, dict):
+        return analysis
+    assumed_walls, service_gyp = [], []
+    for fl in (analysis.get("floors") or []):
+        for room in (fl.get("rooms") or []):
+            if not isinstance(room, dict) or not room.get("in_scope", True):
+                continue
+            name = str(room.get("room_name") or "")
+            mats = room.get("materials") or {}
+            dims = room.get("dimensions") or {}
+            try:
+                wall_sf = float(dims.get("wall_area_sqft") or 0)
+            except (TypeError, ValueError):
+                wall_sf = 0.0
+            try:
+                clg_sf = float(dims.get("ceiling_area_sqft") or 0)
+            except (TypeError, ValueError):
+                clg_sf = 0.0
+            wm = str(mats.get("walls") or "").lower()
+            cm = str(mats.get("ceiling") or "").lower()
+            if "(assumed)" in wm and wall_sf >= 1500:
+                assumed_walls.append((name, wall_sf))
+            if (clg_sf >= 2000 and any(k in cm for k in ("gyp", "gwb", "gypsum"))
+                    and any(k in name.lower() for k in _SERVICE_CEILING_ROOM_KW)):
+                service_gyp.append((name, clg_sf))
+    audit = analysis.setdefault("_substrate_gate_audit", [])
+    if assumed_walls:
+        rooms_txt = "; ".join(f"{n} (~{sf:,.0f} SF)" for n, sf in assumed_walls[:6])
+        _gate_add_rfi(
+            analysis, "Wall substrate",
+            f"Wall substrate is ASSUMED (no legible wall-type legend/tag) on "
+            f"{len(assumed_walls)} large room(s): {rooms_txt}. Please confirm "
+            f"GYP vs CMU/masonry — the substrate sets the rate for this area.")
+        audit.append({"check": "assumed_wall_substrate",
+                      "rooms": [n for n, _ in assumed_walls]})
+    if service_gyp:
+        rooms_txt = "; ".join(f"{n} (~{sf:,.0f} SF)" for n, sf in service_gyp[:6])
+        total = sum(sf for _, sf in service_gyp)
+        _gate_add_rfi(
+            analysis, "Ceiling type",
+            f"Painted GYP ceiling is priced over {total:,.0f} SF of service/"
+            f"industrial space ({rooms_txt}). These areas are typically OPEN "
+            f"TO STRUCTURE (dryfall scope, different rate). Please confirm "
+            f"the ceiling finish before bid.")
+        audit.append({"check": "service_area_gyp_ceiling",
+                      "rooms": [n for n, _ in service_gyp],
+                      "total_sf": round(total)})
+        analysis["manual_review_required"] = True
+        reason = (f"Substrate gate: {total:,.0f} SF of painted-GYP ceiling in "
+                  f"service/industrial rooms — likely exposed-structure "
+                  f"dryfall; confirm before bid.")
+        if analysis.get("manual_review_reason"):
+            analysis["manual_review_reason"] = (
+                str(analysis["manual_review_reason"]) + " | " + reason)
+        else:
+            analysis["manual_review_reason"] = reason
+    if assumed_walls or service_gyp:
+        print(f"   🧱 Substrate gate: {len(assumed_walls)} assumed-wall room(s), "
+              f"{len(service_gyp)} service-GYP-ceiling room(s) flagged for review")
+    return analysis
+
+
+def _apply_vme_primary(analysis):
+    """Release 2 — VME primary (NIGHTSHIFT_VME_PRIMARY, default OFF).
+
+    When compute_vme_primary measures the job's walls with a full
+    reliability verdict, pin total_paintable_wall_sqft to the MEASURED value
+    and scale in-scope paintable rooms' wall areas proportionally, recording
+    'measured' wall provenance. The perimeter-boost / apt-cap heuristics
+    exist to correct vision guesses — pinning the total to geometry
+    supersedes their net effect on walls (they are retired on this path).
+
+    Fail-safe rules: no-op unless the engine is fully reliable, the job is
+    not CMU-heavy (substrate split ambiguity), and the measured/vision ratio
+    is within [0.5, 2.0]. Outside the ratio band the disagreement is too
+    large to auto-apply — an RFI is filed instead.
+    """
+    if not _vme_primary_enabled() or not isinstance(analysis, dict):
+        return analysis
+    pdf_paths = analysis.get("_vme_pdf_paths") or []
+    if not pdf_paths:
+        return analysis
+    try:
+        import vme_attribution as _vme
+        primary = _vme.compute_vme_primary(pdf_paths, analysis)
+    except Exception as e:
+        print(f"   ⚠️  VME primary skipped: {type(e).__name__}: {str(e)[:80]}")
+        return analysis
+    analysis["_vme_primary"] = primary
+    if not primary.get("reliable"):
+        why = "; ".join(primary.get("reasons", [])[:3]) or "unreliable"
+        print(f"   🧪 VME primary: not applied ({why}) — vision walls kept")
+        return analysis
+    agg = analysis.get("aggregated_totals") or {}
+    try:
+        vision = float(agg.get("total_paintable_wall_sqft") or 0)
+        cmu = float(agg.get("total_cmu_wall_sqft") or 0)
+    except (TypeError, ValueError):
+        return analysis
+    measured = float(primary.get("measured_wall_sf") or 0)
+    if vision <= 0 or measured <= 0:
+        return analysis
+    if cmu > 0.10 * vision:
+        print("   🧪 VME primary: not applied (CMU-heavy job — substrate "
+              "split ambiguous); vision walls kept")
+        return analysis
+    ratio = measured / vision
+    if not (0.5 <= ratio <= 2.0):
+        _gate_add_rfi(
+            analysis, "Wall quantity",
+            f"Geometric measurement reads {measured:,.0f} SF of painted wall "
+            f"vs the extraction's {vision:,.0f} SF ({ratio:.1f}x). The gap is "
+            f"too large to auto-reconcile — please verify wall scope before "
+            f"bid.")
+        print(f"   🧪 VME primary: measured {measured:,.0f} vs vision "
+              f"{vision:,.0f} ({ratio:.1f}x) — outside auto-apply band, RFI filed")
+        return analysis
+    for fl in (analysis.get("floors") or []):
+        for room in (fl.get("rooms") or []):
+            if not isinstance(room, dict) or not room.get("in_scope", True):
+                continue
+            mats = str((room.get("materials") or {}).get("walls", "")).lower()
+            if any(k in mats for k in ("cmu", "block", "masonry")):
+                continue
+            dims = room.get("dimensions")
+            if not isinstance(dims, dict):
+                continue
+            try:
+                w = float(dims.get("wall_area_sqft") or 0)
+            except (TypeError, ValueError):
+                continue
+            if w > 0:
+                dims["wall_area_sqft"] = round(w * ratio, 1)
+    agg["total_paintable_wall_sqft"] = round(measured, 1)
+    analysis["aggregated_totals"] = agg
+    analysis["_wall_provenance"] = "measured"
+    analysis["_vme_primary_applied"] = True
+    analysis.setdefault("notes", []).append(
+        f"[VME] Wall quantity is MEASURED from plan geometry "
+        f"({measured:,.0f} SF, {primary.get('basis')} basis, "
+        f"{len(primary.get('by_page', []))} plan page(s)); vision estimate "
+        f"was {vision:,.0f} SF. Perimeter-boost/apt-cap heuristics retired "
+        f"on this path.")
+    print(f"   📐 VME primary APPLIED: walls {vision:,.0f} -> {measured:,.0f} "
+          f"SF (x{ratio:.2f}, measured provenance)")
+    return analysis
 
 
 def _gate_add_rfi(analysis, category, question):
@@ -14421,6 +14634,12 @@ def build_priced_takeoff(analysis, strict=None):
     # rebuild) before any quantity is priced. Flag-gated; no-op when off.
     analysis = _enforce_ceiling_scope_gate(analysis)
 
+    # Substrate provenance gate: review flags for assumed wall substrates and
+    # service-area "painted GYP" ceilings (the TSC gyp/CMU inversion and the
+    # Mercedes exposed-ceiling misread). RFI + manual review only — never a
+    # quantity change. Flag-gated NIGHTSHIFT_SUBSTRATE_GATE; no-op when off.
+    analysis = _substrate_provenance_gate(analysis)
+
     # Door-schedule reconciliation (leaf-count recovery + frame-paint
     # reclassification) for interior-elevation door schedules. Flag-gated;
     # no-op when off.
@@ -14431,6 +14650,13 @@ def build_priced_takeoff(analysis, strict=None):
     # same room's generic-GYP composite instance, dropping only its wall paint
     # scope. Flag-gated NIGHTSHIFT_ENLARGED_FINISH_RECONCILE; no-op when off.
     analysis = _reconcile_enlarged_wall_finish(analysis)
+
+    # VME primary (Release 2): when the vector measurement engine measures
+    # this job's walls with full reliability, pin the wall total to geometry
+    # ('measured' provenance) and scale rooms proportionally. Runs LAST so it
+    # overrides the boost/cap heuristics' net effect on walls. Flag-gated
+    # NIGHTSHIFT_VME_PRIMARY; no-op when off or unreliable.
+    analysis = _apply_vme_primary(analysis)
 
     agg = analysis.get("aggregated_totals", {}) or {}
     ledger = analysis.get("_quantity_adjustments", []) or []
@@ -17582,6 +17808,15 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
         wc_rate = _get_tiered_rate(pm['wallcovering_install'], wallcovering_sqft) if 'wallcovering_install' in pm else 9.00
         wc_markup_key = 'wallcovering_install'
         wc_label = "Wallcovering Install (Labor)"
+        # Rider's verified Mazda takeoff bills WC install at $0.50/SF vs the
+        # $9.00 config default (18x). Override pending Rider's confirmation:
+        # set NIGHTSHIFT_WC_INSTALL_RATE=0.50 once Brian confirms the basis.
+        _wc_env = os.environ.get("NIGHTSHIFT_WC_INSTALL_RATE", "").strip()
+        if _wc_env:
+            try:
+                wc_rate = float(_wc_env)
+            except ValueError:
+                pass
     sw_rate     = _get_tiered_rate(pm['stained_wood'], stained_wood_sqft) if 'stained_wood' in pm else 6.00
     soffit_rate = _get_tiered_rate(pm['interior_soffit'], soffit_sqft) if 'interior_soffit' in pm else 0.85
     corn_rate   = _get_tiered_rate(pm['exterior_cornice'], cornice_lf)
@@ -21912,6 +22147,11 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     # that echo it may not be merged into analysis['notes'] yet at this point.
     if scope_notes:
         analysis.setdefault("project_info", {})["_user_scope_notes"] = scope_notes
+    # VME primary (Release 2) needs the source PDFs at the choke point.
+    try:
+        analysis["_vme_pdf_paths"] = [str(p) for p in (pdf_paths or [])]
+    except Exception:
+        pass
     analysis = build_priced_takeoff(analysis)
 
     # --- Calculate costs ---
