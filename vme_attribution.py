@@ -574,21 +574,88 @@ def measure_plan_viewports(pdf_path, page_index, fallback_scale=None):
 # M2 — per-room scope filtering (geometry measures, reading decides billing)
 # ---------------------------------------------------------------------------
 _UNPAINTABLE_WALL_KW = ("tile", "frp", "storefront", "glass", "curtain",
-                        "prefinish", "unpainted", "existing to remain")
+                        "prefinish", "unpainted", "existing to remain",
+                        "trusscore", "fiberglass")
 
 
-def room_anchors(analysis, page_number=None, sheet_token=None):
-    """Room label anchors for one plan page: [(x_norm, y_norm, painted,
-    height_ft)]. Rooms are matched by extraction source_page (single-file
-    sets) or source_sheet token in the filename (sheet-per-file sets).
-    'painted' comes from READ scope: in_scope + paintable wall material."""
-    out = []
+# Residential-unit room labels. Units are only excluded from wall billing
+# when the CALLER asks for a common-area basis (multifamily jobs where the
+# contractor prices unit interiors per-unit, not by measured wall) — the
+# anchor just carries the classification.
+_UNIT_WORD = re.compile(r"\bunit\b", re.I)
+# bare unit-type code label: "ALS1a (Room 060)", "AL2B (Unit 225)"
+_UNIT_CODE = re.compile(r"^\s*[A-Z]{2,5}\d{0,2}[a-z]?\s*\((?:room|unit)\s*\d+\)", re.I)
+
+
+def _is_unit_room(name) -> bool:
+    n = str(name or "")
+    return bool(_UNIT_WORD.search(n)) or bool(_UNIT_CODE.match(n))
+
+
+def has_residential_units(analysis) -> bool:
+    """True when the job actually contains residential units — several
+    unit-named rooms, multiplied typical units, or a real unit count. A
+    lone 'Cooler Unit' / 'AC Unit' room on a commercial job must NOT turn
+    on unit-basis billing."""
+    pi = analysis.get("project_info") or {}
+    try:
+        if float(pi.get("total_units") or 0) >= 3:
+            return True
+    except (TypeError, ValueError):
+        pass
+    unit_rooms = mult_rooms = 0
     for fl in (analysis.get("floors") or []):
+        for room in (fl.get("rooms") or []):
+            if _is_unit_room(room.get("room_name")):
+                unit_rooms += 1
+            try:
+                if float(room.get("unit_multiplier") or 1) > 1:
+                    mult_rooms += 1
+            except (TypeError, ValueError):
+                pass
+    return unit_rooms >= 5 or mult_rooms >= 3
+
+
+def _floor_tokens(name):
+    n = str(name or "").lower()
+    toks = set()
+    for pat, tok in (("basement", "basement"), ("ground", "ground"),
+                     ("first", "1"), ("1st", "1"),
+                     ("second", "2"), ("2nd", "2"),
+                     ("third", "3"), ("3rd", "3"),
+                     ("fourth", "4"), ("4th", "4"),
+                     ("mezz", "mezz")):
+        if pat in n:
+            toks.add(tok)
+    m = re.search(r"\blevel\s*(\d)", n)
+    if m:
+        toks.add(m.group(1))
+    return toks
+
+
+def room_anchors(analysis, page_number=None, sheet_token=None,
+                 floor_labels=None):
+    """Room label anchors for one plan page: [(x_norm, y_norm, painted,
+    height_ft, is_unit)]. Rooms are matched by extraction source_page
+    (single-file sets) or source_sheet token in the filename (sheet-per-file
+    sets); pass floor_labels (e.g. {'2'}) INSTEAD to match rooms by their
+    floor — the fallback when the extraction sourced a floor's rooms from a
+    different sheet (demo plan) than the one being measured. 'painted' comes
+    from READ scope: in_scope + paintable wall material. 'is_unit' marks
+    residential-unit labels (see _is_unit_room), assigned only when the job
+    has residential units at all."""
+    out = []
+    units_possible = has_residential_units(analysis)
+    for fl in (analysis.get("floors") or []):
+        fl_toks = _floor_tokens(fl.get("floor_name")) if floor_labels else None
         for room in (fl.get("rooms") or []):
             bb = (room.get("bbox") or {}).get("label_bbox_norm")
             if not bb:
                 continue
-            if page_number is not None and room.get("source_page") != page_number:
+            if floor_labels is not None:
+                if not (fl_toks & set(floor_labels)):
+                    continue
+            elif page_number is not None and room.get("source_page") != page_number:
                 continue
             if sheet_token:
                 st = str(room.get("source_sheet") or "").replace("-", "").replace(".", "").upper()
@@ -605,7 +672,8 @@ def room_anchors(analysis, page_number=None, sheet_token=None):
             if h is not None and not (6 <= h <= 45):
                 h = None
             out.append(((bb[0] + bb[2]) / 2.0, (bb[1] + bb[3]) / 2.0,
-                        painted, h))
+                        painted, h,
+                        units_possible and _is_unit_room(room.get("room_name"))))
     return out
 
 
@@ -628,7 +696,7 @@ def scope_filtered_walls(pdf_path, page_index, pts_per_ft, anchors,
     total_lf = sum((hi - lo) for (_, _, lo, hi) in runs) / pts_per_ft
     if len(anchors) < min_anchors:
         return total_lf, total_lf * default_height_ft, total_lf, len(runs), len(anchors)
-    pts = [(ax * W, ay * Hh, painted, h) for (ax, ay, painted, h) in anchors]
+    pts = [(a[0] * W, a[1] * Hh, a[2], a[3]) for a in anchors]
     bill_lf = bill_sf = 0.0
     for orient, perp, lo, hi in runs:
         mx, my = ((lo + hi) / 2.0, perp) if orient == "H" else (perp, (lo + hi) / 2.0)
@@ -670,7 +738,7 @@ def walls_by_basis(pdf_path, page_index, pts_per_ft, anchors,
     finally:
         doc.close()
     W, Hh = rect.width, rect.height
-    pts = [(ax * W, ay * Hh, painted, h) for (ax, ay, painted, h) in anchors]
+    pts = [(a[0] * W, a[1] * Hh, a[2], a[3]) for a in anchors]
     off = vm._WALL_MAX_THICK_FT * pts_per_ft * 1.5
     runs_lf = run_bill_lf = face_bill_lf = 0.0
     run_bill_sf = face_bill_sf = 0.0
@@ -892,11 +960,473 @@ def room_regions(pdf_path, page_index, pts_per_ft, anchors,
             rect = doc[page_index].rect
         finally:
             doc.close()
-        for (ax, ay, painted, h) in anchors:
-            px, py = ax * rect.width, ay * rect.height
+        for a in anchors:
+            painted, h = a[2], a[3]
+            unit = a[4] if len(a) > 4 else False
+            px, py = a[0] * rect.width, a[1] * rect.height
             for reg in regions:
                 if any(x0 <= px <= x1 and y0 <= py <= y1
                        for (x0, y0, x1, y1) in reg["cells"]):
-                    reg["anchors"].append((painted, h, (round(px), round(py))))
+                    reg["anchors"].append((painted, h, (round(px), round(py)),
+                                           unit))
                     break
     return regions
+
+
+# ---------------------------------------------------------------------------
+# M2 — region-scoped wall billing
+# ---------------------------------------------------------------------------
+# walls_by_basis samples each run's two sides against the NEAREST label
+# anchor — cheap, but a wall bounding a large unlabeled space (warehouse,
+# racking mezzanine, exterior) is attributed to whatever labeled room happens
+# to sit closest, leaking its scope across the partition. Here each side is
+# resolved to the room REGION containing the sample point (room_regions),
+# so scope stops at the wall like it does on the plans.
+
+def _region_scope(reg):
+    """(kind, height) for one region: kind in {'paint','nopaint','unit',
+    'out'} or None when the region carries no verdict (unlabeled sealed)."""
+    if reg is None:
+        return None
+    anchs = reg.get("anchors") or []
+    if not anchs:
+        return ("out", None) if reg.get("leaky") else None
+    if any(len(a) > 3 and a[3] for a in anchs):
+        return ("unit", None)
+    painted = [a for a in anchs if a[0]]
+    if not painted:
+        return ("nopaint", None)
+    hs = [a[1] for a in painted if a[1]]
+    return ("paint", max(hs) if hs else None)
+
+
+def walls_by_basis_regions(pdf_path, page_index, pts_per_ft, anchors,
+                           default_height_ft=9.0, regions=None,
+                           samples_per_side=3, use_raster=True):
+    """walls_by_basis with region-resolved sides + common-area basis.
+
+    Each run side is sampled at 25/50/75%% of its span, offset one wall
+    thickness out; each sample resolves to the room region containing it
+    ('paint'/'nopaint'/'unit'/'out'), falling back to the nearest anchor
+    when no region claims the point. A side's verdict is the majority of
+    its resolved samples.
+
+    Returns walls_by_basis keys plus:
+        common_run_lf / common_run_sf   — runs with >=1 painted NON-UNIT side
+        common_face_lf / common_face_sf — painted non-unit faces
+        region_coverage — fraction of samples resolved by a region (the
+                          reliability signal; low coverage means the page's
+                          partition didn't seal and callers should not trust
+                          the scoped numbers)
+    """
+    if regions is None:
+        regions = room_regions(pdf_path, page_index, pts_per_ft, anchors)
+    raster = None
+    if use_raster and anchors:
+        try:
+            raster = RasterRooms(pdf_path, page_index, pts_per_ft, anchors)
+        except Exception:
+            raster = None
+    runs = vm.wall_runs_with_positions(pdf_path, page_index, pts_per_ft)
+    doc = fitz.open(pdf_path)
+    try:
+        rect = doc[page_index].rect
+    finally:
+        doc.close()
+    W, Hh = rect.width, rect.height
+    pts = [(a[0] * W, a[1] * Hh, a[2], a[3], a[4] if len(a) > 4 else False)
+           for a in anchors]
+    cells = [(x0, y0, x1, y1, reg) for reg in regions
+             for (x0, y0, x1, y1) in reg["cells"]]
+
+    def region_at(px, py):
+        for (x0, y0, x1, y1, reg) in cells:
+            if x0 <= px <= x1 and y0 <= py <= y1:
+                return reg
+        return None
+
+    def nearest(mx, my):
+        best, bd = None, None
+        for (ax, ay, painted, h, unit) in pts:
+            d = (ax - mx) ** 2 + (ay - my) ** 2
+            if bd is None or d < bd:
+                bd, best = d, (painted, h, unit)
+        return best
+
+    off = vm._WALL_MAX_THICK_FT * pts_per_ft * 1.5
+    n_samp = n_reg = 0
+    runs_lf = run_bill_lf = face_bill_lf = 0.0
+    run_bill_sf = face_bill_sf = 0.0
+    common_run_lf = common_run_sf = common_face_lf = common_face_sf = 0.0
+
+    def side_verdict(sample_pts):
+        """Majority verdict over one side's samples -> (kind, height)."""
+        nonlocal n_samp, n_reg
+        votes = []
+        for (sx, sy) in sample_pts:
+            n_samp += 1
+            sc = raster.resolve(sx, sy) if raster is not None else None
+            if sc is None:
+                sc = _region_scope(region_at(sx, sy))
+            if sc is not None:
+                n_reg += 1
+                votes.append(sc)
+            elif pts:
+                nb = nearest(sx, sy)
+                if nb:
+                    kind = ("unit" if nb[2] else
+                            ("paint" if nb[0] else "nopaint"))
+                    votes.append((kind, nb[1]))
+        if not votes:
+            return None
+        kinds = [v[0] for v in votes]
+        kind = max(set(kinds), key=kinds.count)
+        hs = [v[1] for v in votes if v[0] == kind and v[1]]
+        return (kind, max(hs) if hs else None)
+
+    for orient, perp, lo, hi in runs:
+        lf = (hi - lo) / pts_per_ft
+        runs_lf += lf
+        fr = [lo + (hi - lo) * f for f in (0.25, 0.5, 0.75)][:samples_per_side]
+        if orient == "H":
+            sides = [side_verdict([(m, perp - off) for m in fr]),
+                     side_verdict([(m, perp + off) for m in fr])]
+        else:
+            sides = [side_verdict([(perp - off, m) for m in fr]),
+                     side_verdict([(perp + off, m) for m in fr])]
+        painted_sides = [s for s in sides if s and s[0] == "paint"]
+        unit_sides = [s for s in sides if s and s[0] == "unit"]
+        if painted_sides or unit_sides:
+            # legacy basis counts unit interiors as painted rooms
+            all_paint = painted_sides + unit_sides
+            run_bill_lf += lf
+            h_run = max((s[1] or default_height_ft) for s in all_paint)
+            run_bill_sf += lf * h_run
+            face_bill_lf += lf * len(all_paint)
+            face_bill_sf += sum(lf * (s[1] or default_height_ft)
+                                for s in all_paint)
+        if painted_sides:
+            common_run_lf += lf
+            h_run = max((s[1] or default_height_ft) for s in painted_sides)
+            common_run_sf += lf * h_run
+            common_face_lf += lf * len(painted_sides)
+            common_face_sf += sum(lf * (s[1] or default_height_ft)
+                                  for s in painted_sides)
+    if not pts and not cells:
+        run_bill_lf = face_bill_lf = runs_lf
+        run_bill_sf = face_bill_sf = runs_lf * default_height_ft
+    return {"runs_lf": runs_lf, "run_bill_lf": run_bill_lf,
+            "face_bill_lf": face_bill_lf, "run_bill_sf": run_bill_sf,
+            "face_bill_sf": face_bill_sf,
+            "common_run_lf": common_run_lf, "common_run_sf": common_run_sf,
+            "common_face_lf": common_face_lf,
+            "common_face_sf": common_face_sf,
+            "region_coverage": (n_reg / n_samp) if n_samp else 0.0,
+            "n_anchors": len(pts), "n_runs": len(runs),
+            "n_regions": len(regions)}
+
+
+def unit_code_vocab(analysis):
+    """Unit-type code tokens ('als1a', 'al2b', ...) from the extraction's
+    unit-room names. Empty on jobs with no residential units, which turns
+    page_text_unit_anchors into a no-op."""
+    if not has_residential_units(analysis):
+        return set()
+    vocab = set()
+    skip = {"unit", "room", "demo", "plan", "typ", "typical", "the"}
+    for fl in (analysis.get("floors") or []):
+        for room in (fl.get("rooms") or []):
+            name = str(room.get("room_name") or "")
+            if not _is_unit_room(name):
+                continue
+            for tok in re.findall(r"[A-Za-z]{2,5}\d{0,2}[a-z]?", name):
+                t = tok.lower()
+                if t not in skip and not t.isdigit() and len(t) >= 2:
+                    vocab.add(t)
+    return vocab
+
+
+def page_text_unit_anchors(pdf_path, page_index, vocab):
+    """Anchors [(x_norm, y_norm, painted=True, h=None, unit=True)] for every
+    page WORD matching a unit-type code. Unit interiors are drawn on floor
+    plans but their rooms are extracted from the ENLARGED unit plans, so
+    label anchors from the extraction never land on them — the sheet's own
+    code labels do."""
+    if not vocab:
+        return []
+    doc = fitz.open(pdf_path)
+    try:
+        page = doc[page_index]
+        W, Hh = page.rect.width, page.rect.height
+        out = []
+        for (x0, y0, x1, y1, word, *_rest) in page.get_text("words"):
+            if word.lower() in vocab:
+                out.append((((x0 + x1) / 2.0) / W, ((y0 + y1) / 2.0) / Hh,
+                            True, None, True))
+        return out
+    finally:
+        doc.close()
+
+
+# ---------------------------------------------------------------------------
+# M2b — raster room resolver (curves/diagonals-proof)
+# ---------------------------------------------------------------------------
+# Rect decomposition seals rooms only when every wall is axis-aligned. Curved
+# corridors and angled wings (senior-living Y-plans) leak the flood and drop
+# region coverage to ~0.1, pushing scope back onto nearest-anchor guessing —
+# which votes across unsealed partitions. Rendering the page and flooding
+# open PIXELS blocks on every drawn wall regardless of geometry. MuPDF
+# enforces a 1-device-pixel minimum stroke, so even hairlines block.
+
+class RasterRooms:
+    """Lazy connected-component room resolver over a rendered plan page.
+
+    resolve(x_pt, y_pt) -> ('paint'|'nopaint'|'unit'|'out', height) or None
+    when the point's component carries no label anchor (caller falls back).
+    """
+
+    def __init__(self, pdf_path, page_index, pts_per_ft, anchors,
+                 px_per_ft=3.0, dark_threshold=200, max_room_ft2=20000.0,
+                 max_anchors_per_room=8):
+        import numpy as np
+        self._np = np
+        self.px_per_ft = px_per_ft
+        self.max_px = max_room_ft2 * px_per_ft * px_per_ft
+        self.max_anchors = max_anchors_per_room
+        zoom = px_per_ft / pts_per_ft if pts_per_ft else 0.05
+        doc = fitz.open(pdf_path)
+        try:
+            page = doc[page_index]
+            rect = page.rect
+            pix = page.get_pixmap(matrix=fitz.Matrix(zoom, zoom),
+                                  colorspace=fitz.csGRAY, alpha=False,
+                                  annots=False)
+        finally:
+            doc.close()
+        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+            pix.height, pix.width)
+        self.zoom = zoom
+        self.W, self.H = pix.width, pix.height
+        self.open = arr > dark_threshold
+        self.label = np.full(arr.shape, -1, dtype=np.int32)
+        self.comp_anchors = {}          # comp id -> list of anchor tuples
+        self.comp_out = set()           # comps touching the page border
+        self._next = 0
+        # anchors in px: (px, py, painted, h, unit)
+        self.apx = [(a[0] * rect.width * zoom, a[1] * rect.height * zoom,
+                     a[2], a[3], a[4] if len(a) > 4 else False)
+                    for a in anchors]
+        for (px, py, painted, h, unit) in self.apx:
+            c = self._component_at(px, py)
+            if c is not None:
+                self.comp_anchors.setdefault(c, []).append((painted, h, unit))
+
+    def _open_near(self, x, y, radius_px=8):
+        """Nearest open pixel to (x, y) within radius (labels sit on text)."""
+        np = self._np
+        xi, yi = int(round(x)), int(round(y))
+        for r in range(radius_px + 1):
+            x0, x1 = max(0, xi - r), min(self.W - 1, xi + r)
+            y0, y1 = max(0, yi - r), min(self.H - 1, yi + r)
+            win = self.open[y0:y1 + 1, x0:x1 + 1]
+            if win.any():
+                ys, xs = np.nonzero(win)
+                k = ((ys + y0 - yi) ** 2 + (xs + x0 - xi) ** 2).argmin()
+                return int(xs[k] + x0), int(ys[k] + y0)
+        return None
+
+    def _component_at(self, x, y):
+        """Component id containing point (px), flooding lazily. None if no
+        open pixel nearby."""
+        pt = self._open_near(x, y)
+        if pt is None:
+            return None
+        xi, yi = pt
+        if self.label[yi, xi] >= 0:
+            return int(self.label[yi, xi])
+        cid = self._next
+        self._next += 1
+        from collections import deque
+        q = deque([(yi, xi)])
+        self.label[yi, xi] = cid
+        touches_border = False
+        npx = 0
+        lab, op = self.label, self.open
+        Wp, Hp = self.W, self.H
+        while q:
+            cy, cx = q.popleft()
+            npx += 1
+            if cx == 0 or cy == 0 or cx == Wp - 1 or cy == Hp - 1:
+                touches_border = True
+            for ny, nx in ((cy - 1, cx), (cy + 1, cx), (cy, cx - 1), (cy, cx + 1)):
+                if 0 <= ny < Hp and 0 <= nx < Wp and lab[ny, nx] < 0 and op[ny, nx]:
+                    lab[ny, nx] = cid
+                    q.append((ny, nx))
+        if touches_border:
+            self.comp_out.add(cid)
+        self.comp_px = getattr(self, "comp_px", {})
+        self.comp_px[cid] = npx
+        return cid
+
+    def resolve(self, x_pt, y_pt):
+        c = self._component_at(x_pt * self.zoom, y_pt * self.zoom)
+        if c is None:
+            return None
+        anchs = self.comp_anchors.get(c)
+        if not anchs:
+            return ("out", None) if c in self.comp_out else None
+        # Trust only ROOM-SIZED, label-coherent components. A component that
+        # swallowed the floor (door openings leak the flood) would smear one
+        # room's scope everywhere — refuse a verdict and let the caller fall
+        # back to local evidence.
+        if getattr(self, "comp_px", {}).get(c, 0) > self.max_px:
+            return None
+        if c in self.comp_out:
+            return None    # open to the page edge yet carrying room labels:
+            # the envelope leaked; the labels don't bound this space
+        if len(anchs) > self.max_anchors:
+            return None
+        units = [a for a in anchs if a[2]]
+        commons = [a for a in anchs if not a[2]]
+        if len(units) >= 2 and len(commons) >= 2:
+            return None
+        if units:
+            return ("unit", None)
+        painted = [a for a in anchs if a[0]]
+        unpainted = [a for a in anchs if not a[0]]
+        if painted and unpainted and len(painted) < 2 * len(unpainted):
+            return None    # conflicting labels without a clear majority
+        if not painted:
+            return ("nopaint", None)
+        hs = [a[1] for a in painted if a[1]]
+        return ("paint", max(hs) if hs else None)
+
+
+# ---------------------------------------------------------------------------
+# M3 — VME primary (measured provenance)
+# ---------------------------------------------------------------------------
+
+def _read_heights(analysis, default=9.0):
+    """Wall-area-weighted READ ceiling height per floor + job default."""
+    per_floor = {}
+    num = den = 0.0
+    for fl in (analysis.get("floors") or []):
+        fnum = fden = 0.0
+        for room in (fl.get("rooms") or []):
+            d = room.get("dimensions") or {}
+            try:
+                h = float(d.get("ceiling_height_feet") or 0)
+                w = float(d.get("wall_area_sqft") or 0)
+            except (TypeError, ValueError):
+                continue
+            if 6 <= h <= 45 and w > 0:
+                fnum += h * w
+                fden += w
+        if fden > 0:
+            per_floor[str(fl.get("floor_name", "")).lower()] = fnum / fden
+            num += fnum
+            den += fden
+    return per_floor, (num / den) if den else default
+
+
+def _height_for(per_floor, default, floor_label):
+    for name, h in per_floor.items():
+        if floor_label in ("1", "ground") and any(
+                k in name for k in ("first", "1st", "ground")):
+            return h
+        if floor_label == "2" and any(k in name for k in ("second", "2nd")):
+            return h
+        if floor_label == "3" and any(k in name for k in ("third", "3rd")):
+            return h
+        if floor_label == "basement" and "basement" in name:
+            return h
+        if floor_label == "mezz" and "mezz" in name:
+            return h
+    return default
+
+
+def _dispersed(anchors):
+    if len(anchors) < 3:
+        return False
+    xs = sorted(a[0] for a in anchors)
+    ys = sorted(a[1] for a in anchors)
+    return (xs[-1] - xs[0]) > 0.15 or (ys[-1] - ys[0]) > 0.15
+
+
+def compute_vme_primary(pdf_paths, analysis, default_height_ft=9.0):
+    """Measured wall quantity for a whole job, with an explicit reliability
+    verdict — the M3 'VME primary' path.
+
+    Reliable ONLY when every identified plan page measures with a detected
+    scale AND carries >=3 spatially-dispersed room-label anchors (so per-room
+    scope filtering actually ran). Any page that fails demotes the whole job
+    to unreliable — the caller keeps vision quantities and this result stays
+    a shadow.
+
+    Returns {reliable, reasons, measured_wall_sf, measured_wall_run_lf,
+    raw_lf, basis, by_page}.
+    """
+    reasons = []
+    try:
+        pages = select_floor_plan_pages(pdf_paths)
+    except Exception as e:
+        return {"reliable": False, "reasons": [f"page selection failed: {e}"]}
+    if not pages:
+        return {"reliable": False, "reasons": ["no floor-plan pages identified"]}
+    multi = len(pdf_paths) > 3
+    per_floor_h, def_h = _read_heights(analysis, default_height_ft)
+    vocab = unit_code_vocab(analysis)
+    face_basis = has_residential_units(analysis)
+    scales = []
+    measured = {}
+    for p in pages:
+        r = vm.measure_wall_runs_geometric(p["pdf"], p["page"])
+        measured[id(p)] = r
+        if r.get("wall_run_lf") is not None:
+            scales.append(r["pts_per_ft"])
+    sib = max(set(scales), key=scales.count) if scales else None
+    tot_bill_sf = tot_run_lf = raw_lf = 0.0
+    by_page = []
+    for p in pages:
+        r = measured[id(p)]
+        if r.get("wall_run_lf") is None and sib:
+            r = vm.measure_wall_runs_geometric(p["pdf"], p["page"], pts_per_ft=sib)
+        if r.get("wall_run_lf") is None:
+            reasons.append(f"unmeasured page {p['pdf']}#{p['page'] + 1} (no scale)")
+            continue
+        if multi:
+            tok = (p["pdf"].rsplit("/", 1)[-1].upper()
+                   .replace("-", "").replace(".", ""))
+            anchors = room_anchors(analysis, sheet_token=tok)
+        else:
+            anchors = room_anchors(analysis, page_number=p["page"] + 1)
+        anchors = anchors + page_text_unit_anchors(p["pdf"], p["page"], vocab)
+        if not _dispersed(anchors):
+            reasons.append(
+                f"page {p['pdf'].rsplit('/', 1)[-1]}#{p['page'] + 1}: "
+                f"{len(anchors)} usable room anchors (need >=3, dispersed)")
+            continue
+        if len(p["floors"]) == 1 and p["floors"][0] != "all":
+            h = _height_for(per_floor_h, def_h, p["floors"][0])
+        else:
+            h = def_h
+        wb = walls_by_basis_regions(p["pdf"], p["page"], r["pts_per_ft"],
+                                    anchors, default_height_ft=h)
+        bill = wb["face_bill_sf"] if face_basis else wb["run_bill_sf"]
+        tot_bill_sf += bill
+        tot_run_lf += wb["run_bill_lf"]
+        raw_lf += r["wall_run_lf"]
+        by_page.append({"pdf": p["pdf"].rsplit("/", 1)[-1],
+                        "page": p["page"] + 1,
+                        "bill_sf": round(bill),
+                        "run_bill_lf": round(wb["run_bill_lf"], 1),
+                        "coverage": round(wb["region_coverage"], 2),
+                        "n_anchors": wb["n_anchors"]})
+    n_ok = len(by_page)
+    reliable = n_ok == len(pages) and n_ok > 0 and not reasons
+    return {"reliable": reliable, "reasons": reasons,
+            "measured_wall_sf": round(tot_bill_sf),
+            "measured_wall_run_lf": round(tot_run_lf, 1),
+            "raw_lf": round(raw_lf, 1),
+            "basis": "face" if face_basis else "run",
+            "by_page": by_page}
