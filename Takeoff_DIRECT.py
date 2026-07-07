@@ -14359,6 +14359,130 @@ def _scope_sweep_max_pages():
     return max(1, min(40, n))
 
 
+def _vme_authoritative_walls_enabled():
+    return os.environ.get(
+        "NIGHTSHIFT_VME_AUTHORITATIVE_WALLS", "0").strip() in (
+        "1", "true", "True")
+
+
+# Sanity band: abstain when the geometric measurement diverges from the LLM
+# read by more than this — a scale misread must never become load-bearing.
+_VME_LLM_RATIO_BAND = (0.4, 2.5)
+
+
+def _apply_vme_authoritative_walls(analysis):
+    """Flag-gated (NIGHTSHIFT_VME_AUTHORITATIVE_WALLS, default off): the
+    vector measurement engine's wall run LF becomes the authoritative wall
+    quantity, replacing the LLM extraction's aggregate.
+
+    Why (PNC Milwaukee, N=4 on identical input, 2026-07-07): the LLM per-
+    sheet extraction produced 29,085 / 12,213 / 12,021 / 30,637 SF of walls
+    across four runs, while the VME shadow measured 2,422.5 LF bit-identically
+    every time — and at the job's actual ceiling height that is +2.7% against
+    the customer's verified takeoff. Geometry doesn't roll dice.
+
+    Hard preconditions (all abstentions leave the LLM value and add a note):
+      - VME measured EVERY selected floor page (no 'unmeasured' entries —
+        partial coverage would silently under-count);
+      - a MEASURED ceiling height exists: median of 3+ in-scope room heights.
+        The engine's 9-ft default is exactly the kind of guess this pipeline
+        refuses to price;
+      - the result is within ×0.4–×2.5 of the LLM read (scale-misread guard).
+
+    Wallcovering stays finish-driven: the schedule/extraction wallcovering
+    sqft is deducted from the geometric total (geometry can't see finishes).
+    LLM per-room data is untouched — rooms keep driving finishes, ceilings,
+    doors and RFIs. Idempotent via analysis['_vme_authoritative'].
+    """
+    if not isinstance(analysis, dict) or not _vme_authoritative_walls_enabled():
+        return analysis
+    if analysis.get("_vme_authoritative") is not None:
+        return analysis
+
+    def _abstain(reason):
+        analysis["_vme_authoritative"] = {"applied": False, "reason": reason}
+        analysis.setdefault("notes", []).append(
+            f"[VME] Geometric wall measurement NOT promoted: {reason}. "
+            f"Walls priced from extraction.")
+        print(f"   🧪 VME authoritative walls: abstained — {reason}")
+        return analysis
+
+    shadow = analysis.get("_vme_shadow_v2")
+    if not shadow:
+        paths = analysis.get("_vme_pdf_paths") or []
+        try:
+            import vme_attribution as _vme
+            shadow = _vme.compute_vme_shadow_v2(paths)
+        except Exception as exc:
+            return _abstain(f"engine unavailable ({type(exc).__name__})")
+        if shadow:
+            analysis["_vme_shadow_v2"] = shadow
+    if not shadow or _num(shadow.get("total_wall_run_lf", 0)) <= 0:
+        return _abstain("no geometric wall measurement for this set")
+    if shadow.get("unmeasured"):
+        return _abstain(
+            f"{len(shadow['unmeasured'])} floor page(s) unmeasured "
+            f"(no scale) — partial geometry must not price the job")
+
+    heights = []
+    for fl in (analysis.get("floors") or []):
+        for rm in (fl.get("rooms") or []):
+            if not isinstance(rm, dict) or not rm.get("in_scope", True):
+                continue
+            h = _num((rm.get("dimensions") or {}).get("ceiling_height_feet", 0))
+            if 6 < h < 30:
+                heights.append(h)
+    if len(heights) < 3:
+        return _abstain(
+            f"only {len(heights)} measured room height(s) — refusing the "
+            f"9-ft default; confirm ceiling height (RFI)")
+    heights.sort()
+    # Wall height basis is the DECK, not the ceiling grid: walls are painted
+    # past ACT grids, so the median room (grid) height under-prices by the
+    # plenum (PNC replay: median 8.58 ft priced -19% vs the verified takeoff;
+    # the exposed-ceiling rooms' 10.83 ft deck height priced +2%). The 90th-
+    # percentile measured height is the deck-height band the exposed/GWB
+    # rooms report — same full-floor-height convention the verified manual
+    # takeoffs use.
+    height = heights[int(0.9 * (len(heights) - 1))]
+
+    agg = analysis.setdefault("aggregated_totals", {})
+    llm_walls = _num(agg.get("total_paintable_wall_sqft", 0))
+    lf = _num(shadow.get("total_wall_run_lf", 0))
+    wc = max(0.0, _num(agg.get("total_wallcovering_sqft", 0)))
+    vme_walls = max(0.0, round(lf * height - wc, 2))
+    if llm_walls > 0:
+        ratio = vme_walls / llm_walls
+        lo, hi = _VME_LLM_RATIO_BAND
+        if not (lo <= ratio <= hi):
+            return _abstain(
+                f"geometric walls {vme_walls:,.0f} vs extracted "
+                f"{llm_walls:,.0f} (x{ratio:.2f}) outside the sanity band — "
+                f"flagging for review instead of overriding")
+
+    agg["total_paintable_wall_sqft"] = vme_walls
+    analysis["_vme_authoritative"] = {
+        "applied": True,
+        "wall_run_lf": lf,
+        "height_ft": round(height, 2),
+        "n_room_heights": len(heights),
+        "wallcovering_deducted_sqft": wc,
+        "llm_wall_sqft": llm_walls,
+        "applied_wall_sqft": vme_walls,
+        "n_floor_pages": shadow.get("n_floor_pages"),
+        "engine": shadow.get("engine"),
+    }
+    analysis.setdefault("notes", []).append(
+        f"[VME] Walls priced from deterministic vector measurement: "
+        f"{lf:,.0f} LF of wall runs × {height:.2f} ft measured ceiling "
+        f"height − {wc:,.0f} sqft wallcovering = {vme_walls:,.0f} sqft "
+        f"(extraction read {llm_walls:,.0f}; kept for comparison).")
+    print(f"   📐 VME authoritative walls: {lf:,.0f} LF × {height:.2f} ft "
+          f"− {wc:,.0f} WC = {vme_walls:,.0f} sqft "
+          f"(LLM read {llm_walls:,.0f})")
+    return analysis
+
+
 def _schedule_count_floor_enabled():
     return os.environ.get("NIGHTSHIFT_SCHEDULE_COUNT_FLOOR", "0").strip() in (
         "1", "true", "True")
@@ -15034,6 +15158,11 @@ def build_priced_takeoff(analysis, strict=None):
     # no-op when off. Runs BEFORE the finish/measurement passes so restored
     # rooms are visible to them.
     analysis = _reconcile_schedule_room_count(analysis)
+
+    # VME Release 2: deterministic geometric wall measurement becomes the
+    # authoritative wall quantity (LLM keeps rooms/finishes). Flag-gated;
+    # abstains loudly rather than guessing.
+    analysis = _apply_vme_authoritative_walls(analysis)
 
     # Enlarged-plan wall-finish reconciliation: propagate a confirmed non-paint
     # wet-wall finish (FRP/Trusscore/tile) from an enlarged detail sheet to the
@@ -22597,7 +22726,11 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             # walls — works on multi-file and layerless sets. The legacy
             # layer-tagged path still runs on single-PDF jobs as a
             # cross-check while v2 matures.
-            shadow_v2 = _vme.compute_vme_shadow_v2(pdf_paths)
+            # Reuse the measurement when the authoritative gate already
+            # computed it at the choke point (identical inputs -> identical
+            # geometry; no need to pay the CPU twice).
+            shadow_v2 = (analysis.get("_vme_shadow_v2")
+                         or _vme.compute_vme_shadow_v2(pdf_paths))
             if shadow_v2:
                 analysis["_vme_shadow_v2"] = shadow_v2
             single_pdf = pdf_paths[0] if (pdf_paths and len(pdf_paths) == 1) else None
