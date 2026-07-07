@@ -12844,6 +12844,24 @@ def _sc_room_type(name):
     return words[0]
 
 
+def _sc_room_number(room):
+    """Room number for dedup identity, '' when the room is unnumbered."""
+    for k in ("room_number", "room_id"):
+        v = str(room.get(k) or "").strip()
+        if v:
+            m = re.search(r"\d+", v)
+            if m:
+                return m.group(0)
+    return ""
+
+
+def _sc_dedup_number_aware():
+    """Kill switch: NIGHTSHIFT_SC_DEDUP_NUMBER_AWARE=0 reverts to type-only."""
+    return os.environ.get(
+        "NIGHTSHIFT_SC_DEDUP_NUMBER_AWARE", "1").strip().lower() not in (
+        "0", "false", "no", "off")
+
+
 def _dedupe_small_commercial_floors(analysis):
     """For a small-commercial building (gated), when a floor's rooms come from
     multiple source pages — the same floor re-drawn on floor/dimension/finish
@@ -12854,6 +12872,15 @@ def _dedupe_small_commercial_floors(analysis):
     counts, which is visible) and only clear cross-sheet type duplicates are
     dropped — never a silent under-count. Double-gated (small-commercial AND
     per-sheet). Idempotent via _sc_floor_deduped.
+
+    Number-aware (PNC Milwaukee, 2026-07-06): type-matching was built for
+    UNNUMBERED redraws (Dutchess). On a numbered 54-room office floor split
+    across sheets, a DIFFERENT office on a secondary page was dropped just
+    for sharing a type with the authoritative page — two consecutive runs
+    lost ~11k SF this way. A room whose number is absent from the
+    authoritative page is a distinct room and is always kept; a room whose
+    number IS on the authoritative page is a certain redraw and is dropped
+    regardless of type. Unnumbered rooms keep the original type behavior.
     """
     if not isinstance(analysis, dict):
         return
@@ -12887,11 +12914,18 @@ def _dedupe_small_commercial_floors(analysis):
             continue  # authoritative page too thin to trust as the floor plan
         auth_types = {_sc_room_type(r.get("room_name")) for r in by_page[auth_page]}
         auth_types.discard("")
+        number_aware = _sc_dedup_number_aware()
+        auth_numbers = {_sc_room_number(r) for r in by_page[auth_page]}
+        auth_numbers.discard("")
         for pg, rs in by_page.items():
             if pg == auth_page:
                 continue
             for r in rs:
-                if _sc_room_type(r.get("room_name")) in auth_types:
+                num = _sc_room_number(r) if number_aware else ""
+                if num and num not in auth_numbers:
+                    continue  # numbered room the authoritative page lacks — distinct, keep
+                if (num and num in auth_numbers) \
+                        or _sc_room_type(r.get("room_name")) in auth_types:
                     r["in_scope"] = False
                     r["scope_exclusion_reason"] = (
                         f"small-commercial: same floor re-drawn on sheet "
