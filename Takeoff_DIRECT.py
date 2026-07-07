@@ -14369,6 +14369,14 @@ def _vme_authoritative_walls_enabled():
 # read by more than this — a scale misread must never become load-bearing.
 _VME_LLM_RATIO_BAND = (0.4, 2.5)
 
+# Scope-coverage floor: the whole-page geometric measurement is only valid
+# when (roughly) the whole drawn floor is in paint scope. Rider-batch
+# certification: partial-scope jobs (Livestock restroom reno +200%, TSC
+# phase +525%, CenHud 46%-of-page +52%) over-price because geometry can't
+# see scope boundaries — that clipping is the VME M4 branch's job. Until
+# then, promote only when in-scope floor area covers most of the footprint.
+_VME_MIN_SCOPE_COVERAGE = 0.6
+
 
 def _apply_vme_authoritative_walls(analysis):
     """Flag-gated (NIGHTSHIFT_VME_AUTHORITATIVE_WALLS, default off): the
@@ -14436,6 +14444,28 @@ def _apply_vme_authoritative_walls(analysis):
         return _abstain(
             f"only {len(heights)} measured room height(s) — refusing the "
             f"9-ft default; confirm ceiling height (RFI)")
+
+    # Scope coverage: whole-page geometry requires (near-)whole-page scope.
+    footprint = 0.0
+    pi = analysis.get("project_info") or {}
+    for k in ("footprint_sqft", "_declared_work_area_sqft", "work_area_sqft"):
+        footprint = _num(pi.get(k, 0)) or _num(analysis.get(k, 0))
+        if footprint > 0:
+            break
+    in_scope_floor = sum(
+        _num((rm.get("dimensions") or {}).get("floor_area_sqft", 0))
+        for fl in (analysis.get("floors") or [])
+        for rm in (fl.get("rooms") or [])
+        if isinstance(rm, dict) and rm.get("in_scope", True))
+    n_pages = max(1, int(_num(shadow.get("n_floor_pages", 1)) or 1))
+    if footprint > 0:
+        coverage = in_scope_floor / (footprint * n_pages)
+        if coverage < _VME_MIN_SCOPE_COVERAGE:
+            return _abstain(
+                f"in-scope floor area {in_scope_floor:,.0f} sqft covers only "
+                f"{coverage:.0%} of the drawn footprint "
+                f"({footprint:,.0f} × {n_pages} floor page(s)) — partial-"
+                f"scope job; whole-page geometry would over-price")
     heights.sort()
     # Wall height basis is the DECK, not the ceiling grid: walls are painted
     # past ACT grids, so the median room (grid) height under-prices by the

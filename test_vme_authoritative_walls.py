@@ -101,6 +101,27 @@ finally:
 check(a["_vme_authoritative"]["applied"] is False,
       "engine returns nothing -> abstain gracefully")
 
+# ── Scope coverage: partial-scope jobs abstain ──────────────────────────────
+print("\nScope coverage")
+a = _analysis()
+a["project_info"] = {"footprint_sqft": 25000}
+for fl in a["floors"]:
+    for rm in fl["rooms"]:
+        rm["dimensions"]["floor_area_sqft"] = 700  # 3,500 of 25,000 = 14%
+a = T._apply_vme_authoritative_walls(a)
+check(a["_vme_authoritative"]["applied"] is False
+      and "partial-scope" in a["_vme_authoritative"]["reason"],
+      "in-scope floor << footprint -> abstain (Livestock/CenHud shape)")
+
+a = _analysis()
+a["project_info"] = {"footprint_sqft": 25000}
+for fl in a["floors"]:
+    for rm in fl["rooms"]:
+        rm["dimensions"]["floor_area_sqft"] = 3200  # 16,000 of 25,000 = 64%
+a = T._apply_vme_authoritative_walls(a)
+check(a["_vme_authoritative"]["applied"] is True,
+      "full-floor TI coverage (PNC shape) -> promoted")
+
 # ── Wallcovering deduction floors at zero ───────────────────────────────────
 print("\nEdge cases")
 a = T._apply_vme_authoritative_walls(
