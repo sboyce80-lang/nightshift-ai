@@ -353,16 +353,36 @@ _WALL_MAX_THICK_FT = 1.15   # 12" CMU + furring
 _WALL_MIN_RUN_FT = 1.5      # ignore pairs overlapping less than a door jamb
 
 
-def _axis_segments(page, min_len_pts=2.0, include_layers=None):
+def _axis_segments(page, min_len_pts=2.0, include_layers=None,
+                   min_width=None):
     """All axis-aligned line segments (+ thin filled rects as face pairs).
 
     Returns (H, V): H = [(y, x0, x1)], V = [(x, y0, y1)]. When
     `include_layers` is not None, only paths whose layer passes the filter
     are used; None means every path (tier-2, layerless).
+
+    min_width: walls carry a heavier lineweight than annotation. "auto"
+    computes the page's modal stroke width (the annotation weight — on
+    Livestock 20k of 24k paths are 0.24pt dimensions/fixtures) and keeps only
+    strokes >= 2x modal (min 0.55pt). Pass None to disable, or a float.
+    Filled thin rectangles are kept regardless (walls drawn as fills).
     """
+    drawings = page.get_drawings()
+    if min_width == "auto":
+        import collections as _c
+        wh = _c.Counter(round(p.get("width") or 0, 2) for p in drawings)
+        modal = wh.most_common(1)[0][0] if wh else 0
+        min_width = max(0.55, 2.0 * modal) if modal else 0.55
+        # pages drawn entirely at one heavy weight: don't filter everything
+        if sum(n for w, n in wh.items() if w >= min_width) < 50:
+            min_width = None
     H, V = [], []
-    for path in page.get_drawings():
+    for path in drawings:
         if include_layers is not None and not include_layers(path.get("layer") or ""):
+            continue
+        is_fill = path.get("fill") is not None and "f" in (path.get("type") or "")
+        if (min_width is not None and not is_fill
+                and (path.get("width") or 0) < min_width):
             continue
         for it in path["items"]:
             if it[0] == "l":
@@ -563,3 +583,59 @@ def wall_area_sqft(pdf_path: str, page_index: int, height_ft: float,
     if m["wall_face_lf"] is None:
         return None
     return m["wall_face_lf"] * height_ft
+
+
+def cluster_wall_runs_list(segments, thickness_pts):
+    """Like cluster_wall_runs but returns the merged run intervals
+    [(perp, lo, hi)] instead of only the total length — callers that need
+    per-run positions (room-scope assignment) use this."""
+    if not segments:
+        return []
+    segments = sorted(segments)
+    out = []
+
+    def flush(band, perp):
+        if not band:
+            return
+        ivs = sorted(band)
+        cs, ce = ivs[0]
+        for s, e in ivs[1:]:
+            if s <= ce + 0.5:
+                ce = max(ce, e)
+            else:
+                out.append((perp, cs, ce))
+                cs, ce = s, e
+        out.append((perp, cs, ce))
+
+    band, band_perp = [], None
+    for perp, lo, hi in segments:
+        if band and perp - band_perp <= thickness_pts:
+            band.append((lo, hi))
+        else:
+            flush(band, band_perp)
+            band = [(lo, hi)]
+        band_perp = perp
+    flush(band, band_perp)
+    return out
+
+
+def wall_runs_with_positions(pdf_path, page_index, pts_per_ft,
+                             min_width=None):
+    """Tier-2 wall runs as positioned intervals: (orient, perp, lo, hi).
+    orient 'H': perp=y, span on x; 'V': perp=x, span on y. Same pairing and
+    clustering as measure_wall_runs_geometric."""
+    if fitz is None:
+        raise RuntimeError("PyMuPDF (fitz) is required")
+    doc = fitz.open(pdf_path)
+    try:
+        H, V = _axis_segments(doc[page_index], min_width=min_width)
+    finally:
+        doc.close()
+    min_gap = _WALL_MIN_THICK_FT * pts_per_ft
+    max_gap = _WALL_MAX_THICK_FT * pts_per_ft
+    min_ov = _WALL_MIN_RUN_FT * pts_per_ft
+    ch = _pair_centerlines(H, min_gap, max_gap, min_ov)
+    cv = _pair_centerlines(V, min_gap, max_gap, min_ov)
+    runs = [("H", p, lo, hi) for (p, lo, hi) in cluster_wall_runs_list(ch, max_gap)]
+    runs += [("V", p, lo, hi) for (p, lo, hi) in cluster_wall_runs_list(cv, max_gap)]
+    return runs

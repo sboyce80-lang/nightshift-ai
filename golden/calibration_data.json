@@ -287,6 +287,296 @@
         "hard_gate_tripped": true
       },
       "output_path": "construction_analysis_20260615_104300.json"
+    },
+    {
+      "job": "364main_riderbatch_2026-07",
+      "verified_on": "2026-07-03",
+      "true_error_pct": 34.2,
+      "true_error_metric": "mean abs % error vs Rider batch targets",
+      "detail": [
+        "total_paintable_wall_sqft: 72838 vs 85353 (15%)",
+        "total_paintable_ceiling_sqft: 15716 vs 26839 (41%)",
+        "total_base_trim_lf: 6722 vs 8629 (22%)",
+        "total_doors_full_paint: 168 vs 155 (8%)",
+        "total_doors_hm_panel: 26 vs 28 (7%)",
+        "total_windows_painted_interior: 0 vs 26 (100%)",
+        "total_stair_sections: 16 vs 11 (45%)"
+      ],
+      "inputs": {
+        "coverage_pct": 1.0,
+        "anchor_pct": 0.877,
+        "verifier_miss_rate": 0.1577,
+        "unanchored_rate": 0.1618,
+        "assumed_frac": 0.0,
+        "adjustment_mag": 0.0,
+        "walls_per_door": 375.5,
+        "ceil_per_door": 81.0,
+        "over_extraction_ratio": 0.0,
+        "n_rooms": 241,
+        "hard_gates": {
+          "failed_pages": false,
+          "missing_footprint": false,
+          "zero_walls": false,
+          "manual_review": false
+        },
+        "hard_gate_tripped": false
+      },
+      "output_path": "rider_batch_durable/364main/result.json"
+    },
+    {
+      "job": "cenhud_riderbatch_2026-07",
+      "verified_on": "2026-07-03",
+      "true_error_pct": 75.2,
+      "true_error_metric": "mean abs % error vs Rider batch targets",
+      "detail": [
+        "total_paintable_wall_sqft: 9396 vs 18925 (50%)",
+        "total_doors_frame_only: 0 vs 35 (100%)"
+      ],
+      "inputs": {
+        "coverage_pct": 1.0,
+        "anchor_pct": 0.0,
+        "verifier_miss_rate": 0.2857,
+        "unanchored_rate": 0.0286,
+        "assumed_frac": 0.0,
+        "adjustment_mag": 0.0,
+        "walls_per_door": 240.9,
+        "ceil_per_door": 61.9,
+        "over_extraction_ratio": 0.0,
+        "n_rooms": 70,
+        "hard_gates": {
+          "failed_pages": false,
+          "missing_footprint": false,
+          "zero_walls": false,
+          "manual_review": true
+        },
+        "hard_gate_tripped": true
+      },
+      "output_path": "rider_batch_durable/cenhud/result.json"
+    },
+    {
+      "job": "livestock_riderbatch_2026-07",
+      "verified_on": "2026-07-03",
+      "true_error_pct": 71.4,
+      "true_error_metric": "mean abs % error vs Rider batch targets",
+      "detail": [
+        "total_paintable_wall_sqft: 10003 vs 5371 (86%)",
+        "total_paintable_ceiling_sqft: 2266 vs 2061 (10%)",
+        "total_base_trim_lf: 0 vs 391 (100%)",
+        "total_doors_full_paint: 11 vs 28 (61%)",
+        "total_windows_painted_interior: 0 vs 25 (100%)"
+      ],
+      "inputs": {
+        "coverage_pct": 1.0,
+        "anchor_pct": 0.9790000000000001,
+        "verifier_miss_rate": 0.0426,
+        "unanchored_rate": 0.2553,
+        "assumed_frac": 0.0,
+        "adjustment_mag": 0.0,
+        "walls_per_door": 344.9,
+        "ceil_per_door": 78.1,
+        "over_extraction_ratio": 0.0,
+        "n_rooms": 47,
+        "hard_gates": {
+          "failed_pages": false,
+          "missing_footprint": false,
+          "zero_walls": false,
+          "manual_review": true
+        },
+        "hard_gate_tripped": true
+      },
+      "output_path": "rider_batch_durable/livestock/result.json"
+    },
+    {
+      "job": "tsc_riderbatch_2026-07",
+      "verified_on": "2026-07-03",
+      "true_error_pct": 197.9,
+      "true_error_metric": "mean abs % error vs Rider batch targets",
+      "detail": [
+        "total_paintable_wall_sqft: 24389 vs 4285 (469%)",
+        "total_cmu_wall_sqft: 8936 vs 17707 (50%)",
+        "total_doors_full_paint: 5 vs 20 (75%)"
+      ],
+      "inputs": {
+        "coverage_pct": 1.0,
+        "anchor_pct": 0.703,
+        "verifier_miss_rate": 0.0,
+        "unanchored_rate": 0.2973,
+        "assumed_frac": 0.0,
+        "adjustment_mag": 0.0,
+        "walls_per_door": 1161.4,
+        "ceil_per_door": 30.4,
+        "over_extraction_ratio": 0.659,
+        "n_rooms": 37,
+        "hard_gates": {
+          "failed_pages": false,
+          "missing_footprint": false,
+          "zero_walls": false,
+          "manual_review": true
+        },
+        "hard_gate_tripped": true
+      },
+      "output_path": "rider_batch_durable/tsc/result.json"
+    },
+    {
+      "job": "mazda_riderbatch_2026-07",
+      "verified_on": "2026-07-03",
+      "true_error_pct": 126.1,
+      "true_error_metric": "mean abs % error vs Rider batch targets",
+      "detail": [
+        "total_paintable_wall_sqft: 44356 vs 17317 (156%)",
+        "total_paintable_ceiling_sqft: 12671 vs 2636 (381%)",
+        "total_dryfall_ceiling_sqft: 6200 vs 7693 (19%)",
+        "total_doors_full_paint: 2 vs 1 (100%)",
+        "total_wallcovering_sqft: 0 vs 6370 (100%)",
+        "total_soffit_sqft: 2318 vs 2306 (1%)"
+      ],
+      "inputs": {
+        "coverage_pct": 1.0,
+        "anchor_pct": 0.1619047619047619,
+        "verifier_miss_rate": 0.0762,
+        "unanchored_rate": 0.019,
+        "assumed_frac": 0.0,
+        "adjustment_mag": 0.0,
+        "walls_per_door": 1167.3,
+        "ceil_per_door": 333.5,
+        "over_extraction_ratio": 0.668,
+        "n_rooms": 105,
+        "hard_gates": {
+          "failed_pages": false,
+          "missing_footprint": false,
+          "zero_walls": false,
+          "manual_review": true
+        },
+        "hard_gate_tripped": true
+      },
+      "output_path": "rider_batch_durable/mazda/result.json"
+    },
+    {
+      "job": "mercedes_riderbatch_2026-07",
+      "verified_on": "2026-07-03",
+      "true_error_pct": 160.7,
+      "true_error_metric": "mean abs % error vs Rider batch targets",
+      "detail": [
+        "total_paintable_wall_sqft: 64709 vs 40638 (59%)",
+        "total_cmu_wall_sqft: 0 vs 9593 (100%)",
+        "total_paintable_ceiling_sqft: 33819 vs 4022 (741%)",
+        "total_dryfall_ceiling_sqft: 918 vs 32848 (97%)",
+        "total_doors_full_paint: 49 vs 29 (69%)",
+        "total_doors_frame_only: 14 vs 24 (42%)",
+        "total_stair_sections: 7 vs 6 (17%)"
+      ],
+      "inputs": {
+        "coverage_pct": 1.0,
+        "anchor_pct": 0.09473684210526316,
+        "verifier_miss_rate": 0.0211,
+        "unanchored_rate": 0.0421,
+        "assumed_frac": 0.0,
+        "adjustment_mag": 0.0,
+        "walls_per_door": 1320.6,
+        "ceil_per_door": 690.2,
+        "over_extraction_ratio": 2.0,
+        "n_rooms": 95,
+        "hard_gates": {
+          "failed_pages": false,
+          "missing_footprint": false,
+          "zero_walls": false,
+          "manual_review": true
+        },
+        "hard_gate_tripped": true
+      },
+      "output_path": "rider_batch_durable/mercedes/result.json"
+    },
+    {
+      "job": "honey_riderbatch_2026-07",
+      "verified_on": "2026-07-03",
+      "true_error_pct": 95.9,
+      "true_error_metric": "mean abs % error vs Rider batch targets",
+      "detail": [
+        "total_paintable_wall_sqft: 12668 vs 4580 (177%)",
+        "total_paintable_ceiling_sqft: 1272 vs 1029 (24%)",
+        "total_doors_full_paint: 1 vs 8 (88%)"
+      ],
+      "inputs": {
+        "coverage_pct": 1.0,
+        "anchor_pct": 0.654,
+        "verifier_miss_rate": 0.0,
+        "unanchored_rate": 0.0,
+        "assumed_frac": 0.0,
+        "adjustment_mag": 0.0,
+        "walls_per_door": 1809.7,
+        "ceil_per_door": 181.7,
+        "over_extraction_ratio": 1.585,
+        "n_rooms": 24,
+        "hard_gates": {
+          "failed_pages": false,
+          "missing_footprint": false,
+          "zero_walls": false,
+          "manual_review": false
+        },
+        "hard_gate_tripped": false
+      },
+      "output_path": "rider_batch_durable/honey/result.json"
+    },
+    {
+      "job": "thorne_riderbatch_2026-07",
+      "verified_on": "2026-07-03",
+      "true_error_pct": 1268.6,
+      "true_error_metric": "mean abs % error vs Rider batch targets",
+      "detail": [
+        "total_paintable_wall_sqft: 118935 vs 35103 (239%)",
+        "total_cmu_wall_sqft: 357 vs 161 (122%)",
+        "total_base_trim_lf: 302 vs 350 (14%)",
+        "total_doors_full_paint: 48 vs 1 (4700%)"
+      ],
+      "inputs": {
+        "coverage_pct": 1.0,
+        "anchor_pct": 0.98,
+        "verifier_miss_rate": 0.0827,
+        "unanchored_rate": 0.0689,
+        "assumed_frac": 0.0,
+        "adjustment_mag": 0.0,
+        "walls_per_door": 1858.4,
+        "ceil_per_door": 440.9,
+        "over_extraction_ratio": 1.655,
+        "n_rooms": 508,
+        "hard_gates": {
+          "failed_pages": false,
+          "missing_footprint": false,
+          "zero_walls": false,
+          "manual_review": false
+        },
+        "hard_gate_tripped": false
+      },
+      "output_path": "rider_batch_durable/thorne/result.json"
+    },
+    {
+      "job": "colonie_riderbatch_2026-07",
+      "verified_on": "2026-07-03",
+      "true_error_pct": 30.1,
+      "true_error_metric": "mean abs % error vs Rider batch targets",
+      "detail": [
+        "total_paintable_wall_sqft: 634344 vs 487621 (30%)"
+      ],
+      "inputs": {
+        "coverage_pct": 1.0,
+        "anchor_pct": 0.002,
+        "verifier_miss_rate": 0.0308,
+        "unanchored_rate": 0.042,
+        "assumed_frac": 0.0,
+        "adjustment_mag": 0.0,
+        "walls_per_door": 386.6,
+        "ceil_per_door": 158.8,
+        "over_extraction_ratio": 0.0,
+        "n_rooms": 1167,
+        "hard_gates": {
+          "failed_pages": false,
+          "missing_footprint": false,
+          "zero_walls": false,
+          "manual_review": false
+        },
+        "hard_gate_tripped": false
+      },
+      "output_path": "rider_batch_durable/colonie/result.json"
     }
   ]
 }
