@@ -26,7 +26,10 @@ def _room(name, sheet, walls, in_scope, wall_sf, floor_h=9.0):
 
 def _analysis(rooms_by_floor):
     return {"floors": [{"floor_name": fn, "rooms": rs}
-                       for fn, rs in rooms_by_floor]}
+                       for fn, rs in rooms_by_floor],
+            # billed quantities come from the aggregate, not the room sums —
+            # the pass must only-reduce this by exactly the SF it removes
+            "aggregated_totals": {"total_paintable_wall_sqft": 2200.0}}
 
 
 def _in_scope_wall(a):
@@ -78,6 +81,10 @@ check("Bathroom 202 on other floor stays painted",
       fl2["Bathroom 202"]["dimensions"]["wall_area_sqft"] == 300)
 check("RFI raised", any("wet-wall" in x.get("question", "")
                         for x in a.get("rfi_items", [])))
+check("aggregate reduced by removed SF (2200-1400=800)",
+      a["aggregated_totals"]["total_paintable_wall_sqft"] == 800.0)
+check("record notes aggregate_reduced",
+      (a.get("_enlarged_finish_reconcile") or {}).get("aggregate_reduced") is True)
 
 # --- idempotent ---
 w = _in_scope_wall(a)

@@ -13958,7 +13958,7 @@ def _reconcile_enlarged_wall_finish(analysis):
     def _wall_sf(r):
         return _num((r.get("dimensions") or {}).get("wall_area_sqft", 0))
 
-    demoted, removed_sf, rfi_rooms = 0, 0.0, []
+    demoted, removed_sf, removed_l5, rfi_rooms = 0, 0.0, 0.0, []
     for floor in analysis.get("floors", []) or []:
         groups = {}
         for room in floor.get("rooms", []) or []:
@@ -13988,6 +13988,7 @@ def _reconcile_enlarged_wall_finish(analysis):
                 dims["wall_area_sqft"] = 0
                 elems = room.get("elements")
                 if isinstance(elems, dict) and _num(elems.get("level_5_finish_sqft")) > 0:
+                    removed_l5 += _num(elems.get("level_5_finish_sqft"))
                     elems["level_5_finish_sqft"] = 0
                 nm = room.get("room_name", room.get("room_id", "room"))
                 rfi_rooms.append(nm)
@@ -13998,7 +13999,22 @@ def _reconcile_enlarged_wall_finish(analysis):
                         note + f" {tag}; walls removed from paint scope "
                         f"(enlarged-finish reconciliation)]").strip()
 
-    record = {"rooms_demoted": demoted, "wall_sqft_removed": round(removed_sf, 2)}
+    # The billed wall quantity comes from aggregated_totals, which
+    # _recalculate_totals sums from the rooms BEFORE this pass runs — zeroing
+    # room geometry alone never reaches the bill (Livestock re-run 2026-07-06:
+    # 9 rooms demoted yet billed walls unchanged). Mirror the ceiling gate:
+    # only-reduce the aggregates by exactly the SF this pass removed.
+    agg = analysis.get("aggregated_totals")
+    if isinstance(agg, dict):
+        if removed_sf > 0:
+            cur = _num(agg.get("total_paintable_wall_sqft", 0))
+            agg["total_paintable_wall_sqft"] = max(0.0, cur - removed_sf)
+        if removed_l5 > 0:
+            cur5 = _num(agg.get("total_level_5_finish_sqft", 0))
+            agg["total_level_5_finish_sqft"] = max(0.0, cur5 - removed_l5)
+
+    record = {"rooms_demoted": demoted, "wall_sqft_removed": round(removed_sf, 2),
+              "aggregate_reduced": bool(isinstance(agg, dict) and removed_sf > 0)}
     analysis["_enlarged_wall_finish_reconciled"] = True
     analysis["_enlarged_finish_reconcile"] = record
     if demoted:
