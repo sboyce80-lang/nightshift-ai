@@ -14963,6 +14963,7 @@ def _apply_vme_authoritative_walls(analysis):
     # instead of abstaining.
     if basis is None:
         scoped = analysis.get("_vme_scoped")
+        scoped_why = "scoped measurement unavailable"
         if scoped is None:
             paths = analysis.get("_vme_pdf_paths") or []
             if paths:
@@ -14970,24 +14971,56 @@ def _apply_vme_authoritative_walls(analysis):
                     import vme_attribution as _vme
                     scoped = _vme.compute_vme_scoped(paths, analysis)
                     analysis["_vme_scoped"] = scoped
-                except Exception:
+                except Exception as exc:
                     scoped = None
+                    scoped_why = (f"scoped measurement failed "
+                                  f"({type(exc).__name__}: {str(exc)[:60]})")
+                    print(f"   ⚠️  VME scoped basis failed: "
+                          f"{type(exc).__name__}: {str(exc)[:120]}")
         if scoped and scoped.get("unmeasured"):
             return _abstain(
                 f"{len(scoped['unmeasured'])} floor page(s) unmeasured even "
                 f"with the job's sibling scale — partial geometry must not "
                 f"price the job")
         if scoped and _num(scoped.get("measured_wall_sf", 0)) > 0:
-            basis = "scoped"
-            vme_gross = _num(scoped.get("measured_wall_sf", 0))
-            rec = {"wall_run_lf": _num(scoped.get("measured_wall_run_lf", 0)),
-                   "painted_frac": scoped.get("painted_frac"),
-                   "scope_modes": [pg.get("scope_mode")
-                                   for pg in scoped.get("by_page", [])],
-                   "n_floor_pages": scoped.get("n_pages"),
-                   "engine": "m4-scoped-regions"}
+            # Measured provenance requires the measurement to actually be
+            # room-anchored. The painted-fraction fallback is LLM scope
+            # share x whole-page geometry — half-inferred; it must not
+            # price the job as 'measured' (Livestock replay: frac-clipped
+            # +73% would have shipped with measured provenance).
+            share = _num(scoped.get("region_lf_share", 0))
+            bill_lf_scoped = _num(scoped.get("measured_wall_run_lf", 0))
+            frac_expect = _num(scoped.get("frac_expectation_lf", 0))
+            if share < 0.6:
+                scoped_why = (
+                    f"scope-clipped measurement is only {share:.0%} room-"
+                    f"anchored (rest is fraction-inferred) — not measured "
+                    f"provenance")
+            elif bill_lf_scoped > 1.75 * max(frac_expect, 1.0):
+                # Region attribution claims far more in-scope wall than the
+                # LLM's room-level scope supports — the two scope signals
+                # disagree, so neither earns measured provenance
+                # (Livestock replay: region billed 99% of a page whose rooms
+                # are 46% painted -> +73% would have shipped as measured).
+                scoped_why = (
+                    f"region attribution bills {bill_lf_scoped:,.0f} LF but "
+                    f"room-level scope supports only ~{frac_expect:,.0f} LF "
+                    f"— scope signals disagree")
+            else:
+                basis = "scoped"
+                vme_gross = _num(scoped.get("measured_wall_sf", 0))
+                rec = {"wall_run_lf": _num(
+                           scoped.get("measured_wall_run_lf", 0)),
+                       "painted_frac": scoped.get("painted_frac"),
+                       "region_lf_share": share,
+                       "scope_modes": [pg.get("scope_mode")
+                                       for pg in scoped.get("by_page", [])],
+                       "n_floor_pages": scoped.get("n_pages"),
+                       "engine": "m4-scoped-regions"}
+        elif scoped is not None:
+            scoped_why = "scoped measurement found no billable wall geometry"
     if basis is None:
-        return _abstain(f"{fallback_why}; scoped measurement unavailable")
+        return _abstain(f"{fallback_why}; {scoped_why}")
 
     vme_walls = max(0.0, round(vme_gross - wc, 2))
     if llm_total > 0:

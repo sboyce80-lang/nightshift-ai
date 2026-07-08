@@ -1496,6 +1496,7 @@ def compute_vme_scoped(pdf_paths, analysis, default_height_ft=9.0):
     labeled_pages = sum(1 for (a, _) in anchor_info.values() if len(a) >= 3)
 
     bill_lf = bill_sf = raw_lf = raw_sf = 0.0
+    region_lf = 0.0
     unmeasured = []
     by_page = []
     for p in pages:
@@ -1533,6 +1534,7 @@ def compute_vme_scoped(pdf_paths, analysis, default_height_ft=9.0):
             else:
                 blf, bsf = wb["run_bill_lf"], wb["run_bill_sf"]
             mode = f"rooms({n_anch},{a_src},cov{wb['region_coverage']:.2f})"
+            region_lf += blf
         raw_lf += lf
         raw_sf += lf * h
         bill_lf += blf
@@ -1548,6 +1550,18 @@ def compute_vme_scoped(pdf_paths, analysis, default_height_ft=9.0):
             "raw_lf": round(raw_lf, 1), "raw_sf": round(raw_sf),
             "basis": "face" if face_basis else "run",
             "painted_frac": round(def_frac, 3),
+            # Share of billed LF that came from room-ANCHORED region billing
+            # (vs the painted-fraction fallback, which is LLM-scope-share x
+            # geometry — half-inferred). The gate requires this to dominate
+            # before granting measured provenance.
+            "region_lf_share": round(region_lf / bill_lf, 3) if bill_lf else 0.0,
+            # What the painted-fraction clip alone would have billed (face
+            # doubles run LF). Region billing that wildly exceeds this is
+            # claiming far more in-scope wall than the LLM's room-level
+            # scope supports — attribution suspect (Livestock: region billed
+            # 99% of a page the rooms say is 46% painted).
+            "frac_expectation_lf": round(
+                raw_lf * def_frac * (2.0 if face_basis else 1.0), 1),
             "unmeasured": unmeasured, "by_page": by_page,
             "n_pages": len(pages), "n_labeled_pages": labeled_pages}
 
