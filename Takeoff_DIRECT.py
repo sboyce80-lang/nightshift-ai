@@ -12564,7 +12564,7 @@ def _dedupe_overlapping_template_floors(analysis):
     return analysis
 
 
-def _base_confirmed_paintable(room, building_type):
+def _base_confirmed_paintable(room, building_type, schedule_base=None):
     """Hard-numbers gate for base trim.
 
     The floor-plan extraction path sets base_trim_lf = room perimeter for
@@ -12575,6 +12575,11 @@ def _base_confirmed_paintable(room, building_type):
     a CONFIRMED paintable (painted) base, so callers can zero it when it is not.
 
     Decision order:
+      0. schedule_base (the room's finish-schedule base_finish code, passed by
+         the caller under NIGHTSHIFT_BASE_TRIM_SCHEDULE_CONFIRM): WB-x/wood/
+         painted -> True, RB-x/resilient -> False, blank/unrecognized -> fall
+         through. The schedule is the authoritative finish source, so it beats
+         the room's own notes (Scott issue #3: WB-1 rooms were still zeroed).
       1. Explicit painted/wood base in any field/note  -> True  (keep)
       2. Explicit resilient/vinyl/cove/tile/none base   -> False (suppress)
       3. Unconfirmed: fall back to building-type default
@@ -12585,6 +12590,10 @@ def _base_confirmed_paintable(room, building_type):
     reference: 8,629 LF confirmed wood base) while excluding unconfirmed
     commercial base, matching how Rider takeoffs treat retail boxes.
     """
+    if schedule_base is not None:
+        sched_verdict = _schedule_base_paintable(schedule_base)
+        if sched_verdict is not None:
+            return sched_verdict
     mats = room.get("materials", {}) or {}
     el = room.get("elements", {}) or {}
     base_sig = " ".join(str(x) for x in (
@@ -13416,6 +13425,147 @@ def _wallcovering_rfi_enabled():
         "1", "true", "True")
 
 
+def _wc_schedule_gate_enabled():
+    # Default OFF pending a PNC rerun: when a machine-read room finish schedule
+    # is present (>= _SCHEDULE_FINISH_AUTHORITY_MIN_ROWS rows), wallcovering is
+    # paid ONLY in rooms whose schedule row designates a WC finish. PNC runs
+    # 2-4: the extractor invented up to $11.7k of wallcovering across runs while
+    # the I601 schedule designates ~103 SF on one pantry wall. Only-reduce:
+    # zeroes non-designated WC, never fabricates area for designated rooms
+    # (those get an RFI when unquantified).
+    return os.environ.get("NIGHTSHIFT_WC_SCHEDULE_GATE", "0").strip() in (
+        "1", "true", "True")
+
+
+def _ceiling_schedule_types_enabled():
+    # Default OFF pending a PNC rerun: per-room ceiling TYPES (GWB vs ACT vs
+    # exposed) come deterministically from the machine-read finish schedule
+    # instead of the extractor's per-run read (PNC: 240 vs 2,400 SF GWB swing
+    # across identical runs). Commercial only. Schedule-ACT/exposed demotes a
+    # painted ceiling; schedule-GWB confirms it (strips the "(assumed)" marker
+    # so the 1b provenance gate keeps it) and restores ceiling area from the
+    # measured floor area when the extractor zeroed it.
+    return os.environ.get("NIGHTSHIFT_CEILING_SCHEDULE_TYPES", "0").strip() in (
+        "1", "true", "True")
+
+
+def _base_trim_schedule_confirm_enabled():
+    # Default OFF pending a PNC rerun: the hard-numbers base-trim gate finally
+    # PAYS schedule-confirmed base. _base_confirmed_paintable() only reads the
+    # room's own fields/notes, so a commercial room whose finish-schedule row
+    # says WB-1/WB-2 (painted wood base) was still zeroed as "unconfirmed"
+    # (Scott's original issue #3). With this flag the schedule row's
+    # base_finish is consulted FIRST: wood/painted codes confirm (trim pays LF
+    # from the measured perimeter), resilient codes still suppress.
+    return os.environ.get(
+        "NIGHTSHIFT_BASE_TRIM_SCHEDULE_CONFIRM", "0").strip() in (
+        "1", "true", "True")
+
+
+# Minimum machine-read schedule rows before the finish schedule is treated as
+# an authoritative per-room FINISH source by the gates above (same threshold
+# the schedule room-count floor uses for the room inventory). A thinner read is
+# likely a partial extraction — gating finishes against it would zero real
+# scope in the rooms it missed.
+_SCHEDULE_FINISH_AUTHORITY_MIN_ROWS = 5
+
+# Wall-finish designations that mean wallcovering (I601 "WC-1", "VWC", ...).
+# A bare "wc" without a digit is NOT matched (WC = water closet elsewhere).
+_WC_FINISH_CODE_RE = re.compile(r"\bwc[\s-]?\d", re.IGNORECASE)
+
+
+def _schedule_wall_finish_is_wc(wall_finish):
+    if not wall_finish:
+        return False
+    wf = str(wall_finish).lower()
+    return bool(_WC_FINISH_CODE_RE.search(wf)) or any(
+        kw in wf for kw in ("wallcovering", "wall covering", "vwc"))
+
+
+def _schedule_ceiling_class(ceiling_finish):
+    """Classify a finish-schedule ceiling code: 'painted' (GWB/GYP/plaster
+    paint scope), 'not_painted' (ACT/exposed/none), 'dryfall', or None when
+    blank/unrecognized OR when BOTH paint and no-paint signals appear (a mixed
+    code like "GWB/OPEN/EXPOSED - GWB sprayed PT4; refer to ceiling plan" is
+    genuinely ambiguous — leave the room alone rather than demote real paint
+    scope). Spray/PT-x callouts count as paint evidence for the ambiguity
+    check: "OPEN/EXPOSED - sprayed PT4" is a spray scope, not a bare deck."""
+    if not ceiling_finish:
+        return None
+    cf = str(ceiling_finish).lower()
+    if "dryfall" in cf:
+        return "dryfall"
+    no_paint = (any(kw in cf for kw in (
+        "act", "acoustic", "lay-in", "lay in", "suspended",
+        "drop ceiling", "exposed", "open to structure", "none", "n/a"))
+        or re.search(r"\bexp\b", cf))
+    painted = (any(kw in cf for kw in (
+        "gyp", "gwb", "gypsum", "drywall", "plaster", "paint", "spray"))
+        or re.search(r"\bpt[\s-]?\d", cf))
+    if no_paint and painted:
+        return None
+    if no_paint:
+        return "not_painted"
+    if painted:
+        return "painted"
+    return None
+
+
+def _schedule_base_paintable(base_finish):
+    """Classify a finish-schedule base code: True = painted/wood base (pays),
+    False = resilient/non-paint base (suppress), None = blank/unrecognized
+    (no schedule opinion — fall back to the room's own evidence). Resilient
+    keywords are checked first so a mixed string suppresses (conservative)."""
+    if not base_finish:
+        return None
+    bf = str(base_finish).lower()
+    if re.search(r"\brb[\s-]?\d", bf) or any(kw in bf for kw in (
+            "rubber", "vinyl", "resilient", "cove", "tile", "ceramic",
+            "carpet", "none", "n/a")):
+        return False
+    if re.search(r"\bwb[\s-]?\d", bf) or any(kw in bf for kw in (
+            "wood", "wd", "paint", "mdf", "pine", "poplar")):
+        return True
+    return None
+
+
+def _get_room_finish_schedule(analysis):
+    rfs = (analysis.get("room_finish_schedule")
+           or (analysis.get("schedule_data") or {}).get("room_finish_schedule")
+           or [])
+    return [r for r in rfs if isinstance(r, dict)]
+
+
+def _build_schedule_row_maps(rfs):
+    """(by_number_token, by_unique_name) lookup maps for schedule rows.
+    Name matching only keeps names that are UNIQUE in the schedule — matching
+    one of six identical 'Office' rows by name would apply the wrong finishes."""
+    by_num, by_name, name_counts = {}, {}, {}
+    for r in rfs:
+        tok = _room_num_token(r.get("room_number"))
+        if tok and tok not in by_num:
+            by_num[tok] = r
+        nm = re.sub(r"[^a-z0-9]+", " ",
+                    str(r.get("room_name", "")).lower()).strip()
+        if nm:
+            name_counts[nm] = name_counts.get(nm, 0) + 1
+            by_name.setdefault(nm, r)
+    for nm, cnt in name_counts.items():
+        if cnt > 1:
+            by_name.pop(nm, None)
+    return by_num, by_name
+
+
+def _match_schedule_row(room, by_num, by_name):
+    tok = _room_num_token(room.get("room_id")) or _room_num_token(
+        room.get("room_number"))
+    if tok and tok in by_num:
+        return by_num[tok]
+    nm = re.sub(r"[^a-z0-9]+", " ",
+                str(room.get("room_name", "")).lower()).strip()
+    return by_name.get(nm)
+
+
 def _vme_primary_enabled():
     # Default OFF pending validation: when the deterministic vector
     # measurement engine measures a job's walls with full reliability (every
@@ -13684,8 +13834,14 @@ def _enforce_ceiling_scope_gate(analysis):
         residential-ceiling-floor + secondary-space supplements survive (364
         Main's GSF-based floor must not regress).
 
-    Three further sub-gates run here (each independently flag-gated, all default
-    OFF pending validation, all commercial-only where noted, all only-reduce):
+    Four further sub-gates run here (each independently flag-gated, all default
+    OFF pending validation, all commercial-only where noted, all only-reduce
+    except the bounded (1e) schedule restore):
+    (1e) NIGHTSHIFT_CEILING_SCHEDULE_TYPES — per-room ceiling types come
+         deterministically from the machine-read finish schedule: schedule
+         ACT/exposed demotes, schedule GWB confirms (and restores area from
+         the measured floor area when the extractor zeroed it; the (2)
+         rebuild may rise by at most the restored SF).
     (1b) NIGHTSHIFT_COMMERCIAL_CEILING_GYP_GATE — provenance-based: demote a
          commercial painted ceiling to ACT/not-painted + RFI only when its
          material is marked "(assumed)" (type not confirmed by RCP/finish
@@ -13735,6 +13891,113 @@ def _enforce_ceiling_scope_gate(analysis):
     is_residential = any(kw in bt for kw in (
         "residential", "multifamily", "multi-family", "apartment", "condo",
         "dorm", "supportive", "senior", "assisted", "mixed-use", "mixed use"))
+
+    # (1e) CEILING TYPES FROM THE FINISH SCHEDULE — flag-gated, commercial
+    # only. The machine-read schedule (I601-style) is the deterministic source
+    # for per-room ceiling TYPE; the extractor's per-run read swung PNC's GWB
+    # ceilings 240 vs 2,400 SF across identical runs. For each in-scope room
+    # matched to a schedule row (number token, unique-name fallback):
+    #   schedule ACT/exposed  -> demote painted ceiling (type is wrong);
+    #   schedule GWB/GYP paint -> confirm: replace the material (stripping any
+    #     "(assumed)" marker so (1b) keeps it) and, when the extractor zeroed
+    #     the area, restore it from the room's measured floor area (ceiling
+    #     area = floor area — a derivation from a measurement, not a guess).
+    # Restored SF is tracked so the (2) aggregate rebuild may raise the total
+    # by AT MOST that amount; everything else stays only-reduce. Dryfall rooms
+    # and blank/unrecognized schedule codes are left alone. Runs BEFORE (1b).
+    sched_ceiling_restored_sqft = 0.0
+    if _ceiling_schedule_types_enabled() and not is_residential:
+        rfs = _get_room_finish_schedule(analysis)
+        if len(rfs) >= _SCHEDULE_FINISH_AUTHORITY_MIN_ROWS:
+            by_num, by_name = _build_schedule_row_maps(rfs)
+            cs_demoted = cs_confirmed = cs_restored = 0
+            cs_demoted_sqft = 0.0
+            cs_unquantified = []
+            for floor in analysis.get("floors", []) or []:
+                for room in floor.get("rooms", []) or []:
+                    if not isinstance(room, dict) or not room.get(
+                            "in_scope", True):
+                        continue
+                    row = _match_schedule_row(room, by_num, by_name)
+                    if row is None:
+                        continue
+                    klass = _schedule_ceiling_class(row.get("ceiling_finish"))
+                    if klass is None or klass == "dryfall":
+                        continue
+                    mats = room.setdefault("materials", {})
+                    if not isinstance(mats, dict):
+                        continue
+                    if "dryfall" in str(mats.get("ceiling", "")).lower():
+                        continue  # tracked in total_dryfall_ceiling_sqft
+                    dims = room.setdefault("dimensions", {})
+                    mult = _extract_multiplier_from_notes(room)
+                    sched_code = str(row.get("ceiling_finish", "")).strip()
+                    if klass == "not_painted":
+                        if not _as_bool(mats.get("ceiling_painted")):
+                            continue
+                        mats["ceiling_painted"] = False
+                        cs_demoted_sqft += _num(
+                            dims.get("ceiling_area_sqft", 0)) * mult
+                        dims["ceiling_area_sqft"] = 0
+                        cs_demoted += 1
+                        note = str(room.get("notes", ""))
+                        if "[Ceiling type per finish schedule" not in note:
+                            room["notes"] = (
+                                note + f" [Ceiling type per finish schedule: "
+                                f"{sched_code} — not field-painted; extracted "
+                                f"painted ceiling removed]").strip()
+                    else:  # klass == "painted" — schedule confirms GWB/GYP
+                        mats["ceiling"] = "GYP (finish schedule)"
+                        cs_confirmed += 1
+                        if not _as_bool(mats.get("ceiling_painted")):
+                            floor_area = _num(dims.get("floor_area_sqft", 0))
+                            area = _num(dims.get("ceiling_area_sqft", 0))
+                            if area <= 0 < floor_area:
+                                dims["ceiling_area_sqft"] = floor_area
+                                sched_ceiling_restored_sqft += \
+                                    floor_area * mult
+                                cs_restored += 1
+                            elif area <= 0:
+                                cs_unquantified.append(str(
+                                    room.get("room_name", "")
+                                    or room.get("room_id", "")))
+                                continue  # no measured area to derive from
+                            else:
+                                sched_ceiling_restored_sqft += area * mult
+                                cs_restored += 1
+                            mats["ceiling_painted"] = True
+                            note = str(room.get("notes", ""))
+                            if "[Ceiling type per finish schedule" not in note:
+                                room["notes"] = (
+                                    note + f" [Ceiling type per finish "
+                                    f"schedule: {sched_code} — painted GWB "
+                                    f"confirmed; area from measured floor "
+                                    f"area]").strip()
+            if cs_demoted or cs_confirmed:
+                record["ceiling_schedule_types"] = {
+                    "demoted": cs_demoted,
+                    "demoted_sqft": round(cs_demoted_sqft, 2),
+                    "confirmed": cs_confirmed,
+                    "restored": cs_restored,
+                    "restored_sqft": round(sched_ceiling_restored_sqft, 2),
+                }
+                print(f"   📋 Ceiling types from finish schedule: "
+                      f"{cs_confirmed} confirmed GWB, "
+                      f"{cs_demoted} demoted (-{cs_demoted_sqft:,.0f} SF), "
+                      f"{cs_restored} restored "
+                      f"(+{sched_ceiling_restored_sqft:,.0f} SF)", flush=True)
+            if cs_unquantified:
+                record.setdefault("ceiling_schedule_types", {})[
+                    "unquantified_rooms"] = cs_unquantified[:12]
+                _gate_add_rfi(
+                    analysis, "Ceiling Scope",
+                    f"The finish schedule confirms painted GWB ceilings in "
+                    f"{len(cs_unquantified)} room(s) "
+                    f"({', '.join(cs_unquantified[:8])}"
+                    f"{'…' if len(cs_unquantified) > 8 else ''}) but no floor "
+                    f"or ceiling area was measured for them, so those "
+                    f"ceilings are $0 in this bid. Provide room dimensions "
+                    f"and we will price them.")
 
     # (1b) COMMERCIAL unconfirmed-ceiling demote — flag-gated, commercial only.
     # PROVENANCE-BASED (redesigned 2026-07-01). A 32-job sweep showed the earlier
@@ -13930,8 +14193,152 @@ def _enforce_ceiling_scope_gate(analysis):
         if saw_in_scope_room and gated < prev:
             agg["total_paintable_ceiling_sqft"] = gated
             record["commercial_aggregate_rebuilt"] = {"from": prev, "to": gated}
+        elif saw_in_scope_room and gated > prev and \
+                sched_ceiling_restored_sqft > 0:
+            # Only-reduce exception: the (1e) schedule gate restored ceilings
+            # the extractor zeroed. Allow the rebuilt total to RISE, but by no
+            # more than the schedule-restored SF — any further excess in the
+            # room sum keeps the conservative prev total.
+            capped = round(min(gated, prev + sched_ceiling_restored_sqft), 2)
+            agg["total_paintable_ceiling_sqft"] = capped
+            record["commercial_aggregate_rebuilt"] = {
+                "from": prev, "to": capped, "schedule_restored": True}
 
     analysis["_ceiling_scope_gate"] = record
+    return analysis
+
+
+def _enforce_wallcovering_schedule_gate(analysis):
+    """Schedule-gated wallcovering (NIGHTSHIFT_WC_SCHEDULE_GATE, default OFF):
+    when a machine-read room finish schedule with >=
+    _SCHEDULE_FINISH_AUTHORITY_MIN_ROWS rows is present, it is the
+    authoritative map of WHICH rooms get wallcovering. Wallcovering the
+    extractor placed in any room the schedule does NOT designate WC-x is
+    zeroed (PNC runs 2-4: up to $11.7k of invented WC vs ~103 SF on one
+    scheduled pantry wall). Only-reduce: designated rooms keep their EXTRACTED
+    area (never fabricated); a designated room with no quantified area — or a
+    designated schedule row no extracted room matched at all — gets an RFI.
+    Zeroing additionally requires a NUMBERED per-room schedule; a legend-style
+    schedule (finish codes keyed by area names, no room numbers — the Mazda
+    pattern) can't be reliably matched, so there the gate is RFI-only.
+    Runs in build_priced_takeoff BEFORE the VME wall passes, which deduct
+    total_wallcovering_sqft from the wall bill — phantom WC would otherwise
+    silently shrink walls too. Idempotent via analysis['_wc_schedule_gate']."""
+    if not isinstance(analysis, dict) or not _wc_schedule_gate_enabled():
+        return analysis
+    if analysis.get("_wc_schedule_gate"):
+        return analysis
+    rfs = _get_room_finish_schedule(analysis)
+    if len(rfs) < _SCHEDULE_FINISH_AUTHORITY_MIN_ROWS:
+        analysis["_wc_schedule_gate"] = {"noop": "schedule_too_thin",
+                                         "rows": len(rfs)}
+        return analysis
+
+    by_num, by_name = _build_schedule_row_maps(rfs)
+    wc_rows = [r for r in rfs
+               if _schedule_wall_finish_is_wc(r.get("wall_finish"))]
+    wc_row_ids = {id(r) for r in wc_rows}
+    # ZEROING requires a real per-ROOM schedule: most rows carry a room
+    # number. A legend-style schedule (finish codes keyed by area NAMES, all
+    # room_number None — the Mazda pattern) can't be reliably matched to
+    # extracted rooms, so against one this gate is RFI-only: it never zeroes
+    # scope it can't prove undesignated.
+    numbered_rows = sum(1 for r in rfs if _room_num_token(r.get("room_number")))
+    can_zero = numbered_rows >= max(
+        _SCHEDULE_FINISH_AUTHORITY_MIN_ROWS, len(rfs) // 2)
+    matched_wc_row_ids = set()
+
+    zeroed_rooms = []
+    zeroed_sqft = 0.0
+    kept_rooms = []
+    kept_sqft = 0.0
+    unquantified = []
+    for floor in analysis.get("floors", []) or []:
+        for room in floor.get("rooms", []) or []:
+            if not isinstance(room, dict) or not room.get("in_scope", True):
+                continue
+            elems = room.setdefault("elements", {})
+            dims = room.get("dimensions") or {}
+            wc = _num(elems.get("wallcovering_sqft", 0)) or _num(
+                dims.get("wallcovering_sqft", 0))
+            row = _match_schedule_row(room, by_num, by_name)
+            designated = row is not None and id(row) in wc_row_ids
+            label = str(room.get("room_name", "")
+                        or room.get("room_id", "")).strip() or "unnamed"
+            if designated:
+                matched_wc_row_ids.add(id(row))
+                if wc > 0:
+                    kept_rooms.append(label)
+                    kept_sqft += wc * _extract_multiplier_from_notes(room)
+                else:
+                    unquantified.append(
+                        (label, str(row.get("wall_finish", "")).strip()))
+                continue
+            if wc <= 0 or not can_zero:
+                continue
+            mult = _extract_multiplier_from_notes(room)
+            zeroed_rooms.append(label)
+            zeroed_sqft += wc * mult
+            elems["wallcovering_sqft"] = 0
+            if "wallcovering_sqft" in dims:
+                dims["wallcovering_sqft"] = 0
+            note = str(room.get("notes", ""))
+            if "[Wallcovering removed — schedule gate" not in note:
+                room["notes"] = (
+                    note + f" [Wallcovering removed — schedule gate; the room "
+                    f"finish schedule does not designate this room WC-x "
+                    f"({wc:,.0f} SF extracted without a schedule basis)]"
+                ).strip()
+
+    # Schedule rows designated WC whose room was never extracted at all (the
+    # missing-pantry case): the WC exists on the schedule but nothing in the
+    # takeoff carries it — surface it in the same RFI.
+    for r in wc_rows:
+        if id(r) not in matched_wc_row_ids:
+            label = str(r.get("room_name", "")
+                        or r.get("room_number", "")).strip() or "unnamed"
+            unquantified.append(
+                (f"{label} (not extracted)",
+                 str(r.get("wall_finish", "")).strip()))
+
+    if zeroed_sqft > 0:
+        agg = analysis.setdefault("aggregated_totals", {})
+        prev = _num(agg.get("total_wallcovering_sqft", 0))
+        agg["total_wallcovering_sqft"] = max(
+            0, round(prev - zeroed_sqft, 2))
+        analysis.setdefault("notes", []).append(
+            f"[Wallcovering] Schedule gate removed {zeroed_sqft:,.0f} SF of "
+            f"wallcovering from {len(zeroed_rooms)} room(s) the finish "
+            f"schedule does not designate WC-x "
+            f"({', '.join(zeroed_rooms[:8])}"
+            f"{'…' if len(zeroed_rooms) > 8 else ''}). Wallcovering is "
+            f"priced only where the schedule designates it.")
+        print(f"   🧻 WC schedule gate: zeroed {zeroed_sqft:,.0f} SF in "
+              f"{len(zeroed_rooms)} non-designated room(s); kept "
+              f"{kept_sqft:,.0f} SF in {len(kept_rooms)} designated room(s)",
+              flush=True)
+    if unquantified:
+        rooms_txt = ", ".join(
+            f"{name} ({code})" for name, code in unquantified[:8])
+        _gate_add_rfi(
+            analysis, "Wallcovering",
+            f"The room finish schedule designates wallcovering in "
+            f"{len(unquantified)} room(s) — {rooms_txt}"
+            f"{'…' if len(unquantified) > 8 else ''} — but no wallcovering "
+            f"area could be quantified from the drawings (which walls, LF × "
+            f"height), so it is $0 in this bid. Provide the wall extents and "
+            f"we will price it.")
+
+    analysis["_wc_schedule_gate"] = {
+        "schedule_wc_rooms": len(wc_rows),
+        "numbered_rows": numbered_rows,
+        "zeroing_enabled": can_zero,
+        "kept_rooms": kept_rooms[:20],
+        "kept_sqft": round(kept_sqft, 2),
+        "zeroed_rooms": zeroed_rooms[:20],
+        "zeroed_sqft": round(zeroed_sqft, 2),
+        "unquantified_rooms": [n for n, _ in unquantified][:20],
+    }
     return analysis
 
 
@@ -15172,6 +15579,12 @@ def build_priced_takeoff(analysis, strict=None):
     # rebuild) before any quantity is priced. Flag-gated; no-op when off.
     analysis = _enforce_ceiling_scope_gate(analysis)
 
+    # Wallcovering schedule gate: WC pays only in rooms the finish schedule
+    # designates WC-x. Must run BEFORE the VME wall passes below — they deduct
+    # total_wallcovering_sqft from the wall bill, so phantom WC would silently
+    # shrink walls too. Flag-gated; no-op when off.
+    analysis = _enforce_wallcovering_schedule_gate(analysis)
+
     # Substrate provenance gate: review flags for assumed wall substrates and
     # service-area "painted GYP" ceilings (the TSC gyp/CMU inversion and the
     # Mercedes exposed-ceiling misread). RFI + manual review only — never a
@@ -15347,6 +15760,16 @@ def _recalculate_totals(analysis):
     _bt_building_type = str(analysis.get("project_info", {}).get("building_type", ""))
     _bt_suppressed_lf = 0
     _bt_suppressed_rooms = 0
+    # Schedule-confirmed base (NIGHTSHIFT_BASE_TRIM_SCHEDULE_CONFIRM): map each
+    # room to its finish-schedule row so WB-x/wood base PAYS instead of being
+    # zeroed as commercial-unconfirmed (and RB-x still suppresses).
+    _bt_sched_maps = None
+    _bt_sched_confirmed_lf = 0
+    _bt_sched_confirmed_rooms = 0
+    if _base_trim_schedule_confirm_enabled():
+        _bt_rfs = _get_room_finish_schedule(analysis)
+        if len(_bt_rfs) >= _SCHEDULE_FINISH_AUTHORITY_MIN_ROWS:
+            _bt_sched_maps = _build_schedule_row_maps(_bt_rfs)
     total_doors_full = 0
     total_doors_hm = 0
     total_doors_frame = 0
@@ -15490,8 +15913,13 @@ def _recalculate_totals(analysis):
             # prompt already defaults base_trim≈perimeter, so this rarely fires
             # there — it mainly recovers per-sheet's missing trim.
             _bt_perim = _num(dims.get("perimeter_lf", 0))
+            _bt_sched_base = None
+            if _bt_sched_maps is not None:
+                _bt_row = _match_schedule_row(room, *_bt_sched_maps)
+                if _bt_row is not None:
+                    _bt_sched_base = _bt_row.get("base_finish")
             if _room_bt == 0 and _bt_perim > 0 and _base_confirmed_paintable(
-                    room, _bt_building_type):
+                    room, _bt_building_type, schedule_base=_bt_sched_base):
                 _room_bt = _bt_perim
                 elems["base_trim_lf"] = _bt_perim
                 _bt_existing = str(room.get("notes", "") or "")
@@ -15500,8 +15928,17 @@ def _recalculate_totals(analysis):
                         _bt_existing + " [Base Trim] derived from wall perimeter "
                         "(paintable base; model under-emitted base_trim_lf)."
                     ).strip()
+            if _room_bt > 0 and _schedule_base_paintable(_bt_sched_base) is True:
+                _bt_sched_confirmed_lf += _room_bt * multiplier
+                _bt_sched_confirmed_rooms += 1
+                _bt_existing = str(room.get("notes", "") or "")
+                if "[Base Trim] finish schedule confirms" not in _bt_existing:
+                    room["notes"] = (
+                        _bt_existing + f" [Base Trim] finish schedule confirms "
+                        f"painted base ({str(_bt_sched_base).strip()})."
+                    ).strip()
             if HARD_NUMBERS_ONLY and _room_bt > 0 and not _base_confirmed_paintable(
-                    room, _bt_building_type):
+                    room, _bt_building_type, schedule_base=_bt_sched_base):
                 # Resilient/unconfirmed base on a commercial job — the perimeter
                 # default is a fabrication, not a measurement. Zero it and flag
                 # for an RFI instead of pricing trim that isn't there.
@@ -16126,6 +16563,20 @@ def _recalculate_totals(analysis):
             f"job and is not field-painted by default. Excluded from paint scope; "
             f"confirm painted-base scope via RFI."
         )
+
+    if _bt_sched_confirmed_rooms:
+        analysis["_base_trim_schedule_confirmed"] = {
+            "rooms": _bt_sched_confirmed_rooms,
+            "lf": round(_bt_sched_confirmed_lf),
+        }
+        analysis.setdefault("notes", []).append(
+            f"[Base Trim] Finish schedule confirms painted base in "
+            f"{_bt_sched_confirmed_rooms} room(s) "
+            f"(~{round(_bt_sched_confirmed_lf):,} LF) — priced per schedule."
+        )
+        print(f"   🪵 Base trim schedule-confirmed: "
+              f"{_bt_sched_confirmed_rooms} room(s), "
+              f"~{round(_bt_sched_confirmed_lf):,} LF paid", flush=True)
 
     # --- Small space ceiling supplement for residential ---
     # Residential units typically have small closets (linen, coat, pantry, utility)
