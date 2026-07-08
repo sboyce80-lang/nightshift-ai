@@ -13757,6 +13757,13 @@ def _apply_vme_primary(analysis):
     """
     if not _vme_primary_enabled() or not isinstance(analysis, dict):
         return analysis
+    # Consolidation (2026-07-08): the authoritative-walls gate is the single
+    # owner of the wall quantity. When it applied, this gate defers instead
+    # of re-pinning a second measurement over it.
+    if (analysis.get("_vme_authoritative") or {}).get("applied"):
+        print("   🧪 VME primary: deferring — authoritative gate already "
+              "priced walls from geometry")
+        return analysis
     pdf_paths = analysis.get("_vme_pdf_paths") or []
     if not pdf_paths:
         return analysis
@@ -14827,17 +14834,30 @@ def _apply_vme_authoritative_walls(analysis):
     every time — and at the job's actual ceiling height that is +2.7% against
     the customer's verified takeoff. Geometry doesn't roll dice.
 
-    Hard preconditions (all abstentions leave the LLM value and add a note):
-      - VME measured EVERY selected floor page (no 'unmeasured' entries —
-        partial coverage would silently under-count);
-      - a MEASURED ceiling height exists: median of 3+ in-scope room heights.
-        The engine's 9-ft default is exactly the kind of guess this pipeline
-        refuses to price;
-      - the result is within ×0.4–×2.5 of the LLM read (scale-misread guard).
+    Two measurement bases, tried in order (2026-07-08 unification):
+      1. whole-floor: total wall-run LF × p90 measured room height —
+         certified ±2.5% on the PNC class; requires every page measured and
+         in-scope floor covering ≥60% of the drawn footprint;
+      2. scoped (M4): compute_vme_scoped — room-region billing where anchors
+         map, painted-fraction clip where they don't, sibling-scale retry
+         for no-scale pages; certified on the Rider goldens. This is what
+         prices partial-scope jobs (renos, phased work) from geometry.
 
-    Wallcovering stays finish-driven: the schedule/extraction wallcovering
-    sqft is deducted from the geometric total (geometry can't see finishes).
-    LLM per-room data is untouched — rooms keep driving finishes, ceilings,
+    Hard preconditions (all abstentions leave the LLM value and add a note):
+      - a MEASURED ceiling height exists: 3+ in-scope room heights. The
+        engine's 9-ft default is exactly the kind of guess this pipeline
+        refuses to price;
+      - every floor page measured on the chosen basis (scoped retries
+        no-scale pages with the job's dominant sibling scale first);
+      - the result is within ×0.4–×2.5 of the LLM read, gyp+CMU combined
+        (scale-misread / metal-building-siding guard).
+
+    Substrate: geometry owns the TOTAL; on CMU-heavy jobs the measured total
+    is split across the gyp/masonry lines by the extraction's proportions
+    (+ RFI) instead of double-counting masonry at gyp rates. Wallcovering
+    stays finish-driven: the schedule/extraction wallcovering sqft is
+    deducted from the geometric total (geometry can't see finishes). LLM
+    per-room data is untouched — rooms keep driving finishes, ceilings,
     doors and RFIs. Idempotent via analysis['_vme_authoritative'].
     """
     if not isinstance(analysis, dict) or not _vme_authoritative_walls_enabled():
@@ -14853,23 +14873,6 @@ def _apply_vme_authoritative_walls(analysis):
         print(f"   🧪 VME authoritative walls: abstained — {reason}")
         return analysis
 
-    shadow = analysis.get("_vme_shadow_v2")
-    if not shadow:
-        paths = analysis.get("_vme_pdf_paths") or []
-        try:
-            import vme_attribution as _vme
-            shadow = _vme.compute_vme_shadow_v2(paths)
-        except Exception as exc:
-            return _abstain(f"engine unavailable ({type(exc).__name__})")
-        if shadow:
-            analysis["_vme_shadow_v2"] = shadow
-    if not shadow or _num(shadow.get("total_wall_run_lf", 0)) <= 0:
-        return _abstain("no geometric wall measurement for this set")
-    if shadow.get("unmeasured"):
-        return _abstain(
-            f"{len(shadow['unmeasured'])} floor page(s) unmeasured "
-            f"(no scale) — partial geometry must not price the job")
-
     heights = []
     for fl in (analysis.get("floors") or []):
         for rm in (fl.get("rooms") or []):
@@ -14883,82 +14886,167 @@ def _apply_vme_authoritative_walls(analysis):
             f"only {len(heights)} measured room height(s) — refusing the "
             f"9-ft default; confirm ceiling height (RFI)")
 
-    # Scope coverage: whole-page geometry requires (near-)whole-page scope.
-    footprint = 0.0
-    pi = analysis.get("project_info") or {}
-    for k in ("footprint_sqft", "_declared_work_area_sqft", "work_area_sqft"):
-        footprint = _num(pi.get(k, 0)) or _num(analysis.get(k, 0))
-        if footprint > 0:
-            break
-    in_scope_floor = sum(
-        _num((rm.get("dimensions") or {}).get("floor_area_sqft", 0))
-        for fl in (analysis.get("floors") or [])
-        for rm in (fl.get("rooms") or [])
-        if isinstance(rm, dict) and rm.get("in_scope", True))
-    n_pages = max(1, int(_num(shadow.get("n_floor_pages", 1)) or 1))
-    if footprint > 0:
-        coverage = in_scope_floor / (footprint * n_pages)
-        if coverage < _VME_MIN_SCOPE_COVERAGE:
-            return _abstain(
-                f"in-scope floor area {in_scope_floor:,.0f} sqft covers only "
-                f"{coverage:.0%} of the drawn footprint "
-                f"({footprint:,.0f} × {n_pages} floor page(s)) — partial-"
-                f"scope job; whole-page geometry would over-price")
-    heights.sort()
-    # Wall height basis is the DECK, not the ceiling grid: walls are painted
-    # past ACT grids, so the median room (grid) height under-prices by the
-    # plenum (PNC replay: median 8.58 ft priced -19% vs the verified takeoff;
-    # the exposed-ceiling rooms' 10.83 ft deck height priced +2%). The 90th-
-    # percentile measured height is the deck-height band the exposed/GWB
-    # rooms report — same full-floor-height convention the verified manual
-    # takeoffs use.
-    height = heights[int(0.9 * (len(heights) - 1))]
-
     agg = analysis.setdefault("aggregated_totals", {})
-    llm_walls = _num(agg.get("total_paintable_wall_sqft", 0))
-    # Substrate guard (same 10% threshold as _apply_vme_primary): geometry
-    # measures ALL wall lines but this aggregate is the GYP-priced one —
-    # on a CMU-heavy job (TSC: 17.7k CMU vs 4.3k gyp) pinning the geometric
-    # total here double-counts the separately-priced masonry at gyp rates
-    # (Rider-golden replay 2026-07-08: TSC priced +525% vs its gyp basis).
-    cmu_walls = _num(agg.get("total_cmu_wall_sqft", 0))
-    if cmu_walls > 0.10 * llm_walls:
-        return _abstain(
-            f"CMU-heavy job ({cmu_walls:,.0f} SF masonry vs {llm_walls:,.0f} "
-            f"SF gyp) — geometry can't split substrates; the masonry line "
-            f"already prices those walls")
-    lf = _num(shadow.get("total_wall_run_lf", 0))
+    llm_gyp = _num(agg.get("total_paintable_wall_sqft", 0))
+    cmu_walls = max(0.0, _num(agg.get("total_cmu_wall_sqft", 0)))
+    llm_total = llm_gyp + cmu_walls
     wc = max(0.0, _num(agg.get("total_wallcovering_sqft", 0)))
-    vme_walls = max(0.0, round(lf * height - wc, 2))
-    if llm_walls > 0:
-        ratio = vme_walls / llm_walls
+
+    shadow = analysis.get("_vme_shadow_v2")
+    if not shadow:
+        paths = analysis.get("_vme_pdf_paths") or []
+        try:
+            import vme_attribution as _vme
+            shadow = _vme.compute_vme_shadow_v2(paths)
+        except Exception as exc:
+            return _abstain(f"engine unavailable ({type(exc).__name__})")
+        if shadow:
+            analysis["_vme_shadow_v2"] = shadow
+
+    # ── Basis 1 (certified on the PNC class): whole-floor geometry × p90
+    # measured room height. Valid only when every page measured AND the
+    # whole drawn floor is (near-)fully in paint scope.
+    basis = None
+    vme_gross = 0.0
+    rec = {}
+    fallback_why = "no geometric wall measurement for this set"
+    if (shadow and _num(shadow.get("total_wall_run_lf", 0)) > 0
+            and not shadow.get("unmeasured")):
+        footprint = 0.0
+        pi = analysis.get("project_info") or {}
+        for k in ("footprint_sqft", "_declared_work_area_sqft",
+                  "work_area_sqft"):
+            footprint = _num(pi.get(k, 0)) or _num(analysis.get(k, 0))
+            if footprint > 0:
+                break
+        in_scope_floor = sum(
+            _num((rm.get("dimensions") or {}).get("floor_area_sqft", 0))
+            for fl in (analysis.get("floors") or [])
+            for rm in (fl.get("rooms") or [])
+            if isinstance(rm, dict) and rm.get("in_scope", True))
+        n_pages = max(1, int(_num(shadow.get("n_floor_pages", 1)) or 1))
+        coverage_ok = True
+        if footprint > 0:
+            coverage = in_scope_floor / (footprint * n_pages)
+            if coverage < _VME_MIN_SCOPE_COVERAGE:
+                coverage_ok = False
+                fallback_why = (
+                    f"in-scope floor area {in_scope_floor:,.0f} sqft covers "
+                    f"only {coverage:.0%} of the drawn footprint "
+                    f"({footprint:,.0f} × {n_pages} floor page(s)) — partial-"
+                    f"scope job; whole-page geometry would over-price")
+        if coverage_ok:
+            heights.sort()
+            # Wall height basis is the DECK, not the ceiling grid: walls are
+            # painted past ACT grids, so the median room (grid) height under-
+            # prices by the plenum (PNC replay: median 8.58 ft priced -19%
+            # vs the verified takeoff; the exposed-ceiling rooms' 10.83 ft
+            # deck height priced +2%). The 90th-percentile measured height is
+            # the deck-height band the exposed/GWB rooms report — same full-
+            # floor-height convention the verified manual takeoffs use.
+            height = heights[int(0.9 * (len(heights) - 1))]
+            lf = _num(shadow.get("total_wall_run_lf", 0))
+            vme_gross = lf * height
+            basis = "whole-floor"
+            rec = {"wall_run_lf": lf, "height_ft": round(height, 2),
+                   "n_floor_pages": shadow.get("n_floor_pages"),
+                   "engine": shadow.get("engine")}
+    elif shadow and shadow.get("unmeasured"):
+        fallback_why = (
+            f"{len(shadow['unmeasured'])} floor page(s) unmeasured "
+            f"(no scale) — partial geometry must not price the job")
+
+    # ── Basis 2 (M4, certified on the Rider goldens): scope-clipped
+    # geometry — region billing where room anchors map, painted-fraction
+    # clip where they don't, sibling-scale retry for no-scale pages. This is
+    # what lets partial-scope jobs (renos, phased work) price from geometry
+    # instead of abstaining.
+    if basis is None:
+        scoped = analysis.get("_vme_scoped")
+        if scoped is None:
+            paths = analysis.get("_vme_pdf_paths") or []
+            if paths:
+                try:
+                    import vme_attribution as _vme
+                    scoped = _vme.compute_vme_scoped(paths, analysis)
+                    analysis["_vme_scoped"] = scoped
+                except Exception:
+                    scoped = None
+        if scoped and scoped.get("unmeasured"):
+            return _abstain(
+                f"{len(scoped['unmeasured'])} floor page(s) unmeasured even "
+                f"with the job's sibling scale — partial geometry must not "
+                f"price the job")
+        if scoped and _num(scoped.get("measured_wall_sf", 0)) > 0:
+            basis = "scoped"
+            vme_gross = _num(scoped.get("measured_wall_sf", 0))
+            rec = {"wall_run_lf": _num(scoped.get("measured_wall_run_lf", 0)),
+                   "painted_frac": scoped.get("painted_frac"),
+                   "scope_modes": [pg.get("scope_mode")
+                                   for pg in scoped.get("by_page", [])],
+                   "n_floor_pages": scoped.get("n_pages"),
+                   "engine": "m4-scoped-regions"}
+    if basis is None:
+        return _abstain(f"{fallback_why}; scoped measurement unavailable")
+
+    vme_walls = max(0.0, round(vme_gross - wc, 2))
+    if llm_total > 0:
+        ratio = vme_walls / llm_total
         lo, hi = _VME_LLM_RATIO_BAND
         if not (lo <= ratio <= hi):
             return _abstain(
-                f"geometric walls {vme_walls:,.0f} vs extracted "
-                f"{llm_walls:,.0f} (x{ratio:.2f}) outside the sanity band — "
+                f"geometric walls {vme_walls:,.0f} ({basis}) vs extracted "
+                f"{llm_total:,.0f} (x{ratio:.2f}) outside the sanity band — "
                 f"flagging for review instead of overriding")
 
-    agg["total_paintable_wall_sqft"] = vme_walls
-    analysis["_vme_authoritative"] = {
+    # Substrate allocation: geometry owns the TOTAL wall quantity; the
+    # extraction's gyp/CMU proportions allocate it across the separately-
+    # priced lines (geometry can't see substrate). Rider-golden replay
+    # 2026-07-08: TSC pinning the geometric total into the gyp line alone
+    # priced +525% vs its gyp basis while the total was within ~16%.
+    split = None
+    if cmu_walls > 0.10 * max(llm_gyp, 1.0) and llm_total > 0:
+        gyp_share = llm_gyp / llm_total
+        new_gyp = round(vme_walls * gyp_share, 2)
+        new_cmu = round(vme_walls - new_gyp, 2)
+        agg["total_paintable_wall_sqft"] = new_gyp
+        agg["total_cmu_wall_sqft"] = new_cmu
+        split = {"gyp_sqft": new_gyp, "cmu_sqft": new_cmu,
+                 "gyp_share": round(gyp_share, 3)}
+        _gate_add_rfi(
+            analysis, "Wall substrate",
+            f"Walls were measured geometrically at {vme_walls:,.0f} SF total "
+            f"and split GYP {new_gyp:,.0f} / masonry {new_cmu:,.0f} using the "
+            f"extraction's substrate proportions. Geometry cannot see "
+            f"substrate — please confirm the GYP vs CMU split before bid.")
+    else:
+        agg["total_paintable_wall_sqft"] = vme_walls
+
+    rec.update({
         "applied": True,
-        "wall_run_lf": lf,
-        "height_ft": round(height, 2),
+        "basis": basis,
         "n_room_heights": len(heights),
         "wallcovering_deducted_sqft": wc,
-        "llm_wall_sqft": llm_walls,
+        "llm_wall_sqft": llm_gyp,
+        "llm_total_wall_sqft": llm_total,
         "applied_wall_sqft": vme_walls,
-        "n_floor_pages": shadow.get("n_floor_pages"),
-        "engine": shadow.get("engine"),
-    }
+        "substrate_split": split,
+    })
+    analysis["_vme_authoritative"] = rec
+    if basis == "whole-floor":
+        detail = (f"{rec['wall_run_lf']:,.0f} LF of wall runs × "
+                  f"{rec['height_ft']:.2f} ft measured ceiling height")
+    else:
+        detail = (f"{rec['wall_run_lf']:,.0f} LF of scope-clipped wall runs "
+                  f"(room-region billing with painted-fraction fallback)")
     analysis.setdefault("notes", []).append(
         f"[VME] Walls priced from deterministic vector measurement: "
-        f"{lf:,.0f} LF of wall runs × {height:.2f} ft measured ceiling "
-        f"height − {wc:,.0f} sqft wallcovering = {vme_walls:,.0f} sqft "
-        f"(extraction read {llm_walls:,.0f}; kept for comparison).")
-    print(f"   📐 VME authoritative walls: {lf:,.0f} LF × {height:.2f} ft "
-          f"− {wc:,.0f} WC = {vme_walls:,.0f} sqft "
-          f"(LLM read {llm_walls:,.0f})")
+        f"{detail} − {wc:,.0f} sqft wallcovering = {vme_walls:,.0f} sqft "
+        f"(extraction read {llm_total:,.0f}; kept for comparison).")
+    print(f"   📐 VME authoritative walls [{basis}]: {vme_walls:,.0f} sqft "
+          f"(LLM read {llm_total:,.0f})"
+          + (f", substrate split gyp {split['gyp_sqft']:,.0f} / cmu "
+             f"{split['cmu_sqft']:,.0f}" if split else ""))
     return analysis
 
 

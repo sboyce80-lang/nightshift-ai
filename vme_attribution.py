@@ -1353,6 +1353,205 @@ def _dispersed(anchors):
     return (xs[-1] - xs[0]) > 0.15 or (ys[-1] - ys[0]) > 0.15
 
 
+def _painted_wall_fracs(analysis):
+    """Painted-wall fraction (painted SF / ALL wall SF) per floor + job
+    default — the scope signal for pages whose room labels can't be mapped
+    spatially. Ported from the M4 golden harness (rider_batch_durable/
+    vme_score.py heights_from_result), including the cross-floor dedup-twin
+    substitution: a floor whose rooms are ALL out-of-scope while a
+    similar-sized sibling floor is (near-)fully painted was deduplicated by
+    the extraction, not excluded from paint — its physical walls are painted
+    like the sibling's."""
+    per_floor = {}
+    painted = allw = 0.0
+    for fl in (analysis.get("floors") or []):
+        f_painted = f_allw = 0.0
+        f_rooms = 0
+        for room in (fl.get("rooms") or []):
+            d = room.get("dimensions") or {}
+            try:
+                w = (float(d.get("wall_area_sqft") or 0)
+                     * float(room.get("unit_multiplier", 1) or 1))
+            except (TypeError, ValueError):
+                w = 0.0
+            if w <= 0 and d.get("perimeter_lf") and d.get("ceiling_height_feet"):
+                try:
+                    w = (float(d.get("perimeter_lf") or 0)
+                         * float(d.get("ceiling_height_feet") or 0))
+                except (TypeError, ValueError):
+                    w = 0.0
+            if w <= 0:
+                continue
+            allw += w
+            f_allw += w
+            f_rooms += 1
+            mats = str((room.get("materials") or {}).get("walls", "")).lower()
+            unpaintable = any(k in mats for k in (
+                "tile", "frp", "storefront", "glass", "curtain",
+                "prefinish", "trusscore", "fiberglass"))
+            if room.get("in_scope", True) and not unpaintable:
+                painted += w
+                f_painted += w
+        if f_allw > 0:
+            per_floor[str(fl.get("floor_name", "")).lower()] = (
+                f_painted / f_allw, f_rooms)
+    default = min(1.0, painted / allw) if allw > 0 else 1.0
+    fixed = {}
+    for name, (ffrac, n) in per_floor.items():
+        if ffrac == 0.0 and n >= 5:
+            sibs = [sf for m, (sf, sn) in per_floor.items()
+                    if m != name and sf > 0.6 and sn >= 5
+                    and 0.7 <= sn / n <= 1.4]
+            if sibs:
+                fixed[name] = (max(sibs), n)
+    per_floor.update(fixed)
+    return per_floor, default
+
+
+def _frac_for(per_floor_frac, default_frac, floor_labels):
+    """Painted fraction for a page from its floors' own rooms; job-level
+    fraction when the floors carry no signal. Floor matching mirrors
+    _height_for."""
+    fr = []
+    for name, (f, _n) in per_floor_frac.items():
+        for lab in (floor_labels or []):
+            if lab in ("1", "ground") and any(
+                    k in name for k in ("first", "1st", "ground")):
+                fr.append(f)
+            elif lab == "2" and any(k in name for k in ("second", "2nd")):
+                fr.append(f)
+            elif lab == "3" and any(k in name for k in ("third", "3rd")):
+                fr.append(f)
+            elif lab == "basement" and "basement" in name:
+                fr.append(f)
+            elif lab == "mezz" and "mezz" in name:
+                fr.append(f)
+    return (sum(fr) / len(fr)) if fr else default_frac
+
+
+def compute_vme_scoped(pdf_paths, analysis, default_height_ft=9.0):
+    """Scope-clipped geometric wall measurement — the M4 path, productionized
+    from the golden harness (rider_batch_durable/vme_score.py, certified vs
+    the Rider takeoffs 2026-07-06/08).
+
+    Unlike compute_vme_primary, a page without mappable room anchors does
+    NOT demote the whole job: it degrades per page —
+      - >=3 dispersed anchors: region-scoped billing (walls_by_basis_regions)
+      - rooms exist but labels cluster/unmappable ('degen'), or <3 anchors:
+        painted-fraction clip (LLM scope share x whole-page geometry)
+      - no rooms for the page while sibling pages ARE labeled: structural
+        sheet (foundation/framing) — bills zero
+    Scale-less pages retry with the job's dominant sibling scale. Heights are
+    the wall-area-weighted per-floor READ heights. Returns
+    {measured_wall_sf, measured_wall_run_lf, raw_lf, raw_sf, basis,
+    painted_frac, unmeasured, by_page, n_pages} — the CALLER applies
+    reliability gating; this function measures whatever it can."""
+    try:
+        pages = select_floor_plan_pages(pdf_paths)
+    except Exception as e:
+        return {"measured_wall_sf": 0, "unmeasured": [],
+                "reasons": [f"page selection failed: {e}"], "by_page": []}
+    if not pages:
+        return {"measured_wall_sf": 0, "unmeasured": [],
+                "reasons": ["no floor-plan pages identified"], "by_page": []}
+    multi = len(pdf_paths) > 3
+    per_floor_h, def_h = _read_heights(analysis, default_height_ft)
+    per_floor_fr, def_frac = _painted_wall_fracs(analysis)
+    vocab = unit_code_vocab(analysis)
+    face_basis = has_residential_units(analysis)
+
+    scales = []
+    measured = {}
+    for p in pages:
+        r = vm.measure_wall_runs_geometric(p["pdf"], p["page"])
+        measured[id(p)] = r
+        if r.get("wall_run_lf") is not None:
+            scales.append(r["pts_per_ft"])
+    sib = max(set(scales), key=scales.count) if scales else None
+
+    def page_anchor_info(p):
+        if multi:
+            tok = (p["pdf"].rsplit("/", 1)[-1].upper()
+                   .replace("-", "").replace(".", ""))
+            a = room_anchors(analysis, sheet_token=tok)
+            if a and _dispersed(a):
+                return a, "sheet"
+        else:
+            a = room_anchors(analysis, page_number=p["page"] + 1)
+            if a and _dispersed(a):
+                return a, "page"
+        fl = [f for f in p["floors"] if f != "all"]
+        if fl:
+            a = room_anchors(analysis, floor_labels=set(fl))
+            # floor-fallback coordinates only transfer within the SAME
+            # document; across separate sheet files nothing guarantees
+            # alignment.
+            if a and not multi and _dispersed(a):
+                return a, "floor"
+            if a:
+                return [], "degen"
+        return [], "none"
+
+    anchor_info = {id(p): page_anchor_info(p) for p in pages}
+    labeled_pages = sum(1 for (a, _) in anchor_info.values() if len(a) >= 3)
+
+    bill_lf = bill_sf = raw_lf = raw_sf = 0.0
+    unmeasured = []
+    by_page = []
+    for p in pages:
+        r = measured[id(p)]
+        if r.get("wall_run_lf") is None and sib:
+            r = vm.measure_wall_runs_geometric(p["pdf"], p["page"],
+                                               pts_per_ft=sib)
+            r["scale_source"] = "sibling"
+        lf = r.get("wall_run_lf")
+        if lf is None:
+            unmeasured.append(f"{p['pdf'].rsplit('/', 1)[-1]}#{p['page'] + 1}")
+            continue
+        if len(p["floors"]) == 1 and p["floors"][0] != "all":
+            h = _height_for(per_floor_h, def_h, p["floors"][0])
+        else:
+            h = def_h
+        anchors, a_src = anchor_info[id(p)]
+        anchors = anchors + page_text_unit_anchors(p["pdf"], p["page"], vocab)
+        wb = walls_by_basis_regions(p["pdf"], p["page"], r["pts_per_ft"],
+                                    anchors, default_height_ft=h)
+        n_anch = wb["n_anchors"]
+        pg_frac = _frac_for(per_floor_fr, def_frac, p["floors"])
+        if a_src == "degen":
+            blf, bsf = lf * pg_frac, lf * h * pg_frac
+            mode = f"frac(degen,{pg_frac:.2f})"
+        elif a_src == "none" and labeled_pages >= 1:
+            blf = bsf = 0.0
+            mode = "structural(0)"
+        elif n_anch < 3:
+            blf, bsf = lf * pg_frac, lf * h * pg_frac
+            mode = f"frac({pg_frac:.2f})"
+        else:
+            if face_basis:
+                blf, bsf = wb["face_bill_lf"], wb["face_bill_sf"]
+            else:
+                blf, bsf = wb["run_bill_lf"], wb["run_bill_sf"]
+            mode = f"rooms({n_anch},{a_src},cov{wb['region_coverage']:.2f})"
+        raw_lf += lf
+        raw_sf += lf * h
+        bill_lf += blf
+        bill_sf += bsf
+        by_page.append({"pdf": p["pdf"].rsplit("/", 1)[-1],
+                        "page": p["page"] + 1, "floors": p["floors"],
+                        "lf": round(lf, 1), "bill_lf": round(blf, 1),
+                        "bill_sf": round(bsf), "scope_mode": mode,
+                        "h": round(h, 2),
+                        "scale_src": r.get("scale_source")})
+    return {"measured_wall_sf": round(bill_sf),
+            "measured_wall_run_lf": round(bill_lf, 1),
+            "raw_lf": round(raw_lf, 1), "raw_sf": round(raw_sf),
+            "basis": "face" if face_basis else "run",
+            "painted_frac": round(def_frac, 3),
+            "unmeasured": unmeasured, "by_page": by_page,
+            "n_pages": len(pages), "n_labeled_pages": labeled_pages}
+
+
 def compute_vme_primary(pdf_paths, analysis, default_height_ft=9.0):
     """Measured wall quantity for a whole job, with an explicit reliability
     verdict — the M3 'VME primary' path.
