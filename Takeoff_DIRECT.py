@@ -13576,6 +13576,37 @@ def _vme_primary_enabled():
         "1", "true", "True")
 
 
+def _vme_source_pdf_paths(pdf_paths):
+    """Map each analysis PDF back to its vector-bearing source for geometric
+    measurement.
+
+    pdf_preprocess.normalize_oversized_pages rasterizes oversized pages to
+    JPEG-embedded pages (writing `<base>_normalized.pdf`) so the LLM path
+    stays under Claude's per-image cap — but rasterization destroys the CAD
+    line work the VME measures, so the engine reads the scale from the
+    preserved text layer and then finds 0.0 LF of wall geometry (2026-07-07
+    Poly Western P5/P7/P10: every normalized page measured zero while the
+    raw-PDF jobs measured fine). The pre-normalization file is still on disk
+    in the same workdir, so geometric measurement must use it; only the
+    Claude-facing analysis needs the normalized copy. Falls back to the
+    given path when no `_normalized` suffix or the original is gone.
+    """
+    out = []
+    for p in pdf_paths or []:
+        p = str(p)
+        try:
+            base, ext = os.path.splitext(p)
+            if base.endswith("_normalized"):
+                orig = base[: -len("_normalized")] + (ext or ".pdf")
+                if os.path.exists(orig):
+                    out.append(orig)
+                    continue
+        except Exception:
+            pass
+        out.append(p)
+    return out
+
+
 def _substrate_gate_enabled():
     # Default OFF pending validation: fail-safe review flags (never quantity
     # changes) for the two substrate misreads the 2026-07 Rider batch proved:
@@ -23169,9 +23200,11 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     # that echo it may not be merged into analysis['notes'] yet at this point.
     if scope_notes:
         analysis.setdefault("project_info", {})["_user_scope_notes"] = scope_notes
-    # VME primary (Release 2) needs the source PDFs at the choke point.
+    # VME primary (Release 2) needs the source PDFs at the choke point —
+    # the VECTOR originals, not the rasterized `_normalized` copies, or the
+    # geometric engine measures 0.0 LF on every normalized page.
     try:
-        analysis["_vme_pdf_paths"] = [str(p) for p in (pdf_paths or [])]
+        analysis["_vme_pdf_paths"] = _vme_source_pdf_paths(pdf_paths)
     except Exception:
         pass
     analysis = build_priced_takeoff(analysis)
@@ -23209,12 +23242,14 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             # cross-check while v2 matures.
             # Reuse the measurement when the authoritative gate already
             # computed it at the choke point (identical inputs -> identical
-            # geometry; no need to pay the CPU twice).
+            # geometry; no need to pay the CPU twice). Measure the vector
+            # originals, never the rasterized `_normalized` copies.
+            _vme_paths = _vme_source_pdf_paths(pdf_paths)
             shadow_v2 = (analysis.get("_vme_shadow_v2")
-                         or _vme.compute_vme_shadow_v2(pdf_paths))
+                         or _vme.compute_vme_shadow_v2(_vme_paths))
             if shadow_v2:
                 analysis["_vme_shadow_v2"] = shadow_v2
-            single_pdf = pdf_paths[0] if (pdf_paths and len(pdf_paths) == 1) else None
+            single_pdf = _vme_paths[0] if len(_vme_paths) == 1 else None
             shadow = _vme.compute_vme_shadow(single_pdf) if single_pdf else None
             if shadow:
                 analysis["_vme_shadow"] = shadow
