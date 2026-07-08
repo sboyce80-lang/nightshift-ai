@@ -122,6 +122,30 @@ a = T._apply_vme_authoritative_walls(a)
 check(a["_vme_authoritative"]["applied"] is True,
       "full-floor TI coverage (PNC shape) -> promoted")
 
+# ── CMU-heavy jobs abstain (TSC shape) ──────────────────────────────────────
+print("\nCMU substrate guard")
+a = _analysis(llm_walls=4285)
+a["aggregated_totals"]["total_cmu_wall_sqft"] = 17707  # TSC: masonry >> gyp
+a = T._apply_vme_authoritative_walls(a)
+check(a["_vme_authoritative"]["applied"] is False
+      and "CMU-heavy" in a["_vme_authoritative"]["reason"],
+      "masonry > 10% of gyp walls -> abstain (TSC +525% replay shape)")
+check(a["aggregated_totals"]["total_paintable_wall_sqft"] == 4285,
+      "LLM gyp walls untouched on CMU abstain")
+
+a = _analysis()
+a["aggregated_totals"]["total_cmu_wall_sqft"] = 500  # 4% of 12,021 — minor
+a = T._apply_vme_authoritative_walls(a)
+check(a["_vme_authoritative"]["applied"] is True,
+      "incidental CMU (<10%) still promotes")
+
+# Zero-LLM-walls rescue (MTA shape) must survive the CMU guard when the
+# job has no masonry at all.
+a = _analysis(llm_walls=0, wc=0)
+a = T._apply_vme_authoritative_walls(a)
+check(a["_vme_authoritative"]["applied"] is True,
+      "LLM read 0 walls, no CMU -> still rescued (MTA shape)")
+
 # ── Wallcovering deduction floors at zero ───────────────────────────────────
 print("\nEdge cases")
 a = T._apply_vme_authoritative_walls(

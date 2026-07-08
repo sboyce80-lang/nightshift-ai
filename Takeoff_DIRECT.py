@@ -14916,6 +14916,17 @@ def _apply_vme_authoritative_walls(analysis):
 
     agg = analysis.setdefault("aggregated_totals", {})
     llm_walls = _num(agg.get("total_paintable_wall_sqft", 0))
+    # Substrate guard (same 10% threshold as _apply_vme_primary): geometry
+    # measures ALL wall lines but this aggregate is the GYP-priced one —
+    # on a CMU-heavy job (TSC: 17.7k CMU vs 4.3k gyp) pinning the geometric
+    # total here double-counts the separately-priced masonry at gyp rates
+    # (Rider-golden replay 2026-07-08: TSC priced +525% vs its gyp basis).
+    cmu_walls = _num(agg.get("total_cmu_wall_sqft", 0))
+    if cmu_walls > 0.10 * llm_walls:
+        return _abstain(
+            f"CMU-heavy job ({cmu_walls:,.0f} SF masonry vs {llm_walls:,.0f} "
+            f"SF gyp) — geometry can't split substrates; the masonry line "
+            f"already prices those walls")
     lf = _num(shadow.get("total_wall_run_lf", 0))
     wc = max(0.0, _num(agg.get("total_wallcovering_sqft", 0)))
     vme_walls = max(0.0, round(lf * height - wc, 2))
