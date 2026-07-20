@@ -5130,6 +5130,22 @@ Go through the window schedule table ROW BY ROW.  For EACH window mark:
    schedule, type detail, and any explicit paint callouts. Components are paintable
    when they exist as wood/MDF trim — they do NOT need to be called out as "PT-x"
    to be painted; wood trim is painted by default unless marked stained/clear.
+7. Classify each window mark's SUPPLY/FINISH status — these determine whether
+   the window can EVER be field-painted:
+   • OWNER-PROVIDED — any annotation like "PROVIDED BY OWNER", "BY OWNER",
+     "OFOI", "OFCI", "NIC", or a named prefinished product supplied by others
+     (e.g. "Pella"). Revision annotations (often in red/colored text) count and
+     may use a bracket or arrow spanning MULTIPLE consecutive rows — apply the
+     annotation to every row the arrow/bracket covers, not just the row it
+     starts on. Owner-provided units arrive factory-finished: NOT field-painted.
+   • FACTORY-FINISHED — fire-rated assemblies with a manufacturer/model (e.g.
+     FYRE-TEC), aluminum/vinyl/fiberglass/clad frames, or finish column says
+     prefinished/factory/anodized. NOT field-painted.
+   • FIELD-PAINTABLE WOOD — wood-framed units (schedule MATERIAL column, or
+     window TYPE detail drawings labeling the type "WD FRAMED" / wood) that are
+     neither owner-provided nor factory-finished. These are the only units that
+     CAN be field-painted; whether they ARE painted still requires a finish
+     schedule or paint spec — report the count, do not mark them painted.
 
 IMPORTANT: Do NOT assume residential windows have painted sashes. Modern windows
 are factory-finished. Casings/aprons/stools, when present as wood trim, ARE
@@ -5162,15 +5178,20 @@ OUTPUT FORMAT — Return ONLY this JSON, no other text:
   "window_schedule": {
     "total_windows": <int>,
     "windows_painted_interior": <int>,
+    "windows_owner_provided": <int>,
+    "windows_factory_finished": <int>,
+    "windows_field_paintable_wood": <int>,
     "window_types": [
       {"mark": "W1", "qty": 10, "frame": "wood", "painted_interior": true,
        "has_casing": true, "has_apron": true, "has_stool_sill": true,
        "has_wood_return": false, "has_drywall_return": false,
-       "sash_painted": false},
+       "sash_painted": false, "owner_provided": false,
+       "factory_finished": false},
       {"mark": "W2", "qty": 5, "frame": "aluminum", "painted_interior": false,
        "has_casing": false, "has_apron": false, "has_stool_sill": false,
        "has_wood_return": false, "has_drywall_return": true,
-       "sash_painted": false}
+       "sash_painted": false, "owner_provided": false,
+       "factory_finished": true}
     ],
     "windows_with_casing": <int>,
     "windows_with_apron": <int>,
@@ -5191,6 +5212,65 @@ OUTPUT FORMAT — Return ONLY this JSON, no other text:
 CRITICAL: List EVERY door mark in "door_marks_counted" — this allows verification.
 If you cannot read a schedule clearly, say so in notes rather than guessing.
 """
+
+
+def _extract_revision_annotations(pdf_path, page_nums):
+    """Deterministically pull COLORED (revision) text + vector marks off the
+    given pages so the schedule prompt can anchor them to rows. Red brackets/
+    arrows spanning many rows are thin vector lines the vision pass reliably
+    misses (364 Main: 'Provided by Owner' covered marks 219-230 via one
+    arrow); their extents are exact in the PDF geometry.
+    Returns a list of human-readable hint strings (possibly empty)."""
+    hints = []
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+    except Exception:
+        return hints
+    for idx, pg_num in enumerate(sorted(page_nums)):
+        if pg_num >= len(doc):
+            continue
+        try:
+            page = doc[pg_num]
+            ph = page.rect.height
+            # Colored text spans (skip black/gray)
+            for b in page.get_text("dict").get("blocks", []):
+                for l in b.get("lines", []):
+                    for s in l.get("spans", []):
+                        col = s.get("color", 0)
+                        r, g, bl = (col >> 16) & 255, (col >> 8) & 255, col & 255
+                        if max(r, g, bl) - min(r, g, bl) < 60:
+                            continue  # grayscale
+                        txt = (s.get("text") or "").strip()
+                        if len(txt) < 4:
+                            continue
+                        bb = s.get("bbox") or (0, 0, 0, 0)
+                        hints.append(
+                            f"PDF page {idx + 1}: colored text \"{txt[:90]}\" "
+                            f"at x={bb[0]:.0f}, y={bb[1]:.0f} of "
+                            f"{ph:.0f}-unit page height")
+            # Colored vector strokes (bracket/arrow shafts): saturated color,
+            # meaningful length
+            for d in page.get_drawings():
+                col = d.get("color")
+                if not col or (max(col) - min(col)) < 0.25:
+                    continue
+                rect = d.get("rect")
+                if rect is None:
+                    continue
+                h, w = rect.height, rect.width
+                if max(h, w) < 40:
+                    continue  # arrowheads/ticks — noise
+                orient = "vertical" if h > w else "horizontal"
+                hints.append(
+                    f"PDF page {idx + 1}: colored {orient} line from "
+                    f"(x={rect.x0:.0f}, y={rect.y0:.0f}) to "
+                    f"(x={rect.x1:.0f}, y={rect.y1:.0f}) of "
+                    f"{ph:.0f}-unit page height")
+        except Exception:
+            continue
+    doc.close()
+    return hints[:30]
 
 
 def analyze_schedule_images(client, pdf_path, schedule_page_nums):
@@ -5227,7 +5307,24 @@ def analyze_schedule_images(client, pdf_path, schedule_page_nums):
         print(f"   ⚠️  Could not build mini-PDF: {e}")
         return None
 
-    # Build content: PDF document + focused prompt
+    # Deterministic colored-annotation hints: revision text + bracket/arrow
+    # extents pulled straight from the PDF geometry, since thin colored lines
+    # spanning many table rows are easy to miss visually.
+    prompt_text = _SCHEDULE_IMAGE_PROMPT
+    ann_hints = _extract_revision_annotations(pdf_path, schedule_page_nums)
+    if ann_hints:
+        prompt_text += (
+            "\n\n═══════════════════════════════════════════════════════════\n"
+            "COLORED REVISION ANNOTATIONS (extracted deterministically from "
+            "the PDF geometry — page numbers refer to THIS mini-PDF; y grows "
+            "downward)\n"
+            "═══════════════════════════════════════════════════════════\n"
+            + "\n".join(f"- {h}" for h in ann_hints)
+            + "\n\nUse these to anchor revision notes to schedule rows: a "
+            "colored VERTICAL line next to an annotation is a span bracket/"
+            "arrow — the annotation applies to EVERY schedule row whose "
+            "vertical position falls inside the line's y-range, not just "
+            "the row where the text sits.")
     content = [
         {
             "type": "document",
@@ -5239,7 +5336,7 @@ def analyze_schedule_images(client, pdf_path, schedule_page_nums):
         },
         {
             "type": "text",
-            "text": _SCHEDULE_IMAGE_PROMPT,
+            "text": prompt_text,
         }
     ]
 
@@ -5354,7 +5451,9 @@ def _merge_schedule_reads(reads):
                 wtypes_by_id[wid] = w
     if wtypes_by_id:
         ws_out["window_types"] = list(wtypes_by_id.values())
-    for k in ("total_windows", "windows_painted_interior"):
+    for k in ("total_windows", "windows_painted_interior",
+              "windows_owner_provided", "windows_factory_finished",
+              "windows_field_paintable_wood"):
         ws_out[k] = max(_num((r.get("window_schedule") or {}).get(k, 0))
                         for r in reads)
     out["window_schedule"] = ws_out
@@ -5397,6 +5496,447 @@ def analyze_schedule_images_consensus(client, pdf_path, schedule_page_nums):
           f"{_num(ds.get('total_doors_full_paint',0)) + _num(ds.get('total_doors_hm_panel',0)):.0f} "
           f"paintable doors")
     return merged
+
+
+def _stair_sheet_extraction_enabled():
+    # Default OFF: targeted stair-flight extraction from stair plan/section
+    # sheets. Stair counts today come from room-level extraction (which counts
+    # landings as sections — 364 Main read 25) clamped by a stairwells×
+    # transitions×2 heuristic (16); Rider's takeoff counts 11 actual flights.
+    # Flights drawn on stair sections/enlarged plans are hard numbers; when
+    # this pass reads them, its count is authoritative and the boost/cap
+    # heuristics stand down.
+    return os.environ.get("NIGHTSHIFT_STAIR_SHEET_EXTRACTION", "0").strip() in (
+        "1", "true", "True")
+
+
+def _identify_stair_pages(pdf_path):
+    """Zero-cost text scan for pages that DRAW the stairs: enlarged stair
+    plans, stair sections, and building sections. Floor plans mention
+    "stair" everywhere, so require stair-construction vocabulary (riser/
+    tread/stringer/handrail/guardrail) or a stair-titled sheet, and skip
+    pure schedule sheets.
+    """
+    try:
+        import fitz  # PyMuPDF
+    except ImportError:
+        return []
+    pages = []
+    try:
+        doc = fitz.open(pdf_path)
+    except Exception:
+        return []
+    for page_num in range(len(doc)):
+        try:
+            text = doc[page_num].get_text().lower()
+        except Exception:
+            continue
+        has_stair_title = any(kw in text for kw in (
+            "stair section", "enlarged stair", "stair plan", "stair detail",
+            "stair elevation"))
+        has_building_section = "building section" in text
+        construction_hits = sum(1 for kw in (
+            "riser", "tread", "stringer", "handrail", "guardrail", "nosing",
+            "landing", "stairwell") if kw in text)
+        # A stair-titled sheet is the target even with sparse vocabulary;
+        # generic building sections need >=2 construction hits so ordinary
+        # wall sections don't sweep in.
+        if (has_stair_title and construction_hits >= 1) or (
+                has_building_section and construction_hits >= 2):
+            pages.append(page_num)
+    doc.close()
+    return pages
+
+
+_STAIR_SHEET_PROMPT = """You are analyzing STAIR PLAN / STAIR SECTION / BUILDING SECTION sheets from an architectural set.
+
+Count the stair FLIGHTS that will exist in the finished building.
+
+DEFINITIONS:
+- A FLIGHT (= section) is one continuous run of steps between two landings
+  or between a floor and a landing. A floor-to-floor climb with one
+  intermediate landing = 2 flights. A straight run with no landing = 1 flight.
+- LANDINGS are NOT flights. Do not count them.
+- Count each stairwell separately, floor by floor, from the LOWEST level it
+  serves (including basement/cellar) to the HIGHEST (including roof access).
+
+METHOD:
+1. Identify each distinct stairwell (Stair A, Stair B, egress stair, etc.).
+2. For each stairwell, read the section/plan and count flights per level
+   transition — sections show this directly as diagonal runs.
+3. Note the stair MATERIAL (wood-framed painted, steel pan, concrete-filled,
+   precast) and whether railings are painted or stained/poly.
+4. If sheets show only SOME stairwells, count what is drawn and say which
+   stairwells you could not verify in the notes — do NOT extrapolate.
+
+Return ONLY this JSON:
+{
+  "stairwells": [
+    {"id": "Stair A", "levels_served": "basement-roof", "flights": 0,
+     "material": "", "notes": ""}
+  ],
+  "total_flight_sections": 0,
+  "confidence": "high|medium|low",
+  "notes": ""
+}
+
+total_flight_sections MUST equal the sum of per-stairwell flights. If the
+sheets do not actually draw the stairs (no runs visible), return
+total_flight_sections 0 with a note — never guess from story count."""
+
+
+def analyze_stair_sheets(client, pdf_path, stair_page_nums):
+    """Targeted stair-flight count from the sheets that draw the stairs.
+    Same mini-PDF mechanism as analyze_schedule_images. Returns a dict
+    {"total_stair_sections", "source": "stair_sheets", ...} compatible with
+    schedule_data["stair_info"], or None.
+    """
+    if not stair_page_nums:
+        return None
+    print(f"\n   🪜 TARGETED STAIR EXTRACTION")
+    print(f"   Extracting {len(stair_page_nums)} stair/section page(s) as mini-PDF...")
+    try:
+        reader = PyPDF2.PdfReader(pdf_path)
+        writer = PyPDF2.PdfWriter()
+        for pg in sorted(stair_page_nums):
+            if pg < len(reader.pages):
+                writer.add_page(reader.pages[pg])
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
+            writer.write(tmp)
+            tmp_path = tmp.name
+        with open(tmp_path, 'rb') as f:
+            pdf_b64 = base64.standard_b64encode(f.read()).decode("utf-8")
+        os.unlink(tmp_path)
+    except Exception as e:
+        print(f"   ⚠️  Could not build stair mini-PDF: {e}")
+        return None
+
+    result_parts = []
+    try:
+        with client.messages.stream(
+            model="claude-sonnet-4-6",
+            max_tokens=3000,
+            temperature=0,
+            timeout=300.0,
+            messages=[{"role": "user", "content": [
+                {"type": "document",
+                 "source": {"type": "base64",
+                            "media_type": "application/pdf",
+                            "data": pdf_b64}},
+                {"type": "text", "text": _STAIR_SHEET_PROMPT},
+            ]}],
+        ) as stream:
+            for text in stream.text_stream:
+                result_parts.append(text)
+    except Exception as e:
+        print(f"   ❌ Stair sheet API call failed: {e}")
+        return None
+
+    parsed = _parse_json_response("".join(result_parts))
+    if not isinstance(parsed, dict):
+        print(f"   ⚠️  Could not parse stair sheet response")
+        return None
+    total = _num(parsed.get("total_flight_sections", 0))
+    wells = parsed.get("stairwells") or []
+    per_well = sum(_num(w.get("flights", 0)) for w in wells
+                   if isinstance(w, dict))
+    # Consistency guard: a total that disagrees with its own breakdown is a
+    # miscount — trust the itemized flights.
+    if wells and per_well > 0 and abs(per_well - total) > 0.5:
+        print(f"   ⚠️  Stair total {total:.0f} != per-stairwell sum "
+              f"{per_well:.0f} — using the itemized sum")
+        total = per_well
+    if total <= 0:
+        print(f"   🪜 Stair sheets present but no flights drawn/readable — "
+              f"leaving stair count to room extraction")
+        return None
+    materials = ", ".join(sorted({str(w.get("material", "")).strip()
+                                  for w in wells
+                                  if isinstance(w, dict) and w.get("material")}))
+    print(f"   ✅ Stair extraction: {total:.0f} flight section(s) across "
+          f"{len(wells)} stairwell(s) [{parsed.get('confidence', '?')}]")
+    return {
+        "total_stair_sections": total,
+        "source": "stair_sheets",
+        "stairwells": wells,
+        "confidence": parsed.get("confidence", ""),
+        "notes": (f"counted from stair/section sheets; materials: "
+                  f"{materials or 'unspecified'}. "
+                  + str(parsed.get("notes", "")).strip()),
+    }
+
+
+def _closet_recovery_enabled():
+    # Default OFF: when residential ceilings read materially below the
+    # wall:ceiling expectation, re-read the unit-plan sheets for small
+    # enclosed spaces (closets/pantry/linen/WIC) the extractor skipped and add
+    # them as MEASURED rooms (ceiling area only — walls/trim stay zero; VME
+    # owns walls and closet partitions are already inside its floor geometry).
+    # This is the priced counterpart of the hard-numbers "[Ceiling Check]"
+    # RFI: the rooms are drawn on the plans, so recovering them is
+    # measurement, not assumption. 364 Main golden: ceilings -26% with zero
+    # closet rooms extracted across 9 floors of a 20-unit building.
+    return os.environ.get("NIGHTSHIFT_CLOSET_RECOVERY", "0").strip() in (
+        "1", "true", "True")
+
+
+_CLOSET_RECOVERY_PROMPT_TMPL = """You are re-reading residential FLOOR PLAN sheets from which rooms were already extracted. Your ONLY job is to find the SMALL ENCLOSED SPACES that were MISSED.
+
+ALREADY-EXTRACTED rooms on these sheets (do NOT return these):
+%s
+
+Find ONLY:
+- closets (bedroom, coat, linen, utility), pantries, W.I.C., laundry/stacked
+  W/D alcoves, vestibules — enclosed spaces with their own walls/door
+- that are DRAWN on these sheets with a readable label or clearly bounded
+  partitions, and are NOT in the already-extracted list for that sheet
+- with floor area under ~150 sqft each
+
+For each, read the dimensions from the plan (labeled dims, or scale off the
+graphic against a labeled adjacent room). Count every drawn INSTANCE
+separately — if 8 units each show a coat closet, return 8 entries (or one
+entry with "count" set to 8 when the units are identical).
+
+Return ONLY this JSON:
+{
+  "recovered_rooms": [
+    {"sheet": "A103", "page": 11, "room_name": "Coat Closet (Unit 2A)",
+     "length_feet": 0.0, "width_feet": 0.0, "floor_area_sqft": 0.0,
+     "count": 1, "how_measured": "labeled dims | scaled vs adjacent room"}
+  ],
+  "notes": ""
+}
+
+HARD RULES: never invent a space that is not drawn; never return a room that
+matches an already-extracted name on the same sheet; if you cannot measure a
+space, omit it and mention it in notes. Empty list is a valid answer."""
+
+
+def _recover_missed_small_rooms(client, pdf_path, page_nums, known_by_sheet):
+    """Targeted re-read of unit-plan pages for missed small rooms.
+    Returns the parsed recovered_rooms list (possibly empty), or None on
+    failure."""
+    if not page_nums:
+        return None
+    known_lines = []
+    for sheet, names in sorted(known_by_sheet.items()):
+        shown = sorted(set(names))
+        known_lines.append(f"  {sheet}: {', '.join(shown[:40])}"
+                           + (" …" if len(shown) > 40 else ""))
+    prompt = _CLOSET_RECOVERY_PROMPT_TMPL % ("\n".join(known_lines) or "  (none)")
+
+    try:
+        reader = PyPDF2.PdfReader(pdf_path)
+        writer = PyPDF2.PdfWriter()
+        for pg in sorted(page_nums):
+            if pg < len(reader.pages):
+                writer.add_page(reader.pages[pg])
+        with tempfile.NamedTemporaryFile(suffix='.pdf', delete=False) as tmp:
+            writer.write(tmp)
+            tmp_path = tmp.name
+        with open(tmp_path, 'rb') as f:
+            pdf_b64 = base64.standard_b64encode(f.read()).decode("utf-8")
+        os.unlink(tmp_path)
+    except Exception as e:
+        print(f"   ⚠️  Could not build closet-recovery mini-PDF: {e}")
+        return None
+
+    result_parts = []
+    try:
+        with client.messages.stream(
+            model="claude-sonnet-4-6",
+            max_tokens=8000,
+            temperature=0,
+            timeout=300.0,
+            messages=[{"role": "user", "content": [
+                {"type": "document",
+                 "source": {"type": "base64",
+                            "media_type": "application/pdf",
+                            "data": pdf_b64}},
+                {"type": "text", "text": prompt},
+            ]}],
+        ) as stream:
+            for text in stream.text_stream:
+                result_parts.append(text)
+    except Exception as e:
+        print(f"   ❌ Closet recovery API call failed: {e}")
+        return None
+
+    parsed = _parse_json_response("".join(result_parts))
+    if not isinstance(parsed, dict):
+        return None
+    return parsed.get("recovered_rooms") or []
+
+
+def _apply_closet_recovery(analysis, client, pdf_paths):
+    """Recover missed small-room ceilings as measured rooms (flag-gated).
+
+    Fires only when the residential ceiling gap the '[Ceiling Check]' RFI
+    flags actually exists. Recovered rooms are appended as synthetic rooms
+    with CEILING + floor area only (walls/perimeter/trim/doors zero) so no
+    other quantity moves, then totals are recalculated. Recovered area is
+    clamped to 1.5x the ratio gap — a re-read may not add more ceiling than
+    the discrepancy it explains.
+    """
+    if not _closet_recovery_enabled() or not isinstance(analysis, dict):
+        return analysis
+    pi = analysis.get("project_info") or {}
+    bt = str(pi.get("building_type", "")).lower()
+    units = _num(pi.get("total_units", 0))
+    is_res = units >= 4 or any(kw in bt for kw in (
+        "residential", "mixed", "multi", "apartment", "condo"))
+    if not is_res:
+        return analysis
+
+    agg = analysis.get("aggregated_totals") or {}
+    total_wall = _num(agg.get("total_paintable_wall_sqft", 0))
+    total_ceiling = _num(agg.get("total_paintable_ceiling_sqft", 0))
+    if total_wall <= 0 or total_ceiling <= 0:
+        return analysis
+    expected_ceiling = total_wall / WALL_TO_FLOOR_RATIO
+    gap = expected_ceiling - total_ceiling
+    if expected_ceiling <= 0 or (gap / expected_ceiling) <= 0.08:
+        return analysis
+
+    # Unit-plan pages = source pages of small residential rooms (single-PDF
+    # sets only — multi-file page indices are ambiguous; the RFI still fires).
+    if len(pdf_paths or []) != 1:
+        print("   🚪 Closet recovery: multi-PDF set — skipped (RFI stands)")
+        return analysis
+    pages = set()
+    known_by_sheet = {}
+    for fl in analysis.get("floors") or []:
+        for rm in fl.get("rooms") or []:
+            if not isinstance(rm, dict) or not rm.get("in_scope", True):
+                continue
+            d = rm.get("dimensions") or {}
+            pg = rm.get("source_page")
+            sheet = str(rm.get("source_sheet") or "?")
+            if pg is None or _num(d.get("floor_area_sqft", 0)) <= 0:
+                continue
+            if _num(d.get("floor_area_sqft", 0)) < 1200:
+                pages.add(int(pg))
+            known_by_sheet.setdefault(sheet, []).append(
+                str(rm.get("room_name", "")))
+    if not pages:
+        return analysis
+
+    print(f"\n   🚪 CLOSET RECOVERY: ceiling {gap:,.0f} sqft below ratio "
+          f"expectation — re-reading {len(pages)} unit-plan page(s)")
+    recovered = _recover_missed_small_rooms(
+        client, pdf_paths[0], sorted(pages), known_by_sheet)
+    if not recovered:
+        print("   🚪 Closet recovery: nothing recovered")
+        return analysis
+
+    # Sanitize + clamp: smallest first until 1.5x the gap is covered.
+    clean = []
+    for r in recovered:
+        if not isinstance(r, dict):
+            continue
+        area = _num(r.get("floor_area_sqft", 0))
+        if area <= 0:
+            area = _num(r.get("length_feet", 0)) * _num(r.get("width_feet", 0))
+        count = max(1, int(_num(r.get("count", 1))))
+        if area <= 0 or area > 160:
+            continue
+        # Belt-and-suspenders dedup vs extracted names on the same sheet
+        name = str(r.get("room_name", "Closet")).strip()
+        sheet = str(r.get("sheet", "?")).strip()
+        if any(name.lower() == str(n).lower()
+               for n in known_by_sheet.get(sheet, [])):
+            continue
+        clean.append((area, count, name, sheet, r))
+    clean.sort(key=lambda t: t[0])
+
+    budget = gap * 1.5
+    added_sf = 0.0
+    added_rooms = 0
+    dropped = 0
+    floors = analysis.setdefault("floors", [])
+    recovery_floor = None
+    for area, count, name, sheet, r in clean:
+        if added_sf + area * count > budget:
+            dropped += count
+            continue
+        # Attach to the floor that owns this sheet; else a dedicated group.
+        target = None
+        for fl in floors:
+            if any(str(rm.get("source_sheet")) == sheet
+                   for rm in (fl.get("rooms") or [])):
+                target = fl
+                break
+        if target is None:
+            if recovery_floor is None:
+                recovery_floor = {"floor_name": "Recovered Small Spaces",
+                                  "rooms": []}
+                floors.append(recovery_floor)
+            target = recovery_floor
+        target.setdefault("rooms", []).append({
+            "room_id": f"CR-{sheet}-{added_rooms}",
+            "room_name": name,
+            "source_sheet": sheet,
+            "source_page": r.get("page"),
+            "source": "closet_recovery",
+            "unit_multiplier": count,
+            "in_scope": True,
+            "dimensions": {
+                "length_feet": _num(r.get("length_feet", 0)),
+                "width_feet": _num(r.get("width_feet", 0)),
+                "floor_area_sqft": area,
+                "ceiling_area_sqft": area,
+                # Walls/perimeter stay 0: VME owns walls, and closet
+                # partitions are already inside its measured geometry.
+                "wall_area_sqft": 0,
+                "perimeter_lf": 0,
+            },
+            "materials": {
+                "walls": "GYP",
+                "ceiling": "GYP (per unit typical)",
+                "ceiling_painted": True,
+                "base": "Unconfirmed",
+            },
+            "elements": {k: 0 for k in (
+                "doors_full_paint", "doors_hm_panel", "doors_frame_only",
+                "windows_total", "windows_painted_interior", "base_trim_lf",
+                "stair_sections", "gyp_between_stairs_sqft",
+                "wallcovering_sqft", "soffit_sqft")},
+            "notes": (f"[Closet Recovery] measured on re-read "
+                      f"({r.get('how_measured', 'plan dims')}); ceiling only "
+                      f"— walls/trim intentionally zero."),
+        })
+        added_sf += area * count
+        added_rooms += count
+
+    if added_rooms == 0:
+        print("   🚪 Closet recovery: no usable rooms after sanitation")
+        return analysis
+
+    # Bump the ceiling aggregate directly instead of calling
+    # _recalculate_totals: the recalc pipeline invokes the VME wall gates,
+    # which are NOT re-entrant (they pin once and early-return on their
+    # marker), so an extra recalc here could apply them prematurely or lose
+    # a pinned value. The synthetic rooms are in floors[], so any later
+    # natural recalc re-sums to the same ceiling total.
+    agg["total_paintable_ceiling_sqft"] = total_ceiling + added_sf
+    analysis["aggregated_totals"] = agg
+    analysis["_closet_recovery"] = {
+        "rooms": added_rooms, "ceiling_sqft": round(added_sf),
+        "dropped_over_budget": dropped,
+    }
+    note = (f"[Closet Recovery] Re-read the unit plans and recovered "
+            f"{added_rooms} small space(s) (+{added_sf:,.0f} sqft ceiling, "
+            f"measured — walls/trim unchanged).")
+    if dropped:
+        note += (f" {dropped} further candidate(s) exceeded the ratio-gap "
+                 f"budget and were NOT priced. RFI REQUIRED: confirm "
+                 f"closet/small-space ceilings beyond the "
+                 f"{added_sf:,.0f} sqft recovered.")
+    analysis.setdefault("notes", []).append(note)
+    print(f"   🚪 Closet recovery: +{added_rooms} room(s), "
+          f"+{added_sf:,.0f} sqft ceiling"
+          + (f", {dropped} dropped (over budget)" if dropped else ""))
+    return analysis
 
 
 def _normalize_floor_key(name):
@@ -9422,6 +9962,20 @@ def _purge_stale_schedule_notes(combined, *, doors=False, windows=False):
               f"that contradict a detected schedule")
 
 
+def _window_wood_default_enabled():
+    # Default OFF: on residential/mixed-use jobs whose window schedule confirms
+    # field-paintable WOOD windows (not owner-provided, not factory-finished),
+    # price them as painted interior even without an explicit paint spec — the
+    # same trade-default argument as residential painted-wood base trim.
+    # 364 Main golden (2026-07-08): the schedule proves 70 paintable wood units
+    # (92 − 6 FYRE-TEC − 16 owner-provided Pella) but Rider's final bid painted
+    # only 26 — the black-interior subset lives in a finish spec guide OUTSIDE
+    # the bid set. The default over-prices when the finish schedule is missing,
+    # so it stays opt-in; OFF still emits the quantified RFI.
+    return os.environ.get("NIGHTSHIFT_WINDOW_WOOD_DEFAULT", "0").strip() in (
+        "1", "true", "True")
+
+
 def _apply_schedule_overrides(combined):
     """
     Apply authoritative schedule data (from door/window schedule PDFs)
@@ -9730,6 +10284,63 @@ def _apply_schedule_overrides(combined):
                 f"wood returns={wood_return_ct:.0f}, drywall returns={drywall_return_ct:.0f}"
             )
 
+    # --- Field-paintable wood windows (supply/finish breakdown) ---
+    # The schedule proves which windows CAN be field-painted: wood-framed and
+    # neither owner-provided (Pella-by-owner etc.) nor factory-finished
+    # (fire-rated, aluminum/vinyl/clad). Whether they ARE painted needs a
+    # finish schedule; absent one, the count is surfaced as a quantified RFI
+    # (or priced under the opt-in residential wood default).
+    sched_win_owner = _num(ws.get("windows_owner_provided", 0)) * schedule_scale
+    sched_win_factory = _num(ws.get("windows_factory_finished", 0)) * schedule_scale
+    sched_win_wood = _num(ws.get("windows_field_paintable_wood", 0)) * schedule_scale
+    if sched_win_total > 0 and sched_win_wood <= 0:
+        # Older reads lack the summary field — derive from per-type rows,
+        # counting only frames with positive wood evidence.
+        derived = 0.0
+        for wt in (ws.get("window_types") or []):
+            if not isinstance(wt, dict):
+                continue
+            if wt.get("owner_provided") or wt.get("factory_finished"):
+                continue
+            frame = str(wt.get("frame", "")).lower()
+            if any(k in frame for k in ("alum", "vinyl", "fiberglass", "clad",
+                                        "steel", "fyre", "fire-rated")):
+                continue
+            if "wood" in frame or "wd " in frame or frame.startswith("wd"):
+                derived += max(1.0, _num(wt.get("qty", 1)))
+        sched_win_wood = derived * schedule_scale
+
+    if sched_win_total > 0 and sched_win_wood > 0 and sched_win_painted <= 0:
+        agg["total_windows_field_paintable"] = sched_win_wood
+        authoritative_keys.add("total_windows_field_paintable")
+        _excl = (f"{sched_win_owner:.0f} owner-provided and "
+                 f"{sched_win_factory:.0f} factory-finished excluded")
+        _pi_bt = str(pi.get("building_type", "")).lower()
+        _residential_ctx = _num(pi.get("total_units", 0)) >= 4 or any(
+            kw in _pi_bt for kw in (
+                "residential", "multifamily", "multi-family", "apartment",
+                "condo", "mixed-use", "mixed use", "dorm"))
+        if _window_wood_default_enabled() and _residential_ctx:
+            agg["total_windows_painted_interior"] = sched_win_wood
+            authoritative_keys.add("total_windows_painted_interior")
+            overrides_applied.append(
+                f"Windows (assumed): {sched_win_wood:.0f} field-paintable wood "
+                f"window(s) priced as painted interior — residential wood-window "
+                f"default ({_excl}; no interior paint spec on the schedule). "
+                f"Confirm the painted subset against the finish schedule.")
+            print(f"   🔧 Window wood default: {sched_win_wood:.0f} wood "
+                  f"window(s) priced as painted interior (assumed)")
+        else:
+            overrides_applied.append(
+                f"Windows: {sched_win_wood:.0f} field-paintable wood window(s) "
+                f"NOT priced — the schedule shows no interior paint spec "
+                f"({_excl}). RFI REQUIRED: confirm which of the "
+                f"{sched_win_wood:.0f} wood windows receive interior paint "
+                f"(no finish schedule in the set) — none are priced under the "
+                f"hard-numbers policy.")
+            print(f"   📋 Windows: {sched_win_wood:.0f} field-paintable wood "
+                  f"window(s) flagged for RFI (not priced)")
+
     # --- Door count sanity check for multi-unit residential ---
     building_type = str(combined.get("project_info", {}).get("building_type", "")).lower()
     total_units = _num(combined.get("project_info", {}).get("total_units", 0))
@@ -9742,12 +10353,26 @@ def _apply_schedule_overrides(combined):
                 f"typical unit door multipliers. RFI recommended."
             )
 
-    # --- Stair schedule overrides (only override upward — stairs aren't in schedule) ---
+    # --- Stair schedule overrides ---
     si = schedule_data.get("stair_info", {})
     sched_stairs = _num(si.get("total_stair_sections", 0)) * schedule_scale
     room_stairs = _num(agg.get("total_stair_sections", 0))
 
-    if sched_stairs > room_stairs:
+    if sched_stairs > 0 and si.get("source") == "stair_sheets":
+        # Targeted stair-sheet extraction counted the drawn flights — this is
+        # authoritative BOTH directions (room extraction counts landings as
+        # sections), and the downstream boost/cap heuristics stand down.
+        agg["total_stair_sections"] = sched_stairs
+        authoritative_keys.add("total_stair_sections")
+        combined["_stair_sheet_authoritative"] = True
+        overrides_applied.append(
+            f"Stairs SET from stair/section sheets: {sched_stairs:.0f} flight "
+            f"section(s) (room-level had {room_stairs:.0f}; "
+            f"{str(si.get('notes', '')).strip()})"
+        )
+    elif sched_stairs > room_stairs:
+        # Legacy schedule-notes stair count: only override upward — stairs
+        # aren't in door/window schedules, so a low read proves nothing.
         agg["total_stair_sections"] = sched_stairs
         authoritative_keys.add("total_stair_sections")
         overrides_applied.append(
@@ -21575,6 +22200,32 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         print(f"   ⚠️  Schedule pre-scan failed: {e}")
         image_schedule_data = None
 
+    # --- Targeted stair-flight extraction (flag-gated) ---
+    # Stair schedules rarely exist; the flights live on stair/building
+    # sections. When enabled, read them directly — the count supersedes the
+    # room-derived one and the boost/cap heuristics stand down.
+    if _stair_sheet_extraction_enabled():
+        try:
+            _existing_stairs = _num(((image_schedule_data or {}).get(
+                "stair_info") or {}).get("total_stair_sections", 0))
+            if _existing_stairs <= 0:
+                for pdf_path_scan in pdf_paths:
+                    stair_pages = _identify_stair_pages(pdf_path_scan)
+                    if not stair_pages:
+                        continue
+                    print(f"\n🔎 Stair pages in "
+                          f"{os.path.basename(pdf_path_scan)}: "
+                          f"{[p + 1 for p in stair_pages]}")
+                    stair_data = analyze_stair_sheets(
+                        client, pdf_path_scan, stair_pages)
+                    if stair_data:
+                        if image_schedule_data is None:
+                            image_schedule_data = {}
+                        image_schedule_data["stair_info"] = stair_data
+                        break
+        except Exception as e:
+            print(f"   ⚠️  Stair sheet extraction failed: {e}")
+
     # --- Pre-extract the Room Finish Schedule ---
     # Drives wallcovering + per-room wall/ceiling/base finishes. Gated by a
     # zero-cost text scan so the LLM call only runs when a finish schedule is
@@ -22580,6 +23231,18 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     # of bidding blind.
     analysis = _validate_unit_multipliers(analysis)
 
+    # --- Closet recovery (flag-gated, measured) ---
+    # Re-reads the unit plans for missed small enclosed spaces when the
+    # residential ceiling gap exists; runs BEFORE the GSF ceiling floor so a
+    # measured recovery shrinks what the assumed floor would add.
+    try:
+        analysis = _apply_closet_recovery(analysis, client, pdf_paths)
+        _adj_snap = _ledger_stage(analysis, "closet_recovery", _adj_snap,
+                                  source="measured",
+                                  basis="targeted re-read of unit-plan sheets")
+    except Exception as e:
+        print(f"   ⚠️  Closet recovery failed: {e or type(e).__name__}")
+
     # --- Residential ceiling floor (GSF-based) ---
     # Per-room ceiling extraction systematically under-counts dense
     # vector-rendered architectural sets. When extracted ceiling falls
@@ -22691,6 +23354,14 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     # Calculate expected minimum stair count based on building size
     # Typical: 2 stairwells × (effective_levels - 1) transitions × 2 flights
     expected_min_stairs = 2 * max(1, effective_levels - 1) * 2
+
+    if analysis.get("_stair_sheet_authoritative"):
+        # Targeted stair-sheet extraction counted the drawn flights — the
+        # room-count boost and landing cap below are heuristics for counts we
+        # DIDN'T measure; they must not touch a measured one.
+        print(f"   🪜 Stair count is stair-sheet authoritative "
+              f"({current_stairs:.0f} flights) — boost/cap heuristics skipped")
+        total_stories = 0
 
     if total_stories >= 2 and (current_stairs == 0 or current_stairs < expected_min_stairs * 0.7):
         # Stairs are missing or seem too low for the building
