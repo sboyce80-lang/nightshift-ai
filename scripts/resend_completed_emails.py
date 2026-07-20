@@ -108,10 +108,13 @@ def _resend_one(engine, submission_id, cc_emails):
             print(f"  ! {submission_id}: status={row['status']!r} (expected 'completed') — skipping")
             return False
 
+        # Newest first: a re-run stacks a second result JSON/PDF on the
+        # same submission, and the customer must get the latest one.
         files = conn.execute(text("""
             SELECT filename, r2_key, content_type
             FROM files
             WHERE submission_id = :sid AND kind = 'result'
+            ORDER BY created_at DESC
         """), {"sid": submission_id}).mappings().all()
 
     json_file = next((f for f in files if f["filename"].endswith(".json")), None)

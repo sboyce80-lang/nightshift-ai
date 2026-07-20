@@ -122,6 +122,39 @@ a = T._apply_vme_authoritative_walls(a)
 check(a["_vme_authoritative"]["applied"] is True,
       "full-floor TI coverage (PNC shape) -> promoted")
 
+# ── CMU-heavy jobs: geometric total split by substrate proportions ─────────
+print("\nCMU substrate split")
+a = _analysis(llm_walls=4285)
+a["aggregated_totals"]["total_cmu_wall_sqft"] = 17707  # TSC: masonry >> gyp
+a = T._apply_vme_authoritative_walls(a)
+rec = a["_vme_authoritative"]
+vme_total = round(2422.5 * 10.83 - 103, 2)
+exp_gyp = round(vme_total * (4285 / (4285 + 17707)), 2)
+check(rec["applied"] is True and rec["substrate_split"] is not None,
+      "masonry-heavy -> applied WITH substrate split (TSC replay shape)")
+check(abs(a["aggregated_totals"]["total_paintable_wall_sqft"] - exp_gyp) < 1,
+      "gyp line = geometric total x extracted gyp share")
+check(abs(a["aggregated_totals"]["total_cmu_wall_sqft"]
+          - (vme_total - exp_gyp)) < 1,
+      "masonry line gets the remainder — total stays geometric")
+check(any("substrate" in str(r).lower()
+          for r in a.get("_pre_pricing_rfis", [])),
+      "substrate split files an RFI")
+
+a = _analysis()
+a["aggregated_totals"]["total_cmu_wall_sqft"] = 500  # 4% of 12,021 — minor
+a = T._apply_vme_authoritative_walls(a)
+check(a["_vme_authoritative"]["applied"] is True
+      and a["_vme_authoritative"]["substrate_split"] is None,
+      "incidental CMU (<10%) promotes without split")
+
+# Zero-LLM-walls rescue (MTA shape) must survive the CMU guard when the
+# job has no masonry at all.
+a = _analysis(llm_walls=0, wc=0)
+a = T._apply_vme_authoritative_walls(a)
+check(a["_vme_authoritative"]["applied"] is True,
+      "LLM read 0 walls, no CMU -> still rescued (MTA shape)")
+
 # ── Wallcovering deduction floors at zero ───────────────────────────────────
 print("\nEdge cases")
 a = T._apply_vme_authoritative_walls(
