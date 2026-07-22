@@ -1123,15 +1123,56 @@ def send_email_with_attachments(to_email, subject, body, attachment_paths,
     return True
 
 
+# Gmail rejects messages over 25 MB with SMTP 552. Attachments ride as
+# base64 (~1.37x raw bytes), so the raw-byte budget that survives the
+# envelope is ~17 MB; keep 1 MB headroom for body/headers. Annotated
+# plan sets routinely exceed this (54-192 MB on 2026-07-21 jobs) and
+# were bouncing the ENTIRE estimate email.
+_EMAIL_MSG_LIMIT = 25 * 1024 * 1024
+_B64_OVERHEAD = 1.37
+_ATTACH_BUDGET_RAW = int(_EMAIL_MSG_LIMIT / _B64_OVERHEAD) - 1024 * 1024
+
+
+def _budget_attachments(paths):
+    """Split candidate attachment paths into (kept, skipped) so the
+    base64-encoded message stays under the Gmail size limit.
+
+    Paths are considered in priority order (analysis PDF and estimate
+    PDF come before annotated drawings); a file that would blow the
+    remaining budget is skipped, but later smaller files may still fit.
+    Missing/None paths are dropped silently. Kill switch:
+    NIGHTSHIFT_EMAIL_SIZE_GUARD=0 restores attach-everything.
+    """
+    guard_on = os.environ.get(
+        "NIGHTSHIFT_EMAIL_SIZE_GUARD", "1").strip() != "0"
+    kept, skipped = [], []
+    used = 0
+    for p in paths:
+        if not p or not os.path.exists(p):
+            continue
+        size = os.path.getsize(p)
+        if guard_on and used + size > _ATTACH_BUDGET_RAW:
+            skipped.append(p)
+            continue
+        kept.append(p)
+        used += size
+    return kept, skipped
+
+
 def send_result_email(contact_info, result, extra_attachment_paths=None,
                       estimate_pdf_path=None):
     """Email the contractor that their estimate is ready.
 
     Attaches the analysis PDF, the formal branded Estimate PDF (with the
-    org's logo), and any extra attachments (annotated drawings, etc.).
+    org's logo), and any extra attachments (annotated drawings, etc.)
+    that fit the size budget — oversized files are omitted with a note
+    in the body rather than bouncing the whole message.
     The raw result JSON is intentionally *not* attached — end users don't
     know what to do with it. `send_result_json_to_admin` ships that
     separately to admin@knightshiftai.com so we still keep a copy.
+
+    Raises on SMTP failure so the caller can release the email claim
+    for a manual resend.
     """
     if not EMAIL_ADDRESS or not EMAIL_APP_PASSWORD:
         logger.warning("SMTP not configured — skipping email notification")
@@ -1146,6 +1187,24 @@ def send_result_email(contact_info, result, extra_attachment_paths=None,
     for item in costs.get("line_items", []):
         if item.get("qty", 0) > 0:
             items_text += f"  - {item['item']}: ${item['total']:,.2f}\n"
+
+    # Analysis PDF and estimate PDF first — they're small and essential.
+    # Annotated drawings are the ones that blow the budget.
+    candidates = [result.get("output_pdf_path"), estimate_pdf_path]
+    candidates += list(extra_attachment_paths or [])
+    attach_paths, skipped_paths = _budget_attachments(candidates)
+    if skipped_paths:
+        skipped_names = ", ".join(
+            os.path.basename(p) for p in skipped_paths)
+        logger.warning(
+            "Result email attachments exceed size budget — omitting: %s",
+            skipped_names)
+        omitted_note = (
+            "\nNOTE: Some files were too large to attach"
+            f" ({skipped_names}). They are archived and available on"
+            " request.\n")
+    else:
+        omitted_note = ""
 
     body = f"""Hi {contact_info['name']},
 
@@ -1173,7 +1232,7 @@ drawings. A formal proposal will follow after review.
 
 Attached: the detailed analysis PDF and a formal Estimate (PDF) you can
 forward directly to your client.
-
+{omitted_note}
 Best regards,
 {COMPANY_NAME}
 {COMPANY_PHONE}
@@ -1190,36 +1249,12 @@ Best regards,
     msg["Subject"] = "Knight Shift - Your Painting Estimate is Ready"
     msg.attach(MIMEText(body, "plain"))
 
-    pdf_path = result.get("output_pdf_path")
-    if pdf_path and os.path.exists(pdf_path):
-        with open(pdf_path, "rb") as f:
+    for attach_path in attach_paths:
+        with open(attach_path, "rb") as f:
             att = MIMEApplication(f.read(), _subtype="pdf")
             att.add_header(
                 "Content-Disposition", "attachment",
-                filename=os.path.basename(pdf_path),
-            )
-            msg.attach(att)
-
-    # Formal Estimate PDF (carries the org logo). Best-effort — if the
-    # estimate render failed earlier the path will be None and we just
-    # ship the analysis PDF + annotated drawings.
-    if estimate_pdf_path and os.path.exists(estimate_pdf_path):
-        with open(estimate_pdf_path, "rb") as f:
-            att = MIMEApplication(f.read(), _subtype="pdf")
-            att.add_header(
-                "Content-Disposition", "attachment",
-                filename=os.path.basename(estimate_pdf_path),
-            )
-            msg.attach(att)
-
-    for extra_path in extra_attachment_paths or []:
-        if not extra_path or not os.path.exists(extra_path):
-            continue
-        with open(extra_path, "rb") as f:
-            att = MIMEApplication(f.read(), _subtype="pdf")
-            att.add_header(
-                "Content-Disposition", "attachment",
-                filename=os.path.basename(extra_path),
+                filename=os.path.basename(attach_path),
             )
             msg.attach(att)
 
@@ -1232,7 +1267,12 @@ Best regards,
             server.send_message(msg)
         logger.info("Result email sent to %s", contact_info["email"])
     except Exception as exc:
+        # Re-raise so the call site can release the email claim — the
+        # old swallow left bounced sends claimed forever, which blocked
+        # every retry AND suppressed rerun emails (2026-07-08 incident,
+        # re-hit 3x on 2026-07-21).
         logger.error("Failed to send result email: %s", exc)
+        raise
 
 
 # Internal archive recipient. The raw result JSON is engineering-grade
