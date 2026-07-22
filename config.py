@@ -245,6 +245,11 @@ PRICING_MODEL = {
         "unit": "sqft", "markup": 0.04,
         "tiers": [{"min_qty": 0, "max_qty": None, "rate": 6.00}],    # Stain/clear-coat per Rider
     },
+    # ── Painted Cabinets / Millwork ── (field-painted cabinet faces, PT-x schedule rows)
+    "painted_cabinets": {
+        "unit": "sqft", "markup": 0.04,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 8.00}],    # Placeholder — confirm rate with Rider
+    },
     # ── Exterior Wall/Panel Painting ── (Rider Mazda: EP-2, EP-3, EP-4, EX-PNL)
     "exterior_painting": {
         "unit": "sqft", "markup": 0.04,
