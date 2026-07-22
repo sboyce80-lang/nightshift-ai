@@ -19734,26 +19734,52 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
             _wall_boost_fired = ('[Perimeter Wall Boost]' in _notes_blob) or ('[Wall Boost]' in _notes_blob)
         except Exception:
             _wall_boost_fired = False
+        # VME-authoritative walls are a deterministic vector measurement — phantom-floor
+        # duplication (the over-extraction these caps defend against) cannot inflate a
+        # geometric measurement, so the WALL caps can only ever slash a geometry-grounded
+        # quantity while labor hours and the Trust Summary keep the measured total
+        # (364 Main 2026-07-21: unit cap cut VME's 112,727 -> 77,556). The authoritative
+        # gate is the single owner of the wall quantity when it applied, and is itself
+        # gated by NIGHTSHIFT_VME_AUTHORITATIVE_WALLS — no separate flag here. Ceiling
+        # caps stay active in this case: ceilings are still LLM-derived.
+        _vme_walls_applied = False
+        try:
+            _vme_walls_applied = bool(
+                ((analysis or {}).get("_vme_authoritative") or {}).get("applied"))
+        except Exception:
+            _vme_walls_applied = False
         _suppress_caps = _apt_cap_boost_guard_enabled() and _wall_boost_fired
-        if not _suppress_caps:
-            if _footprint > 0:
+        _suppress_wall_caps = _suppress_caps or _vme_walls_applied
+        if _footprint > 0:
+            if not _suppress_wall_caps:
                 _wall_caps.append(round(_footprint * _stories_cap * 3.0))
+            if not _suppress_caps:
                 _ceil_caps.append(round(_footprint * _stories_cap * 1.0))
-            if _cap_units >= 4:
+        if _cap_units >= 4:
+            if not _suppress_wall_caps:
                 # 3,000 SF walls per unit + 50% of footprint for commercial/basement floors
                 # Calibrated: Fishkill manual 43,003 walls / 12 units = 3,584/unit;
                 # using 3,000 as cap allows for unit count over-estimation by building inventory.
                 _extra_floors = max(0, _stories_cap - 2)  # floors beyond 2 residential
                 _unit_wall_cap = round(_cap_units * 3000 + _extra_floors * _footprint * 0.5) if _footprint > 0 else round(_cap_units * 3300)
                 _wall_caps.append(_unit_wall_cap)
+            if not _suppress_caps:
                 _ceil_caps.append(round(_cap_units * 1100))
-        elif analysis is not None:
+        if _suppress_caps and analysis is not None:
             analysis.setdefault("notes", []).append(
                 f"[Apt Cap Boost Guard] Multi-family wall/ceiling area caps suppressed "
                 f"because a perimeter/wall boost fired this run — extraction was under-counted, "
                 f"so the caps (footprint {_footprint:,.0f} SF x {_stories_cap:g} stories) would "
                 f"fire backwards and slash a boost that is already bounded to 1.30x. Pricing the "
                 f"boosted wall/ceiling totals directly.")
+        elif _vme_walls_applied and analysis is not None:
+            analysis.setdefault("notes", []).append(
+                f"[Apt Cap VME Guard] Multi-family WALL area caps suppressed because the "
+                f"VME authoritative gate priced walls from deterministic vector geometry "
+                f"this run — the caps defend against LLM phantom-floor duplication, which "
+                f"cannot inflate a geometric measurement, so they would only slash the "
+                f"measured quantity (caps: footprint {_footprint:,.0f} SF x {_stories_cap:g} "
+                f"stories x 3.0, units x 3,000). Ceiling caps remain active.")
         if _wall_caps:
             _max_wall_sqft = min(_wall_caps)
             if wall_sqft > _max_wall_sqft:
