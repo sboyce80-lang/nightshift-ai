@@ -345,7 +345,7 @@ def _build_line_items(result: dict) -> List[dict]:
          ["stair"],
          "Risers and adjacent stair walls prepared and finished as part of the painted-stair scope."),
         ("Trim, doors, and windows",
-         ["trim", "door", "window", "hm panel", "frame"],
+         ["trim", "door", "window", "hm panel", "frame", "cabinet"],
          "Caulked, filled, sanded, and finished with two coats. Includes baseboards, casings, doors, and frames as scheduled."),
         ("Interior painting — walls & ceilings",
          ["wall", "ceiling", "soffit"],
@@ -356,6 +356,7 @@ def _build_line_items(result: dict) -> List[dict]:
                for title, _kw, scope in buckets}  # type: dict
     misc = {"title": "Additional scope", "scope": "", "total": 0.0}
 
+    specialty_labels = []
     for li in items:
         qty = float(li.get("qty") or 0)
         total = float(li.get("total") or 0)
@@ -366,10 +367,28 @@ def _build_line_items(result: dict) -> List[dict]:
         for title, kws, _scope in buckets:
             if any(kw in label for kw in kws):
                 grouped[title]["total"] += total
+                if title == "Specialty coatings":
+                    specialty_labels.append(label)
                 matched = True
                 break
         if not matched:
             misc["total"] += total
+
+    # When the Specialty bucket holds ONLY stained-wood lines, say so — a
+    # generic "Specialty coatings" row the customer can't tie to any plan
+    # scope reads as an invented charge (Rider feedback on Biddle,
+    # 2026-07-21: the $311 stained-wood line surfaced as an unexplained
+    # 'Specialty coatings' item). Gated with the stained-wood hard-numbers
+    # gate so the rollout is a single flag.
+    if os.environ.get("NIGHTSHIFT_STAINED_WOOD_GATE", "0").strip() in (
+            "1", "true", "True"):
+        if specialty_labels and all(
+                "stained wood" in l for l in specialty_labels):
+            grouped["Specialty coatings"]["title"] = \
+                "Stained & clear-coat woodwork"
+            grouped["Specialty coatings"]["scope"] = (
+                "Wood surfaces stained/clear-coated per the finish "
+                "schedule.")
 
     # Print order: Interior first (most familiar), then trim/stairs, then
     # specialty + exterior, then any uncategorized leftovers. Buckets with

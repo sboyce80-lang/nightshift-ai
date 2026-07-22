@@ -155,6 +155,7 @@ _SO_ROOM_ITEM = _so_obj({
         "painted_columns_ea": _SO_NUM,
         "wallcovering_sqft": _SO_NUM,
         "stained_wood_sqft": _SO_NUM,
+        "painted_cabinet_sqft": _SO_NUM,
         "soffit_sqft": _SO_NUM,
         "painted_railing_lf": _SO_NUM,
     }),
@@ -3322,6 +3323,39 @@ def _ext_pricing_fix_enabled():
           includes painted surfaces above 14 ft (soffits/roof peaks), which
           ladders don't reach even on 1-story buildings."""
     return os.environ.get("NIGHTSHIFT_EXT_PRICING_FIX", "0").strip() in (
+        "1", "true", "True")
+
+
+def _residential_elev_pass_enabled():
+    """Run the dedicated elevation pass on NON-commercial jobs too, when the
+    main extraction shows exterior-paint signals. The commercial-only gate
+    skipped Biddle Residence (2026-07-21): scope note 3 on A500 said the
+    existing second-floor vinyl siding/trim/windows are 'to be PAINTED',
+    the exterior dict carried nonzero siding/soffit quantities, and
+    elevation sheets A200/A201 were IN the upload — but the pass never ran
+    because building_type was residential, so the exterior shipped unpriced
+    and the RFIs asked the customer for A-200 sheets they had already
+    submitted."""
+    return os.environ.get("NIGHTSHIFT_RESIDENTIAL_ELEV_PASS", "0").strip() in (
+        "1", "true", "True")
+
+
+def _painted_cabinets_enabled():
+    """Price-or-RFI gate for painted-cabinet finish-schedule rows (see
+    _apply_painted_cabinet_gate). Biddle 2026-07-21: the schedule row
+    'Kitchen/Dining - Painted Cabinets / Paint - Benjamin Moore Advance
+    (PT-4)' was extracted and then silently dropped — no line item, no RFI."""
+    return os.environ.get("NIGHTSHIFT_PAINTED_CABINETS", "0").strip() in (
+        "1", "true", "True")
+
+
+def _stained_wood_gate_enabled():
+    """Hard-numbers gate for stained wood (see _apply_stained_wood_gate).
+    Biddle 2026-07-21: 48 SF of 'Stained Wood Panels' was self-admittedly
+    'recorded as estimate' for cabinet veneer faces that other notes
+    conclude are factory finishes — it shipped as a $311 'Specialty
+    coatings' line the customer couldn't tie to any plan scope."""
+    return os.environ.get("NIGHTSHIFT_STAINED_WOOD_GATE", "0").strip() in (
         "1", "true", "True")
 
 
@@ -7221,6 +7255,7 @@ IMPORTANT RULES:
             "painted_columns_ea": 0,
             "wallcovering_sqft": 0,
             "stained_wood_sqft": 0,
+            "painted_cabinet_sqft": 0,
             "soffit_sqft": 0,
             "painted_railing_lf": 0
           },
@@ -7251,6 +7286,7 @@ IMPORTANT RULES:
     "total_painted_columns_ea": 0,
     "total_wallcovering_sqft": 0,
     "total_stained_wood_sqft": 0,
+    "total_painted_cabinet_sqft": 0,
     "total_soffit_sqft": 0,
     "total_painted_railing_lf": 0
   },
@@ -7388,6 +7424,27 @@ Be thorough — analyze ALL pages of the PDF. Completeness is more important tha
             "═══════════════════════════════════════════════════════════\n"
         )
         prompt = viewport_directive + "\n" + prompt
+
+    # Painted-cabinet extraction instructions (NIGHTSHIFT_PAINTED_CABINETS).
+    # Appended only behind the flag so default extraction is byte-identical;
+    # note the sheet-checkpoint signature includes the prompt, so flipping
+    # the flag invalidates per-sheet checkpoints (intended — the field set
+    # changed).
+    if _painted_cabinets_enabled():
+        prompt += """
+
+Painted Cabinets / Millwork (field-painted only): Check finish schedules and millwork
+sheets (interior details/elevations/sections) for:
+  - Cabinet or millwork rows whose finish is a field PAINT spec — e.g. "Painted
+    Cabinets", a PT-x paint code on cabinet faces, "Benjamin Moore Advance" on casework
+  - Wood VENEER (WD-x) and LAMINATE (LM-x) cabinet finishes are FACTORY finishes — they
+    are NOT painted and NOT stained-wood scope; record 0 for those
+  - Calculate: painted_cabinet_sqft = visible face area from the millwork elevations/
+    sections (width × height per run or unit, counted per the drawings)
+  - Do NOT double-count the same faces as stained_wood_sqft or wall_area_sqft
+  - Hard numbers only: if the schedule calls for painted cabinets but the millwork
+    dimensions are not drawn, record 0 — the pricing gate will issue an RFI
+  - Record as "painted_cabinet_sqft" per room (set to 0 if none)"""
 
     return prompt
 
@@ -8584,14 +8641,64 @@ def _drop_stale_elevation_claims(analysis_result, merged_exterior):
               f"missing-elevation note(s); exterior anchored to pages {pages}")
 
 
+# Exterior quantity fields whose presence (without exterior_paint_sqft)
+# signals that the main pass saw exterior paint scope it could not fully
+# quantify — the case where the elevation pass has something to add.
+_EXTERIOR_QTY_SIGNAL_KEYS = (
+    "hardie_siding_sqft", "cornice_lf", "window_trim_lf", "soffit_sqft",
+    "railing_lf", "azek_trim_lf", "corner_board_lf", "steel_lintel_lf",
+)
+
+# A note mentioning paint together with one of these surface words is an
+# exterior-paint callout (Biddle A500: "Existing second floor vinyl siding,
+# trim, and windows to be PAINTED to match new exterior siding and trim").
+_EXTERIOR_PAINT_NOTE_WORDS = (
+    "siding", "exterior", "soffit", "fascia", "stucco", "facade",
+    "shutter", "porch",
+)
+
+
+def _exterior_paint_signal(analysis_result):
+    """Reason string when a job's extraction shows exterior-paint scope
+    that hasn't been quantified (exterior_paint_sqft is 0), else None.
+
+    Two deterministic signals, checked in order:
+      1. Nonzero exterior quantity fields (siding/soffit/trim/…) — the
+         main pass measured SOMETHING exterior, so elevations are worth
+         reading for the rest.
+      2. Note language pairing 'paint' with an exterior surface word.
+         Notes containing 'no exterior' are skipped so an explicit
+         exterior-excluded callout can't trigger the pass.
+    """
+    exterior = (analysis_result or {}).get("exterior") or {}
+    hits = [k for k in _EXTERIOR_QTY_SIGNAL_KEYS
+            if _num(exterior.get(k, 0)) > 0]
+    if hits:
+        return f"extracted exterior quantities present ({', '.join(hits)})"
+    texts = []
+    if exterior.get("notes"):
+        texts.append(str(exterior["notes"]))
+    for n in (analysis_result or {}).get("notes") or []:
+        texts.append(n if isinstance(n, str) else str(n))
+    for t in texts:
+        low = t.lower()
+        if "paint" not in low or "no exterior" in low:
+            continue
+        if any(w in low for w in _EXTERIOR_PAINT_NOTE_WORDS):
+            return f"exterior-paint note language: {t.strip()[:140]!r}"
+    return None
+
+
 def _maybe_run_exterior_pass(client, pdf_path, analysis_result):
-    """If `analysis_result` is missing exterior scope on a commercial job,
-    run a dedicated elevation-only extraction and merge the results.
+    """If `analysis_result` is missing exterior scope on a commercial job —
+    or, behind NIGHTSHIFT_RESIDENTIAL_ELEV_PASS, on any job whose
+    extraction shows exterior-paint signals — run a dedicated
+    elevation-only extraction and merge the results.
 
     Idempotent and side-effect-free if the analysis already has exterior
-    sqft or the building isn't commercial. Mutates `analysis_result`.
-    Emits an RFI note when no elevation pages are found OR the dedicated
-    pass also returns 0 sqft on a commercial job.
+    sqft or no trigger applies. Mutates `analysis_result`. Emits an RFI
+    note when no elevation pages are found OR the dedicated pass also
+    returns 0 sqft.
     """
     if not isinstance(analysis_result, dict):
         return
@@ -8604,15 +8711,22 @@ def _maybe_run_exterior_pass(client, pdf_path, analysis_result):
             "retail", "dealership"
         )
     )
+    res_signal = None
     if not is_commercial:
-        return
+        if _residential_elev_pass_enabled():
+            res_signal = _exterior_paint_signal(analysis_result)
+        if not res_signal:
+            return
 
     exterior = analysis_result.get("exterior", {}) or {}
     if _num(exterior.get("exterior_paint_sqft", 0)) > 0:
         return  # Already have exterior scope — don't burn an extra API call
 
-    print(f"   🏛  Commercial job with 0 exterior sqft — running dedicated "
+    bt_label = "Commercial" if is_commercial else "Non-commercial"
+    print(f"   🏛  {bt_label} job with 0 exterior sqft — running dedicated "
           f"elevation pass...")
+    if res_signal:
+        print(f"      (residential trigger: {res_signal})")
     time.sleep(10)
     ext_data = _extract_exterior_scope(client, pdf_path)
     if ext_data:
@@ -8645,13 +8759,18 @@ def _maybe_run_exterior_pass(client, pdf_path, analysis_result):
         if _num(merged.get("exterior_paint_sqft", 0)) == 0 \
                 and _num(merged.get("hardie_siding_sqft", 0)) == 0 \
                 and _num(merged.get("cornice_lf", 0)) == 0:
+            _surfaces = ("storefront, rear/service doors, fascia, soffit, "
+                         "bollards, sign band, exposed CMU") if is_commercial \
+                else ("siding, trim, soffit/fascia, porch, shutters, "
+                      "exterior doors and windows")
             analysis_result.setdefault("notes", []).append(
-                "[RFI: Exterior Scope] Commercial building with 0 sqft "
-                "exterior paint extracted from elevation pages "
-                f"({merged.get('source_pages', [])}). Confirm with owner "
-                "whether any exterior painting is required (storefront, "
-                "rear/service doors, fascia, soffit, bollards, sign band, "
-                "exposed CMU). Do not assume zero without confirmation."
+                f"[RFI: Exterior Scope] "
+                f"{'Commercial' if is_commercial else 'Residential'} "
+                "building with 0 sqft exterior paint extracted from "
+                f"elevation pages ({merged.get('source_pages', [])}). "
+                "Confirm with owner whether any exterior painting is "
+                f"required ({_surfaces}). Do not assume zero without "
+                "confirmation."
             )
     else:
         # No elevation pages found at all — most likely the PDF is a
@@ -9812,6 +9931,7 @@ def _estimate_from_room_finish_schedule(room_schedule_data, schedule_data=None):
                     "painted_columns_ea": 0,
                     "wallcovering_sqft": 0,
                     "stained_wood_sqft": 0,
+                    "painted_cabinet_sqft": 0,
                     "soffit_sqft": 0,
                     "painted_railing_lf": 0,
                 },
@@ -9888,6 +10008,7 @@ def _estimate_from_room_finish_schedule(room_schedule_data, schedule_data=None):
                 "painted_columns_ea": 0,
                 "wallcovering_sqft": 0,
                 "stained_wood_sqft": 0,
+                "painted_cabinet_sqft": 0,
                 "soffit_sqft": 0,
                 "painted_railing_lf": 0,
             },
@@ -9939,6 +10060,7 @@ def _estimate_from_room_finish_schedule(room_schedule_data, schedule_data=None):
                 "painted_columns_ea": 0,
                 "wallcovering_sqft": 0,
                 "stained_wood_sqft": 0,
+                "painted_cabinet_sqft": 0,
                 "soffit_sqft": 0,
                 "painted_railing_lf": 0,
             },
@@ -15103,6 +15225,189 @@ def _enforce_wallcovering_schedule_gate(analysis):
     return analysis
 
 
+# Words that mark a finish-schedule row as cabinet/millwork scope.
+_CABINET_ROW_WORDS = ("cabinet", "millwork", "casework", "built-in", "built in")
+# Finish-text markers meaning the surface arrives factory/shop-finished —
+# NOT field paint scope and NOT confirmation of field stain scope.
+_FACTORY_FINISH_MARKERS = (
+    "veneer", "laminate", "factory", "shop-applied", "shop applied",
+    "prefinished", "pre-finished")
+# Finish-text signals of FIELD-APPLIED stain/clear-coat work (checked after
+# the factory markers and with 'stainless' stripped).
+_STAIN_FIELD_FINISH_SIGNALS = (
+    "stain", "clear coat", "clear-coat", "clearcoat", "site finished",
+    "site-finished", "varnish", "polyurethane", "natural finish",
+    "transparent finish")
+
+
+def _schedule_painted_cabinet_rows(rfs):
+    """Finish-schedule rows that call for FIELD-PAINTED cabinets/millwork.
+
+    A row qualifies when its name or finish mentions cabinet/millwork AND the
+    finish is a paint spec (Biddle: room_name 'Kitchen/Dining - Painted
+    Cabinets', wall_finish 'Paint - Benjamin Moore Advance (PT-4)'). Rows
+    whose finish carries a factory marker (wood veneer WD-x, laminate LM-x)
+    are factory-finished casework, not paint scope."""
+    rows = []
+    for r in rfs:
+        if not isinstance(r, dict):
+            continue
+        name = str(r.get("room_name", "") or "").lower()
+        finish = str(r.get("wall_finish", "") or "").lower()
+        if not any(w in name + " " + finish for w in _CABINET_ROW_WORDS):
+            continue
+        if "paint" not in finish:
+            continue
+        if any(m in finish for m in _FACTORY_FINISH_MARKERS):
+            continue
+        rows.append(r)
+    return rows
+
+
+def _apply_painted_cabinet_gate(analysis):
+    """Price-or-RFI for painted-cabinet schedule rows
+    (NIGHTSHIFT_PAINTED_CABINETS, default OFF).
+
+    Biddle Residence 2026-07-21: the finish schedule row 'Kitchen/Dining -
+    Painted Cabinets / Paint - Benjamin Moore Advance (PT-4)' was extracted
+    and then silently dropped — no line item, no RFI — while the millwork
+    sheets (A700-A704) carried real dimensions. This gate guarantees a
+    painted-cabinet schedule row is never silent again: when
+    total_painted_cabinet_sqft was measured it prices through the
+    'painted_cabinets' cost line; when it is 0 the gate emits an RFI naming
+    the rows. Never fabricates area. Idempotent via
+    analysis['_painted_cabinet_gate']."""
+    if not isinstance(analysis, dict) or not _painted_cabinets_enabled():
+        return analysis
+    if analysis.get("_painted_cabinet_gate"):
+        return analysis
+    rows = _schedule_painted_cabinet_rows(_get_room_finish_schedule(analysis))
+    if not rows:
+        analysis["_painted_cabinet_gate"] = {
+            "noop": "no_painted_cabinet_rows"}
+        return analysis
+    labels = []
+    for r in rows:
+        nm = str(r.get("room_name", "") or "").strip() or "unnamed"
+        fin = str(r.get("wall_finish", "") or "").strip()
+        labels.append(f"{nm} ({fin})" if fin else nm)
+    agg = analysis.setdefault("aggregated_totals", {})
+    total = _num(agg.get("total_painted_cabinet_sqft", 0))
+    if total > 0:
+        analysis.setdefault("notes", []).append(
+            f"[Painted Cabinets] Finish schedule designates painted "
+            f"cabinets in {len(rows)} row(s) ({'; '.join(labels[:6])}"
+            f"{'…' if len(labels) > 6 else ''}); {total:,.0f} SF of "
+            f"measured cabinet faces priced.")
+    else:
+        _gate_add_rfi(
+            analysis, "Painted Cabinets",
+            f"The finish schedule calls for FIELD-PAINTED cabinets in "
+            f"{len(rows)} row(s) — {'; '.join(labels[:6])}"
+            f"{'…' if len(labels) > 6 else ''} — but no cabinet face area "
+            f"could be measured from the millwork drawings, so cabinet "
+            f"painting is $0 in this bid. Confirm the painted-cabinet "
+            f"extents (elevations or LF of uppers/lowers with heights) and "
+            f"we will price it.")
+        print(f"   🚪 Painted-cabinet gate: {len(rows)} schedule row(s) "
+              f"call for painted cabinets, 0 SF measured — RFI issued",
+              flush=True)
+    analysis["_painted_cabinet_gate"] = {
+        "schedule_rows": labels[:20],
+        "measured_sqft": round(total, 2),
+        "rfi_issued": total <= 0,
+    }
+    return analysis
+
+
+def _schedule_confirms_field_stained_wood(rfs):
+    """Return a row label when the finish schedule confirms FIELD-APPLIED
+    stain/clear-coat scope, else None.
+
+    Only wall/ceiling/base finish fields count (floor_finish is flooring-
+    contractor scope — 'Oak, Site Finished' floors must not confirm stained
+    wall panels). A field whose text carries a factory marker (veneer,
+    laminate, shop-applied…) never confirms, whatever else it says."""
+    for r in rfs or []:
+        if not isinstance(r, dict):
+            continue
+        for field in ("wall_finish", "ceiling_finish", "base_finish"):
+            v = str(r.get(field, "") or "").lower()
+            if not v:
+                continue
+            if any(m in v for m in _FACTORY_FINISH_MARKERS):
+                continue
+            v = v.replace("stainless", "")
+            if any(s in v for s in _STAIN_FIELD_FINISH_SIGNALS):
+                nm = str(r.get("room_name", "") or "").strip() or "unnamed"
+                return f"{nm}: {str(r.get(field, '')).strip()[:80]}"
+    return None
+
+
+def _apply_stained_wood_gate(analysis):
+    """Hard-numbers gate for stained wood
+    (NIGHTSHIFT_STAINED_WOOD_GATE, default OFF).
+
+    Biddle Residence 2026-07-21: 48 SF of 'Stained Wood Panels' shipped as a
+    $311 'Specialty coatings' line the customer couldn't tie to any plan
+    scope — the extraction's own notes say the quantity was 'recorded as
+    estimate' for cabinet veneer faces that are factory finishes. When an
+    authoritative finish schedule is present and NO row confirms
+    field-applied stain/clear-coat (veneer/laminate are factory finishes,
+    not confirmation), the stained-wood quantity is zeroed with an RFI.
+    Jobs without an authoritative schedule are untouched (fail-safe).
+    Idempotent via analysis['_stained_wood_gate']."""
+    if not isinstance(analysis, dict) or not _stained_wood_gate_enabled():
+        return analysis
+    if analysis.get("_stained_wood_gate"):
+        return analysis
+    agg = analysis.setdefault("aggregated_totals", {})
+    sw = _num(agg.get("total_stained_wood_sqft", 0))
+    if sw <= 0:
+        analysis["_stained_wood_gate"] = {"noop": "no_stained_wood"}
+        return analysis
+    rfs = _get_room_finish_schedule(analysis)
+    if len(rfs) < _SCHEDULE_FINISH_AUTHORITY_MIN_ROWS:
+        analysis["_stained_wood_gate"] = {"noop": "schedule_too_thin",
+                                          "rows": len(rfs),
+                                          "kept_sqft": round(sw, 2)}
+        return analysis
+    confirmed = _schedule_confirms_field_stained_wood(rfs)
+    if confirmed:
+        analysis["_stained_wood_gate"] = {"kept_sqft": round(sw, 2),
+                                          "confirmed_by": confirmed}
+        return analysis
+    # Zero the aggregate and every per-room quantity that fed it.
+    for floor in analysis.get("floors", []) or []:
+        for room in floor.get("rooms", []) or []:
+            if not isinstance(room, dict):
+                continue
+            for holder_key in ("elements", "dimensions"):
+                holder = room.get(holder_key)
+                if isinstance(holder, dict) and \
+                        _num(holder.get("stained_wood_sqft", 0)) > 0:
+                    holder["stained_wood_sqft"] = 0
+    agg["total_stained_wood_sqft"] = 0
+    analysis.setdefault("notes", []).append(
+        f"[Stained Wood] Hard-numbers gate removed {sw:,.0f} SF of stained "
+        f"wood: the finish schedule has no row confirming field-applied "
+        f"stain/clear-coat (wood veneer and laminate finishes are "
+        f"factory-applied). Stained wood is priced only where the schedule "
+        f"or drawings confirm field finishing.")
+    _gate_add_rfi(
+        analysis, "Stained Wood",
+        f"{sw:,.0f} SF of stained/clear-coat wood was extracted, but the "
+        f"finish schedule does not confirm any field-applied stain or "
+        f"clear-coat scope (the wood surfaces on the schedule are "
+        f"veneer/laminate factory finishes), so it is $0 in this bid. "
+        f"Confirm whether any site stain/clear-coat work is required and "
+        f"on which surfaces.")
+    print(f"   🪵 Stained-wood gate: zeroed {sw:,.0f} SF "
+          f"(no schedule confirmation of field stain scope)", flush=True)
+    analysis["_stained_wood_gate"] = {"zeroed_sqft": round(sw, 2)}
+    return analysis
+
+
 def _door_schedule_scope_fix_enabled():
     return os.environ.get("NIGHTSHIFT_DOOR_SCHEDULE_FIX", "0").strip() in (
         "1", "true", "True")
@@ -16471,6 +16776,16 @@ def build_priced_takeoff(analysis, strict=None):
     # shrink walls too. Flag-gated; no-op when off.
     analysis = _enforce_wallcovering_schedule_gate(analysis)
 
+    # Painted-cabinet price-or-RFI gate: a finish-schedule row calling for
+    # field-painted cabinets must price (measured SF) or RFI — never vanish
+    # silently. Flag-gated; no-op when off.
+    analysis = _apply_painted_cabinet_gate(analysis)
+
+    # Stained-wood hard-numbers gate: zero unconfirmed stained wood when an
+    # authoritative schedule shows only factory wood finishes. Flag-gated;
+    # no-op when off.
+    analysis = _apply_stained_wood_gate(analysis)
+
     # Substrate provenance gate: review flags for assumed wall substrates and
     # service-area "painted GYP" ceilings (the TSC gyp/CMU inversion and the
     # Mercedes exposed-ceiling misread). RFI + manual review only — never a
@@ -16668,6 +16983,7 @@ def _recalculate_totals(analysis):
     total_painted_columns = 0
     total_wallcovering = 0
     total_stained_wood = 0
+    total_painted_cabinets = 0
     total_soffit = 0
     total_painted_railing = 0
     # Extended-scope operator options (flag-gated; 0 when NIGHTSHIFT_EXTENDED_SCOPE off)
@@ -16894,6 +17210,10 @@ def _recalculate_totals(analysis):
 
             # Stained wood / clear-coat panels
             total_stained_wood += _num(elems.get("stained_wood_sqft", 0)) * multiplier
+
+            # Painted cabinet/millwork faces (PT-x schedule rows)
+            total_painted_cabinets += _num(
+                elems.get("painted_cabinet_sqft", 0)) * multiplier
 
             # Interior soffits (GYP drywall drops)
             total_soffit += _num(elems.get("soffit_sqft", 0)) * multiplier
@@ -17421,6 +17741,7 @@ def _recalculate_totals(analysis):
         "total_painted_columns_ea": total_painted_columns,
         "total_wallcovering_sqft": total_wallcovering,
         "total_stained_wood_sqft": total_stained_wood,
+        "total_painted_cabinet_sqft": total_painted_cabinets,
         "total_soffit_sqft": total_soffit,
         "total_painted_railing_lf": total_painted_railing,
         # Extended-scope operator options (0 unless NIGHTSHIFT_EXTENDED_SCOPE on)
@@ -19471,6 +19792,10 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     # Stained wood / clear-coat panels
     stained_wood_sqft = _num(aggregated_totals.get('total_stained_wood_sqft', 0))
 
+    # Painted cabinet/millwork faces
+    painted_cabinet_sqft = _num(
+        aggregated_totals.get('total_painted_cabinet_sqft', 0))
+
     # Interior soffits (GYP drywall drops)
     soffit_sqft = _num(aggregated_totals.get('total_soffit_sqft', 0))
 
@@ -19759,6 +20084,7 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
             except ValueError:
                 pass
     sw_rate     = _get_tiered_rate(pm['stained_wood'], stained_wood_sqft) if 'stained_wood' in pm else 6.00
+    pc_rate     = _get_tiered_rate(pm['painted_cabinets'], painted_cabinet_sqft) if 'painted_cabinets' in pm else 8.00
     soffit_rate = _get_tiered_rate(pm['interior_soffit'], soffit_sqft) if 'interior_soffit' in pm else 0.85
     corn_rate   = _get_tiered_rate(pm['exterior_cornice'], cornice_lf)
     wt_rate     = _get_tiered_rate(pm['exterior_window_trim'], window_trim_lf)
@@ -20181,6 +20507,8 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
               wc_rate, _get_markup(wc_markup_key) if wc_markup_key in pm else 0.04),
         _line(f"Stained Wood Panels - {stained_wood_sqft:,.0f} sqft @ ${sw_rate:.2f}", stained_wood_sqft,
               sw_rate, _get_markup('stained_wood') if 'stained_wood' in pm else 0.04),
+        _line(f"Painted Cabinets - {painted_cabinet_sqft:,.0f} sqft @ ${pc_rate:.2f}", painted_cabinet_sqft,
+              pc_rate, _get_markup('painted_cabinets') if 'painted_cabinets' in pm else 0.04),
         _line(f"Interior Soffits - {soffit_sqft:,.0f} sqft @ ${soffit_rate:.2f}", soffit_sqft,
               soffit_rate, _get_markup('interior_soffit') if 'interior_soffit' in pm else 0.06),
         _line(f"Exterior Cornice - {cornice_lf:,.0f} LF @ ${corn_rate:.2f}", cornice_lf,
@@ -20239,7 +20567,8 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
         _interior_keys = {"Gyp. Walls", "Gyp. Ceilings", "CMU Walls", "Dryfall Ceiling",
                           "Base Trim", "Doors", "Windows", "Stairs", "Gyp. Between",
                           "Level 5", "Concrete Sealer", "Painted Columns",
-                          "Wallcovering", "Stained Wood", "Interior Soffits", "Interior Lift",
+                          "Wallcovering", "Stained Wood", "Painted Cabinets",
+                          "Interior Soffits", "Interior Lift",
                           "Lyme Wash", "Plaster Walls", "Epoxy Walls", "Precast Walls (Interior)"}
         # Remove individual interior items
         line_items = [li for li in line_items
@@ -21023,6 +21352,7 @@ def interactive_adjustments(analysis, costs, pricing_model_used=None):
         ("total_concrete_floor_sqft",       "Concrete Floor (sqft)"),
         ("total_wallcovering_sqft",         "Wallcovering (sqft)"),
         ("total_stained_wood_sqft",         "Stained Wood (sqft)"),
+        ("total_painted_cabinet_sqft",      "Painted Cabinets (sqft)"),
         ("total_soffit_sqft",               "Interior Soffits (sqft)"),
         ("total_gyp_between_stairs_sqft",   "Gyp. Between Stairs (sqft)"),
         ("total_level_5_finish_sqft",       "Level 5 Finish (sqft)"),
@@ -21054,6 +21384,7 @@ def interactive_adjustments(analysis, costs, pricing_model_used=None):
         ("painted_columns",    "Painted Columns"),
         ("wallcovering_install", "Wallcovering Install"),
         ("stained_wood",       "Stained Wood"),
+        ("painted_cabinets",   "Painted Cabinets"),
         ("exterior_cornice",   "Ext. Cornice"),
         ("exterior_window_trim","Ext. Window Trim"),
         ("exterior_painting",  "Ext. Painting"),
