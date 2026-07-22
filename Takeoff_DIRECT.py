@@ -3288,6 +3288,43 @@ def _apt_cap_boost_guard_enabled():
         "1", "true", "True")
 
 
+def _elev_reconcile_enabled():
+    """Drop stale 'elevation sheets missing' claims once the dedicated
+    elevation pass has actually read those sheets. The tiled room-extraction
+    call is deliberately fed only plan-sheet tiles, so its notes truthfully
+    say the elevations were 'not included in the pages provided' — but that
+    claim is false at the SET level, and downstream it becomes RFIs asking
+    the customer for sheets they already submitted plus a Will synthesis
+    that treats the elevation-derived exterior takeoff as unanchored
+    (BofA Vails Gate 2026-07-21: confidence 32%, two bogus Missing-Drawings
+    RFIs for A01.01/A01.02 which were pages 4-5 of the upload)."""
+    return os.environ.get("NIGHTSHIFT_ELEV_RECONCILE", "0").strip() in (
+        "1", "true", "True")
+
+
+def _ext_pricing_fix_enabled():
+    """Exterior pricing fixes from the BofA Vails Gate run (2026-07-21):
+    extracted exterior quantities that never reached the cost lines.
+      (a) 'vinyl siding' in the factory-finish keyword list zeroed Azek/
+          corner boards even though the notes explicitly said the vinyl
+          siding is prepped and PAINTED (EXPT-15) — explicit paint language
+          now overrides the factory-finish suppression;
+      (b) the Azek-covers-window-casings dedup zeroed 320 LF of window trim
+          because of 60 LF of Azek, and ran before the suppression that then
+          zeroed the Azek itself — it now runs after suppression and only
+          when Azek LF >= window-trim LF;
+      (c) exterior soffit_sqft was extracted but never priced (config key
+          exterior_soffit_fascia existed unwired);
+      (d) exterior_door_count was extracted by the elevation pass but
+          dropped in the merge and never priced;
+      (e) an explicit lift_required=true with real exterior scope was zeroed
+          by the blanket single-story rule — the extractor's criterion
+          includes painted surfaces above 14 ft (soffits/roof peaks), which
+          ladders don't reach even on 1-story buildings."""
+    return os.environ.get("NIGHTSHIFT_EXT_PRICING_FIX", "0").strip() in (
+        "1", "true", "True")
+
+
 def _title_text_is_plan_sheet(raw_text):
     """Classify a page as a plan sheet from its (title-block) text.
 
@@ -8487,6 +8524,66 @@ exterior scope visible.")."""
         return None
 
 
+_ELEV_MISSING_SIGNALS = (
+    "not included", "were not included", "not provided", "were not provided",
+    "missing", "cannot be extracted without", "request sheet", "request sheets",
+    "not visible", "were not visible",
+)
+
+
+def _drop_stale_elevation_claims(analysis_result, merged_exterior):
+    """After the dedicated elevation pass has successfully read elevation
+    sheets, remove earlier notes claiming those sheets are missing.
+
+    The tiled room-extraction call only sees plan-sheet tiles, so its notes
+    legitimately report the elevations as 'not included in the pages
+    provided' — true for that call, false for the upload. Left in place,
+    those claims become Missing-Drawings RFIs for sheets the customer
+    already submitted, and Will treats the elevation-derived exterior
+    quantities as unanchored placeholders. Only fires when the elevation
+    pass returned at least one nonzero quantity, and only drops segments
+    that BOTH mention elevations AND carry a missing-signal phrase — a
+    genuinely absent door schedule note is untouched. Gated by
+    NIGHTSHIFT_ELEV_RECONCILE."""
+    if not _elev_reconcile_enabled():
+        return
+    _has_data = any(_num(merged_exterior.get(k, 0)) > 0 for k in (
+        "exterior_paint_sqft", "hardie_siding_sqft", "cornice_lf",
+        "window_trim_lf", "soffit_sqft", "railing_lf", "azek_trim_lf",
+        "corner_board_lf", "steel_lintel_lf", "exterior_door_count",
+        "bollard_count", "pipe_handrail_lf"))
+    if not _has_data:
+        return
+
+    def _is_stale(segment):
+        s = str(segment).lower()
+        return ("elevation" in s
+                and any(sig in s for sig in _ELEV_MISSING_SIGNALS))
+
+    dropped = 0
+    ext_notes = str(merged_exterior.get("notes", "") or "")
+    if ext_notes:
+        kept = [seg for seg in ext_notes.split(" | ") if not _is_stale(seg)]
+        dropped += ext_notes.count(" | ") + 1 - len(kept)
+        merged_exterior["notes"] = " | ".join(kept)
+
+    a_notes = analysis_result.get("notes")
+    if isinstance(a_notes, list):
+        kept_a = [n for n in a_notes if not _is_stale(n)]
+        dropped += len(a_notes) - len(kept_a)
+        analysis_result["notes"] = kept_a
+
+    if dropped:
+        pages = merged_exterior.get("source_pages", [])
+        analysis_result.setdefault("notes", []).append(
+            f"[Elevation Reconcile] The dedicated exterior pass located and "
+            f"read the elevation sheets (pages {pages}) — {dropped} earlier "
+            f"note(s) claiming elevation sheets were missing were dropped as "
+            f"stale. Exterior quantities are anchored to those sheets.")
+        print(f"   🏛  Elevation reconcile: dropped {dropped} stale "
+              f"missing-elevation note(s); exterior anchored to pages {pages}")
+
+
 def _maybe_run_exterior_pass(client, pdf_path, analysis_result):
     """If `analysis_result` is missing exterior scope on a commercial job,
     run a dedicated elevation-only extraction and merge the results.
@@ -8525,7 +8622,7 @@ def _maybe_run_exterior_pass(client, pdf_path, analysis_result):
         for key in (
             "exterior_paint_sqft", "hardie_siding_sqft", "cornice_lf",
             "window_trim_lf", "soffit_sqft", "railing_lf", "azek_trim_lf",
-            "corner_board_lf", "steel_lintel_lf",
+            "corner_board_lf", "steel_lintel_lf", "exterior_door_count",
             "bollard_count", "pipe_handrail_lf",
         ):
             if _num(merged.get(key, 0)) == 0 and _num(ext_data.get(key, 0)) > 0:
@@ -8541,6 +8638,7 @@ def _maybe_run_exterior_pass(client, pdf_path, analysis_result):
             merged["notes"] = (existing + " | " if existing else "") + str(ext_note)
         merged["source_pages"] = ext_data.get("source_pages", [])
         analysis_result["exterior"] = merged
+        _drop_stale_elevation_claims(analysis_result, merged)
 
         # If pass returned all zeros on a commercial job, emit an RFI rather
         # than silently dropping exterior scope.
@@ -19411,8 +19509,14 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
 
     # Exterior window trim: when Azek trim is present, window casings are already
     # covered by the Azek line item. Suppress to avoid double-counting.
-    if azek_lf > 0 and window_trim_lf > 0:
-        window_trim_lf = 0
+    # Under NIGHTSHIFT_EXT_PRICING_FIX this dedup is deferred until after the
+    # factory-finish suppression (which can zero the Azek itself) and only
+    # fires when the Azek LF actually covers the casing LF — 60 LF of Azek
+    # trash-enclosure boards must not erase 320 LF of window casings
+    # (BofA Vails Gate 2026-07-21: both quantities ended up at 0).
+    if not _ext_pricing_fix_enabled():
+        if azek_lf > 0 and window_trim_lf > 0:
+            window_trim_lf = 0
 
     # --- Hardie/Azek/Lintel: price by default when extraction found them ---
     # If Claude measured Hardie sqft, Azek LF, corner boards, or steel lintels
@@ -19435,6 +19539,22 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     _scope_says_no_paint = any(kw in _scope_ext for kw in (
         'no exterior paint', 'no siding paint', 'exterior excluded',
         'siding excluded', 'do not paint siding'))
+    # Explicit paint language overrides the factory-finish keyword hit: the
+    # keywords above treat any 'vinyl siding' mention as unpainted, but some
+    # scopes explicitly repaint it (BofA Vails Gate: "painted vinyl siding
+    # (EXPT-15)", "vinyl siding is prepped and painted per notes 08/09" —
+    # the keyword zeroed the Azek and corner boards on a job whose whole
+    # point was painting the siding).
+    if _ext_pricing_fix_enabled() and _siding_factory_finished:
+        _painted_siding_signals = (
+            'painted vinyl', 'paint vinyl', 'paint the vinyl',
+            'painted siding', 'paint siding', 'paint the siding',
+            'siding is prepped and painted', 'prepped and painted',
+            'siding to be painted', 'paint existing siding',
+            'siding receives paint', 'siding receives new paint',
+            'repaint siding', 'repaint the siding', 'repainted siding')
+        if any(kw in _ext_notes for kw in _painted_siding_signals):
+            _siding_factory_finished = False
     _suppress_siding = _siding_factory_finished or _scope_says_no_paint
 
     if _suppress_siding:
@@ -19446,6 +19566,25 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
             corner_lf = 0
         if steel_lintel_lf_ext > 0:
             steel_lintel_lf_ext = 0
+
+    # Deferred Azek/window-casing dedup (see comment at the legacy site
+    # above): runs after the suppression so a suppressed Azek quantity can
+    # no longer erase real window trim, and only when the Azek LF is large
+    # enough to plausibly BE the casing stock.
+    if _ext_pricing_fix_enabled():
+        if azek_lf > 0 and window_trim_lf > 0 and azek_lf >= window_trim_lf:
+            window_trim_lf = 0
+
+    # Exterior soffit/fascia + exterior HM doors — extracted by the
+    # elevation pass but historically never priced: the
+    # exterior_soffit_fascia config key existed unwired, and
+    # exterior_door_count was dropped by the merge key list
+    # (BofA Vails Gate: 480 SF soffit + 2 painted HM service doors at $0).
+    ext_soffit_sqft = 0
+    ext_doors_ea = 0
+    if _ext_pricing_fix_enabled():
+        ext_soffit_sqft = _num(exterior.get('soffit_sqft', 0))
+        ext_doors_ea = _num(exterior.get('exterior_door_count', 0))
 
     # --- Cornice: keep if extraction found it, suppress only if zero ---
     # Cornice/brackets are almost always field-painted, even on new construction.
@@ -19522,24 +19661,38 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     lift_needed = 1 if exterior.get('lift_required', False) else 0
     int_lift_needed = 1 if exterior.get('interior_lift_required', False) else 0
 
-    # Single-story buildings never need exterior lifts (ladders suffice)
-    _total_stories_lift = _num(project_info.get('total_stories', 1))
-    if _total_stories_lift <= 1 and lift_needed:
-        lift_needed = 0
-
-    # If any exterior scope exists, require exterior lift (unless single-family ≤3 stories)
-    # Cornice work on 2+ story buildings requires a lift — ladders only suffice at residential scale.
     # Complete list of priced exterior quantities (painted_railing is excluded —
     # it is frequently interior stair railing, as on the Beloit Clinic reno).
     # Stain quantities are resolved into locals further down; read them straight
     # from the exterior dict here so the lift check doesn't depend on ordering.
+    # Computed BEFORE the single-story rule so that rule can distinguish an
+    # explicit lift_required with real exterior scope from a height-only flag.
     has_any_ext = (
         ext_paint_sqft > 0 or hardie_sqft > 0 or azek_lf > 0 or cornice_lf > 0
         or window_trim_lf > 0 or corner_lf > 0 or steel_lintel_lf_ext > 0
+        or ext_soffit_sqft > 0 or ext_doors_ea > 0
         or _num(exterior.get('stain_siding_sqft', 0)) > 0
         or _num(exterior.get('stain_trim_lf', 0)) > 0
         or _num(exterior.get('stain_railing_lf', 0)) > 0
     )
+
+    # Single-story buildings never need exterior lifts (ladders suffice) —
+    # UNLESS the extractor explicitly set lift_required on a job with real
+    # exterior scope. The extractor's criterion includes painted surfaces
+    # above ~14 ft (soffits, roof peaks, parapets), which ladders don't
+    # reach even on 1-story buildings (BofA Vails Gate: 1-story branch,
+    # soffit/roof-peak work >14 ft, lift silently dropped from the bid).
+    _total_stories_lift = _num(project_info.get('total_stories', 1))
+    if _total_stories_lift <= 1 and lift_needed:
+        _explicit_lift_with_scope = (
+            _ext_pricing_fix_enabled()
+            and bool(exterior.get('lift_required', False))
+            and has_any_ext)
+        if not _explicit_lift_with_scope:
+            lift_needed = 0
+
+    # If any exterior scope exists, require exterior lift (unless single-family ≤3 stories)
+    # Cornice work on 2+ story buildings requires a lift — ladders only suffice at residential scale.
     if has_any_ext and lift_needed == 0:
         # Single-family homes ≤3 stories use ladders, not lifts
         _sf_stories_ext = _num(project_info.get('total_stories', 0))
@@ -19614,6 +19767,8 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     azek_rate   = _get_tiered_rate(pm['exterior_azek_trim'], azek_lf) if 'exterior_azek_trim' in pm else 9.00
     corner_rate = _get_tiered_rate(pm['exterior_corner_board'], corner_lf) if 'exterior_corner_board' in pm else 9.00
     lintel_rate = _get_tiered_rate(pm['exterior_steel_lintel'], steel_lintel_lf_ext) if 'exterior_steel_lintel' in pm else 32.00
+    ext_soffit_rate = _get_tiered_rate(pm['exterior_soffit_fascia'], ext_soffit_sqft) if 'exterior_soffit_fascia' in pm else 7.25
+    ext_door_rate = _get_tiered_rate(pm['doors_hm_panel'], ext_doors_ea)
     # Extended-scope rates (operator sets these in the Pricing tab; default $0)
     epoxy_rate      = _get_tiered_rate(pm['epoxy_wall_area'], epoxy_sqft) if 'epoxy_wall_area' in pm else 0.0
     precast_int_rate = _get_tiered_rate(pm['precast_walls_interior'], precast_int_sqft) if 'precast_walls_interior' in pm else 0.0
@@ -19734,26 +19889,52 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
             _wall_boost_fired = ('[Perimeter Wall Boost]' in _notes_blob) or ('[Wall Boost]' in _notes_blob)
         except Exception:
             _wall_boost_fired = False
+        # VME-authoritative walls are a deterministic vector measurement — phantom-floor
+        # duplication (the over-extraction these caps defend against) cannot inflate a
+        # geometric measurement, so the WALL caps can only ever slash a geometry-grounded
+        # quantity while labor hours and the Trust Summary keep the measured total
+        # (364 Main 2026-07-21: unit cap cut VME's 112,727 -> 77,556). The authoritative
+        # gate is the single owner of the wall quantity when it applied, and is itself
+        # gated by NIGHTSHIFT_VME_AUTHORITATIVE_WALLS — no separate flag here. Ceiling
+        # caps stay active in this case: ceilings are still LLM-derived.
+        _vme_walls_applied = False
+        try:
+            _vme_walls_applied = bool(
+                ((analysis or {}).get("_vme_authoritative") or {}).get("applied"))
+        except Exception:
+            _vme_walls_applied = False
         _suppress_caps = _apt_cap_boost_guard_enabled() and _wall_boost_fired
-        if not _suppress_caps:
-            if _footprint > 0:
+        _suppress_wall_caps = _suppress_caps or _vme_walls_applied
+        if _footprint > 0:
+            if not _suppress_wall_caps:
                 _wall_caps.append(round(_footprint * _stories_cap * 3.0))
+            if not _suppress_caps:
                 _ceil_caps.append(round(_footprint * _stories_cap * 1.0))
-            if _cap_units >= 4:
+        if _cap_units >= 4:
+            if not _suppress_wall_caps:
                 # 3,000 SF walls per unit + 50% of footprint for commercial/basement floors
                 # Calibrated: Fishkill manual 43,003 walls / 12 units = 3,584/unit;
                 # using 3,000 as cap allows for unit count over-estimation by building inventory.
                 _extra_floors = max(0, _stories_cap - 2)  # floors beyond 2 residential
                 _unit_wall_cap = round(_cap_units * 3000 + _extra_floors * _footprint * 0.5) if _footprint > 0 else round(_cap_units * 3300)
                 _wall_caps.append(_unit_wall_cap)
+            if not _suppress_caps:
                 _ceil_caps.append(round(_cap_units * 1100))
-        elif analysis is not None:
+        if _suppress_caps and analysis is not None:
             analysis.setdefault("notes", []).append(
                 f"[Apt Cap Boost Guard] Multi-family wall/ceiling area caps suppressed "
                 f"because a perimeter/wall boost fired this run — extraction was under-counted, "
                 f"so the caps (footprint {_footprint:,.0f} SF x {_stories_cap:g} stories) would "
                 f"fire backwards and slash a boost that is already bounded to 1.30x. Pricing the "
                 f"boosted wall/ceiling totals directly.")
+        elif _vme_walls_applied and analysis is not None:
+            analysis.setdefault("notes", []).append(
+                f"[Apt Cap VME Guard] Multi-family WALL area caps suppressed because the "
+                f"VME authoritative gate priced walls from deterministic vector geometry "
+                f"this run — the caps defend against LLM phantom-floor duplication, which "
+                f"cannot inflate a geometric measurement, so they would only slash the "
+                f"measured quantity (caps: footprint {_footprint:,.0f} SF x {_stories_cap:g} "
+                f"stories x 3.0, units x 3,000). Ceiling caps remain active.")
         if _wall_caps:
             _max_wall_sqft = min(_wall_caps)
             if wall_sqft > _max_wall_sqft:
@@ -20016,6 +20197,10 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
               corner_rate, _get_markup('exterior_corner_board') if 'exterior_corner_board' in pm else 0.05),
         _line(f"Ext. Steel Lintels - {steel_lintel_lf_ext:,.0f} LF @ ${lintel_rate:.2f}", steel_lintel_lf_ext,
               lintel_rate, _get_markup('exterior_steel_lintel') if 'exterior_steel_lintel' in pm else 0.05),
+        _line(f"Ext. Soffit/Fascia - {ext_soffit_sqft:,.0f} sqft @ ${ext_soffit_rate:.2f}", ext_soffit_sqft,
+              ext_soffit_rate, _get_markup('exterior_soffit_fascia') if 'exterior_soffit_fascia' in pm else 0.06),
+        _line(f"Ext. HM Doors - {ext_doors_ea:.0f} EA @ ${ext_door_rate:.2f}", ext_doors_ea,
+              ext_door_rate, _get_markup('doors_hm_panel')),
         _line(f"Exterior Lift Rental - {lift_needed} EA @ ${lift_rate:.2f}", lift_needed,
               lift_rate, _get_markup('exterior_lift_rental')),
         _line(f"Interior Lift Rental - {int_lift_needed} EA @ ${int_lift_rate:.2f}", int_lift_needed,
