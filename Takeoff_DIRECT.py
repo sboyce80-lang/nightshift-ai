@@ -3138,6 +3138,54 @@ def _per_sheet_retry_enabled():
         "1", "true", "True")
 
 
+def _failed_sheet_retry_enabled():
+    """End-of-run retry of individually FAILED plan sheets — distinct from
+    the whole-file collapse retry above. A page that returned None from
+    _extract_single_sheet has already burned _call_sheet_api's in-call
+    retry ladder, so it is retried again only AFTER the rest of the run
+    completes: transient API conditions get the length of the remaining
+    sheets to clear, and a fresh call also re-rolls unparseable-response
+    failures the ladder never retries."""
+    return os.environ.get("NIGHTSHIFT_FAILED_SHEET_RETRY", "0").strip() in (
+        "1", "true", "True")
+
+
+def _failed_sheet_retry_rounds():
+    """End-of-run passes over the still-failed pages, clamped to 1-3."""
+    try:
+        n = int(os.environ.get("NIGHTSHIFT_FAILED_SHEET_RETRY_N", "2"))
+    except (ValueError, TypeError):
+        n = 2
+    return max(1, min(3, n))
+
+
+def _retry_failed_sheets(failed_pages, attempt_fn, rounds):
+    """Retry scheduler for individually failed plan sheets.
+
+    Runs up to `rounds` passes over the still-failed pages, calling
+    attempt_fn(page_idx0) -> truthy on success, and stops early once
+    nothing is left. An attempt that raises counts as a failure for that
+    page without aborting the pass. Pure control flow (no API) so the
+    round/recovery accounting is unit-testable offline. Returns
+    (recovered_pages, still_failed_pages)."""
+    recovered = []
+    remaining = list(failed_pages or [])
+    for _ in range(max(1, rounds)):
+        if not remaining:
+            break
+        still = []
+        for pg in remaining:
+            ok = False
+            try:
+                ok = bool(attempt_fn(pg))
+            except Exception as exc:
+                print(f"      ⚠️  Sheet retry crashed on page {pg + 1}: "
+                      f"{type(exc).__name__}: {str(exc)[:120]}")
+            (recovered if ok else still).append(pg)
+        remaining = still
+    return recovered, remaining
+
+
 # Wall-material tokens that mark a room as CMU/masonry/exposed (tracked
 # separately from paintable GYP). Used to isolate the GYP-wall collapse signal.
 _PER_SHEET_CMU_WALL_HINTS = (
@@ -4301,6 +4349,66 @@ def _analyze_pdf_per_sheet(client, pdf_path, scope_notes="",
         sheet_results.append({"page_idx0": pg, "sheet_id": sheet_id,
                               "analysis": sheet_analysis})
 
+    # End-of-run second chance for sheets that failed individually (Otto
+    # Cadillac 2026-07-21: pages 28-29 — the door/finish-schedule area
+    # sheets — each failed once and shipped as coverage holes, costing the
+    # estimate its door counts and wall finishes). See
+    # _failed_sheet_retry_enabled for why the retry waits until now.
+    recovered_pages = []
+    if failed_pages and _failed_sheet_retry_enabled():
+
+        def _attempt_failed_sheet(pg):
+            sheet_id = _sheet_id_for(pg)
+            page_no = pg + 1
+            parsed = parsed_pages.get(pg)
+            sheet_context = _build_sheet_context(sheet_id, page_no,
+                                                 total_pages,
+                                                 text_layers.get(pg))
+            print(f"      🔁 Sheet {sheet_id} (p{page_no}): retrying...")
+            sheet_analysis = _extract_single_sheet(
+                client, pdf_path, pg, sheet_id, static_prompt, sheet_context)
+            if sheet_analysis is None:
+                return False
+            anchored, n_rooms = _stamp_sheet_provenance(
+                sheet_analysis, sheet_id, page_no, parsed)
+            if verify_on and n_rooms >= 0:
+                verification = _verify_single_sheet(
+                    client, pdf_path, pg, sheet_id, sheet_analysis, parsed)
+                if verification:
+                    n_added, n_flagged = _apply_sheet_verification(
+                        sheet_analysis, verification, sheet_id, page_no,
+                        parsed)
+                    if n_added or n_flagged:
+                        print(f"         🔎 verify: +{n_added} missed "
+                              f"room(s), {n_flagged} unanchored flag(s)")
+                else:
+                    print(f"         🔎 verify: no result (non-fatal)")
+            ckpt_key = _sheet_checkpoint_key(ckpt_prompt_sig, sheet_context,
+                                             verify_on)
+            _sheet_checkpoint_save(ckpt_dir, pg, ckpt_key, sheet_id,
+                                   sheet_analysis)
+            n_rooms_total = sum(len(fl.get("rooms") or [])
+                                for fl in (sheet_analysis.get("floors") or []))
+            print(f"         → {n_rooms_total} room(s) (recovered on retry)")
+            # Upgrade-only ledger: "measured" (rank 4) supersedes the
+            # "failed" (rank 1) mark from the first attempt, so the
+            # coverage gate stops flagging this page.
+            _ledger_mark(pdf_path, [pg], "measured",
+                         f"per-sheet retry recovered (sheet {sheet_id})")
+            sheet_results.append({"page_idx0": pg, "sheet_id": sheet_id,
+                                  "analysis": sheet_analysis})
+            return True
+
+        print(f"   🔁 Per-sheet: end-of-run retry of {len(failed_pages)} "
+              f"failed sheet(s) (pages {[p + 1 for p in failed_pages]}, "
+              f"up to {_failed_sheet_retry_rounds()} round(s))")
+        recovered_pages, failed_pages = _retry_failed_sheets(
+            failed_pages, _attempt_failed_sheet, _failed_sheet_retry_rounds())
+        if recovered_pages:
+            # Recovered sheets appended out of order — restore page order
+            # so the merge sees the same sequence a clean run would.
+            sheet_results.sort(key=lambda r: r["page_idx0"])
+
     if not sheet_results:
         print(f"   ❌ Per-sheet: all {len(plan_pages)} sheet(s) failed for "
               f"{filename} — legacy path")
@@ -4309,6 +4417,11 @@ def _analyze_pdf_per_sheet(client, pdf_path, scope_notes="",
     merged = _merge_sheet_analyses(sheet_results)
     total_rooms = merged.get("project_info", {}).get("total_rooms_found", 0)
     n_merges = len(merged.get("_canonical_merge_log") or [])
+    if recovered_pages:
+        merged.setdefault("notes", []).append(
+            f"[Per-Sheet] {len(recovered_pages)} plan sheet(s) recovered by "
+            f"end-of-run retry (pages {sorted(p + 1 for p in recovered_pages)}) "
+            f"— quantities from these sheets ARE included.")
     if failed_pages:
         merged.setdefault("notes", []).append(
             f"[Per-Sheet] {len(failed_pages)} plan sheet(s) FAILED "
