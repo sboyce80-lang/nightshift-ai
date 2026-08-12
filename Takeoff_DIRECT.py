@@ -15951,6 +15951,11 @@ def _vme_authoritative_walls_enabled():
         "1", "true", "True")
 
 
+def _markup_takeoff_enabled():
+    return os.environ.get("NIGHTSHIFT_MARKUP_TAKEOFF", "0").strip() in (
+        "1", "true", "True")
+
+
 # Sanity band: abstain when the geometric measurement diverges from the LLM
 # read by more than this — a scale misread must never become load-bearing.
 _VME_LLM_RATIO_BAND = (0.4, 2.5)
@@ -16221,6 +16226,193 @@ def _apply_vme_authoritative_walls(analysis):
           f"(LLM read {llm_total:,.0f})"
           + (f", substrate split gyp {split['gyp_sqft']:,.0f} / cmu "
              f"{split['cmu_sqft']:,.0f}" if split else ""))
+    return analysis
+
+
+# Markup takeoff needs enough classified measurement marks to be a takeoff
+# and not a stray dimension: a real measured set carries dozens.
+_MARKUP_MIN_CLASSIFIED = 8
+# Sanity band vs the LLM read — wider than VME's because markups legitimately
+# diverge from extraction (they are the customer's scope), but a x4 disagree
+# means the subjects were probably misclassified.
+_MARKUP_LLM_RATIO_BAND = (0.3, 3.0)
+
+
+def _apply_markup_takeoff_authoritative(analysis):
+    """Flag-gated (NIGHTSHIFT_MARKUP_TAKEOFF, default off): measurement
+    annotations embedded in the uploaded PDFs become the authoritative
+    takeoff quantities.
+
+    Why (Harlem Valley Homestead / JW Estimating, 2026-08-12): Rider's
+    outside estimator delivered the drawings WITH their measured takeoff
+    burned in as Bluebeam-style annotations — wall runs as PolyLines with
+    lengths, ceilings as Polygons with areas, doors as count groups, sealed
+    concrete as filled rectangles. The customer treats those numbers as
+    fact. The pipeline flattened the page and re-guessed everything: walls
+    priced 7,200 SF (after a cap) vs 17,402 measured, ceilings 3,211 vs
+    9,009, doors 39 vs 29, concrete 3,480 vs 5,546 — a $28.0k bid against
+    the contractor's $43.5k. Every one of those numbers was machine-readable
+    in the file, deterministically, with zero LLM involvement.
+
+    Hard-numbers policy: annotation measurements ARE hard numbers — a human
+    measured them onto the plans. When present in force they outrank both
+    the LLM extraction and the VME geometric read (which measures wall
+    centerlines, not the marked paint scope). This pass therefore runs
+    AFTER the VME passes and overrides walls when it applies.
+
+    Walls need a height basis: markups carry LF, and we convert with the
+    same measured-room-height convention as the VME gate (p90 of in-scope
+    room heights, ≥3 required). Ceilings/doors/railings/concrete are direct
+    quantities and apply even when the height basis is missing.
+
+    Fail-safe: fewer than _MARKUP_MIN_CLASSIFIED classified marks, or a
+    wall total outside the sanity band vs the extraction, abstains loudly
+    (note + record) and changes nothing. Unclassified subjects become an
+    RFI, never a guess. Idempotent via analysis['_markup_takeoff'].
+    """
+    if not isinstance(analysis, dict) or not _markup_takeoff_enabled():
+        return analysis
+    if analysis.get("_markup_takeoff") is not None:
+        return analysis
+
+    def _abstain(reason):
+        analysis["_markup_takeoff"] = {"applied": False, "reason": reason}
+        analysis.setdefault("notes", []).append(
+            f"[Markup Takeoff] Measurement annotations NOT promoted: "
+            f"{reason}.")
+        print(f"   📏 Markup takeoff: abstained — {reason}")
+        return analysis
+
+    paths = analysis.get("_vme_pdf_paths") or []
+    if not paths:
+        return _abstain("original PDF paths unavailable (annotations do not "
+                        "survive normalization)")
+    try:
+        from markup_takeoff import extract_markup_takeoff
+        mk = extract_markup_takeoff(paths)
+    except Exception as exc:
+        return _abstain(f"extractor unavailable ({type(exc).__name__})")
+
+    if mk["n_classified"] < _MARKUP_MIN_CLASSIFIED:
+        return _abstain(
+            f"only {mk['n_classified']} classified measurement annotation(s) "
+            f"— not a measured markup set")
+
+    agg = analysis.setdefault("aggregated_totals", {})
+    applied, rfi_bits = [], []
+
+    # ── Walls: LF × measured ceiling height (same p90 deck-height
+    # convention as the VME authoritative gate).
+    total_wall_lf = mk["wall_lf"] + mk["mr_wall_lf"]
+    if total_wall_lf > 0:
+        heights = []
+        for fl in (analysis.get("floors") or []):
+            for rm in (fl.get("rooms") or []):
+                if not isinstance(rm, dict) or not rm.get("in_scope", True):
+                    continue
+                h = _num((rm.get("dimensions") or {}).get(
+                    "ceiling_height_feet", 0))
+                if 6 < h < 30:
+                    heights.append(h)
+        if len(heights) < 3:
+            analysis.setdefault("notes", []).append(
+                "[Markup Takeoff] Wall runs measured "
+                f"({total_wall_lf:,.0f} LF) but no measured ceiling height "
+                "(<3 room heights) — walls left on the extraction basis; "
+                "confirm ceiling height (RFI).")
+        else:
+            heights.sort()
+            height = heights[int(0.9 * (len(heights) - 1))]
+            mk_walls = round(total_wall_lf * height, 2)
+            llm_walls = _num(agg.get("total_paintable_wall_sqft", 0)) + \
+                max(0.0, _num(agg.get("total_cmu_wall_sqft", 0)))
+            if llm_walls > 0:
+                ratio = mk_walls / llm_walls
+                lo, hi = _MARKUP_LLM_RATIO_BAND
+                if not (lo <= ratio <= hi):
+                    return _abstain(
+                        f"marked-up walls {mk_walls:,.0f} sqft vs extracted "
+                        f"{llm_walls:,.0f} (x{ratio:.2f}) outside the sanity "
+                        f"band — subjects may be misclassified; flagging "
+                        f"for review")
+            agg["total_paintable_wall_sqft"] = mk_walls
+            applied.append(
+                f"walls {mk_walls:,.0f} sqft ({mk['wall_lf']:,.0f} LF paint "
+                f"+ {mk['mr_wall_lf']:,.0f} LF MR × {height:.2f} ft)")
+            if mk["mr_wall_lf"] > 0:
+                rfi_bits.append(
+                    f"{mk['mr_wall_lf']:,.0f} LF of walls are marked "
+                    f"moisture-resistant (MR) paint — confirm MR product "
+                    f"and any rate difference")
+
+    # ── Ceilings: direct SF (includes areas the extraction assumed
+    # exposed/unpainted — the markup is the scope authority).
+    total_ceil = mk["ceiling_sf"] + mk["mr_ceiling_sf"]
+    if total_ceil > 0:
+        prev = _num(agg.get("total_paintable_ceiling_sqft", 0))
+        agg["total_paintable_ceiling_sqft"] = round(total_ceil, 2)
+        applied.append(
+            f"ceilings {total_ceil:,.0f} sqft (extraction read {prev:,.0f})")
+        if mk["mr_ceiling_sf"] > 0:
+            rfi_bits.append(
+                f"{mk['mr_ceiling_sf']:,.0f} sqft of ceilings are marked MR "
+                f"paint — confirm product")
+
+    # ── Doors: count groups are the scope count.
+    if mk["doors_total"] > 0:
+        prev_fp = _num(agg.get("total_doors_full_paint", 0))
+        agg["total_doors_full_paint"] = mk["doors_total"]
+        stash = analysis.get("_schedule_authoritative_counts")
+        if isinstance(stash, dict) and "total_doors_full_paint" in stash:
+            stash["total_doors_full_paint"] = mk["doors_total"]
+        applied.append(
+            f"doors {mk['doors_total']} (extraction counted {prev_fp:,.0f})")
+        if mk["doors_large"] > 0:
+            rfi_bits.append(
+                f"{mk['doors_large']} door(s) are ≥{6}' wide (likely "
+                f"overhead/coiling) and are marked for paint — confirm the "
+                f"coating system for overhead doors")
+
+    # ── Railings / concrete: direct quantities.
+    if mk["railing_lf"] > 0:
+        agg["total_painted_railing_lf"] = mk["railing_lf"]
+        applied.append(f"railing {mk['railing_lf']:,.0f} LF")
+    if mk["concrete_sf"] > 0:
+        prev_c = _num(agg.get("total_concrete_floor_sqft", 0))
+        agg["total_concrete_floor_sqft"] = round(mk["concrete_sf"], 2)
+        applied.append(
+            f"sealed concrete {mk['concrete_sf']:,.0f} sqft "
+            f"(extraction read {prev_c:,.0f})")
+
+    if not applied:
+        return _abstain("no classified quantities to apply")
+
+    rec = {
+        "applied": True,
+        "extracted": {k: mk[k] for k in (
+            "wall_lf", "mr_wall_lf", "ceiling_sf", "mr_ceiling_sf",
+            "railing_lf", "stair_sf", "concrete_sf", "doors_total",
+            "doors_large", "n_classified", "n_measurement")},
+        "applied_items": applied,
+        "unclassified": mk["unclassified"][:20],
+    }
+    analysis["_markup_takeoff"] = rec
+    analysis.setdefault("notes", []).append(
+        "[Markup Takeoff] Quantities priced from the measurement "
+        "annotations embedded in the uploaded drawings ("
+        f"{mk['n_classified']} classified marks): " + "; ".join(applied) +
+        ". These are the estimator's own measured markups and are treated "
+        "as the scope authority.")
+    if mk["unclassified"]:
+        subjects = ", ".join(sorted({s for s, _ in mk["unclassified"]
+                                     if s})[:6]) or "unlabeled marks"
+        rfi_bits.append(
+            f"{len(mk['unclassified'])} measurement annotation(s) could not "
+            f"be classified ({subjects}) — confirm whether they carry "
+            f"additional paint scope")
+    for bit in rfi_bits:
+        _gate_add_rfi(analysis, "Markup Takeoff", bit + ".")
+    print(f"   📏 Markup takeoff authoritative: " + "; ".join(applied))
     return analysis
 
 
@@ -16933,6 +17125,14 @@ def build_priced_takeoff(analysis, strict=None):
     # overrides the boost/cap heuristics' net effect on walls. Flag-gated
     # NIGHTSHIFT_VME_PRIMARY; no-op when off or unreliable.
     analysis = _apply_vme_primary(analysis)
+
+    # Measurement-markup takeoff: when the uploaded set carries the
+    # estimator's own measurement annotations (Bluebeam wall runs, ceiling
+    # areas, door count groups), those are the scope authority — they outrank
+    # both the LLM extraction and the geometric wall read, so this runs after
+    # every other quantity pass. Flag-gated NIGHTSHIFT_MARKUP_TAKEOFF;
+    # no-op when off or when the set carries no measured markups.
+    analysis = _apply_markup_takeoff_authoritative(analysis)
 
     agg = analysis.get("aggregated_totals", {}) or {}
     ledger = analysis.get("_quantity_adjustments", []) or []
@@ -20255,11 +20455,37 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
             # Camping World: 11,251 SF walls on 14,155 SF footprint = 0.80 ratio.
             # Using 1.25× to allow wall over-count to compensate for missing items
             # (exposed ductwork, metal walls, interior lift not yet extracted).
+            #
+            # DETERMINISTIC-WALLS GUARD (Harlem Valley 2026-08-12): this cap
+            # defends against LLM over-extraction; it must never clamp a wall
+            # quantity that came from deterministic measurement. When the VME
+            # authoritative gate or the markup-takeoff gate priced the walls,
+            # the cap fired backwards — it cut a measured 14,386 SF to
+            # footprint×stories×1.25 = 7,200 on Harlem Valley (JW's manual
+            # takeoff: 17,402). Same rationale as the multi-family cap guard
+            # below; gated by the same flags that own the wall quantity.
+            #
+            # Stories basis: total_stories excludes basements, but basement
+            # walls are painted and in the wall total — a 1-story building
+            # with a finished basement has two painted levels. Use the floor
+            # count actually analyzed when it is larger.
+            _det_walls_applied = bool(
+                ((analysis or {}).get("_vme_authoritative") or {}).get("applied")
+                or ((analysis or {}).get("_markup_takeoff") or {}).get("applied"))
             total_stories = _num(project_info.get('total_stories', 1))
-            if _footprint > 0 and total_stories <= 2:
-                max_wall_sqft = round(_footprint * total_stories * 1.25)
+            _levels = max(total_stories,
+                          _num(project_info.get('total_floors_analyzed', 0)))
+            if _footprint > 0 and total_stories <= 2 and not _det_walls_applied:
+                max_wall_sqft = round(_footprint * max(1, _levels) * 1.25)
                 if wall_sqft > max_wall_sqft:
                     wall_sqft = max_wall_sqft
+            elif _det_walls_applied and analysis is not None:
+                analysis.setdefault("notes", []).append(
+                    "[Commercial Cap Guard] Large-commercial wall cap "
+                    "suppressed — walls were priced from deterministic "
+                    "measurement (VME geometry or markup takeoff), which the "
+                    "cap's target failure mode (LLM over-extraction) cannot "
+                    "inflate.")
         else:
             # Small commercial / renovation rates (from config.py SMALL_COMMERCIAL_RATES)
             if not _rate_locked('gyp_walls'):
@@ -20342,12 +20568,28 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
                 ((analysis or {}).get("_vme_authoritative") or {}).get("applied"))
         except Exception:
             _vme_walls_applied = False
-        _suppress_caps = _apt_cap_boost_guard_enabled() and _wall_boost_fired
-        _suppress_wall_caps = _suppress_caps or _vme_walls_applied
+        # Markup-takeoff quantities are deterministic annotation measurements
+        # — same immunity as VME for walls, and (unlike VME) the ceilings are
+        # measured directly too, so ceiling caps also stand down when the
+        # markup gate priced them.
+        _markup_rec = {}
+        try:
+            _markup_rec = ((analysis or {}).get("_markup_takeoff") or {})
+        except Exception:
+            _markup_rec = {}
+        _markup_applied = bool(_markup_rec.get("applied"))
+        _markup_ceilings = _markup_applied and (
+            _num((_markup_rec.get("extracted") or {}).get("ceiling_sf", 0))
+            + _num((_markup_rec.get("extracted") or {}).get("mr_ceiling_sf", 0))
+            > 0)
+        _suppress_caps = (_apt_cap_boost_guard_enabled() and _wall_boost_fired)
+        _suppress_wall_caps = (_suppress_caps or _vme_walls_applied
+                               or _markup_applied)
+        _suppress_ceil_caps = _suppress_caps or _markup_ceilings
         if _footprint > 0:
             if not _suppress_wall_caps:
                 _wall_caps.append(round(_footprint * _stories_cap * 3.0))
-            if not _suppress_caps:
+            if not _suppress_ceil_caps:
                 _ceil_caps.append(round(_footprint * _stories_cap * 1.0))
         if _cap_units >= 4:
             if not _suppress_wall_caps:
@@ -20357,7 +20599,7 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
                 _extra_floors = max(0, _stories_cap - 2)  # floors beyond 2 residential
                 _unit_wall_cap = round(_cap_units * 3000 + _extra_floors * _footprint * 0.5) if _footprint > 0 else round(_cap_units * 3300)
                 _wall_caps.append(_unit_wall_cap)
-            if not _suppress_caps:
+            if not _suppress_ceil_caps:
                 _ceil_caps.append(round(_cap_units * 1100))
         if _suppress_caps and analysis is not None:
             analysis.setdefault("notes", []).append(
@@ -20366,6 +20608,14 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
                 f"so the caps (footprint {_footprint:,.0f} SF x {_stories_cap:g} stories) would "
                 f"fire backwards and slash a boost that is already bounded to 1.30x. Pricing the "
                 f"boosted wall/ceiling totals directly.")
+        elif _markup_applied and analysis is not None:
+            analysis.setdefault("notes", []).append(
+                f"[Apt Cap Markup Guard] Multi-family WALL area caps suppressed because "
+                f"the markup-takeoff gate priced walls from the measurement annotations "
+                f"embedded in the drawings — deterministic quantities the caps' target "
+                f"failure mode (LLM phantom-floor duplication) cannot inflate. "
+                + ("Ceiling caps also suppressed (ceilings measured directly by the "
+                   "markups)." if _markup_ceilings else "Ceiling caps remain active."))
         elif _vme_walls_applied and analysis is not None:
             analysis.setdefault("notes", []).append(
                 f"[Apt Cap VME Guard] Multi-family WALL area caps suppressed because the "
