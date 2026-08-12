@@ -405,6 +405,54 @@ def select_floor_plan_pages(pdf_paths):
     return out
 
 
+def _measurement_copies(pdf_paths):
+    """Annotation-stripped copies of any PDF that carries annotations.
+
+    PyMuPDF's get_drawings() includes annotation APPEARANCE STREAMS, so
+    markup geometry (measurement polylines, revision clouds, stamps) is
+    indistinguishable from drawn wall vectors and inflates the wall read.
+    Harlem Valley 2026-08-11 blind test: 1,438.6 LF measured on the
+    estimator's marked-up set vs 1,372.3 LF on the same sheet with
+    annotations stripped — +4.8% of phantom wall from the markups alone.
+    The engine must measure the DRAWING, never the markups (the markup
+    quantities themselves are the markup-takeoff gate's job).
+
+    Files without annotations pass through untouched (no copy, no I/O).
+    Copies land in a temp dir and live for the process; workers are
+    ephemeral containers, matching the pipeline's existing temp handling.
+    """
+    out = []
+    for p in pdf_paths or []:
+        try:
+            doc = fitz.open(p)
+            has = any(pg.first_annot for pg in doc)
+            if not has:
+                doc.close()
+                out.append(p)
+                continue
+            n = 0
+            for pg in doc:
+                while pg.first_annot:
+                    pg.delete_annot(pg.first_annot)
+                    n += 1
+            import os as _os
+            import tempfile as _tempfile
+            # Keep the ORIGINAL basename: downstream anchor matching
+            # (compute_vme_scoped) tokenizes the filename for sheet tags,
+            # so the measurement copy must answer to the same name.
+            tmpdir = _tempfile.mkdtemp(prefix="vme-noannot-")
+            tmp = _os.path.join(tmpdir, _os.path.basename(p))
+            doc.save(tmp)
+            doc.close()
+            print(f"   📐 VME: measuring annotation-stripped copy of "
+                  f"{_os.path.basename(p)} ({n} annotation(s) excluded "
+                  f"from geometry)")
+            out.append(tmp)
+        except Exception:
+            out.append(p)  # fail open: measure the original
+    return out
+
+
 def compute_vme_shadow_v2(pdf_paths, default_height_ft=9.0):
     """M4/M5 shadow: title-based page selection + tier-2 geometric walls.
 
@@ -419,6 +467,7 @@ def compute_vme_shadow_v2(pdf_paths, default_height_ft=9.0):
         paths = [p for p in (pdf_paths or []) if p]
         if not paths:
             return None
+        paths = _measurement_copies(paths)
         # single-page single-file sets ARE the floor plan (CenHud)
         if len(paths) == 1:
             try:
@@ -1447,6 +1496,7 @@ def compute_vme_scoped(pdf_paths, analysis, default_height_ft=9.0):
     painted_frac, unmeasured, by_page, n_pages} — the CALLER applies
     reliability gating; this function measures whatever it can."""
     try:
+        pdf_paths = _measurement_copies(pdf_paths)
         pages = select_floor_plan_pages(pdf_paths)
     except Exception as e:
         return {"measured_wall_sf": 0, "unmeasured": [],
