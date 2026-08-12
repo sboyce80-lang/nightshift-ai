@@ -15956,6 +15956,151 @@ def _markup_takeoff_enabled():
         "1", "true", "True")
 
 
+def _ceiling_assume_painted_enabled():
+    return os.environ.get(
+        "NIGHTSHIFT_CEILING_ASSUME_PAINTED", "0").strip() in (
+        "1", "true", "True")
+
+
+def _room_geometry_shadow_enabled():
+    return os.environ.get(
+        "NIGHTSHIFT_ROOM_GEOMETRY_SHADOW", "0").strip() in (
+        "1", "true", "True")
+
+
+def _apply_ceiling_assume_painted(analysis):
+    """Flag-gated (NIGHTSHIFT_CEILING_ASSUME_PAINTED, default off): an
+    enclosed room's ceiling is PAINTED unless the documents show otherwise.
+
+    Harlem Valley blind test (2026-08-11): with no RCP and no finish
+    schedule on the sheet, extraction classified the shop/basement/
+    mechanical ceilings OPEN/EXPOSED by room-function heuristic (3,211 SF
+    priced), while the customer's estimator applied the opposite default —
+    "all ceilings assumed drywall, no details given" — and painted 9,009
+    SF. Neither is a measurement; this gate adopts the estimator
+    convention for the same evidence state, keeps the RFI, and leaves any
+    ceiling with actual document evidence alone.
+
+    A room flips only when ALL hold: in scope; ceiling_painted is False;
+    the ceiling material carries the '(assumed)' provenance marker (i.e.,
+    the classification came from the room-function heuristic, not an RCP,
+    finish-schedule row, or schedule gate — those strip/never add the
+    marker); and it reads exposed/open. Only-increase by exactly the
+    flipped rooms' ceiling areas. Idempotent via
+    analysis['_ceiling_assume_painted'].
+    """
+    if not isinstance(analysis, dict) or not _ceiling_assume_painted_enabled():
+        return analysis
+    if analysis.get("_ceiling_assume_painted") is not None:
+        return analysis
+
+    flipped, added_sf = [], 0.0
+    for fl in (analysis.get("floors") or []):
+        mult_f = max(1, int(_num(fl.get("unit_multiplier", 1)) or 1))
+        for rm in (fl.get("rooms") or []):
+            if not isinstance(rm, dict) or not rm.get("in_scope", True):
+                continue
+            mats = rm.get("materials") or {}
+            if mats.get("ceiling_painted"):
+                continue
+            mat = str(mats.get("ceiling") or "").lower()
+            if "assumed" not in mat:
+                continue  # evidence-based classification — respect it
+            if not any(k in mat for k in ("open", "exposed", "unpainted",
+                                          "none", "unfinished")):
+                continue
+            area = _num((rm.get("dimensions") or {}).get(
+                "ceiling_area_sqft", 0))
+            if area <= 0:
+                continue
+            mult = mult_f * max(1, int(_num(rm.get("unit_multiplier", 1))
+                                       or 1))
+            mats["ceiling_painted"] = True
+            rm["materials"] = mats
+            note = str(rm.get("notes", ""))
+            tag = "[ceiling assumed PAINTED per enclosed-room default"
+            if tag not in note:
+                rm["notes"] = (note + f" {tag} — no RCP/schedule evidence "
+                               f"of exposed structure; confirm (RFI)]"
+                               ).strip()
+            flipped.append(rm.get("room_name") or rm.get("room_id")
+                           or "room")
+            added_sf += area * mult
+
+    rec = {"applied": bool(flipped), "rooms_flipped": len(flipped),
+           "ceiling_sqft_added": round(added_sf, 2)}
+    analysis["_ceiling_assume_painted"] = rec
+    if flipped:
+        agg = analysis.setdefault("aggregated_totals", {})
+        cur = _num(agg.get("total_paintable_ceiling_sqft", 0))
+        agg["total_paintable_ceiling_sqft"] = round(cur + added_sf, 2)
+        room_list = ", ".join(sorted(set(flipped))[:8])
+        if len(set(flipped)) > 8:
+            room_list += f", and {len(set(flipped)) - 8} more"
+        analysis.setdefault("notes", []).append(
+            f"[Ceiling Assume Painted] {len(flipped)} room(s) with no RCP/"
+            f"finish-schedule ceiling evidence were assumed-exposed by room "
+            f"function; the enclosed-room default paints them "
+            f"(+{added_sf:,.0f} sqft): {room_list}. Same convention manual "
+            f"estimators apply when no ceiling details are given.")
+        _gate_add_rfi(
+            analysis, "Ceiling Scope",
+            f"No reflected ceiling plan or finish schedule confirms the "
+            f"ceiling type in: {room_list}. These ceilings are PRICED AS "
+            f"PAINTED per the enclosed-room default — confirm which are "
+            f"exposed structure so the estimate can be adjusted.")
+        print(f"   🎨 Ceiling assume-painted: {len(flipped)} room(s), "
+              f"+{added_sf:,.0f} sqft (RFI added)")
+    return analysis
+
+
+def _compute_room_geometry_shadow(analysis):
+    """Flag-gated (NIGHTSHIFT_ROOM_GEOMETRY_SHADOW, default off):
+    comparison-only room-geometry measurement stored on the analysis for
+    corpus calibration (the VME-shadow playbook). Never changes a quantity.
+    Measures annotation-stripped copies so markup ink can't leak in."""
+    if not isinstance(analysis, dict) or not _room_geometry_shadow_enabled():
+        return analysis
+    if analysis.get("_room_geometry_shadow") is not None:
+        return analysis
+    paths = analysis.get("_vme_pdf_paths") or []
+    if not paths:
+        return analysis
+    try:
+        from vme_attribution import _measurement_copies
+        from room_geometry import compute_room_geometry_shadow
+        clean = _measurement_copies(paths)
+        # room-label anchors from the bbox spike, keyed to measurement copies
+        anchors = {}
+        orig_to_clean = dict(zip(paths, clean))
+        for fl in (analysis.get("floors") or []):
+            for rm in (fl.get("rooms") or []):
+                bb = (rm or {}).get("bbox") or {}
+                nb = bb.get("label_bbox_norm")
+                size = bb.get("page_size_pt")
+                if not nb or not size:
+                    continue
+                src = bb.get("source_pdf")
+                pdf = orig_to_clean.get(src) or (
+                    clean[0] if len(clean) == 1 else None)
+                if not pdf:
+                    continue
+                page0 = int(_num(rm.get("source_page", 1)) or 1) - 1
+                cx = (nb[0] + nb[2]) / 2.0 * size[0]
+                cy = (nb[1] + nb[3]) / 2.0 * size[1]
+                name = str(rm.get("room_id") or rm.get("room_name") or "?")
+                anchors.setdefault((pdf, page0), []).append((name, cx, cy))
+        shadow = compute_room_geometry_shadow(clean, anchors)
+        analysis["_room_geometry_shadow"] = shadow
+        n_pages = len(shadow.get("pages") or [])
+        print(f"   📐 Room-geometry shadow recorded ({n_pages} page(s), "
+              f"comparison-only)")
+    except Exception as exc:
+        analysis["_room_geometry_shadow"] = {
+            "error": f"{type(exc).__name__}: {str(exc)[:80]}"}
+    return analysis
+
+
 # Sanity band: abstain when the geometric measurement diverges from the LLM
 # read by more than this — a scale misread must never become load-bearing.
 _VME_LLM_RATIO_BAND = (0.4, 2.5)
@@ -17075,6 +17220,12 @@ def build_priced_takeoff(analysis, strict=None):
     # rebuild) before any quantity is priced. Flag-gated; no-op when off.
     analysis = _enforce_ceiling_scope_gate(analysis)
 
+    # Enclosed-room ceiling default (JW convention): assumed-exposed rooms
+    # with no RCP/schedule evidence price as painted + RFI. Runs after the
+    # ceiling scope gate so evidence-based demotions stand. Flag-gated;
+    # no-op when off.
+    analysis = _apply_ceiling_assume_painted(analysis)
+
     # Wallcovering schedule gate: WC pays only in rooms the finish schedule
     # designates WC-x. Must run BEFORE the VME wall passes below — they deduct
     # total_wallcovering_sqft from the wall bill, so phantom WC would silently
@@ -17133,6 +17284,12 @@ def build_priced_takeoff(analysis, strict=None):
     # every other quantity pass. Flag-gated NIGHTSHIFT_MARKUP_TAKEOFF;
     # no-op when off or when the set carries no measured markups.
     analysis = _apply_markup_takeoff_authoritative(analysis)
+
+    # Room-geometry shadow: comparison-only per-room area / paint-face /
+    # door-swing measurement recorded for corpus calibration (the VME-shadow
+    # certification playbook). Never changes a quantity. Flag-gated;
+    # no-op when off.
+    analysis = _compute_room_geometry_shadow(analysis)
 
     agg = analysis.get("aggregated_totals", {}) or {}
     ledger = analysis.get("_quantity_adjustments", []) or []
