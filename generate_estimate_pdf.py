@@ -334,16 +334,21 @@ def _build_line_items(result: dict) -> List[dict]:
     # the label contains "wall"; Exterior Window Trim would otherwise fall
     # into Trim, etc.)
     buckets = [
+        # NOTE: bare "railing" must NOT live in the Exterior bucket — the
+        # "Painted Railings" line is interior stair handrail (Harlem Valley
+        # 2026-08-12: an interior handrail printed under "Exterior surfaces
+        # power-washed…" on an interior-only bid). Exterior railing lines
+        # are labeled "Ext. Stain Railing" and still match "ext.".
         ("Exterior",
-         ["exterior", "ext.", "hardie", "azek", "cornice", "siding", "railing", "lintel"],
+         ["exterior", "ext.", "hardie", "azek", "cornice", "siding", "lintel"],
          "Exterior surfaces power-washed, scraped, spot-primed, caulked, and finished with two coats."),
         ("Specialty coatings",
          ["cmu", "dryfall", "concrete", "lyme wash", "lymewash", "plaster",
           "column", "wallcovering", "stained wood", "level 5", "lift rental"],
          "Specialty surface preparation and coating per manufacturer requirements."),
         ("Stairs",
-         ["stair"],
-         "Risers and adjacent stair walls prepared and finished as part of the painted-stair scope."),
+         ["stair", "railing", "handrail"],
+         "Risers, railings, and adjacent stair walls prepared and finished as part of the painted-stair scope."),
         ("Trim, doors, and windows",
          ["trim", "door", "window", "hm panel", "frame", "cabinet"],
          "Caulked, filled, sanded, and finished with two coats. Includes baseboards, casings, doors, and frames as scheduled."),
