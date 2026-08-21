@@ -15024,6 +15024,101 @@ def _gate_add_rfi(analysis, category, question):
     bucket.append({"category": category, "question": question})
 
 
+def _reconcile_door_sources(analysis):
+    """Flag-gated (NIGHTSHIFT_DOOR_SOURCE_RECONCILE, default off): door
+    counts summed across sheet FAMILIES must not stack.
+
+    2026-08-21 Caris: 68 doors extracted from the A9.1 door-details sheet
+    (≈JW's 75) plus 25 more plan-counted on the recovered A1.2 floor plan
+    — the same physical doors, counted from two sources, priced 93. When
+    door-bearing rooms span >1 sheet family and one family is a
+    detail/schedule sheet (A9x/A6x-series or 'door' in a sheet title),
+    the total is the LARGER family's count, not the sum. Only-reduce;
+    skips when a real door schedule set counts authoritatively; manual
+    note; idempotent.
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if os.environ.get("NIGHTSHIFT_DOOR_SOURCE_RECONCILE", "0").strip() \
+            not in ("1", "true", "True"):
+        return analysis
+    if analysis.get("_door_source_reconcile"):
+        return analysis
+    stash = analysis.get("_schedule_authoritative_counts") or {}
+    if "total_doors_full_paint" in stash:
+        analysis["_door_source_reconcile"] = {"noop": "schedule_authoritative"}
+        return analysis
+
+    DOOR_KEYS = ("doors_full_paint", "doors_hm_panel", "doors_frame_only")
+    fam_tot = {}
+    for fl in (analysis.get("floors") or []):
+        for r in (fl.get("rooms") or []):
+            if not isinstance(r, dict) or r.get("in_scope") is False:
+                continue
+            el = r.get("elements") or {}
+            n = sum(_num(el.get(k, 0)) for k in DOOR_KEYS)
+            if n <= 0:
+                continue
+            sheet = str(r.get("source_sheet") or "?")
+            mult = max(1, int(_num(r.get("unit_multiplier", 1)) or 1))
+            fam = "detail" if re.match(r"A-?[69]", sheet, re.IGNORECASE) \
+                else "plan"
+            fam_tot.setdefault(fam, 0.0)
+            fam_tot[fam] += n * mult
+    if len(fam_tot) < 2:
+        analysis["_door_source_reconcile"] = {"noop": "single_family",
+                                              "families": fam_tot}
+        return analysis
+
+    total = sum(fam_tot.values())
+    keep_fam = max(fam_tot, key=fam_tot.get)
+    excess = total - fam_tot[keep_fam]
+    if excess <= 0.2 * fam_tot[keep_fam]:
+        analysis["_door_source_reconcile"] = {"noop": "within_tolerance",
+                                              "families": fam_tot}
+        return analysis
+
+    # Zero door counts on the smaller family's rooms; adjust aggregates.
+    removed = {k: 0.0 for k in DOOR_KEYS}
+    for fl in (analysis.get("floors") or []):
+        for r in (fl.get("rooms") or []):
+            if not isinstance(r, dict) or r.get("in_scope") is False:
+                continue
+            sheet = str(r.get("source_sheet") or "?")
+            fam = "detail" if re.match(r"A-?[69]", sheet, re.IGNORECASE) \
+                else "plan"
+            if fam == keep_fam:
+                continue
+            el = r.get("elements") or {}
+            mult = max(1, int(_num(r.get("unit_multiplier", 1)) or 1))
+            for k in DOOR_KEYS:
+                v = _num(el.get(k, 0))
+                if v > 0:
+                    removed[k] += v * mult
+                    el[k] = 0
+    agg = analysis.setdefault("aggregated_totals", {})
+    for k, agg_key in (("doors_full_paint", "total_doors_full_paint"),
+                       ("doors_hm_panel", "total_doors_hm_panel"),
+                       ("doors_frame_only", "total_doors_frame_only")):
+        if removed[k] > 0 and agg_key in agg:
+            agg[agg_key] = max(0, round(_num(agg.get(agg_key, 0))
+                                        - removed[k], 2))
+    dropped_n = sum(removed.values())
+    analysis.setdefault("notes", []).append(
+        f"[Door Source Reconcile] Door counts appeared on two sheet "
+        f"families ({', '.join(f'{f}: {c:.0f}' for f, c in fam_tot.items())})"
+        f" — the same doors counted twice. Kept the {keep_fam} family's "
+        f"count; removed {dropped_n:.0f} duplicate door(s). Confirm against "
+        f"the door schedule.")
+    print(f"   🚪 Door source reconcile: kept {keep_fam} "
+          f"({fam_tot[keep_fam]:.0f}), removed {dropped_n:.0f} duplicate "
+          f"door(s) from the other family", flush=True)
+    analysis["_door_source_reconcile"] = {"families": fam_tot,
+                                          "kept": keep_fam,
+                                          "removed": dropped_n}
+    return analysis
+
+
 _UNIT_STOP_TOKENS = {"suite", "room", "area", "unit", "typical", "typ",
                      "floor", "first", "second", "third", "fourth", "fifth",
                      "1st", "2nd", "3rd", "4th", "5th", "north", "south",
@@ -18180,6 +18275,10 @@ def build_priced_takeoff(analysis, strict=None):
     # among the room gates so everything downstream sees the deduped room
     # set. Flag-gated; no-op when off.
     analysis = _dedup_template_instances(analysis)
+
+    # Door source reconcile: door counts from a detail/schedule sheet and
+    # a floor plan must not stack. Flag-gated; no-op when off.
+    analysis = _reconcile_door_sources(analysis)
 
     # Final ceiling-scope reconciliation (ACT demote + commercial aggregate
     # rebuild) before any quantity is priced. Flag-gated; no-op when off.
