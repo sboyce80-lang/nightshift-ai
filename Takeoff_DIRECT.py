@@ -7280,6 +7280,12 @@ Multi-unit residential buildings often have IDENTICAL floor plans repeated acros
 - Determine the TOTAL COUNT of each unit type from the drawings, schedules, or unit mix tables.
 - Look for unit counts in: Light & Ventilation schedules, unit mix tables, apartment number series
   (e.g., units 201-208 on 2nd floor = 8 units), door schedule unit groups, or key plans.
+- HOTELS/HOSPITALITY: the unit count is the KEY / GUESTROOM count. Look for "KEYS",
+  "GUESTROOM COUNT", "ROOM COUNT" on the cover sheet, code summary, or life-safety plans,
+  and guestroom number series per floor (e.g., rooms 201-238 = 38 keys on floor 2).
+  Set total_units to the TOTAL key count — a hotel whose guestroom typicals are drawn
+  once still has total_units = the full key count (Hudson 2026-08: typicals were
+  multiplied by units DRAWN (3) instead of the key count; walls priced 3x under).
 - CROSS-FLOOR MULTIPLICATION — explicit formula:
   unit_multiplier(type T) = (count of T on a typical floor) × (number of typical residential floors)
   * Example: 364 Main has unit numbers 201-210 (2nd floor) AND 301-310 (3rd floor) = 10 units/floor
@@ -15230,6 +15236,14 @@ def _reconcile_floor_finishes(analysis):
                 for tok in _ROOM_ID_TOKEN_RX.findall(clause):
                     noted_ids.add(_norm_room_id(tok))
 
+    # Machine-read finish-schedule rows are the most durable evidence
+    # channel (prose notes vary run-to-run — the ULUM rerun regenerated
+    # extraction without the "EP-1 confirmed" note and epoxy dropped back
+    # to $0). A row's floor_finish naming an EP-x/sealed system is a hard
+    # number regardless of what the narrator wrote.
+    rfs = _get_room_finish_schedule(analysis)
+    by_num, by_name = (_build_schedule_row_maps(rfs) if rfs else ({}, {}))
+
     applied = []
     for fl in (analysis.get("floors") or []):
         for r in (fl.get("rooms") or []):
@@ -15246,6 +15260,13 @@ def _reconcile_floor_finishes(analysis):
             if not hit and noted_ids:
                 rid = _norm_room_id(r.get("room_id"))
                 hit = bool(rid) and rid in noted_ids
+            if not hit and rfs:
+                row = _match_schedule_row(r, by_num, by_name)
+                ff = str((row or {}).get("floor_finish") or "")
+                if _FLOOR_FINISH_EXCLUDED_RX.search(ff):
+                    polished_seen = True
+                elif _FLOOR_FINISH_POSITIVE_RX.search(ff):
+                    hit = True
             if not hit:
                 continue
             area = _num((r.get("dimensions") or {}).get("floor_area_sqft", 0))
@@ -17547,6 +17568,30 @@ def _run_scope_sweep(client, pdf_paths, analysis):
     }
     print(f"   🧹 Scope sweep: {len(pages_swept)} page(s) reviewed, "
           f"{len(all_findings)} scope observation(s)")
+
+    # Quantified-but-unpriced documented scope must not ship under a clean
+    # bill: the Hudson rerun surfaced "power washing ±24,652 SF" as an
+    # observation, every gate cleared, and a −42% base bid went out with
+    # manual_review=False. A sweep finding that carries an explicit
+    # quantity is documented scope this bid does NOT price — reviewer
+    # eyes required.
+    quantified = []
+    _qty_rx = re.compile(r"[\d,]{3,}\s*(?:SF|LF|sq\.?\s?ft)", re.IGNORECASE)
+    for f in all_findings:
+        m = _qty_rx.search(str(f.get("detail") or ""))
+        if m:
+            quantified.append(
+                f"{f.get('item') or f.get('category')}: {m.group(0)} "
+                f"({f.get('sheet') or '?'})")
+    if quantified:
+        analysis.setdefault("notes", []).append(
+            f"[Scope Sweep] {len(quantified)} documented scope item(s) with "
+            f"explicit quantities are NOT priced in this bid: "
+            f"{'; '.join(quantified[:5])}"
+            f"{'…' if len(quantified) > 5 else ''}. Manual review required.")
+        analysis["manual_review_required"] = True
+        print(f"   🧹 Scope sweep: {len(quantified)} quantified unpriced "
+              f"scope item(s) — manual review forced", flush=True)
     return analysis["_scope_sweep"]
 
 
@@ -21595,6 +21640,31 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
             print(f"   📐 Footprint pricing: {footprint_sqft:,.0f} SF × ${_fp_rate:.2f} = ${_footprint_interior_total:,.0f} "
                   f"(room extraction: {wall_sqft:,.0f} wall SF, quality: {_extraction_quality})")
 
+    # Power-washing allowance (flag NIGHTSHIFT_POWER_WASH_ALLOWANCE,
+    # default OFF, and only when the org configures a 'power_washing'
+    # rate): the scope sweep captures facade-cleaning spec blocks with
+    # explicit SF (Hudson A2.01 "±24,652 SF", JW priced $40.9k) — with a
+    # rate on file that documented quantity becomes a labeled allowance
+    # line instead of an RFI-only note. No rate configured → RFI stands.
+    pw_sqft = 0.0
+    pw_rate = 0.0
+    if (os.environ.get("NIGHTSHIFT_POWER_WASH_ALLOWANCE", "0").strip()
+            in ("1", "true", "True") and 'power_washing' in pm
+            and isinstance(analysis, dict)):
+        for _f in ((analysis.get("_scope_sweep") or {}).get("findings")
+                   or []):
+            _txt = f"{_f.get('item') or ''} {_f.get('detail') or ''}"
+            if not re.search(r"power\s*wash|pressure\s*wash", _txt,
+                             re.IGNORECASE):
+                continue
+            _m = re.search(r"([\d,]{3,})\s*(?:SF|sq\.?\s?ft)", _txt,
+                           re.IGNORECASE)
+            if _m:
+                pw_sqft = max(pw_sqft,
+                              float(_m.group(1).replace(",", "")))
+        if pw_sqft > 0:
+            pw_rate = _get_tiered_rate(pm['power_washing'], pw_sqft)
+
     line_items = [
         _line(f"Gyp. Walls - {wall_sqft:,.0f} sqft @ ${wall_rate:.2f}", wall_sqft,
               wall_rate, _get_markup('gyp_walls')),
@@ -21741,6 +21811,12 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
                  "exterior_cmu": _get_markup('exterior_painting'),
                  "misc_metals": _get_markup('painted_railing') if 'painted_railing' in pm else 0.06},
     )
+
+    if pw_sqft > 0:
+        line_items.append(_line(
+            f"Power Washing (ALLOWANCE — per plans note) - "
+            f"{pw_sqft:,.0f} sqft @ ${pw_rate:.2f}", pw_sqft, pw_rate,
+            _get_markup('power_washing')))
 
     return {
         "line_items": line_items,
