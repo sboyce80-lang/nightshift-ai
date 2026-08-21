@@ -408,6 +408,38 @@ T._enforce_wallcovering_schedule_gate(a2)
 check(rooms2[0]["elements"]["wallcovering_sqft"] == 240,
       "WC-auth off: room must keep extracted value")
 
+# ---------------------------------------------------------------------------
+# WC match-coverage safe mode (2026-08-21 Homewood regression): schedule keys
+# rooms as "211/217 (typical)", extraction names them descriptively with no
+# numbers -> 0% match -> zeroing must DISABLE (RFI-only), extracted WC kept.
+# ---------------------------------------------------------------------------
+os.environ["NIGHTSHIFT_WC_SCHEDULE_GATE"] = "1"
+os.environ["NIGHTSHIFT_WC_SCHEDULE_AUTHORITATIVE"] = "0"
+sched_typ = []
+for i in range(6):
+    r = _row(101 + i, f"Living/Sleeping - King Type {i}")
+    r["room_number"] = f"2{i}1/2{i}7 (typical)"
+    r["wall_finish"] = "WC 01 (Wallcovering), PT 03 (Paint)"
+    sched_typ.append(r)
+rooms = [
+    {"room_id": "F1-143", "room_name": "King Studio A (First Floor)",
+     "in_scope": True, "materials": {"walls": "GYP"},
+     "dimensions": {"wall_area_sqft": 500},
+     "elements": {"wallcovering_sqft": 480}, "notes": ""},
+]
+a = _an(rooms, sched_typ, agg={"total_wallcovering_sqft": 480})
+T._enforce_wallcovering_schedule_gate(a)
+rec = a.get("_wc_schedule_gate", {})
+check(rooms[0]["elements"]["wallcovering_sqft"] == 480,
+      f"WC safe-mode: unmatched-schedule room lost its extracted WC "
+      f"({rooms[0]['elements']['wallcovering_sqft']})")
+check(a["aggregated_totals"]["total_wallcovering_sqft"] == 480,
+      "WC safe-mode: aggregate must be untouched")
+check(rec.get("zeroing_enabled") is False and rec.get("wc_match_share") == 0.0,
+      f"WC safe-mode: zeroing must be disabled at 0% match ({rec.get('wc_match_share')})")
+check(any("RFI-only" in str(n) for n in a.get("notes", [])),
+      "WC safe-mode: explanatory note missing")
+
 print("=== PASS ===" if not fails else
       "=== ISSUES: " + "; ".join(fails) + " ===")
 raise SystemExit(1 if fails else 0)

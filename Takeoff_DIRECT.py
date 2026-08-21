@@ -15742,6 +15742,44 @@ def _enforce_wallcovering_schedule_gate(analysis):
         _SCHEDULE_FINISH_AUTHORITY_MIN_ROWS, len(rfs) // 2)
     matched_wc_row_ids = set()
 
+    # Match-coverage safe mode (2026-08-21 Homewood regression): the
+    # schedule's rows were keyed "211/217 (typical)" while extracted rooms
+    # carried no numbers and descriptive names — ZERO WC rows matched any
+    # room, so every extracted-WC room looked "not designated" and the
+    # gate zeroed 60k SF of real guestroom wallcovering. When most WC rows
+    # match nothing, the gate cannot distinguish "not designated" from
+    # "matching failed" — zeroing disables (RFI-only), same principle as
+    # the legend-style safeguard above.
+    wc_match_share = 0.0
+    if wc_rows:
+        pre_matched = set()
+        for _floor in analysis.get("floors", []) or []:
+            for _room in _floor.get("rooms", []) or []:
+                if not isinstance(_room, dict):
+                    continue
+                _row = _match_schedule_row(_room, by_num, by_name)
+                if _row is not None and id(_row) in wc_row_ids:
+                    pre_matched.add(id(_row))
+        wc_match_share = len(pre_matched) / len(wc_rows)
+        # Scope the safe mode to WC-DOMINATED schedules (≥1/3 of rows and
+        # ≥3 rows designate WC): there, unmatched rows mean the naming
+        # conventions disagree and zeroing guts the job's core scope.
+        # A schedule with an incidental WC row or two (the PNC pantry
+        # case) keeps zeroing — unmatched invented WC stays the risk.
+        wc_dominated = len(wc_rows) >= max(3, len(rfs) // 3)
+        if can_zero and wc_dominated and wc_match_share < 0.5:
+            can_zero = False
+            print(f"   🧻 WC schedule gate: only {wc_match_share:.0%} of "
+                  f"{len(wc_rows)} WC row(s) matched an extracted room — "
+                  f"schedule/room naming disagree; zeroing DISABLED "
+                  f"(RFI-only mode)", flush=True)
+            analysis.setdefault("notes", []).append(
+                f"[Wallcovering] Schedule gate ran RFI-only: "
+                f"{wc_match_share:.0%} of the schedule's WC rows matched "
+                f"extracted rooms (schedule keys rooms as number lists / "
+                f"typicals; extraction names them descriptively). Extracted "
+                f"wallcovering kept; confirm room-by-room WC designation.")
+
     zeroed_rooms = []
     zeroed_sqft = 0.0
     kept_rooms = []
@@ -15867,6 +15905,7 @@ def _enforce_wallcovering_schedule_gate(analysis):
         "numbered_rows": numbered_rows,
         "zeroing_enabled": can_zero,
         "authoritative_enabled": _wc_schedule_authoritative_enabled(),
+        "wc_match_share": round(wc_match_share, 3),
         "promoted_rooms": promoted_rooms[:20],
         "promoted_sqft": round(promoted_sqft, 2),
         "kept_rooms": kept_rooms[:20],
