@@ -20,13 +20,21 @@ def _room(rid, doors=0, wall=0):
 
 
 class TestSheetConsensusMerge(unittest.TestCase):
-    def test_max_recovers_missed_fields(self):
+    def test_fill_only_recovers_missed_fields(self):
         a = _read([_room("101", doors=2, wall=0)])
         b = _read([_room("101", doors=0, wall=400)])
         m = td._merge_sheet_consensus_reads([a, b])
         r = m["floors"][0]["rooms"][0]
         self.assertEqual(r["elements"]["doors_full_paint"], 2)
         self.assertEqual(r["dimensions"]["wall_area_sqft"], 400)
+
+    def test_fill_only_never_raises_nonzero(self):
+        # ULUM R4 regression: read-2's larger wall area must NOT win
+        a = _read([_room("101", wall=300)])
+        b = _read([_room("101", wall=450)])
+        m = td._merge_sheet_consensus_reads([a, b])
+        self.assertEqual(m["floors"][0]["rooms"][0]["dimensions"]
+                         ["wall_area_sqft"], 300)
 
     def test_union_adds_room_seen_once(self):
         a = _read([_room("101", doors=1)])
@@ -68,8 +76,8 @@ class TestFuzzyCollisionGuard(unittest.TestCase):
         m = td._merge_sheet_consensus_reads([a, b])
         rooms = m["floors"][0]["rooms"]
         self.assertEqual(len(rooms), 1)
-        self.assertEqual(rooms[0]["dimensions"]["wall_area_sqft"], 450)
-        self.assertEqual(rooms[0]["elements"]["doors_full_paint"], 2)
+        self.assertEqual(rooms[0]["dimensions"]["wall_area_sqft"], 400)
+        self.assertEqual(rooms[0]["elements"]["doors_full_paint"], 1)
 
     def test_genuinely_new_room_still_unions(self):
         a = _read([_room("101")])

@@ -4117,9 +4117,15 @@ def _merge_sheet_consensus_reads(reads):
                 or _norm_room_id(r.get("room_name")))
 
     def _merge_numeric(dst, src):
+        # FILL-ONLY (ULUM R4 regression): a non-zero field is never
+        # raised — max-merge let read-2's larger wall areas win on
+        # well-extracted jobs (+34% walls) and decoupled scaled-dim
+        # marker notes (read-1) from the values they flagged (read-2).
+        # Zero/missing fields fill from the other read, which is the
+        # entire recovery benefit (Harlem dims, Caris doors).
         for k, v in (src or {}).items():
             if isinstance(v, (int, float)):
-                if _num(dst.get(k, 0)) < _num(v):
+                if _num(dst.get(k, 0)) == 0 and _num(v) != 0:
                     dst[k] = v
             elif isinstance(v, str) and v.strip() and not str(
                     dst.get(k) or "").strip():
