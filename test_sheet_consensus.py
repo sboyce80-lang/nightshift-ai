@@ -53,5 +53,33 @@ class TestSheetConsensusMerge(unittest.TestCase):
         self.assertEqual(m["project_info"]["total_units"], 109)
 
 
+class TestFuzzyCollisionGuard(unittest.TestCase):
+    def test_renamed_room_merges_not_duplicates(self):
+        # Hudson R4: 'Living Room' vs 'Living/Sleeping Room' — same room,
+        # two names; blind union inflated 77→115 rooms.
+        a = _read([{"room_id": "u1-living", "room_name": "Living Room",
+                    "in_scope": True,
+                    "dimensions": {"wall_area_sqft": 400},
+                    "elements": {"doors_full_paint": 1}}])
+        b = _read([{"room_id": "u1-livslp",
+                    "room_name": "Living/Sleeping Room", "in_scope": True,
+                    "dimensions": {"wall_area_sqft": 450},
+                    "elements": {"doors_full_paint": 2}}])
+        m = td._merge_sheet_consensus_reads([a, b])
+        rooms = m["floors"][0]["rooms"]
+        self.assertEqual(len(rooms), 1)
+        self.assertEqual(rooms[0]["dimensions"]["wall_area_sqft"], 450)
+        self.assertEqual(rooms[0]["elements"]["doors_full_paint"], 2)
+
+    def test_genuinely_new_room_still_unions(self):
+        a = _read([_room("101")])
+        b = _read([_room("101"), {"room_id": "b-05",
+                                  "room_name": "Boiler Plant",
+                                  "in_scope": True, "dimensions": {},
+                                  "elements": {}}])
+        m = td._merge_sheet_consensus_reads([a, b])
+        self.assertEqual(len(m["floors"][0]["rooms"]), 2)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -4150,7 +4150,34 @@ def _merge_sheet_consensus_reads(reads):
                     _merge_numeric(tgt.setdefault("elements", {}),
                                    r.get("elements"))
                 elif k:
-                    # room only one read saw — union it in
+                    # Room only one read saw. Guard against phantom
+                    # duplication first (Hudson R4: reads named the same
+                    # rooms differently — 'Living Room' vs 'Living/
+                    # Sleeping' — and blind union inflated 77→115 rooms,
+                    # walls +65%): a fuzzy collision with an existing
+                    # room means SAME room, so field-max merge into it
+                    # instead of adding.
+                    toks = set(re.findall(
+                        r"[a-z0-9]+", str(r.get("room_name") or "").lower()))
+                    toks -= {"room", "area", "the", "a"}
+                    collided = None
+                    if toks:
+                        for ek, er in room_index.items():
+                            etoks = set(re.findall(
+                                r"[a-z0-9]+",
+                                str(er.get("room_name") or "").lower()))
+                            etoks -= {"room", "area", "the", "a"}
+                            inter = toks & etoks
+                            if etoks and (len(inter) / max(
+                                    1, min(len(toks), len(etoks)))) >= 0.5:
+                                collided = er
+                                break
+                    if collided is not None:
+                        _merge_numeric(collided.setdefault("dimensions", {}),
+                                       r.get("dimensions"))
+                        _merge_numeric(collided.setdefault("elements", {}),
+                                       r.get("elements"))
+                        continue
                     tgt_floor = None
                     fname = str(fl.get("floor_name") or "")
                     for bf in floors:
