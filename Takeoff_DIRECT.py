@@ -14985,6 +14985,116 @@ def _gate_add_rfi(analysis, category, question):
     bucket.append({"category": category, "question": question})
 
 
+_FLOOR_FINISH_POSITIVE_RX = re.compile(
+    r"\bEP[- ]?\d|epoxy\s+(?:floor|mortar|coating|resin|broadcast)|"
+    r"\bSC[- ]?(?:\d|HRI)|sealed\s+concrete|concrete\s+seal", re.IGNORECASE)
+_FLOOR_FINISH_EXCLUDED_RX = re.compile(
+    r"polished\s+concrete|\bPC[- ]?\d", re.IGNORECASE)
+_ROOM_ID_TOKEN_RX = re.compile(r"\[([A-Z]{0,3}[- ]?\d[\w.-]*)\]")
+
+
+def _norm_room_id(rid):
+    return re.sub(r"[^a-z0-9]", "", str(rid or "").lower())
+
+
+def _reconcile_floor_finishes(analysis):
+    """Flag-gated (NIGHTSHIFT_FLOOR_FINISH_RECONCILE, default off): wire
+    explicitly-documented floor coatings into the priced field.
+
+    2026-08-20 JW batch (ULUM): the sheet-level extraction note read
+    "EP-1 (Epoxy) confirmed in Kitchen [1-09] and Kitchen Storage [1-10]"
+    — hard evidence, recorded — yet both rooms priced $0 floors because
+    the per-room prompt rule ("concrete_floor_sqft ONLY on explicit
+    sealer spec") made the model leave the field 0. JW priced $18.9k of
+    floors on that job. Same class on Homewood (SC-HRI epoxy mortar,
+    $10.2k) and Harlem (sealed concrete, $13.0k).
+
+    Evidence honored (hard numbers only — no heuristics):
+      - room-level: the room's own notes/materials mention EP-x / epoxy
+        floor system / SC-x / sealed concrete;
+      - sheet-level: an analysis note carries a positive mention AND
+        bracketed room ids ([1-09]) — applied to those rooms only.
+    A hit on a room whose concrete_floor_sqft is 0 sets it to the room's
+    measured floor_area_sqft (the schedule says the WHOLE floor gets the
+    system). Polished concrete (PC-x) stays excluded per the hard-numbers
+    policy but now emits an RFI note instead of silence.
+    Only-increase on evidence; idempotent via _floor_finish_reconcile.
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if os.environ.get("NIGHTSHIFT_FLOOR_FINISH_RECONCILE", "0").strip() not in (
+            "1", "true", "True"):
+        return analysis
+    if analysis.get("_floor_finish_reconcile"):
+        return analysis
+
+    # Sheet-level notes: room ids named near a positive mention.
+    noted_ids = set()
+    polished_seen = False
+    for note in (analysis.get("notes") or []):
+        # Clause-scope the id harvest: one note often lists several
+        # finishes ("EP-1 in Kitchen [1-09]; PC-1 in Bar [1-02]") and the
+        # polished rooms must NOT inherit the epoxy clause's evidence.
+        for clause in re.split(r"[;.\n]", str(note)):
+            if _FLOOR_FINISH_EXCLUDED_RX.search(clause):
+                polished_seen = True
+                continue
+            if _FLOOR_FINISH_POSITIVE_RX.search(clause):
+                for tok in _ROOM_ID_TOKEN_RX.findall(clause):
+                    noted_ids.add(_norm_room_id(tok))
+
+    applied = []
+    for fl in (analysis.get("floors") or []):
+        for r in (fl.get("rooms") or []):
+            if not isinstance(r, dict) or r.get("in_scope") is False:
+                continue
+            el = r.setdefault("elements", {})
+            if _num(el.get("concrete_floor_sqft", 0)) > 0:
+                continue
+            own_text = " ".join([str(r.get("notes") or ""),
+                                 json.dumps(r.get("materials") or {})])
+            if _FLOOR_FINISH_EXCLUDED_RX.search(own_text):
+                polished_seen = True
+            hit = bool(_FLOOR_FINISH_POSITIVE_RX.search(own_text))
+            if not hit and noted_ids:
+                rid = _norm_room_id(r.get("room_id"))
+                hit = bool(rid) and rid in noted_ids
+            if not hit:
+                continue
+            area = _num((r.get("dimensions") or {}).get("floor_area_sqft", 0))
+            if area <= 0:
+                continue
+            el["concrete_floor_sqft"] = round(area, 2)
+            r["notes"] = (str(r.get("notes") or "") +
+                          " [floor-finish reconcile: documented coating "
+                          "wired to pricing]").strip()
+            applied.append((r.get("room_name") or r.get("room_id") or "?",
+                            round(area, 2)))
+
+    if applied:
+        agg = analysis.setdefault("aggregated_totals", {})
+        total = 0.0
+        for fl in (analysis.get("floors") or []):
+            for r in (fl.get("rooms") or []):
+                if isinstance(r, dict) and r.get("in_scope") is not False:
+                    total += _num((r.get("elements") or {})
+                                  .get("concrete_floor_sqft", 0))
+        agg["total_concrete_floor_sqft"] = round(total, 2)
+        names = ", ".join(f"{n} ({a:,.0f} SF)" for n, a in applied[:6])
+        analysis.setdefault("notes", []).append(
+            f"[Floor-Finish Reconcile] Wired {len(applied)} documented "
+            f"floor-coating room(s) into pricing: {names} — total "
+            f"{total:,.0f} SF. Evidence: explicit EP-x/SC-x/sealed-concrete "
+            f"callouts recorded by extraction but left unpriced.")
+    if polished_seen:
+        analysis.setdefault("notes", []).append(
+            "[Floor-Finish Reconcile] Polished concrete (PC-x) present but "
+            "NOT priced per hard-numbers policy — RFI: confirm whether a "
+            "sealer/coating over the polished slab is in the paint scope.")
+    analysis["_floor_finish_reconcile"] = True
+    return analysis
+
+
 def _enforce_ceiling_scope_gate(analysis):
     """Authoritative final ceiling-scope reconciliation, run inside
     build_priced_takeoff (the choke point before calculate_costs). Fixes two
@@ -17411,6 +17521,11 @@ def build_priced_takeoff(analysis, strict=None):
     # total_wallcovering_sqft from the wall bill, so phantom WC would silently
     # shrink walls too. Flag-gated; no-op when off.
     analysis = _enforce_wallcovering_schedule_gate(analysis)
+
+    # Floor-finish reconcile: documented EP-x/SC-x/sealed-concrete coatings
+    # recorded by extraction but left at 0 get wired into pricing; polished
+    # concrete emits an RFI instead of silence. Flag-gated; no-op when off.
+    analysis = _reconcile_floor_finishes(analysis)
 
     # Painted-cabinet price-or-RFI gate: a finish-schedule row calling for
     # field-painted cabinets must price (measured SF) or RFI — never vanish
