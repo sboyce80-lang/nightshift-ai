@@ -248,7 +248,9 @@ _STRUCTURED_OUTPUTS_BROKEN = False  # kept for any external readers
 
 
 def _structured_outputs_enabled():
-    if _STRUCTURED_OUTPUTS_MODE == "off":
+    # _STRUCTURED_OUTPUTS_BROKEN honored for backward compat — external
+    # code (and tests) set the boolean directly as a kill switch.
+    if _STRUCTURED_OUTPUTS_MODE == "off" or _STRUCTURED_OUTPUTS_BROKEN:
         return False
     return os.environ.get("NIGHTSHIFT_STRUCTURED_OUTPUTS", "1").strip() not in (
         "0", "false", "False")
