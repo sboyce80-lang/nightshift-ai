@@ -210,14 +210,45 @@ _EXTRACTION_OUTPUT_SCHEMA = _so_obj({
     "has_window_schedule": _SO_BOOL,
 })
 
+# Slim variant for the grammar-400 fallback ladder: rooms + project_info
+# only (no exterior block, no schedule booleans). Loses exterior detail on
+# the affected call but keeps schema-enforced JSON — vastly better than
+# unconstrained text, whose narrated responses cost whole sheets on the
+# 2026-08-20 JW batch. Exterior quantities on slim-mode runs come from the
+# dedicated exterior passes.
+_EXTRACTION_OUTPUT_SCHEMA_SLIM = _so_obj({
+    "project_info": _so_obj({
+        "total_floors_analyzed": _SO_NUM,
+        "total_rooms_found": _SO_NUM,
+        "scale_notation": _SO_STR,
+        "building_type": _SO_STR,
+        "total_stories": _SO_NUM,
+        "total_units": _SO_NUM,
+        "footprint_sqft": _SO_NUM,
+    }),
+    "floors": {"type": "array", "items": _so_obj({
+        "floor_name": _SO_STR,
+        "rooms": {"type": "array", "items": _SO_ROOM_ITEM},
+    })},
+    "notes": _SO_STR_ARR,
+    "no_floor_plans_found": _SO_BOOL,
+    "no_detailed_floor_plans_found": _SO_BOOL,
+})
+
 # Kill switch: if the API ever rejects the schema (400 naming output_config/
 # schema/format), flip to text mode for the rest of the process instead of
 # failing every call. The repair parser handles text mode as before.
-_STRUCTURED_OUTPUTS_BROKEN = False
+# Three-state ladder (2026-08-20 JW batch fix): "full" schema → grammar
+# 400 → "slim" schema (rooms-only: ~60% fewer grammar branches) → second
+# 400 → "off" (text mode). The old two-state ladder dropped straight to
+# unconstrained text, whose 68-95k-char narrated responses then failed
+# JSON repair and cost whole sheets on 5/5 batch jobs.
+_STRUCTURED_OUTPUTS_MODE = "full"   # "full" | "slim" | "off"
+_STRUCTURED_OUTPUTS_BROKEN = False  # kept for any external readers
 
 
 def _structured_outputs_enabled():
-    if _STRUCTURED_OUTPUTS_BROKEN:
+    if _STRUCTURED_OUTPUTS_MODE == "off":
         return False
     return os.environ.get("NIGHTSHIFT_STRUCTURED_OUTPUTS", "1").strip() not in (
         "0", "false", "False")
@@ -228,26 +259,37 @@ def _extraction_output_kwargs():
     enforced JSON output when enabled, nothing otherwise."""
     if not _structured_outputs_enabled():
         return {}
+    schema = (_EXTRACTION_OUTPUT_SCHEMA_SLIM
+              if _STRUCTURED_OUTPUTS_MODE == "slim"
+              else _EXTRACTION_OUTPUT_SCHEMA)
     return {"output_config": {
-        "format": {"type": "json_schema", "schema": _EXTRACTION_OUTPUT_SCHEMA},
+        "format": {"type": "json_schema", "schema": schema},
     }}
 
 
 def _maybe_disable_structured_outputs(exc):
-    """If `exc` is the API rejecting our output schema, flip the kill
-    switch (process-wide) and return True so the caller can retry the
-    call in text mode instead of failing the chunk/batch."""
-    global _STRUCTURED_OUTPUTS_BROKEN
-    if _STRUCTURED_OUTPUTS_BROKEN:
+    """If `exc` is the API rejecting our output schema, step the ladder
+    down one state (full → slim → off, process-wide) and return True so
+    the caller can retry the call at the reduced level instead of
+    failing the chunk/batch."""
+    global _STRUCTURED_OUTPUTS_MODE, _STRUCTURED_OUTPUTS_BROKEN
+    if _STRUCTURED_OUTPUTS_MODE == "off":
         return False
     msg = str(exc).lower()
     if isinstance(exc, anthropic.BadRequestError) and any(
             t in msg for t in ("output_config", "json_schema", "schema",
-                               "output format", "structured")):
-        _STRUCTURED_OUTPUTS_BROKEN = True
-        print("   ⚠️  API rejected the structured-output schema — falling "
-              "back to text mode for the rest of this run "
-              f"({str(exc)[:160]})")
+                               "output format", "structured", "grammar")):
+        if _STRUCTURED_OUTPUTS_MODE == "full":
+            _STRUCTURED_OUTPUTS_MODE = "slim"
+            print("   ⚠️  API rejected the full structured-output schema — "
+                  "retrying this run with the slim (rooms-only) schema "
+                  f"({str(exc)[:120]})")
+        else:
+            _STRUCTURED_OUTPUTS_MODE = "off"
+            _STRUCTURED_OUTPUTS_BROKEN = True
+            print("   ⚠️  API rejected the slim schema too — falling back "
+                  f"to text mode for the rest of this run "
+                  f"({str(exc)[:120]})")
         return True
     return False
 
@@ -355,6 +397,61 @@ def _repair_truncated_json(candidate):
     return attempts
 
 
+def _iter_balanced_objects(text, max_objects=8, max_scans=12):
+    """Yield every balanced top-level {...} span in `text`, tolerating
+    narration before/between/after the JSON (the 2026-08-20 JW batch
+    failure mode: 68-95k-char responses opening with "I'll analyze..."
+    prose, sometimes with several fenced blocks, defeated the single
+    greedy-span stages). Scans are bounded so a pathological 95k-char
+    input can't go quadratic."""
+    spans = []
+    i, n, scans = 0, len(text), 0
+    while i < n and len(spans) < max_objects and scans < max_scans:
+        start = text.find("{", i)
+        if start < 0:
+            break
+        scans += 1
+        depth, in_str, esc, end = 0, False, False, -1
+        for j in range(start, n):
+            ch = text[j]
+            if esc:
+                esc = False
+                continue
+            if ch == "\\":
+                if in_str:
+                    esc = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch in "{[":
+                depth += 1
+            elif ch in "}]":
+                depth -= 1
+                if depth == 0 and ch == "}":
+                    end = j
+                    break
+                if depth < 0:
+                    break
+        if end > start:
+            spans.append(text[start:end + 1])
+            i = end + 1
+        elif depth > 0:
+            break  # truncated final object — nothing balanced past here
+        else:
+            i = start + 1  # stray close before open; try the next brace
+    return spans
+
+
+# Keys that identify a real extraction/schedule payload vs. an incidental
+# JSON snippet quoted inside narration.
+_SIGNAL_KEYS = ("floors", "rooms", "room_finish_schedule", "project_info",
+                "no_floor_plans_found", "door_marks", "window_marks",
+                "sheet_id", "structural_finish_scope")
+
+
 def _parse_json_response(text, context=""):
     """Extract and parse the JSON object from a model response.
 
@@ -395,14 +492,61 @@ def _parse_json_response(text, context=""):
     obj = _try(re.sub(r",\s*([}\]])", r"\1", candidate))
     if obj is not None:
         return obj
-    # 5. Truncation close-out repair (response cut off mid-output)
-    for repaired in _repair_truncated_json(text):
-        obj = _try(repaired) or _try(re.sub(r",\s*([}\]])", r"\1", repaired))
-        if obj is not None:
-            print(f"   🩹 JSON repair recovered a truncated/malformed "
-                  f"response{' (' + context + ')' if context else ''} "
-                  f"({len(text)} chars in)")
-            return obj
+    # 4b. Multi-object scan: narration before/between/after JSON defeats
+    # the single greedy span (stage 3 grabs first-{ .. last-} across
+    # narration and multiple fenced blocks). Parse each balanced object
+    # individually; prefer payloads carrying extraction signal keys,
+    # then the largest parseable one.
+    parsed = []
+    for span in _iter_balanced_objects(text):
+        o = _try(span) or _try(re.sub(r",\s*([}\]])", r"\1", span))
+        if o is not None:
+            parsed.append(o)
+    last_resort = None
+    if parsed:
+        signal = [o for o in parsed if any(k in o for k in _SIGNAL_KEYS)]
+        if signal:
+            best = max(signal, key=lambda o: len(json.dumps(o)))
+            print(f"   🩹 JSON repair: multi-object scan recovered a payload"
+                  f"{' (' + context + ')' if context else ''} "
+                  f"({len(parsed)} object(s) in {len(text)} chars)")
+            return best
+        # No signal keys among the balanced objects — a truncated real
+        # payload may still sit beyond them (narration quoting a complete
+        # brace pair before the cut-off extraction). Hold the best
+        # balanced object as a last resort and let the truncation stages
+        # try first.
+        last_resort = max(parsed, key=lambda o: len(json.dumps(o)))
+    # 4c. Unterminated fenced block (```json opened, never closed —
+    # truncated responses): hand everything after the fence marker to the
+    # truncation close-out below by re-pointing `text` at it.
+    open_fence = re.search(r"```(?:json)?\s*(\{.*)\Z", text, re.DOTALL)
+    if open_fence:
+        text = open_fence.group(1)
+    # 5. Truncation close-out repair (response cut off mid-output).
+    # The walker anchors at the first "{" — wrong anchor when narration
+    # quotes a complete brace pair before the real (truncated) payload —
+    # so also retry anchored at the LAST place a signal key opens an
+    # object, which is where the real payload starts.
+    candidates_texts = [text]
+    starts = [m.start() for k in _SIGNAL_KEYS
+              for m in re.finditer(r"\{\s*\"" + k + r"\"", text)]
+    if starts:
+        candidates_texts.append(text[max(starts):])
+    for cand_text in candidates_texts:
+        for repaired in _repair_truncated_json(cand_text):
+            obj = _try(repaired) or _try(re.sub(r",\s*([}\]])", r"\1",
+                                                repaired))
+            if obj is not None:
+                print(f"   🩹 JSON repair recovered a truncated/malformed "
+                      f"response{' (' + context + ')' if context else ''} "
+                      f"({len(text)} chars in)")
+                return obj
+    if last_resort is not None:
+        print(f"   🩹 JSON repair: returning best balanced object "
+              f"(no signal keys)"
+              f"{' (' + context + ')' if context else ''}")
+        return last_resort
     print(f"   ⚠️  JSON parse failed after all repair attempts"
           f"{' (' + context + ')' if context else ''} — "
           f"{len(text)} chars, head: {text[:80]!r}")
@@ -3839,9 +3983,45 @@ def _call_sheet_api(client, content_blocks, output_kwargs, label,
                 try:
                     return _collect_stream_text(stream, label=label)
                 except TruncatedResponseError as _te:
-                    print(f"      ✂️  {label}: truncated at max_tokens — "
-                          f"salvaging partial response")
-                    return _te.partial_text
+                    # Continuation beats salvage: resend with the partial
+                    # as an assistant prefill so the model finishes the
+                    # SAME output instead of us close-out-repairing a cut
+                    # JSON (2026-08-20 JW batch: salvaged partials still
+                    # failed repair on 5/5 jobs). Falls back to the
+                    # partial if continuation itself errors.
+                    joined = _te.partial_text
+                    for cont in range(2):
+                        print(f"      ✂️  {label}: truncated at max_tokens "
+                              f"({len(joined)} chars) — requesting "
+                              f"continuation {cont + 1}/2")
+                        try:
+                            with client.messages.stream(
+                                model="claude-sonnet-4-6",
+                                max_tokens=max_tokens,
+                                temperature=0,
+                                timeout=300.0,
+                                messages=[
+                                    {"role": "user",
+                                     "content": content_blocks},
+                                    {"role": "assistant",
+                                     "content": joined},
+                                ],
+                                # no output_config: grammar mode rejects
+                                # assistant prefill; a JSON prefix
+                                # continues fine unconstrained
+                            ) as cstream:
+                                try:
+                                    joined += _collect_stream_text(
+                                        cstream, label=f"{label} cont")
+                                    return joined
+                                except TruncatedResponseError as _ce:
+                                    joined += _ce.partial_text
+                        except Exception as _cexc:
+                            print(f"      ⚠️  {label}: continuation failed "
+                                  f"({type(_cexc).__name__}) — using "
+                                  f"salvaged partial")
+                            break
+                    return joined
         except anthropic.BadRequestError as e:
             if _maybe_disable_structured_outputs(e):
                 output_kwargs = {}
