@@ -15011,6 +15011,86 @@ def _gate_add_rfi(analysis, category, question):
     bucket.append({"category": category, "question": question})
 
 
+_SCALED_DIM_MARKER_RX = re.compile(
+    r"scaled (?:from|at|off)\b|dimensions are approximate|"
+    r"approximate and must be verified|do not use[^.]{0,40}(?:as )?final",
+    re.IGNORECASE)
+
+
+def _quarantine_scaled_dims(analysis):
+    """Flag-gated (NIGHTSHIFT_SCALED_DIM_QUARANTINE, default off): rooms
+    whose own extraction notes admit their dimensions were SCALED off a
+    drawing ("scaled from the RCP at 1/4\" — do not use as final") do not
+    price walls from those dimensions.
+
+    2026-08-20 JW batch (ULUM): RCP-scaled room dims were admitted into
+    quantities — the extraction itself wrote "approximate and must be
+    verified … do not use as final" — and walls landed +71% / ceilings
+    +122%, disguised by offsetting misses (+21% total). A self-admitted
+    approximation is not a hard number; per the hard-numbers policy the
+    wall area and perimeter are zeroed + RFI, ceilings left to the ceiling
+    gates (RCP is authoritative for ceiling TYPE). Only-reduce; original
+    values preserved on the room; idempotent via _scaled_dim_quarantine.
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if os.environ.get("NIGHTSHIFT_SCALED_DIM_QUARANTINE", "0").strip() not in (
+            "1", "true", "True"):
+        return analysis
+    if analysis.get("_scaled_dim_quarantine"):
+        return analysis
+
+    quarantined = []
+    removed_wall = 0.0
+    for fl in (analysis.get("floors") or []):
+        for r in (fl.get("rooms") or []):
+            if not isinstance(r, dict) or r.get("in_scope") is False:
+                continue
+            if not _SCALED_DIM_MARKER_RX.search(str(r.get("notes") or "")):
+                continue
+            dims = r.get("dimensions") or {}
+            wall = _num(dims.get("wall_area_sqft", 0))
+            if wall <= 0:
+                continue
+            mult = _extract_multiplier_from_notes(r)
+            r["_scaled_dim_quarantined"] = {
+                "wall_area_sqft": wall,
+                "perimeter_lf": _num(dims.get("perimeter_lf", 0))}
+            dims["wall_area_sqft"] = 0
+            dims["perimeter_lf"] = 0
+            removed_wall += wall * mult
+            quarantined.append(r.get("room_name") or r.get("room_id") or "?")
+            r["notes"] = (str(r.get("notes") or "") +
+                          " [scaled-dim quarantine: wall area not priced — "
+                          "dimension source self-reported as scaled/"
+                          "approximate]").strip()
+
+    if quarantined:
+        agg = analysis.setdefault("aggregated_totals", {})
+        prev = _num(agg.get("total_paintable_wall_sqft", 0))
+        agg["total_paintable_wall_sqft"] = max(
+            0, round(prev - removed_wall, 2))
+        analysis.setdefault("notes", []).append(
+            f"[Scaled-Dim Quarantine] {len(quarantined)} room(s) had wall "
+            f"quantities derived from self-reported scaled/approximate "
+            f"dimensions — {removed_wall:,.0f} SF removed from the wall "
+            f"bill pending dimensioned-plan or VME corroboration: "
+            f"{', '.join(quarantined[:8])}"
+            f"{'…' if len(quarantined) > 8 else ''}.")
+        _gate_add_rfi(
+            analysis, "Scaled Dimensions",
+            f"{len(quarantined)} room(s) ({removed_wall:,.0f} SF of walls) "
+            f"were measurable only by scaling undimensioned drawings, which "
+            f"this takeoff does not price. Provide dimensioned plans for "
+            f"these areas and we will price them.")
+        print(f"   📏 Scaled-dim quarantine: removed {removed_wall:,.0f} SF "
+              f"of scaled-dim walls across {len(quarantined)} room(s)",
+              flush=True)
+    analysis["_scaled_dim_quarantine"] = {
+        "rooms": quarantined[:20], "removed_wall_sqft": round(removed_wall, 2)}
+    return analysis
+
+
 def _enforce_unit_mix_coverage(analysis):
     """Flag-gated (NIGHTSHIFT_UNIT_MIX_GATE, default off): detect
     unit-typical multiplication that doesn't cover the project's unit
@@ -17176,6 +17256,13 @@ _SCOPE_SWEEP_KEYWORDS = (
     ("scope of work", 8), ("general notes", 6), ("alternate", 6),
     ("allowance", 6), ("specification", 4), ("legend", 3),
     ("schedule", 3), ("exposed structure", 8), ("exposed deck", 8),
+    # Exterior/elevation scope (F4, 2026-08-20 JW batch): power-washing
+    # spec blocks and exterior finish keynotes live on elevation sheets no
+    # other pass reads (Hudson A2.01: "POWER WASHING SCOPE … ±24,652 SF",
+    # $40.9k; Caris A3.1: siding/columns/fascia, $20.8k).
+    ("power wash", 10), ("pressure wash", 10), ("tuck-point", 8),
+    ("tuckpoint", 8), ("exterior elevation", 8), ("facade", 6),
+    ("elevation", 4), ("sealant", 4), ("keynote", 4),
 )
 
 
@@ -17263,6 +17350,10 @@ Report, per page:
   intumescent coating, dryfall.
 - Callouts to paint exposed structure / exposed deck / MEP / bar joists.
 - Exterior painting scope (elevations or notes calling for exterior paint).
+- Exterior CLEANING/PREP sold with paint scope: power-washing or
+  pressure-washing spec blocks (often with an SF area on elevation
+  sheets), tuck-pointing allowances (LF), sealant replacement around
+  openings — quote the stated quantity and the sheet it appears on.
 - Alternates, allowances, or unit prices that touch painting.
 - Scope-of-work notes: inclusions, exclusions, phasing, owner-supplied items,
   "paint all ..." directives.
@@ -17674,6 +17765,12 @@ def build_priced_takeoff(analysis, strict=None):
     # review) instead of silently under/over-billing. Flag-gated; no-op
     # when off.
     analysis = _enforce_unit_mix_coverage(analysis)
+
+    # Scaled-dim quarantine: rooms whose notes admit scaled/approximate
+    # dimensions do not price walls from them (zero + RFI, hard-numbers
+    # policy). Runs BEFORE the VME wall passes so VME can re-supply the
+    # geometry authoritatively. Flag-gated; no-op when off.
+    analysis = _quarantine_scaled_dims(analysis)
 
     # Painted-cabinet price-or-RFI gate: a finish-schedule row calling for
     # field-painted cabinets must price (measured SF) or RFI — never vanish
@@ -21486,7 +21583,17 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
               stair_rate, _get_markup('stairs')),
         _line(f"Gyp. Between Stairs - {gyp_stairs:,.0f} sqft @ ${gyps_rate:.2f}", gyp_stairs,
               gyps_rate, _get_markup('gyp_between_stairs')),
-        _line(f"Level 5 Finish - {level_5_sqft:,.0f} sqft @ ${l5_rate:.2f}", level_5_sqft,
+        # F7 (2026-08-20 JW batch): Level-5 was real documented scope on
+        # Hudson (D18) and ULUM (finish schedule) yet estimators like JW
+        # absorb it in wall rates — labeling it an ALLOWANCE makes it a
+        # strikeable line instead of silent base-bid inflation.
+        _line((f"Level 5 Finish (ALLOWANCE — per finish schedule; strike if "
+               f"carried by drywall sub) - {level_5_sqft:,.0f} sqft @ "
+               f"${l5_rate:.2f}"
+               if os.environ.get("NIGHTSHIFT_LEVEL5_ALLOWANCE", "0").strip()
+               in ("1", "true", "True")
+               else f"Level 5 Finish - {level_5_sqft:,.0f} sqft @ "
+                    f"${l5_rate:.2f}"), level_5_sqft,
               l5_rate, _get_markup('level_5_finish')),
         _line(f"Concrete Sealer - {concrete_sqft:,.0f} sqft @ ${conc_rate:.2f}", concrete_sqft,
               conc_rate, _get_markup('concrete_sealer')),
