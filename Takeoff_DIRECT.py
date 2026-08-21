@@ -9017,6 +9017,20 @@ def _maybe_run_exterior_pass(client, pdf_path, analysis_result):
             "retail", "dealership"
         )
     )
+    # S5 (2026-08-21 JW batch): the commercial-keyword gate blocked the
+    # elevation pass on Caris ('assisted living / residential care
+    # facility', JW exterior \$20.8k) and Hudson ('multi-family / hotel')
+    # — the same class as the Biddle residential-elev finding, from the
+    # other side. Behind NIGHTSHIFT_ELEV_PASS_ALL_TYPES, any NON-single-
+    # family building with 0 exterior sqft gets the dedicated pass;
+    # single-family keeps the residential-signal path.
+    if (not is_commercial
+            and os.environ.get("NIGHTSHIFT_ELEV_PASS_ALL_TYPES",
+                               "0").strip() in ("1", "true", "True")
+            and not any(kw in bt for kw in ("single-family", "single family",
+                                            "sfr"))):
+        is_commercial = True  # treat as elevation-pass-eligible
+
     res_signal = None
     if not is_commercial:
         if _residential_elev_pass_enabled():
