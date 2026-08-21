@@ -16424,6 +16424,41 @@ def _enforce_wallcovering_schedule_gate(analysis):
                 # area when the extractor recorded less (guessed splits,
                 # per-unit approximations). Mixed WC+PT rows are skipped:
                 # that split genuinely needs interior elevations.
+                # R3 (2026-08-21, Homewood): MIXED WC+PT rows get a
+                # configurable WC share of wall area (allowance-labeled)
+                # — JW treats guestroom walls as ~all-WC while the
+                # schedule lists 'WC 01 + PT 03 + WD 01' per room, and
+                # refusing to split left WC at 41% of JW. Set
+                # NIGHTSHIFT_WC_MIXED_SHARE to a 0-1 fraction to enable
+                # (e.g. 0.8); unset/0 keeps the strict skip.
+                _mixed_share = 0.0
+                try:
+                    _mixed_share = min(1.0, max(0.0, float(os.environ.get(
+                        "NIGHTSHIFT_WC_MIXED_SHARE", "0") or 0)))
+                except (TypeError, ValueError):
+                    _mixed_share = 0.0
+                if (_wc_schedule_authoritative_enabled()
+                        and _mixed_share > 0
+                        and _schedule_wall_finish_is_wc(row.get("wall_finish"))
+                        and not _schedule_wall_finish_is_wc_only(
+                            row.get("wall_finish"))):
+                    wall_area = _num(dims.get("wall_area_sqft", 0))
+                    target = round(wall_area * _mixed_share, 2)
+                    if target > wc:
+                        mult = _extract_multiplier_from_notes(room)
+                        promoted_sqft += (target - wc) * mult
+                        promoted_rooms.append(label)
+                        elems["wallcovering_sqft"] = target
+                        note = str(room.get("notes", ""))
+                        if "[WC mixed-share" not in note:
+                            room["notes"] = (
+                                note + f" [WC mixed-share ALLOWANCE: "
+                                f"schedule row designates WC+PT — "
+                                f"{_mixed_share:.0%} of wall area carried "
+                                f"as WC ({wc:,.0f}→{target:,.0f} SF); "
+                                f"confirm split from interior "
+                                f"elevations]").strip()
+                        wc = target
                 if (_wc_schedule_authoritative_enabled()
                         and _schedule_wall_finish_is_wc_only(
                             row.get("wall_finish"))):
@@ -21706,6 +21741,26 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
 
     # Interior surfaces
     wall_sqft = _num(aggregated_totals.get('total_paintable_wall_sqft', 0))
+
+    # R3 (2026-08-21, Homewood): outside the VME-authoritative path the
+    # wall bill was never reduced by wallcovering — the same wall surface
+    # billed as painted gyp AND WC install (rerun-3: 315k SF walls + 151k
+    # SF WC on a 146k-SF-surface building). Behind NIGHTSHIFT_WC_WALL_
+    # DEDUCT, wallcovered SF comes out of the painted-wall bill exactly
+    # like the VME pass does.
+    if (os.environ.get("NIGHTSHIFT_WC_WALL_DEDUCT", "0").strip()
+            in ("1", "true", "True")
+            and not ((analysis or {}).get("_vme_authoritative") or {}
+                     ).get("applied")):
+        _wc_for_deduct = _num(aggregated_totals.get(
+            'total_wallcovering_sqft', 0))
+        if _wc_for_deduct > 0 and wall_sqft > 0:
+            _wall_before = wall_sqft
+            wall_sqft = max(0.0, round(wall_sqft - _wc_for_deduct, 2))
+            print(f"   🧻 WC wall deduction: painted walls "
+                  f"{_wall_before:,.0f} − {_wc_for_deduct:,.0f} WC = "
+                  f"{wall_sqft:,.0f} SF")
+
     ceil_sqft = _num(aggregated_totals.get('total_paintable_ceiling_sqft', 0))
     cmu_wall_sqft = _num(aggregated_totals.get('total_cmu_wall_sqft', 0))
     lymewash_sqft = _num(aggregated_totals.get('total_lymewash_wall_sqft', 0))

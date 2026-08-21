@@ -459,6 +459,28 @@ check(a["aggregated_totals"]["total_wallcovering_sqft"] == 2350,
 check(rec.get("unmatched_kept_sqft") == 350,
       f"WC positive-evidence: record ({rec.get('unmatched_kept_sqft')})")
 
+# R3: mixed WC+PT rows promote to the configured share of wall area.
+os.environ["NIGHTSHIFT_WC_SCHEDULE_GATE"] = "1"
+os.environ["NIGHTSHIFT_WC_SCHEDULE_AUTHORITATIVE"] = "1"
+os.environ["NIGHTSHIFT_WC_MIXED_SHARE"] = "0.8"
+sched_mix = _sched6(**{"101": {"wall_finish": "WC 01 (Wallcovering), PT 03 (Paint)"}})
+rooms = [_room(101, "Office A", wc=100)]  # wall_area 500 -> 80% = 400
+a = _an(rooms, sched_mix, agg={"total_wallcovering_sqft": 100})
+T._enforce_wallcovering_schedule_gate(a)
+check(rooms[0]["elements"]["wallcovering_sqft"] == 400,
+      f"WC mixed-share: expected 400, got "
+      f"{rooms[0]['elements']['wallcovering_sqft']}")
+check("[WC mixed-share" in rooms[0]["notes"],
+      "WC mixed-share: allowance note missing")
+check(a["aggregated_totals"]["total_wallcovering_sqft"] == 400,
+      f"WC mixed-share: aggregate {a['aggregated_totals']['total_wallcovering_sqft']}")
+os.environ["NIGHTSHIFT_WC_MIXED_SHARE"] = "0"
+rooms2 = [_room(101, "Office A", wc=100)]
+a2 = _an(rooms2, sched_mix, agg={"total_wallcovering_sqft": 100})
+T._enforce_wallcovering_schedule_gate(a2)
+check(rooms2[0]["elements"]["wallcovering_sqft"] == 100,
+      "WC mixed-share off: extracted value must stand")
+
 # Zero WC rows (Caris S4 crash): gate must run clean, no UnboundLocalError.
 sched_nowc = [_row(n, f"Office {n}") for n in (101, 102, 103, 104, 105, 106)]
 rooms = [_room(101, "Office 101", wc=120)]
