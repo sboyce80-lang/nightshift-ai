@@ -15024,6 +15024,96 @@ def _gate_add_rfi(analysis, category, question):
     bucket.append({"category": category, "question": question})
 
 
+_UNFINISHED_FLOOR_ROOM_RX = re.compile(
+    r"basement|mechanical|mech\b|storage|utility|electrical|receiving|"
+    r"vehicle|shop|warehouse|wash", re.IGNORECASE)
+_HARD_FLOOR_FINISH_RX = re.compile(
+    r"vct|tile|carpet|wood|lvt|epoxy|terrazzo|rubber|linoleum|flagstone|"
+    r"polished", re.IGNORECASE)
+
+
+def _apply_sealed_concrete_allowance(analysis):
+    """Flag-gated (NIGHTSHIFT_SEALED_CONCRETE_ALLOWANCE, default off):
+    utility-class rooms with NO documented floor finish carry a sealed-
+    concrete ALLOWANCE (strikeable, like Level-5) instead of silence.
+
+    Policy call (Steven, 2026-08-21 six-step sequence): Harlem's biggest
+    single miss was \$13k of sealed concrete JW priced from his own
+    knowledge — the clean drawings never state a floor finish for the
+    basement/shop spaces (the callout lived on HIS markup legend). The
+    hard-numbers default (0 + RFI) stands for finished spaces; for rooms
+    whose NAME says utility class (basement/mechanical/storage/shop/wash)
+    AND whose floor finish is undocumented, an unfinished slab is the
+    only possible floor — sealing it is standard scope. Priced into
+    concrete_floor_sqft as a labeled allowance + RFI so an estimator can
+    strike it. Only-increase; skips rooms with any documented finish;
+    idempotent via _sealed_concrete_allowance.
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if os.environ.get("NIGHTSHIFT_SEALED_CONCRETE_ALLOWANCE", "0").strip() \
+            not in ("1", "true", "True"):
+        return analysis
+    if analysis.get("_sealed_concrete_allowance"):
+        return analysis
+    rfs = _get_room_finish_schedule(analysis)
+    by_num, by_name = (_build_schedule_row_maps(rfs) if rfs else ({}, {}))
+
+    applied = []
+    added = 0.0
+    for fl in (analysis.get("floors") or []):
+        for r in (fl.get("rooms") or []):
+            if not isinstance(r, dict) or r.get("in_scope") is False:
+                continue
+            el = r.setdefault("elements", {})
+            if _num(el.get("concrete_floor_sqft", 0)) > 0:
+                continue
+            nm = str(r.get("room_name") or "")
+            if not _UNFINISHED_FLOOR_ROOM_RX.search(nm):
+                continue
+            blob = " ".join([str(r.get("notes") or ""),
+                             json.dumps(r.get("materials") or {})])
+            row = _match_schedule_row(r, by_num, by_name) if rfs else None
+            if row is not None:
+                blob += " " + str(row.get("floor_finish") or "")
+            if _HARD_FLOOR_FINISH_RX.search(blob):
+                continue  # documented finish — not an unfinished slab
+            area = _num((r.get("dimensions") or {})
+                        .get("floor_area_sqft", 0))
+            if area <= 0:
+                continue
+            mult = max(1, int(_num(r.get("unit_multiplier", 1)) or 1))
+            el["concrete_floor_sqft"] = round(area, 2)
+            added += area * mult
+            applied.append(f"{nm} ({area:,.0f} SF)")
+            r["notes"] = (str(r.get("notes") or "") +
+                          " [sealed-concrete ALLOWANCE: utility-class room "
+                          "with undocumented floor finish — strike if not "
+                          "in scope]").strip()
+
+    if added > 0:
+        agg = analysis.setdefault("aggregated_totals", {})
+        agg["total_concrete_floor_sqft"] = round(
+            _num(agg.get("total_concrete_floor_sqft", 0)) + added, 2)
+        analysis.setdefault("notes", []).append(
+            f"[Sealed-Concrete Allowance] {len(applied)} utility-class "
+            f"room(s) with undocumented floor finish carry a sealed-"
+            f"concrete allowance totaling {added:,.0f} SF: "
+            f"{', '.join(applied[:6])}{'…' if len(applied) > 6 else ''}. "
+            f"Strike the line if slab sealing is not in the paint scope.")
+        _gate_add_rfi(
+            analysis, "Sealed Concrete",
+            f"The drawings do not document a floor finish for "
+            f"{len(applied)} utility-class room(s) ({added:,.0f} SF). An "
+            f"allowance for sealing the exposed slab is included — confirm "
+            f"whether slab sealing is in the painting scope.")
+        print(f"   🧱 Sealed-concrete allowance: {len(applied)} room(s), "
+              f"{added:,.0f} SF", flush=True)
+    analysis["_sealed_concrete_allowance"] = {
+        "rooms": len(applied), "added_sqft": round(added, 2)}
+    return analysis
+
+
 def _apply_geometric_room_completion(analysis):
     """Flag-gated (NIGHTSHIFT_GEOMETRIC_ROOM_COMPLETION, default off):
     starved rooms (extracted but with unreadable dimensions) get their
@@ -18509,6 +18599,12 @@ def build_priced_takeoff(analysis, strict=None):
     # starved-walls promotion). Requires the shadow above. Flag-gated;
     # no-op when off.
     analysis = _apply_geometric_room_completion(analysis)
+
+    # Sealed-concrete allowance: utility-class rooms with undocumented
+    # floor finish carry a strikeable slab-sealing allowance + RFI. Runs
+    # after geometric completion so starved rooms have floor areas.
+    # Flag-gated; no-op when off.
+    analysis = _apply_sealed_concrete_allowance(analysis)
 
     agg = analysis.get("aggregated_totals", {}) or {}
     ledger = analysis.get("_quantity_adjustments", []) or []
