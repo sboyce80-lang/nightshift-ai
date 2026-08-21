@@ -4069,16 +4069,102 @@ def _extract_single_sheet(client, pdf_path, page_idx0, sheet_id,
         return None
     content.extend(image_blocks)
 
-    text = _call_sheet_api(client, content, _extraction_output_kwargs(),
-                           label=f"sheet {sheet_id}")
-    if not text:
+    reads = []
+    n_reads = 1
+    try:
+        n_reads = max(1, min(3, int(os.environ.get(
+            "NIGHTSHIFT_PER_SHEET_CONSENSUS", "1"))))
+    except (TypeError, ValueError):
+        n_reads = 1
+    for attempt in range(n_reads):
+        text = _call_sheet_api(client, content, _extraction_output_kwargs(),
+                               label=f"sheet {sheet_id}"
+                               + (f" read {attempt + 1}" if n_reads > 1
+                                  else ""))
+        if not text:
+            continue
+        parsed = _parse_json_response(text)
+        if isinstance(parsed, dict):
+            reads.append(parsed)
+    if not reads:
+        print(f"      ⚠️  Sheet {sheet_id}: no parseable read "
+              f"({n_reads} attempt(s))")
         return None
-    parsed = _parse_json_response(text)
-    if not isinstance(parsed, dict):
-        print(f"      ⚠️  Sheet {sheet_id}: unparseable response "
-              f"({len(text)} chars)")
-        return None
-    return parsed
+    if len(reads) == 1:
+        return reads[0]
+    merged = _merge_sheet_consensus_reads(reads)
+    print(f"      🔁 Sheet {sheet_id}: consensus over {len(reads)} reads — "
+          f"{sum(len(f.get('rooms') or []) for f in merged.get('floors') or [])} "
+          f"room(s) after union-merge")
+    return merged
+
+
+def _merge_sheet_consensus_reads(reads):
+    """Union-merge N reads of the SAME sheet (R2, 2026-08-21: Caris doors
+    went 68→93→2 across identical-input runs — single-read sampling noise
+    is the dominant remaining error source).
+
+    Rooms are unioned by normalized room_id+name; for rooms seen in
+    multiple reads, numeric leaf fields take the MAX (a read that missed
+    a door/dim is recovered; over-extraction is what the downstream gates
+    and dedup are for) and strings take the first non-empty value.
+    project_info comes from the first read (max for unit/room counts)."""
+    import copy
+    base = copy.deepcopy(reads[0])
+
+    def _key(r):
+        return (_norm_room_id(r.get("room_id"))
+                or _norm_room_id(r.get("room_name")))
+
+    def _merge_numeric(dst, src):
+        for k, v in (src or {}).items():
+            if isinstance(v, (int, float)):
+                if _num(dst.get(k, 0)) < _num(v):
+                    dst[k] = v
+            elif isinstance(v, str) and v.strip() and not str(
+                    dst.get(k) or "").strip():
+                dst[k] = v
+            elif isinstance(v, dict):
+                _merge_numeric(dst.setdefault(k, {}), v)
+
+    floors = base.setdefault("floors", [])
+    room_index = {}
+    for fl in floors:
+        for r in (fl.get("rooms") or []):
+            k = _key(r)
+            if k:
+                room_index[k] = r
+    for other in reads[1:]:
+        pi = other.get("project_info") or {}
+        bpi = base.setdefault("project_info", {})
+        for k in ("total_units", "total_rooms_found", "total_stories"):
+            if _num(bpi.get(k, 0)) < _num(pi.get(k, 0)):
+                bpi[k] = pi[k]
+        for fl in (other.get("floors") or []):
+            for r in (fl.get("rooms") or []):
+                k = _key(r)
+                if k and k in room_index:
+                    tgt = room_index[k]
+                    _merge_numeric(tgt.setdefault("dimensions", {}),
+                                   r.get("dimensions"))
+                    _merge_numeric(tgt.setdefault("elements", {}),
+                                   r.get("elements"))
+                elif k:
+                    # room only one read saw — union it in
+                    tgt_floor = None
+                    fname = str(fl.get("floor_name") or "")
+                    for bf in floors:
+                        if str(bf.get("floor_name") or "") == fname:
+                            tgt_floor = bf
+                            break
+                    if tgt_floor is None:
+                        tgt_floor = {"floor_name": fname or "Consensus",
+                                     "rooms": []}
+                        floors.append(tgt_floor)
+                    nr = copy.deepcopy(r)
+                    tgt_floor.setdefault("rooms", []).append(nr)
+                    room_index[k] = nr
+    return base
 
 
 # ── Verification pass (replaces 3x consensus) ──────────────────────────────
