@@ -20606,6 +20606,23 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     windows = _num(aggregated_totals.get('total_windows_painted_interior',
                    aggregated_totals.get('total_windows', 0)))
 
+    # Window TRIM ops (stool/apron/casing) — flag-gated
+    # (NIGHTSHIFT_WINDOW_TRIM_SCOPE, default OFF). 2026-08-20 JW batch:
+    # the schedule scan already counts paintable components per window
+    # (total_window_casings/stools/aprons/wood_returns) but nothing priced
+    # them — window trim went to $0 on all 5 jobs while JW priced
+    # stool&apron&casing per window ($90k across three jobs, sash ops
+    # aside). One window with several components = ONE trim op (max, not
+    # sum), matching how an estimator prices the line.
+    window_trim_ops = 0.0
+    if os.environ.get("NIGHTSHIFT_WINDOW_TRIM_SCOPE", "0").strip() in (
+            "1", "true", "True"):
+        window_trim_ops = max(
+            _num(aggregated_totals.get('total_window_casings_painted', 0)),
+            _num(aggregated_totals.get('total_window_stools_painted', 0)),
+            _num(aggregated_totals.get('total_window_aprons_painted', 0)),
+            _num(aggregated_totals.get('total_window_wood_returns_painted', 0)))
+
     # Stairs
     stair_sections = _num(aggregated_totals.get('total_stair_sections', 0))
     gyp_stairs = _num(aggregated_totals.get('total_gyp_between_stairs_sqft', 0))
@@ -20880,6 +20897,11 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     door_hm_rate = _get_tiered_rate(pm['doors_hm_panel'], doors_hm)
     door_frame_rate = _get_tiered_rate(pm['doors_frame_only'], doors_frame)
     win_rate    = _get_tiered_rate(pm['windows'], windows)
+    # Window trim op rate: dedicated pm key when configured, else the
+    # standard windows rate tier (comparable per-EA op).
+    win_trim_rate = (_get_tiered_rate(pm['window_trim'], window_trim_ops)
+                     if 'window_trim' in pm
+                     else _get_tiered_rate(pm['windows'], window_trim_ops))
     stair_rate  = _get_tiered_rate(pm['stairs'], stair_sections)
     gyps_rate   = _get_tiered_rate(pm['gyp_between_stairs'], gyp_stairs)
     l5_rate     = _get_tiered_rate(pm['level_5_finish'], level_5_sqft)
@@ -21376,6 +21398,10 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
               door_frame_rate, _get_markup('doors_frame_only')),
         _line(f"Windows (Interior Paint) - {windows:.0f} EA @ ${win_rate:.2f}", windows,
               win_rate, _get_markup('windows')),
+        _line(f"Window Trim (stool/apron/casing) - {window_trim_ops:.0f} EA "
+              f"@ ${win_trim_rate:.2f}", window_trim_ops, win_trim_rate,
+              _get_markup('window_trim') if 'window_trim' in pm
+              else _get_markup('windows')),
         _line(f"Stairs - {stair_sections:.0f} sections @ ${stair_rate:.2f}", stair_sections,
               stair_rate, _get_markup('stairs')),
         _line(f"Gyp. Between Stairs - {gyp_stairs:,.0f} sqft @ ${gyps_rate:.2f}", gyp_stairs,
