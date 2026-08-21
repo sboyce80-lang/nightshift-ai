@@ -17649,6 +17649,91 @@ def _positive_number_in(obj):
         and obj > 0
 
 
+def _rescue_swept_schedules(client, pdf_paths, analysis):
+    """Flag-gated (NIGHTSHIFT_SWEEP_SCHEDULE_RESCUE, default off): when the
+    scope sweep LOCATES a door/window schedule page that the pre-scans
+    missed, actually EXTRACT it instead of only upgrading the detection
+    flag with "contents NOT extracted".
+
+    2026-08-21 JW batch: window counts failed on 3 jobs because the real
+    schedule pages never reached the schedule extractor — Hudson's
+    text-scan matched the cover sheet (false positive) while the sweep
+    correctly identified the schedule pages; window trim/sash lines then
+    had no component counts to price. Runs the located pages through
+    analyze_schedule_images_consensus and applies the existing
+    authoritative override path. Non-fatal on any failure.
+    """
+    if os.environ.get("NIGHTSHIFT_SWEEP_SCHEDULE_RESCUE", "0").strip() not in (
+            "1", "true", "True"):
+        return analysis
+    sweep = analysis.get("_scope_sweep") or {}
+    pages = sweep.get("pages_swept") or []
+    sd = analysis.get("schedule_data") or {}
+
+    def _have(kind):
+        if kind == "door_schedule":
+            d = sd.get("door_schedule") or {}
+            return (_num(d.get("total_doors_full_paint", 0))
+                    + _num(d.get("total_doors_hm_panel", 0))) > 0
+        w = sd.get("window_schedule") or {}
+        return _num(w.get("total_windows", 0)) > 0
+
+    # file basename -> set of 0-based page indices to extract
+    want = {}
+    for p in pages:
+        kind = str(p.get("page_kind") or "")
+        if kind not in ("door_schedule", "window_schedule"):
+            continue
+        if _have(kind):
+            continue
+        try:
+            idx0 = int(p.get("page")) - 1
+        except (TypeError, ValueError):
+            continue
+        want.setdefault(str(p.get("file") or ""), set()).add(idx0)
+    if not want:
+        return analysis
+
+    for pdf_path in pdf_paths or []:
+        base = os.path.basename(pdf_path)
+        idxs = sorted(want.get(base) or [])
+        if not idxs:
+            continue
+        print(f"   🧯 Sweep schedule rescue: extracting {len(idxs)} "
+              f"schedule page(s) {[i + 1 for i in idxs]} from {base}",
+              flush=True)
+        try:
+            rescued = analyze_schedule_images_consensus(client, pdf_path,
+                                                        idxs)
+        except Exception as _exc:
+            print(f"      ⚠️  rescue extraction failed (non-fatal): "
+                  f"{type(_exc).__name__}: {str(_exc)[:100]}")
+            continue
+        if not rescued:
+            print("      ⚠️  rescue extraction returned no data")
+            continue
+        merged_kinds = []
+        for key in ("door_schedule", "window_schedule", "stair_info"):
+            if rescued.get(key) and not _have(key):
+                analysis.setdefault("schedule_data", {})[key] = rescued[key]
+                sd = analysis["schedule_data"]
+                merged_kinds.append(key)
+        if not merged_kinds:
+            continue
+        if "door_schedule" in merged_kinds:
+            analysis["has_door_schedule"] = True
+        if "window_schedule" in merged_kinds:
+            analysis["has_window_schedule"] = True
+        analysis.setdefault("notes", []).append(
+            f"[Sweep Schedule Rescue] {', '.join(merged_kinds)} recovered "
+            f"from sweep-located page(s) {[i + 1 for i in idxs]} of {base} "
+            f"and applied authoritatively.")
+        # Push the rescued counts through the standard authoritative path
+        # (door/window totals, component counts, stash for recalc).
+        _apply_schedule_overrides(analysis)
+    return analysis
+
+
 def _reconcile_scope_sweep(analysis):
     """Deterministic diff of sweep findings against the priced analysis.
 
@@ -24868,6 +24953,10 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         try:
             _run_scope_sweep(client, pdf_paths, analysis)
             _reconcile_scope_sweep(analysis)
+            # Rescue: sweep-located door/window schedule pages the
+            # pre-scans missed get EXTRACTED (not just flag-upgraded)
+            # and applied authoritatively. Flag-gated; no-op when off.
+            _rescue_swept_schedules(client, pdf_paths, analysis)
         except Exception as _sweep_err:
             print(f"   ⚠️  Scope sweep failed (non-fatal): {_sweep_err}")
     # Canonicalize source_sheet on every room BEFORE the upload-sheet
