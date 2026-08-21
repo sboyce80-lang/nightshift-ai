@@ -20927,6 +20927,19 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
             _num(aggregated_totals.get('total_window_aprons_painted', 0)),
             _num(aggregated_totals.get('total_window_wood_returns_painted', 0)))
 
+    # Window SASH ops (flag NIGHTSHIFT_WINDOW_SASH_OPS, default OFF):
+    # sash policy softening per Steven 2026-08-21. The schedule scan
+    # already proves which windows are field-paintable wood (not owner-
+    # provided, not factory-finished) — JW priced sash on all three window
+    # jobs ($150/EA, same as pm window_sash) while the commercial
+    # exclusion zeroed ours. Priced as a labeled ALLOWANCE only when the
+    # Windows (Interior Paint) line isn't already carrying them.
+    sash_ops = 0.0
+    if (os.environ.get("NIGHTSHIFT_WINDOW_SASH_OPS", "0").strip()
+            in ("1", "true", "True") and windows <= 0):
+        sash_ops = _num(aggregated_totals.get(
+            'total_windows_field_paintable', 0))
+
     # Stairs
     stair_sections = _num(aggregated_totals.get('total_stair_sections', 0))
     gyp_stairs = _num(aggregated_totals.get('total_gyp_between_stairs_sqft', 0))
@@ -21856,6 +21869,14 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
             f"Power Washing (ALLOWANCE — per plans note) - "
             f"{pw_sqft:,.0f} sqft @ ${pw_rate:.2f}", pw_sqft, pw_rate,
             _get_markup('power_washing')))
+
+    if sash_ops > 0 and 'window_sash' in pm:
+        _sash_rate = _get_tiered_rate(pm['window_sash'], sash_ops)
+        line_items.append(_line(
+            f"Window Sash (ALLOWANCE — field-paintable wood per schedule; "
+            f"strike if factory-finished) - {sash_ops:.0f} EA @ "
+            f"${_sash_rate:.2f}", sash_ops, _sash_rate,
+            _get_markup('window_sash')))
 
     return {
         "line_items": line_items,

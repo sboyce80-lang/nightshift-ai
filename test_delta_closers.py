@@ -77,6 +77,8 @@ class TestPowerWashAllowance(unittest.TestCase):
             pm["power_washing"] = {"unit": "sqft", "markup": 0.06,
                 "tiers": [{"min_qty": 0, "max_qty": None,
                            "rate": 0.35}]}
+        else:
+            pm.pop("power_washing", None)
         analysis = {"_scope_sweep": dict(self.SWEEP)}
         return td.calculate_costs({"total_paintable_wall_sqft": 100},
                                   building_type="commercial",
@@ -100,6 +102,61 @@ class TestPowerWashAllowance(unittest.TestCase):
         ce = self._run("0", True)
         self.assertFalse([l for l in ce["line_items"]
                           if "Power Washing" in str(l.get("item", ""))])
+
+
+class TestSashOpsAllowance(unittest.TestCase):
+    AGG = {"total_paintable_wall_sqft": 100,
+           "total_windows_painted_interior": 0,
+           "total_windows_field_paintable": 161}
+
+    def tearDown(self):
+        os.environ.pop("NIGHTSHIFT_WINDOW_SASH_OPS", None)
+
+    def _sash(self, ce):
+        return [l for l in ce["line_items"]
+                if str(l.get("item", "")).startswith("Window Sash")]
+
+    def test_flag_on_prices_field_paintable(self):
+        os.environ["NIGHTSHIFT_WINDOW_SASH_OPS"] = "1"
+        ce = td.calculate_costs(dict(self.AGG), building_type="commercial")
+        line = self._sash(ce)
+        self.assertEqual(len(line), 1)
+        self.assertEqual(line[0]["qty"], 161)
+        self.assertIn("ALLOWANCE", line[0]["item"])
+        self.assertGreater(line[0]["total"], 0)
+
+    def test_flag_off_no_line(self):
+        os.environ["NIGHTSHIFT_WINDOW_SASH_OPS"] = "0"
+        ce = td.calculate_costs(dict(self.AGG), building_type="commercial")
+        self.assertFalse(self._sash(ce))
+
+    def test_no_double_count_when_windows_priced(self):
+        os.environ["NIGHTSHIFT_WINDOW_SASH_OPS"] = "1"
+        agg = dict(self.AGG, total_windows_painted_interior=20)
+        ce = td.calculate_costs(agg, building_type="residential")
+        self.assertFalse(self._sash(ce))
+
+
+class TestPowerWashConfigRate(unittest.TestCase):
+    def test_rate_now_in_pricing_model(self):
+        self.assertIn("power_washing", td.PRICING_MODEL)
+        self.assertIn("window_trim", td.PRICING_MODEL)
+        # JW 26-390 reproduction: 24,652 SF through the real config rate
+        os.environ["NIGHTSHIFT_POWER_WASH_ALLOWANCE"] = "1"
+        try:
+            analysis = {"_scope_sweep": {"findings": [{
+                "category": "exterior", "item": "Power washing",
+                "detail": "CLEAN FACADE +/- 24,652 SF", "sheet": "A2.01"}]}}
+            ce = td.calculate_costs({"total_paintable_wall_sqft": 100},
+                                    building_type="commercial",
+                                    analysis=analysis)
+            pw = [l for l in ce["line_items"]
+                  if "Power Washing" in str(l.get("item", ""))]
+            self.assertEqual(pw[0]["qty"], 24652)
+            jw = 38826.90
+            self.assertLess(abs(pw[0]["total"] - jw) / jw, 0.005)
+        finally:
+            os.environ.pop("NIGHTSHIFT_POWER_WASH_ALLOWANCE", None)
 
 
 if __name__ == "__main__":
