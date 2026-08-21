@@ -440,6 +440,25 @@ check(rec.get("zeroing_enabled") is False and rec.get("wc_match_share") == 0.0,
 check(any("RFI-only" in str(n) for n in a.get("notes", [])),
       "WC safe-mode: explanatory note missing")
 
+# WC-dominated + matching healthy: an UNMATCHED room keeps extracted WC
+# (positive-evidence zeroing — Homewood rerun-2: 71k SF of unit instances
+# zeroed for merely not being in the typicals-keyed schedule).
+sched_dom = [_row(n, f"Suite {n}", wall="WC-01") for n in
+             (101, 102, 103, 104, 105, 106)]
+rooms = [_room(n, f"Suite {n}", wc=400) for n in
+         (101, 102, 103, 104, 105)]        # 5/6 rows matched (share 0.83)
+rooms.append(_room(999, "Suite 999", wc=350))  # unmatched -> KEPT now
+a = _an(rooms, sched_dom, agg={"total_wallcovering_sqft": 2350})
+T._enforce_wallcovering_schedule_gate(a)
+rec = a.get("_wc_schedule_gate", {})
+check(rooms[5]["elements"]["wallcovering_sqft"] == 350,
+      "WC positive-evidence: unmatched room on WC-dominated schedule lost WC")
+check(a["aggregated_totals"]["total_wallcovering_sqft"] == 2350,
+      f"WC positive-evidence: aggregate should stay 2350 "
+      f"({a['aggregated_totals']['total_wallcovering_sqft']})")
+check(rec.get("unmatched_kept_sqft") == 350,
+      f"WC positive-evidence: record ({rec.get('unmatched_kept_sqft')})")
+
 print("=== PASS ===" if not fails else
       "=== ISSUES: " + "; ".join(fails) + " ===")
 raise SystemExit(1 if fails else 0)

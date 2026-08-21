@@ -15786,6 +15786,8 @@ def _enforce_wallcovering_schedule_gate(analysis):
     kept_sqft = 0.0
     promoted_rooms = []
     promoted_sqft = 0.0
+    unmatched_kept_rooms = []
+    unmatched_kept_sqft = 0.0
     unquantified = []
     for floor in analysis.get("floors", []) or []:
         for room in floor.get("rooms", []) or []:
@@ -15832,6 +15834,20 @@ def _enforce_wallcovering_schedule_gate(analysis):
                         (label, str(row.get("wall_finish", "")).strip()))
                 continue
             if wc <= 0 or not can_zero:
+                continue
+            # On a WC-DOMINATED schedule, zeroing needs POSITIVE evidence:
+            # a matched row designating a non-WC finish. An UNMATCHED room
+            # is unknown, not "not designated" — Homewood rerun-2 zeroed
+            # 71,481 SF across 213 unit-instance rooms whose numbers
+            # simply weren't in the typicals-keyed schedule. Unmatched
+            # rooms on WC-dominated schedules keep extracted WC (the
+            # unquantified/RFI machinery still surfaces them via the
+            # aggregate note below). Incidental-WC schedules (PNC pantry)
+            # keep the strict behavior.
+            if wc_dominated and row is None:
+                unmatched_kept_rooms.append(label)
+                unmatched_kept_sqft += wc * _extract_multiplier_from_notes(
+                    room)
                 continue
             mult = _extract_multiplier_from_notes(room)
             zeroed_rooms.append(label)
@@ -15888,6 +15904,17 @@ def _enforce_wallcovering_schedule_gate(analysis):
               f"{len(zeroed_rooms)} non-designated room(s); kept "
               f"{kept_sqft:,.0f} SF in {len(kept_rooms)} designated room(s)",
               flush=True)
+    if unmatched_kept_sqft > 0:
+        analysis.setdefault("notes", []).append(
+            f"[Wallcovering] {len(unmatched_kept_rooms)} room(s) carrying "
+            f"{unmatched_kept_sqft:,.0f} SF of extracted wallcovering did "
+            f"not match any schedule row (typicals-keyed schedule) — WC "
+            f"KEPT (no positive non-WC designation). Confirm room-by-room "
+            f"WC extents against the finish schedule.")
+        print(f"   🧻 WC schedule gate: kept {unmatched_kept_sqft:,.0f} SF "
+              f"in {len(unmatched_kept_rooms)} unmatched room(s) — "
+              f"WC-dominated schedule, no positive non-WC designation",
+              flush=True)
     if unquantified:
         rooms_txt = ", ".join(
             f"{name} ({code})" for name, code in unquantified[:8])
@@ -15906,6 +15933,7 @@ def _enforce_wallcovering_schedule_gate(analysis):
         "zeroing_enabled": can_zero,
         "authoritative_enabled": _wc_schedule_authoritative_enabled(),
         "wc_match_share": round(wc_match_share, 3),
+        "unmatched_kept_sqft": round(unmatched_kept_sqft, 2),
         "promoted_rooms": promoted_rooms[:20],
         "promoted_sqft": round(promoted_sqft, 2),
         "kept_rooms": kept_rooms[:20],
