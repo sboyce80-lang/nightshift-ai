@@ -14620,6 +14620,32 @@ def _schedule_wall_finish_is_wc(wall_finish):
         kw in wf for kw in ("wallcovering", "wall covering", "vwc"))
 
 
+def _wc_schedule_authoritative_enabled():
+    # Default OFF pending Homewood rerun (2026-08-20 JW batch): the finish
+    # schedule designated whole guestroom walls WC-x but the extractor
+    # GUESSED per-room splits ("~50% of wall area", "~480 SF/unit") — WC
+    # landed at 44,701 SF vs JW's 136,636 SF and the shortfall was priced
+    # as painted gyp instead ($700k swing on a $1.32M WC job). When ON:
+    # a room whose schedule row is WC-ONLY (no PT co-designation) gets
+    # wallcovering_sqft promoted to its full measured wall area — a hard
+    # number (schedule says the walls are WC; the walls are measured).
+    # Mixed WC+PT rows stay extracted-value + RFI (the split needs
+    # interior elevations).
+    return os.environ.get(
+        "NIGHTSHIFT_WC_SCHEDULE_AUTHORITATIVE", "0").strip() in (
+        "1", "true", "True")
+
+
+def _schedule_wall_finish_is_wc_only(wall_finish):
+    """True when the schedule row designates wallcovering with NO paint
+    co-designation — the case where full wall area is the defensible WC
+    quantity. 'WC-01' → True; 'WC 01 + PT 03' → False."""
+    if not _schedule_wall_finish_is_wc(wall_finish):
+        return False
+    wf = str(wall_finish).lower()
+    return not re.search(r"\bpt[- ]?\d|\bpaint", wf)
+
+
 def _schedule_ceiling_class(ceiling_finish):
     """Classify a finish-schedule ceiling code: 'painted' (GWB/GYP/plaster
     paint scope), 'not_painted' (ACT/exposed/none), 'dryfall', or None when
@@ -15538,6 +15564,8 @@ def _enforce_wallcovering_schedule_gate(analysis):
     zeroed_sqft = 0.0
     kept_rooms = []
     kept_sqft = 0.0
+    promoted_rooms = []
+    promoted_sqft = 0.0
     unquantified = []
     for floor in analysis.get("floors", []) or []:
         for room in floor.get("rooms", []) or []:
@@ -15553,6 +15581,29 @@ def _enforce_wallcovering_schedule_gate(analysis):
                         or room.get("room_id", "")).strip() or "unnamed"
             if designated:
                 matched_wc_row_ids.add(id(row))
+                # Authoritative promotion (sub-flag, default OFF): a
+                # WC-ONLY schedule row means the room's walls ARE the
+                # wallcovering quantity — promote to full measured wall
+                # area when the extractor recorded less (guessed splits,
+                # per-unit approximations). Mixed WC+PT rows are skipped:
+                # that split genuinely needs interior elevations.
+                if (_wc_schedule_authoritative_enabled()
+                        and _schedule_wall_finish_is_wc_only(
+                            row.get("wall_finish"))):
+                    wall_area = _num(dims.get("wall_area_sqft", 0))
+                    if wall_area > wc:
+                        mult = _extract_multiplier_from_notes(room)
+                        promoted_sqft += (wall_area - wc) * mult
+                        promoted_rooms.append(label)
+                        elems["wallcovering_sqft"] = round(wall_area, 2)
+                        note = str(room.get("notes", ""))
+                        if "[WC authoritative" not in note:
+                            room["notes"] = (
+                                note + f" [WC authoritative: schedule row "
+                                f"is WC-only — promoted "
+                                f"{wc:,.0f}→{wall_area:,.0f} SF (full "
+                                f"measured wall area)]").strip()
+                        wc = wall_area
                 if wc > 0:
                     kept_rooms.append(label)
                     kept_sqft += wc * _extract_multiplier_from_notes(room)
@@ -15587,6 +15638,20 @@ def _enforce_wallcovering_schedule_gate(analysis):
                 (f"{label} (not extracted)",
                  str(r.get("wall_finish", "")).strip()))
 
+    if promoted_sqft > 0:
+        agg = analysis.setdefault("aggregated_totals", {})
+        prev = _num(agg.get("total_wallcovering_sqft", 0))
+        agg["total_wallcovering_sqft"] = round(prev + promoted_sqft, 2)
+        analysis.setdefault("notes", []).append(
+            f"[Wallcovering] Authoritative promotion: {len(promoted_rooms)} "
+            f"WC-only room(s) promoted to full measured wall area "
+            f"(+{promoted_sqft:,.0f} SF): "
+            f"{', '.join(promoted_rooms[:8])}"
+            f"{'…' if len(promoted_rooms) > 8 else ''}. The finish schedule "
+            f"designates these walls wallcovering with no paint split — the "
+            f"measured wall area is the quantity.")
+        print(f"   🧻 WC authoritative: promoted {promoted_sqft:,.0f} SF "
+              f"across {len(promoted_rooms)} WC-only room(s)", flush=True)
     if zeroed_sqft > 0:
         agg = analysis.setdefault("aggregated_totals", {})
         prev = _num(agg.get("total_wallcovering_sqft", 0))
@@ -15619,6 +15684,9 @@ def _enforce_wallcovering_schedule_gate(analysis):
         "schedule_wc_rooms": len(wc_rows),
         "numbered_rows": numbered_rows,
         "zeroing_enabled": can_zero,
+        "authoritative_enabled": _wc_schedule_authoritative_enabled(),
+        "promoted_rooms": promoted_rooms[:20],
+        "promoted_sqft": round(promoted_sqft, 2),
         "kept_rooms": kept_rooms[:20],
         "kept_sqft": round(kept_sqft, 2),
         "zeroed_rooms": zeroed_rooms[:20],

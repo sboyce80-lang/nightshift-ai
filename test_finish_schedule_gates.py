@@ -369,6 +369,45 @@ T._recalculate_totals(a2)
 check("_base_trim_schedule_confirmed" not in a2,
       "no-schedule: base-trim confirm must be inert")
 
+# ---------------------------------------------------------------------------
+# WC authoritative promotion (F2a, 2026-08-20 JW batch / Homewood) — WC-only
+# schedule rows promote to full measured wall area; mixed WC+PT rows do not.
+# ---------------------------------------------------------------------------
+os.environ["NIGHTSHIFT_WC_SCHEDULE_GATE"] = "1"
+os.environ["NIGHTSHIFT_WC_SCHEDULE_AUTHORITATIVE"] = "1"
+sched = _sched6(**{"101": {"wall_finish": "WC-01"},
+                   "102": {"wall_finish": "WC 01 + PT 03"},
+                   "103": {"wall_finish": "WC-10"}})
+rooms = [
+    _room(101, "Office A", wc=240),      # WC-only, guessed split -> promote to 500
+    _room(102, "Office B", wc=240),      # mixed WC+PT -> keep extracted 240
+    _room(103, "Corridor", wc=0),        # WC-only, unquantified -> promote to 500
+]
+a = _an(rooms, sched, agg={"total_wallcovering_sqft": 480})
+T._enforce_wallcovering_schedule_gate(a)
+rec = a.get("_wc_schedule_gate", {})
+check(rooms[0]["elements"]["wallcovering_sqft"] == 500,
+      f"WC-auth: WC-only room not promoted to wall area "
+      f"({rooms[0]['elements']['wallcovering_sqft']})")
+check(rooms[1]["elements"]["wallcovering_sqft"] == 240,
+      "WC-auth: mixed WC+PT room must keep extracted value")
+check(rooms[2]["elements"]["wallcovering_sqft"] == 500,
+      "WC-auth: unquantified WC-only room must promote, not RFI")
+check(rec.get("promoted_sqft") == 760,
+      f"WC-auth: promoted_sqft should be 760, got {rec.get('promoted_sqft')}")
+check(a["aggregated_totals"]["total_wallcovering_sqft"] == 1240,
+      f"WC-auth: aggregate should be 480+760=1240, got "
+      f"{a['aggregated_totals']['total_wallcovering_sqft']}")
+check("[WC authoritative" in rooms[0]["notes"],
+      "WC-auth: promoted room missing provenance note")
+# flag OFF -> no promotion (baseline behavior preserved)
+os.environ["NIGHTSHIFT_WC_SCHEDULE_AUTHORITATIVE"] = "0"
+rooms2 = [_room(101, "Office A", wc=240)]
+a2 = _an(rooms2, sched, agg={"total_wallcovering_sqft": 240})
+T._enforce_wallcovering_schedule_gate(a2)
+check(rooms2[0]["elements"]["wallcovering_sqft"] == 240,
+      "WC-auth off: room must keep extracted value")
+
 print("=== PASS ===" if not fails else
       "=== ISSUES: " + "; ".join(fails) + " ===")
 raise SystemExit(1 if fails else 0)
