@@ -15024,6 +15024,138 @@ def _gate_add_rfi(analysis, category, question):
     bucket.append({"category": category, "question": question})
 
 
+def _apply_geometric_room_completion(analysis):
+    """Flag-gated (NIGHTSHIFT_GEOMETRIC_ROOM_COMPLETION, default off):
+    starved rooms (extracted but with unreadable dimensions) get their
+    floor/ceiling areas from the room-geometry shadow's per-room
+    measurements — the ceiling/doors analog of VME's starved walls
+    promotion.
+
+    2026-08-21 Harlem: 26 rooms extracted from the 1-page mega-sheet, 20+
+    with zero dims. VME starved-promote fixed walls (13,213 SF, −24% vs
+    JW) but ceilings priced 264 SF vs JW's 9,009 — the room polygons that
+    would supply those areas are already measured by the room-geometry
+    shadow (label-anchored flood fill on the CAD linework). Only rooms
+    with a geometric 'ok' measurement are completed; ceiling area applies
+    only where the ceiling is painted per extraction. Door-swing counts
+    from the geometry become a quantified RFI when they exceed the priced
+    door count ≥2x (counts are symbols — swings include closets — so they
+    inform review, never price directly). Only-increase on measured
+    evidence; idempotent via _geometric_room_completion.
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if os.environ.get("NIGHTSHIFT_GEOMETRIC_ROOM_COMPLETION", "0").strip() \
+            not in ("1", "true", "True"):
+        return analysis
+    if analysis.get("_geometric_room_completion"):
+        return analysis
+    shadow = analysis.get("_room_geometry_shadow") or {}
+    pages = [p for p in (shadow.get("pages") or []) if p.get("rooms")]
+    if not pages:
+        analysis["_geometric_room_completion"] = {"noop": "no_shadow_rooms"}
+        return analysis
+
+    geo_rooms = {}
+    for p in pages:
+        for name, rec in (p.get("rooms") or {}).items():
+            if (rec.get("status") in ("ok", "measured")
+                    and _num(rec.get("area_sqft", 0)) > 0):
+                geo_rooms[_norm_room_id(name)] = _num(rec["area_sqft"])
+
+    completed = []
+    added_ceiling = 0.0
+    for fl in (analysis.get("floors") or []):
+        for r in (fl.get("rooms") or []):
+            if not isinstance(r, dict) or r.get("in_scope") is False:
+                continue
+            dims = r.setdefault("dimensions", {})
+            key = (_norm_room_id(r.get("room_id"))
+                   or _norm_room_id(r.get("room_name")))
+            area = geo_rooms.get(key) or geo_rooms.get(
+                _norm_room_id(r.get("room_name")))
+            floor_area = _num(dims.get("floor_area_sqft", 0))
+            source = None
+            if floor_area <= 0 and area:
+                # Tier 1: fully starved — floor area from the polygon.
+                dims["floor_area_sqft"] = round(area, 2)
+                floor_area = area
+                source = "polygon"
+            elif floor_area > 0:
+                source = "extracted floor area"
+            if floor_area <= 0:
+                continue
+            mats = r.get("materials") or {}
+            ceil_painted = bool(mats.get("ceiling_painted"))
+            ceil_mat = str(mats.get("ceiling") or "").upper()
+            # UNKNOWN ceiling (blank material, no negative evidence) on an
+            # enclosed room counts as paintable-with-RFI — the enclosed-
+            # room JW-convention default. Harlem: 20/26 rooms carried a
+            # BLANK ceiling material (starved extraction) and no gate
+            # touched them; JW painted 8.6k SF of those ceilings.
+            ceil_unknown = (not ceil_mat.strip() and not ceil_painted
+                            and not any(t in str(mats).upper() for t in
+                                        ("ACT", "EXPOSED", "OPEN",
+                                         "NOT PTD", "NOT PAINTED")))
+            if ((ceil_painted or ceil_unknown) and "ACT" not in ceil_mat
+                    and _num(dims.get("ceiling_area_sqft", 0)) <= 0):
+                # Tier 2: ceiling-starved — a painted flat ceiling's area
+                # IS the room's floor area (geometry corroborates when a
+                # polygon exists). Harlem: ceilings priced 264 SF vs JW's
+                # 9,009 while every room had a measured floor area.
+                mult = max(1, int(_num(r.get("unit_multiplier", 1)) or 1))
+                dims["ceiling_area_sqft"] = round(floor_area, 2)
+                if ceil_unknown:
+                    mats["ceiling"] = "GYP (assumed — geometric completion)"
+                    mats["ceiling_painted"] = True
+                    r["materials"] = mats
+                added_ceiling += floor_area * mult
+                completed.append(r.get("room_name") or r.get("room_id")
+                                 or "?")
+                unk = ("; type unknown, assumed painted — RFI"
+                       if ceil_unknown else "")
+                r["notes"] = (str(r.get("notes") or "") +
+                              f" [geometric completion: ceiling area from "
+                              f"{source}{unk}]").strip()
+
+    if added_ceiling > 0:
+        agg = analysis.setdefault("aggregated_totals", {})
+        agg["total_paintable_ceiling_sqft"] = round(
+            _num(agg.get("total_paintable_ceiling_sqft", 0))
+            + added_ceiling, 2)
+    if completed:
+        analysis.setdefault("notes", []).append(
+            f"[Geometric Room Completion] {len(completed)} starved room(s) "
+            f"completed from measured room polygons "
+            f"(+{added_ceiling:,.0f} SF painted ceiling): "
+            f"{', '.join(completed[:8])}"
+            f"{'…' if len(completed) > 8 else ''}.")
+        print(f"   📐 Geometric room completion: {len(completed)} room(s), "
+              f"+{added_ceiling:,.0f} SF ceiling", flush=True)
+
+    # Door-swing cross-check (informational, never prices).
+    swings = 0
+    for p in (shadow.get("pages") or []):
+        swings += _num((p.get("doors") or {}).get("swing_count", 0))
+    agg = analysis.get("aggregated_totals", {})
+    priced_doors = sum(_num(agg.get(k, 0)) for k in
+                       ("total_doors_full_paint", "total_doors_hm_panel",
+                        "total_doors_frame_only"))
+    if swings >= 2 * max(priced_doors, 1) and swings >= 8:
+        _gate_add_rfi(
+            analysis, "Doors",
+            f"The drawings show ~{swings:.0f} door swings geometrically but "
+            f"only {priced_doors:.0f} door(s) are priced — door extraction "
+            f"was likely starved. Confirm the door count/schedule and we "
+            f"will reprice.")
+        analysis["manual_review_required"] = True
+    analysis["_geometric_room_completion"] = {
+        "completed_rooms": len(completed),
+        "added_ceiling_sqft": round(added_ceiling, 2),
+        "door_swings": swings, "priced_doors": priced_doors}
+    return analysis
+
+
 def _reconcile_door_sources(analysis):
     """Flag-gated (NIGHTSHIFT_DOOR_SOURCE_RECONCILE, default off): door
     counts summed across sheet FAMILIES must not stack.
@@ -18371,6 +18503,12 @@ def build_priced_takeoff(analysis, strict=None):
     # certification playbook). Never changes a quantity. Flag-gated;
     # no-op when off.
     analysis = _compute_room_geometry_shadow(analysis)
+
+    # Geometric room completion: starved rooms get floor/ceiling areas
+    # from the shadow's measured polygons (ceilings analog of the VME
+    # starved-walls promotion). Requires the shadow above. Flag-gated;
+    # no-op when off.
+    analysis = _apply_geometric_room_completion(analysis)
 
     agg = analysis.get("aggregated_totals", {}) or {}
     ledger = analysis.get("_quantity_adjustments", []) or []
