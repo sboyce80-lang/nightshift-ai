@@ -92,5 +92,24 @@ class TestSweepScheduleRescue(unittest.TestCase):
         self.assertNotIn("schedule_data", out)
 
 
+class TestTextScanChannel(unittest.TestCase):
+    def tearDown(self):
+        os.environ.pop("NIGHTSHIFT_SWEEP_SCHEDULE_RESCUE", None)
+
+    def test_measured_page_schedule_located_by_text(self):
+        os.environ["NIGHTSHIFT_SWEEP_SCHEDULE_RESCUE"] = "1"
+        a = {"project_info": {"building_type": "commercial"},
+             "aggregated_totals": {}, "floors": [], "notes": [],
+             "_scope_sweep": {"pages_swept": []}}  # sweep found nothing
+        with mock.patch.object(td, "_locate_schedule_pages_by_text",
+                               return_value={"door_schedule": [],
+                                             "window_schedule": [7]}),              mock.patch.object(td, "analyze_schedule_images_consensus",
+                               return_value=dict(RESCUED)) as m:
+            td._rescue_swept_schedules(None, ["/x/plans.pdf"], a)
+            m.assert_called_once()
+            self.assertEqual(m.call_args[0][2], [7])
+        self.assertTrue(a["has_window_schedule"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

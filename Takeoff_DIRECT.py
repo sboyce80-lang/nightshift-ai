@@ -18206,6 +18206,44 @@ def _positive_number_in(obj):
         and obj > 0
 
 
+def _locate_schedule_pages_by_text(pdf_path):
+    """0-based page indices of door/window schedule pages via the same
+    text passes as _detect_schedule_in_pdf — but returning WHERE, so the
+    rescue can extract them. Works on measured pages too (R1, 2026-08-21:
+    Hudson's window schedule sits ON a measured floor-plan sheet, which
+    the sweep never visits)."""
+    out = {"door_schedule": [], "window_schedule": []}
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+    except Exception:
+        return out
+    try:
+        for i, page in enumerate(doc):
+            txt = None
+            for kind, phrases, tokens in (
+                    ("door_schedule", _DOOR_TITLE_PHRASES,
+                     _DOOR_TABLE_TOKENS),
+                    ("window_schedule", _WINDOW_TITLE_PHRASES,
+                     _WINDOW_TABLE_TOKENS)):
+                hit = False
+                try:
+                    hit = _has_schedule_sheet_title(page, phrases)
+                except Exception:
+                    hit = False
+                if not hit:
+                    if txt is None:
+                        txt = page.get_text().lower()
+                    hit = (any(p.lower() in txt for p in phrases)
+                           and sum(1 for tok in tokens
+                                   if tok.lower() in txt) >= 2)
+                if hit:
+                    out[kind].append(i)
+    finally:
+        doc.close()
+    return out
+
+
 def _rescue_swept_schedules(client, pdf_paths, analysis):
     """Flag-gated (NIGHTSHIFT_SWEEP_SCHEDULE_RESCUE, default off): when the
     scope sweep LOCATES a door/window schedule page that the pre-scans
@@ -18248,6 +18286,18 @@ def _rescue_swept_schedules(client, pdf_paths, analysis):
         except (TypeError, ValueError):
             continue
         want.setdefault(str(p.get("file") or ""), set()).add(idx0)
+
+    # R1 second channel: text-scan located schedule pages — including
+    # MEASURED pages the sweep never visits (Hudson: window schedule on a
+    # measured floor-plan sheet; the sweep-only rescue never fired).
+    for pdf_path in pdf_paths or []:
+        located = _locate_schedule_pages_by_text(pdf_path)
+        for kind, idxs in located.items():
+            if _have(kind) or not idxs:
+                continue
+            base = os.path.basename(pdf_path)
+            for i in idxs[:4]:
+                want.setdefault(base, set()).add(i)
     if not want:
         return analysis
 
@@ -18269,9 +18319,22 @@ def _rescue_swept_schedules(client, pdf_paths, analysis):
         if not rescued:
             print("      ⚠️  rescue extraction returned no data")
             continue
+        def _nonempty(kind, data):
+            # A rescued schedule read that counted NOTHING is a false
+            # positive (Hudson: 'window schedule' matches the p.1 drafting
+            # -symbols legend) — merging zeroes would arm the phantom-
+            # window zeroing override against real room counts.
+            if kind == "door_schedule":
+                return (_num(data.get("total_doors_full_paint", 0))
+                        + _num(data.get("total_doors_hm_panel", 0))) > 0
+            if kind == "window_schedule":
+                return _num(data.get("total_windows", 0)) > 0
+            return bool(data)
+
         merged_kinds = []
         for key in ("door_schedule", "window_schedule", "stair_info"):
-            if rescued.get(key) and not _have(key):
+            if (rescued.get(key) and not _have(key)
+                    and _nonempty(key, rescued[key])):
                 analysis.setdefault("schedule_data", {})[key] = rescued[key]
                 sd = analysis["schedule_data"]
                 merged_kinds.append(key)
