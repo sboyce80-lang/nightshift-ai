@@ -15024,6 +15024,202 @@ def _gate_add_rfi(analysis, category, question):
     bucket.append({"category": category, "question": question})
 
 
+_UNIT_STOP_TOKENS = {"suite", "room", "area", "unit", "typical", "typ",
+                     "floor", "first", "second", "third", "fourth", "fifth",
+                     "1st", "2nd", "3rd", "4th", "5th", "north", "south",
+                     "east", "west", "ff", "accessible", "ada", "the"}
+
+
+def _unit_core_tokens(text):
+    """Canonical core tokens for unit-type matching: 'King One BDR Suite
+    (First Floor - South)' and 'Accessible King 1BR Suite 226' both reduce
+    to {'king', '1br'}."""
+    t = str(text or "").lower()
+    t = re.sub(r"\bone\b", "1", t)
+    t = re.sub(r"\btwo\b", "2", t)
+    t = re.sub(r"\bthree\b", "3", t)
+    t = re.sub(r"\b(bedroom|bdr|bd)\b", "br", t)
+    t = re.sub(r"(\d)\s*br\b", r"\1br", t)
+    toks = set(re.findall(r"[a-z0-9]+", t))
+    return {x for x in toks
+            if x not in _UNIT_STOP_TOKENS and not x.isdigit()}
+
+
+def _dedup_template_instances(analysis):
+    """Flag-gated (NIGHTSHIFT_TEMPLATE_INSTANCE_DEDUP, default off): a
+    multiplied unit TEMPLATE and the drawn per-floor INSTANCES of the same
+    unit type must never both price.
+
+    2026-08-21 Homewood rerun-3: extraction emitted 'King 1BR Suite'
+    template rooms ×109 AND 449 numbered instance rooms ('King 1BR Suite
+    201 - Bathroom', …) carrying 155k SF of walls — everything priced ~2x
+    (+51% vs JW). The July multifamily batch was the same class. The
+    extraction prompt forbids the both-present shape but multi-pass /
+    per-sheet merges reassemble it.
+
+    Deterministic rule: for each unit type carrying a template (multiplier
+    ≥ 2), find instance rooms (multiplier < 2) whose unit_type or
+    name-core matches the template's core tokens. Keep whichever side's
+    implied unit count is CLOSER to project total_units (ties → template,
+    whose per-unit quantities are canonical); mark the losing side
+    in_scope=False and subtract its contributions from the aggregates
+    (schedule-authoritative keys untouched). Coexistence itself is an
+    extraction fault → manual review. Only-reduce; idempotent via
+    _template_instance_dedup.
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if os.environ.get("NIGHTSHIFT_TEMPLATE_INSTANCE_DEDUP", "0").strip() \
+            not in ("1", "true", "True"):
+        return analysis
+    if analysis.get("_template_instance_dedup"):
+        return analysis
+
+    rooms_flat = []
+    for fl in (analysis.get("floors") or []):
+        for r in (fl.get("rooms") or []):
+            if isinstance(r, dict) and r.get("in_scope") is not False:
+                rooms_flat.append(r)
+
+    # Group templates by core-token signature.
+    templates = {}
+    for r in rooms_flat:
+        mult = _num(r.get("unit_multiplier", 1)) or 1
+        if mult < 2:
+            continue
+        core = frozenset(_unit_core_tokens(r.get("unit_type")
+                                           or r.get("room_name")))
+        if not core:
+            continue
+        templates.setdefault(core, {"rooms": [], "mult": 0})
+        templates[core]["rooms"].append(r)
+        templates[core]["mult"] = max(templates[core]["mult"], mult)
+    if not templates:
+        analysis["_template_instance_dedup"] = {"noop": "no_templates"}
+        return analysis
+
+    total_units = _num((analysis.get("project_info") or {})
+                       .get("total_units", 0))
+    _ROOMS_PER_UNIT_GUESS = 3.0  # living+bath+kitchen-ish; count basis only
+
+    dropped = []
+    detail = []
+    for core, t in templates.items():
+        instances = []
+        for r in rooms_flat:
+            mult = _num(r.get("unit_multiplier", 1)) or 1
+            if mult >= 2 or r in t["rooms"]:
+                continue
+            rcore = _unit_core_tokens(r.get("unit_type"))
+            if not (core <= rcore):
+                rcore = _unit_core_tokens(r.get("room_name"))
+            if core <= rcore:
+                instances.append(r)
+        if not instances:
+            continue
+        inst_units = max(1.0, len(instances) / _ROOMS_PER_UNIT_GUESS)
+        keep_template = True
+        if total_units >= 2:
+            keep_template = (abs(t["mult"] - total_units)
+                             <= abs(inst_units - total_units))
+        losers = instances if keep_template else t["rooms"]
+        side = "instances" if keep_template else "template"
+        for r in losers:
+            r["in_scope"] = False
+            r["scope_exclusion_reason"] = (
+                "template-instance dedup: duplicate of the "
+                + ("multiplied unit template" if keep_template
+                   else "drawn unit instances"))
+            dropped.append(r)
+        detail.append(f"{'/'.join(sorted(core))}: kept "
+                      f"{'template ×%d' % t['mult'] if keep_template else 'instances'}, "
+                      f"dropped {len(losers)} {side} room(s)")
+
+    # Full-coverage arithmetic pass: when the surviving templates already
+    # claim ≥90% of the building's units, EVERY remaining unit-like
+    # numbered instance is a duplicate by arithmetic — the building has no
+    # units left for it to be. (Homewood rerun-3: the ×109 template
+    # absorbed ALL keys while drawn instances carried other type names —
+    # 'King Studio A (First Floor)' etc. — that no per-type match reaches.)
+    kept_tpl_mult = sum(
+        t["mult"] for t in templates.values()
+        if any(r.get("in_scope") is not False for r in t["rooms"]))
+    if total_units >= 2 and kept_tpl_mult >= 0.9 * total_units:
+        _UNIT_LIKE_RX = re.compile(
+            r"\b(suite|studio|guest\s?room|king|queen)\b", re.IGNORECASE)
+        for r in rooms_flat:
+            if r.get("in_scope") is False:
+                continue
+            mult = _num(r.get("unit_multiplier", 1)) or 1
+            if mult >= 2:
+                continue
+            nm = str(r.get("room_name") or "")
+            ut = str(r.get("unit_type") or "")
+            unit_like = (_UNIT_LIKE_RX.search(nm) or
+                         _UNIT_LIKE_RX.search(ut))
+            if not unit_like or "common" in ut.lower():
+                continue
+            r["in_scope"] = False
+            r["scope_exclusion_reason"] = (
+                "template-instance dedup: templates already cover "
+                f"{kept_tpl_mult:.0f} of {total_units:.0f} units — this "
+                "unit-like instance has no unit left to be")
+            dropped.append(r)
+        if len(dropped) > len(detail):
+            detail.append(
+                f"full-coverage pass: templates cover "
+                f"{kept_tpl_mult:.0f}/{total_units:.0f} units — remaining "
+                f"unit-like instances dropped")
+
+    if dropped:
+        # Subtract dropped contributions from aggregates — EXCEPT keys the
+        # schedule set authoritatively (independent of room duplication).
+        stash = analysis.get("_schedule_authoritative_counts") or {}
+        agg = analysis.setdefault("aggregated_totals", {})
+        KEYMAP = (("total_paintable_wall_sqft", "wall_area_sqft", "dims"),
+                  ("total_paintable_ceiling_sqft", "ceiling_area_sqft",
+                   "dims"),
+                  ("total_wallcovering_sqft", "wallcovering_sqft", "el"),
+                  ("total_base_trim_lf", "base_trim_lf", "el"),
+                  ("total_doors_full_paint", "doors_full_paint", "el"),
+                  ("total_doors_hm_panel", "doors_hm_panel", "el"),
+                  ("total_doors_frame_only", "doors_frame_only", "el"),
+                  ("total_windows_painted_interior",
+                   "windows_painted_interior", "el"),
+                  ("total_level_5_finish_sqft", "level_5_finish_sqft", "el"),
+                  ("total_concrete_floor_sqft", "concrete_floor_sqft", "el"),
+                  ("total_soffit_sqft", "soffit_sqft", "el"),
+                  ("total_stained_wood_sqft", "stained_wood_sqft", "el"),
+                  ("total_painted_cabinet_sqft", "painted_cabinet_sqft",
+                   "el"),
+                  ("total_painted_railing_lf", "painted_railing_lf", "el"))
+        for agg_key, room_key, src in KEYMAP:
+            if agg_key in stash:
+                continue
+            delta = 0.0
+            for r in dropped:
+                mult = _num(r.get("unit_multiplier", 1)) or 1
+                bag = (r.get("dimensions") if src == "dims"
+                       else r.get("elements")) or {}
+                delta += _num(bag.get(room_key, 0)) * max(1, mult)
+            if delta > 0 and agg_key in agg:
+                agg[agg_key] = max(0, round(_num(agg.get(agg_key, 0))
+                                            - delta, 2))
+        analysis.setdefault("notes", []).append(
+            f"[Template-Instance Dedup] {len(dropped)} duplicate room(s) "
+            f"removed — a multiplied unit template and drawn instances of "
+            f"the same unit type were BOTH present ({'; '.join(detail[:4])}"
+            f"{'…' if len(detail) > 4 else ''}). The extraction emitting "
+            f"both is itself a fault — manual review required.")
+        analysis["manual_review_required"] = True
+        print(f"   🏘️  Template-instance dedup: dropped {len(dropped)} "
+              f"duplicate room(s) ({'; '.join(detail[:3])})", flush=True)
+
+    analysis["_template_instance_dedup"] = {
+        "dropped_rooms": len(dropped), "detail": detail[:10]}
+    return analysis
+
+
 _SCALED_DIM_MARKER_RX = re.compile(
     r"scaled (?:from|at|off)\b|dimensions are approximate|"
     r"approximate and must be verified|do not use[^.]{0,40}(?:as )?final",
@@ -17978,6 +18174,12 @@ def build_priced_takeoff(analysis, strict=None):
     # authoritative quantities. Kill switch NIGHTSHIFT_LEDGER_ENFORCE,
     # default ON.
     analysis = _enforce_ledger_precedence(analysis)
+
+    # Template-instance dedup: a multiplied unit template and drawn
+    # instances of the same unit type must never both price. Runs FIRST
+    # among the room gates so everything downstream sees the deduped room
+    # set. Flag-gated; no-op when off.
+    analysis = _dedup_template_instances(analysis)
 
     # Final ceiling-scope reconciliation (ACT demote + commercial aggregate
     # rebuild) before any quantity is priced. Flag-gated; no-op when off.
