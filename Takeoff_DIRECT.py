@@ -3993,6 +3993,11 @@ def _call_sheet_api(client, content_blocks, output_kwargs, label,
                     # partial if continuation itself errors.
                     joined = _te.partial_text
                     for cont in range(2):
+                        # rstrip BEFORE building the prefill and keep the
+                        # accumulator aligned with it — the API 400s on
+                        # assistant prefill ending in whitespace, and the
+                        # continuation continues the rstripped text.
+                        joined = joined.rstrip()
                         print(f"      ✂️  {label}: truncated at max_tokens "
                               f"({len(joined)} chars) — requesting "
                               f"continuation {cont + 1}/2")
@@ -16832,10 +16837,46 @@ def _apply_vme_authoritative_walls(analysis):
         ratio = vme_walls / llm_total
         lo, hi = _VME_LLM_RATIO_BAND
         if not (lo <= ratio <= hi):
-            return _abstain(
-                f"geometric walls {vme_walls:,.0f} ({basis}) vs extracted "
-                f"{llm_total:,.0f} (x{ratio:.2f}) outside the sanity band — "
-                f"flagging for review instead of overriding")
+            # Starved-extraction promotion (flag NIGHTSHIFT_VME_STARVED_
+            # PROMOTE, default OFF): the band treats the extraction as a
+            # trustworthy reference, but when most in-scope rooms carry
+            # ZERO wall area the extraction is self-evidently starved
+            # (unreadable dims) and the band comparison is meaningless —
+            # abstaining here priced Harlem at 2,572 SF against 13,213 SF
+            # of measured geometry (JW: 15,667) on the 2026-08-20 batch.
+            # Geometry with measured provenance wins; loud RFI + the
+            # existing manual-review path still apply downstream.
+            n_rooms = zero_wall = 0
+            for _fl in (analysis.get("floors") or []):
+                for _r in (_fl.get("rooms") or []):
+                    if not isinstance(_r, dict) or _r.get("in_scope") is False:
+                        continue
+                    n_rooms += 1
+                    if _num((_r.get("dimensions") or {})
+                            .get("wall_area_sqft", 0)) <= 0:
+                        zero_wall += 1
+            starved = (n_rooms >= 5 and zero_wall / n_rooms >= 0.5
+                       and ratio > hi)
+            if starved and os.environ.get(
+                    "NIGHTSHIFT_VME_STARVED_PROMOTE", "0").strip() in (
+                    "1", "true", "True"):
+                _gate_add_rfi(
+                    analysis, "Walls (geometric)",
+                    f"Room extraction was starved on this set ({zero_wall} "
+                    f"of {n_rooms} rooms had unreadable dimensions, only "
+                    f"{llm_total:,.0f} SF of walls) — the geometric "
+                    f"measurement ({vme_walls:,.0f} SF, {basis}) was used "
+                    f"instead. Confirm ceiling heights and wall extents "
+                    f"before bid.")
+                print(f"   🧪 VME starved-promote: extraction has "
+                      f"{zero_wall}/{n_rooms} zero-wall rooms — geometric "
+                      f"{vme_walls:,.0f} SF promoted over extracted "
+                      f"{llm_total:,.0f} SF (band bypassed)", flush=True)
+            else:
+                return _abstain(
+                    f"geometric walls {vme_walls:,.0f} ({basis}) vs extracted "
+                    f"{llm_total:,.0f} (x{ratio:.2f}) outside the sanity band — "
+                    f"flagging for review instead of overriding")
 
     # Substrate allocation: geometry owns the TOTAL wall quantity; the
     # extraction's gyp/CMU proportions allocate it across the separately-
