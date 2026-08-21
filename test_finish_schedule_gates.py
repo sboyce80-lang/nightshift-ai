@@ -459,6 +459,16 @@ check(a["aggregated_totals"]["total_wallcovering_sqft"] == 2350,
 check(rec.get("unmatched_kept_sqft") == 350,
       f"WC positive-evidence: record ({rec.get('unmatched_kept_sqft')})")
 
+# Zero WC rows (Caris S4 crash): gate must run clean, no UnboundLocalError.
+sched_nowc = [_row(n, f"Office {n}") for n in (101, 102, 103, 104, 105, 106)]
+rooms = [_room(101, "Office 101", wc=120)]
+a = _an(rooms, sched_nowc, agg={"total_wallcovering_sqft": 120})
+try:
+    T._enforce_wallcovering_schedule_gate(a)
+    check(True, "zero-WC-rows schedule runs without crashing")
+except Exception as e:
+    check(False, f"zero-WC-rows schedule crashed: {e!r}")
+
 print("=== PASS ===" if not fails else
       "=== ISSUES: " + "; ".join(fails) + " ===")
 raise SystemExit(1 if fails else 0)

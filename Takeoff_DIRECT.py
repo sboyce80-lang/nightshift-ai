@@ -16278,6 +16278,8 @@ def _enforce_wallcovering_schedule_gate(analysis):
     # "matching failed" — zeroing disables (RFI-only), same principle as
     # the legend-style safeguard above.
     wc_match_share = 0.0
+    wc_dominated = False  # must exist even with zero WC rows (Caris S4
+    #                       crash: UnboundLocalError in the room loop)
     if wc_rows:
         pre_matched = set()
         for _floor in analysis.get("floors", []) or []:
