@@ -15011,6 +15011,80 @@ def _gate_add_rfi(analysis, category, question):
     bucket.append({"category": category, "question": question})
 
 
+def _enforce_unit_mix_coverage(analysis):
+    """Flag-gated (NIGHTSHIFT_UNIT_MIX_GATE, default off): detect
+    unit-typical multiplication that doesn't cover the project's unit
+    count, and fail LOUD instead of silently under-billing.
+
+    2026-08-20 JW batch (Hudson Hotel): guestroom typicals on A4.02-A4.04
+    were multiplied by the units DRAWN (1-3 each) instead of the hotel's
+    key count — walls 22,940 vs 72,382 SF, doors 62 vs 197 (~3x under,
+    silent). The inverse (multifamily 2x OVER) hit the 2026-07-03 Rider
+    batch. Either direction, the multiplication basis was never checked
+    against the authoritative unit count.
+
+    Deterministic check, no scaling (scaling without a per-type unit mix
+    would be a heuristic — hard-numbers policy forbids it): compare
+    project_info.total_units (index/code-plan extraction) against the
+    unit instances actually multiplied (per unit_type: max multiplier).
+    Mismatch beyond 1.5x either way → validation warning + quantified RFI
+    + manual review. Idempotent via _unit_mix_gate.
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if os.environ.get("NIGHTSHIFT_UNIT_MIX_GATE", "0").strip() not in (
+            "1", "true", "True"):
+        return analysis
+    if analysis.get("_unit_mix_gate"):
+        return analysis
+
+    pi = analysis.get("project_info") or {}
+    total_units = _num(pi.get("total_units", 0))
+    by_type = {}
+    for fl in (analysis.get("floors") or []):
+        for r in (fl.get("rooms") or []):
+            if not isinstance(r, dict) or r.get("in_scope") is False:
+                continue
+            ut = str(r.get("unit_type") or "").strip()
+            if not ut:
+                continue
+            mult = max(1, int(_num(r.get("unit_multiplier", 1))))
+            by_type[ut] = max(by_type.get(ut, 0), mult)
+    covered = sum(by_type.values())
+
+    rec = {"total_units": total_units, "unit_types": by_type,
+           "covered_instances": covered, "flagged": False}
+    if total_units >= 2 and covered >= 1:
+        ratio = total_units / covered
+        if ratio >= 1.5 or ratio <= (1 / 1.5):
+            rec["flagged"] = True
+            direction = ("UNDER" if ratio >= 1.5 else "OVER")
+            analysis.setdefault("notes", []).append(
+                f"[Unit-Mix Gate] Multiplication basis does not cover the "
+                f"project: index/inventory says {total_units:.0f} units but "
+                f"unit-typical extraction multiplied only {covered} "
+                f"instance(s) across {len(by_type)} type(s) "
+                f"({', '.join(f'{t}×{m}' for t, m in list(by_type.items())[:6])}). "
+                f"Quantities from unit typicals are likely {direction}-"
+                f"stated by ~{max(ratio, 1/ratio):.1f}x. No automatic "
+                f"scaling applied (per-type unit mix not extractable as a "
+                f"hard number) — manual review required.")
+            _gate_add_rfi(
+                analysis, "Unit Mix",
+                f"The drawings indicate {total_units:.0f} units but the "
+                f"takeoff's unit-typical multiplication covers only "
+                f"{covered} unit instance(s). Provide the per-floor unit "
+                f"mix (count of each unit type) and we will re-price; "
+                f"unit-derived quantities in this bid are unreliable "
+                f"until then.")
+            analysis["manual_review_required"] = True
+            print(f"   🏢 Unit-mix gate: {total_units:.0f} units vs "
+                  f"{covered} multiplied instance(s) — flagged "
+                  f"({direction}, ~{max(ratio, 1/ratio):.1f}x)", flush=True)
+    analysis["_unit_mix_gate"] = rec
+    return analysis
+
+
 _FLOOR_FINISH_POSITIVE_RX = re.compile(
     r"\bEP[- ]?\d|epoxy\s+(?:floor|mortar|coating|resin|broadcast)|"
     r"\bSC[- ]?(?:\d|HRI)|sealed\s+concrete|concrete\s+seal", re.IGNORECASE)
@@ -17594,6 +17668,12 @@ def build_priced_takeoff(analysis, strict=None):
     # recorded by extraction but left at 0 get wired into pricing; polished
     # concrete emits an RFI instead of silence. Flag-gated; no-op when off.
     analysis = _reconcile_floor_finishes(analysis)
+
+    # Unit-mix coverage check: unit-typical multiplication that doesn't
+    # cover the project's unit count flags loud (warning + RFI + manual
+    # review) instead of silently under/over-billing. Flag-gated; no-op
+    # when off.
+    analysis = _enforce_unit_mix_coverage(analysis)
 
     # Painted-cabinet price-or-RFI gate: a finish-schedule row calling for
     # field-painted cabinets must price (measured SF) or RFI — never vanish
