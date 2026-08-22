@@ -339,6 +339,15 @@ def _build_line_items(result: dict) -> List[dict]:
         # 2026-08-12: an interior handrail printed under "Exterior surfaces
         # power-washed…" on an interior-only bid). Exterior railing lines
         # are labeled "Ext. Stain Railing" and still match "ext.".
+        # Power washing prints as its own row — the allowance line (JW-class
+        # exterior scope, 2026-08) is often a five-figure amount and matched
+        # no bucket, so it fell into the bare "Additional scope" row: a $38k
+        # unexplained charge on Hudson Hotel (the Biddle specialty-line
+        # failure class). Listed before Exterior so wash-only scope isn't
+        # described as "finished with two coats".
+        ("Power washing",
+         ["power wash", "pressure wash"],
+         "Exterior surfaces power-washed per the plan requirements. Priced as an allowance; remove if carried by others."),
         ("Exterior",
          ["exterior", "ext.", "hardie", "azek", "cornice", "siding", "lintel"],
          "Exterior surfaces power-washed, scraped, spot-primed, caulked, and finished with two coats."),
@@ -360,6 +369,7 @@ def _build_line_items(result: dict) -> List[dict]:
     grouped = {title: {"title": title, "scope": scope, "total": 0.0}
                for title, _kw, scope in buckets}  # type: dict
     misc = {"title": "Additional scope", "scope": "", "total": 0.0}
+    misc_labels = []
 
     specialty_labels = []
     for li in items:
@@ -378,6 +388,7 @@ def _build_line_items(result: dict) -> List[dict]:
                 break
         if not matched:
             misc["total"] += total
+            misc_labels.append(str(li.get("item") or "").strip())
 
     # When the Specialty bucket holds ONLY stained-wood lines, say so — a
     # generic "Specialty coatings" row the customer can't tie to any plan
@@ -404,9 +415,13 @@ def _build_line_items(result: dict) -> List[dict]:
         "Stairs",
         "Specialty coatings",
         "Exterior",
+        "Power washing",
     ]
     out = [grouped[title] for title in display_order if grouped[title]["total"] > 0]
     if misc["total"] > 0:
+        # Never print a bare unexplained amount (the Biddle failure class) —
+        # list the underlying cost lines as the scope text.
+        misc["scope"] = "\n".join(misc_labels)
         out.append(misc)
     return out
 
