@@ -3797,6 +3797,12 @@ def _sheet_checkpoint_dir(pdf_path):
         return None
 
 
+# V4 (variance-reduction, 2026-08-22): bump when the consensus MERGE code
+# changes — the R4 batch silently replayed max-merge-era checkpoints after
+# the fill-only fix landed because the key never saw merge semantics.
+_CONSENSUS_MERGE_CODE_VERSION = "fill-only-v2-median-v3"
+
+
 def _sheet_checkpoint_key(static_prompt, sheet_context, verify_enabled):
     h = hashlib.sha256()
     h.update(str(_SHEET_CHECKPOINT_VERSION).encode())
@@ -3805,7 +3811,38 @@ def _sheet_checkpoint_key(static_prompt, sheet_context, verify_enabled):
     h.update(b"|")
     h.update(str(sheet_context).encode("utf-8", "replace"))
     h.update(b"|verify=%d" % (1 if verify_enabled else 0))
+    # Consensus configuration + merge-code version: a different N or a
+    # changed merge algorithm produces a DIFFERENT sheet result and must
+    # not replay a stale one.
+    h.update(b"|consensus=%d|%s" % (
+        _effective_consensus_n(),
+        _CONSENSUS_MERGE_CODE_VERSION.encode()))
     return h.hexdigest()[:16]
+
+
+_CONSENSUS_JOB_PAGE_COUNT = 0  # set by the per-sheet loop; module-global
+
+
+def _effective_consensus_n():
+    """Per-class consensus N (V3): the configured NIGHTSHIFT_PER_SHEET_
+    CONSENSUS, forced to 1 on large DD-class sets (page count ≥
+    NIGHTSHIFT_CONSENSUS_DD_MIN_PAGES, default 30) — ULUM (49 pages) was
+    stable and bid-grade single-read (−5.6%) and consistently −16/−17%
+    under consensus; big sets' variance is cross-sheet, not per-read."""
+    try:
+        n = max(1, min(3, int(os.environ.get(
+            "NIGHTSHIFT_PER_SHEET_CONSENSUS", "1"))))
+    except (TypeError, ValueError):
+        n = 1
+    if n > 1:
+        try:
+            dd_min = int(os.environ.get(
+                "NIGHTSHIFT_CONSENSUS_DD_MIN_PAGES", "30"))
+        except (TypeError, ValueError):
+            dd_min = 30
+        if _CONSENSUS_JOB_PAGE_COUNT >= dd_min > 0:
+            return 1
+    return n
 
 
 def _sheet_checkpoint_load(ckpt_dir, page_idx0, key_hash):
@@ -4070,12 +4107,7 @@ def _extract_single_sheet(client, pdf_path, page_idx0, sheet_id,
     content.extend(image_blocks)
 
     reads = []
-    n_reads = 1
-    try:
-        n_reads = max(1, min(3, int(os.environ.get(
-            "NIGHTSHIFT_PER_SHEET_CONSENSUS", "1"))))
-    except (TypeError, ValueError):
-        n_reads = 1
+    n_reads = _effective_consensus_n()
     for attempt in range(n_reads):
         text = _call_sheet_api(client, content, _extraction_output_kwargs(),
                                label=f"sheet {sheet_id}"
@@ -4116,22 +4148,30 @@ def _merge_sheet_consensus_reads(reads):
         return (_norm_room_id(r.get("room_id"))
                 or _norm_room_id(r.get("room_name")))
 
-    def _merge_numeric(dst, src):
-        # FILL-ONLY (ULUM R4 regression): a non-zero field is never
-        # raised — max-merge let read-2's larger wall areas win on
-        # well-extracted jobs (+34% walls) and decoupled scaled-dim
-        # marker notes (read-1) from the values they flagged (read-2).
-        # Zero/missing fields fill from the other read, which is the
-        # entire recovery benefit (Harlem dims, Caris doors).
+    n_total_reads = len(reads)
+
+    def _merge_numeric(dst, src, all_vals=None):
+        # N=2: FILL-ONLY (ULUM R4 regression) — a non-zero field is never
+        # raised; zeros fill from the other read (the recovery benefit:
+        # Harlem dims, Caris doors) with no inflation path.
+        # N>=3 (V2): per-field MEDIAN across reads when all_vals provided
+        # — the outlier read (Caris doors 2 among [34, 34, 2]) loses the
+        # vote instead of poisoning the merge in either direction.
         for k, v in (src or {}).items():
             if isinstance(v, (int, float)):
-                if _num(dst.get(k, 0)) == 0 and _num(v) != 0:
+                if all_vals is not None:
+                    vals = sorted(_num(x.get(k, 0)) for x in all_vals)
+                    med = vals[len(vals) // 2]
+                    dst[k] = med
+                elif _num(dst.get(k, 0)) == 0 and _num(v) != 0:
                     dst[k] = v
             elif isinstance(v, str) and v.strip() and not str(
                     dst.get(k) or "").strip():
                 dst[k] = v
             elif isinstance(v, dict):
-                _merge_numeric(dst.setdefault(k, {}), v)
+                _merge_numeric(dst.setdefault(k, {}), v,
+                               all_vals=[x.get(k) or {} for x in all_vals]
+                               if all_vals is not None else None)
 
     floors = base.setdefault("floors", [])
     room_index = {}
@@ -4197,6 +4237,33 @@ def _merge_sheet_consensus_reads(reads):
                     nr = copy.deepcopy(r)
                     tgt_floor.setdefault("rooms", []).append(nr)
                     room_index[k] = nr
+
+    # V2: median pass for N>=3. A room seen in ≥2 reads gets per-field
+    # medians across ALL reads (absence votes 0), so a single outlier
+    # read can no longer poison a field in either direction.
+    if n_total_reads >= 3:
+        def _version_in(read, k):
+            for fl in (read.get("floors") or []):
+                for r in (fl.get("rooms") or []):
+                    if _key(r) == k:
+                        return r
+            return None
+
+        for k, base_room in room_index.items():
+            versions = [v for v in (_version_in(rd, k) for rd in reads)
+                        if v is not None]
+            if len(versions) < 2:
+                continue  # single-read room: fill-only union stands
+            while len(versions) < n_total_reads:
+                versions.append({})
+            for bag in ("dimensions", "elements"):
+                union_src = {}
+                for v in versions:
+                    for kk, vv in (v.get(bag) or {}).items():
+                        union_src.setdefault(kk, vv)
+                _merge_numeric(base_room.setdefault(bag, {}), union_src,
+                               all_vals=[v.get(bag) or {}
+                                         for v in versions])
     return base
 
 
@@ -4671,6 +4738,16 @@ def _analyze_pdf_per_sheet(client, pdf_path, scope_notes="",
     verify_on = _sheet_verification_enabled()
     ckpt_dir = _sheet_checkpoint_dir(pdf_path) \
         if _sheet_checkpoint_enabled() else None
+
+    # V3: expose this job's page scale so _effective_consensus_n can force
+    # single-read on DD-class sets. Must be set BEFORE any checkpoint key
+    # is computed (the key embeds the effective N).
+    global _CONSENSUS_JOB_PAGE_COUNT
+    _CONSENSUS_JOB_PAGE_COUNT = total_pages
+    if _effective_consensus_n() != max(1, min(3, int(os.environ.get(
+            "NIGHTSHIFT_PER_SHEET_CONSENSUS", "1") or 1))):
+        print(f"   🔁 Consensus: DD-class set ({total_pages} pages) — "
+              f"forcing single-read per sheet")
 
     print(f"   📑 PER-SHEET EXTRACTION: {len(plan_pages)} plan sheet(s) of "
           f"{len(included)} painting-relevant, {total_pages} total"
@@ -15359,7 +15436,41 @@ def _apply_geometric_room_completion(analysis):
     # Door-swing cross-check (informational, never prices).
     swings = 0
     for p in (shadow.get("pages") or []):
-        swings += _num((p.get("doors") or {}).get("swing_count", 0))
+        d = p.get("doors") or {}
+        swings += _num(d.get("swing_count", 0)) or _num(
+            d.get("quarter_sweeps", 0))
+
+    # V1 (flag NIGHTSHIFT_DOOR_SWING_AUTHORITY, default off): geometric
+    # swing count CAPS the priced door total when the signal is strong —
+    # Hudson's confirmatory run priced 378 doors on a set whose two
+    # other runs read 127-245 (count sampling noise × unit multipliers).
+    # SIGNAL GUARD: the swing counter reads 0 on some drawing styles
+    # (Hudson unit plans today), so the cap engages ONLY when swings ≥ 10
+    # AND ≥ 30% of the priced total — a weak/absent signal never caps.
+    # Only-reduce, proportional across door classes, loud note.
+    if (os.environ.get("NIGHTSHIFT_DOOR_SWING_AUTHORITY", "0").strip()
+            in ("1", "true", "True")):
+        agg = analysis.setdefault("aggregated_totals", {})
+        keys = ("total_doors_full_paint", "total_doors_hm_panel",
+                "total_doors_frame_only")
+        priced = sum(_num(agg.get(kk, 0)) for kk in keys)
+        cap = swings * 1.2
+        if (swings >= 10 and priced > cap
+                and swings >= 0.3 * priced
+                and "total_doors_full_paint" not in
+                (analysis.get("_schedule_authoritative_counts") or {})):
+            scale = cap / priced
+            for kk in keys:
+                if _num(agg.get(kk, 0)) > 0:
+                    agg[kk] = round(_num(agg[kk]) * scale, 1)
+            analysis.setdefault("notes", []).append(
+                f"[Door Swing Authority] Priced doors capped "
+                f"{priced:.0f} → {cap:.0f} — the drawings show "
+                f"~{swings:.0f} door swings geometrically and no door "
+                f"schedule overrides. Confirm the door count.")
+            print(f"   🚪 Door-swing authority: capped {priced:.0f} → "
+                  f"{cap:.0f} doors ({swings:.0f} swings measured)",
+                  flush=True)
     agg = analysis.get("aggregated_totals", {})
     priced_doors = sum(_num(agg.get(k, 0)) for k in
                        ("total_doors_full_paint", "total_doors_hm_panel",
