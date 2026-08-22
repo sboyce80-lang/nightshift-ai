@@ -3797,6 +3797,12 @@ def _sheet_checkpoint_dir(pdf_path):
         return None
 
 
+# V4 (variance-reduction, 2026-08-22): bump when the consensus MERGE code
+# changes — the R4 batch silently replayed max-merge-era checkpoints after
+# the fill-only fix landed because the key never saw merge semantics.
+_CONSENSUS_MERGE_CODE_VERSION = "fill-only-v2-median-v3"
+
+
 def _sheet_checkpoint_key(static_prompt, sheet_context, verify_enabled):
     h = hashlib.sha256()
     h.update(str(_SHEET_CHECKPOINT_VERSION).encode())
@@ -3805,7 +3811,38 @@ def _sheet_checkpoint_key(static_prompt, sheet_context, verify_enabled):
     h.update(b"|")
     h.update(str(sheet_context).encode("utf-8", "replace"))
     h.update(b"|verify=%d" % (1 if verify_enabled else 0))
+    # Consensus configuration + merge-code version: a different N or a
+    # changed merge algorithm produces a DIFFERENT sheet result and must
+    # not replay a stale one.
+    h.update(b"|consensus=%d|%s" % (
+        _effective_consensus_n(),
+        _CONSENSUS_MERGE_CODE_VERSION.encode()))
     return h.hexdigest()[:16]
+
+
+_CONSENSUS_JOB_PAGE_COUNT = 0  # set by the per-sheet loop; module-global
+
+
+def _effective_consensus_n():
+    """Per-class consensus N (V3): the configured NIGHTSHIFT_PER_SHEET_
+    CONSENSUS, forced to 1 on large DD-class sets (page count ≥
+    NIGHTSHIFT_CONSENSUS_DD_MIN_PAGES, default 30) — ULUM (49 pages) was
+    stable and bid-grade single-read (−5.6%) and consistently −16/−17%
+    under consensus; big sets' variance is cross-sheet, not per-read."""
+    try:
+        n = max(1, min(3, int(os.environ.get(
+            "NIGHTSHIFT_PER_SHEET_CONSENSUS", "1"))))
+    except (TypeError, ValueError):
+        n = 1
+    if n > 1:
+        try:
+            dd_min = int(os.environ.get(
+                "NIGHTSHIFT_CONSENSUS_DD_MIN_PAGES", "30"))
+        except (TypeError, ValueError):
+            dd_min = 30
+        if _CONSENSUS_JOB_PAGE_COUNT >= dd_min > 0:
+            return 1
+    return n
 
 
 def _sheet_checkpoint_load(ckpt_dir, page_idx0, key_hash):
@@ -4070,12 +4107,7 @@ def _extract_single_sheet(client, pdf_path, page_idx0, sheet_id,
     content.extend(image_blocks)
 
     reads = []
-    n_reads = 1
-    try:
-        n_reads = max(1, min(3, int(os.environ.get(
-            "NIGHTSHIFT_PER_SHEET_CONSENSUS", "1"))))
-    except (TypeError, ValueError):
-        n_reads = 1
+    n_reads = _effective_consensus_n()
     for attempt in range(n_reads):
         text = _call_sheet_api(client, content, _extraction_output_kwargs(),
                                label=f"sheet {sheet_id}"
@@ -4116,22 +4148,30 @@ def _merge_sheet_consensus_reads(reads):
         return (_norm_room_id(r.get("room_id"))
                 or _norm_room_id(r.get("room_name")))
 
-    def _merge_numeric(dst, src):
-        # FILL-ONLY (ULUM R4 regression): a non-zero field is never
-        # raised — max-merge let read-2's larger wall areas win on
-        # well-extracted jobs (+34% walls) and decoupled scaled-dim
-        # marker notes (read-1) from the values they flagged (read-2).
-        # Zero/missing fields fill from the other read, which is the
-        # entire recovery benefit (Harlem dims, Caris doors).
+    n_total_reads = len(reads)
+
+    def _merge_numeric(dst, src, all_vals=None):
+        # N=2: FILL-ONLY (ULUM R4 regression) — a non-zero field is never
+        # raised; zeros fill from the other read (the recovery benefit:
+        # Harlem dims, Caris doors) with no inflation path.
+        # N>=3 (V2): per-field MEDIAN across reads when all_vals provided
+        # — the outlier read (Caris doors 2 among [34, 34, 2]) loses the
+        # vote instead of poisoning the merge in either direction.
         for k, v in (src or {}).items():
             if isinstance(v, (int, float)):
-                if _num(dst.get(k, 0)) == 0 and _num(v) != 0:
+                if all_vals is not None:
+                    vals = sorted(_num(x.get(k, 0)) for x in all_vals)
+                    med = vals[len(vals) // 2]
+                    dst[k] = med
+                elif _num(dst.get(k, 0)) == 0 and _num(v) != 0:
                     dst[k] = v
             elif isinstance(v, str) and v.strip() and not str(
                     dst.get(k) or "").strip():
                 dst[k] = v
             elif isinstance(v, dict):
-                _merge_numeric(dst.setdefault(k, {}), v)
+                _merge_numeric(dst.setdefault(k, {}), v,
+                               all_vals=[x.get(k) or {} for x in all_vals]
+                               if all_vals is not None else None)
 
     floors = base.setdefault("floors", [])
     room_index = {}
@@ -4197,6 +4237,33 @@ def _merge_sheet_consensus_reads(reads):
                     nr = copy.deepcopy(r)
                     tgt_floor.setdefault("rooms", []).append(nr)
                     room_index[k] = nr
+
+    # V2: median pass for N>=3. A room seen in ≥2 reads gets per-field
+    # medians across ALL reads (absence votes 0), so a single outlier
+    # read can no longer poison a field in either direction.
+    if n_total_reads >= 3:
+        def _version_in(read, k):
+            for fl in (read.get("floors") or []):
+                for r in (fl.get("rooms") or []):
+                    if _key(r) == k:
+                        return r
+            return None
+
+        for k, base_room in room_index.items():
+            versions = [v for v in (_version_in(rd, k) for rd in reads)
+                        if v is not None]
+            if len(versions) < 2:
+                continue  # single-read room: fill-only union stands
+            while len(versions) < n_total_reads:
+                versions.append({})
+            for bag in ("dimensions", "elements"):
+                union_src = {}
+                for v in versions:
+                    for kk, vv in (v.get(bag) or {}).items():
+                        union_src.setdefault(kk, vv)
+                _merge_numeric(base_room.setdefault(bag, {}), union_src,
+                               all_vals=[v.get(bag) or {}
+                                         for v in versions])
     return base
 
 
@@ -4671,6 +4738,16 @@ def _analyze_pdf_per_sheet(client, pdf_path, scope_notes="",
     verify_on = _sheet_verification_enabled()
     ckpt_dir = _sheet_checkpoint_dir(pdf_path) \
         if _sheet_checkpoint_enabled() else None
+
+    # V3: expose this job's page scale so _effective_consensus_n can force
+    # single-read on DD-class sets. Must be set BEFORE any checkpoint key
+    # is computed (the key embeds the effective N).
+    global _CONSENSUS_JOB_PAGE_COUNT
+    _CONSENSUS_JOB_PAGE_COUNT = total_pages
+    if _effective_consensus_n() != max(1, min(3, int(os.environ.get(
+            "NIGHTSHIFT_PER_SHEET_CONSENSUS", "1") or 1))):
+        print(f"   🔁 Consensus: DD-class set ({total_pages} pages) — "
+              f"forcing single-read per sheet")
 
     print(f"   📑 PER-SHEET EXTRACTION: {len(plan_pages)} plan sheet(s) of "
           f"{len(included)} painting-relevant, {total_pages} total"
@@ -8948,6 +9025,7 @@ Return ONLY this JSON (one object, no commentary):
   "exterior_siding_type": "",
   "lift_required": false,
   "notes": "<1-2 sentences describing what was painted and why your numbers reflect that>",
+  "paint_evidence": "<QUOTE the exact keynote/spec/finish-schedule text that mandates exterior PAINTING (e.g. 'PAINT ALL FIBER CEMENT SIDING SW7674'). If no text explicitly calls for painting the facade — e.g. the notes only cover power washing, patch/repair, sealant, or tuck-pointing — write NONE and set the paint/siding quantities to 0.>",
   "source_sheets": ["A-201", "A-202"]
 }
 
@@ -9169,6 +9247,44 @@ def _maybe_run_exterior_pass(client, pdf_path, analysis_result):
     time.sleep(10)
     ext_data = _extract_exterior_scope(client, pdf_path)
     if ext_data:
+        # G2 exterior-evidence gate (NIGHTSHIFT_EXTERIOR_EVIDENCE_GATE,
+        # default off): painted-surface quantities require QUOTED text
+        # mandating exterior painting. Hudson ($29.8k) and ULUM ($7.3k)
+        # priced facade paint on sets whose keynotes only call for power
+        # washing / patch-repair / sealant / tuck-pointing — assumed
+        # scope, not hard numbers. Without paint evidence the painted-
+        # surface fields zero and a quantified RFI ships instead.
+        # Structural counts (doors/bollards/railings) are physical
+        # objects, not paint judgments — they pass through.
+        if (os.environ.get("NIGHTSHIFT_EXTERIOR_EVIDENCE_GATE",
+                           "0").strip() in ("1", "true", "True")):
+            ev = str(ext_data.get("paint_evidence") or "").strip()
+            has_paint_ev = (ev and ev.upper() != "NONE"
+                            and re.search(r"paint|coat|stain|finish",
+                                          ev, re.IGNORECASE))
+            painted_keys = ("exterior_paint_sqft", "hardie_siding_sqft",
+                            "cornice_lf", "window_trim_lf", "soffit_sqft",
+                            "azek_trim_lf", "corner_board_lf",
+                            "steel_lintel_lf")
+            zeroed_ext = {k: _num(ext_data.get(k, 0)) for k in painted_keys
+                          if _num(ext_data.get(k, 0)) > 0}
+            if zeroed_ext and not has_paint_ev:
+                for k in zeroed_ext:
+                    ext_data[k] = 0
+                qty_txt = ", ".join(f"{k}={v:,.0f}"
+                                    for k, v in zeroed_ext.items())
+                _gate_add_rfi(
+                    analysis_result, "Exterior Painting",
+                    f"Elevation measurement found paintable exterior "
+                    f"surfaces ({qty_txt}) but NO drawing text mandates "
+                    f"exterior painting (notes cover cleaning/repair "
+                    f"scope only) — $0 carried per the hard-numbers "
+                    f"policy. Confirm whether facade painting is in "
+                    f"scope and we will price the measured quantities.")
+                print(f"   🏛  Exterior evidence gate: zeroed "
+                      f"{len(zeroed_ext)} unpainted-evidence field(s) "
+                      f"({qty_txt}) — RFI shipped", flush=True)
+
         # Merge non-zero numeric fields into the existing exterior dict
         # (preserve any prior values; only fill gaps).
         merged = dict(exterior)
@@ -15359,7 +15475,41 @@ def _apply_geometric_room_completion(analysis):
     # Door-swing cross-check (informational, never prices).
     swings = 0
     for p in (shadow.get("pages") or []):
-        swings += _num((p.get("doors") or {}).get("swing_count", 0))
+        d = p.get("doors") or {}
+        swings += _num(d.get("swing_count", 0)) or _num(
+            d.get("quarter_sweeps", 0))
+
+    # V1 (flag NIGHTSHIFT_DOOR_SWING_AUTHORITY, default off): geometric
+    # swing count CAPS the priced door total when the signal is strong —
+    # Hudson's confirmatory run priced 378 doors on a set whose two
+    # other runs read 127-245 (count sampling noise × unit multipliers).
+    # SIGNAL GUARD: the swing counter reads 0 on some drawing styles
+    # (Hudson unit plans today), so the cap engages ONLY when swings ≥ 10
+    # AND ≥ 30% of the priced total — a weak/absent signal never caps.
+    # Only-reduce, proportional across door classes, loud note.
+    if (os.environ.get("NIGHTSHIFT_DOOR_SWING_AUTHORITY", "0").strip()
+            in ("1", "true", "True")):
+        agg = analysis.setdefault("aggregated_totals", {})
+        keys = ("total_doors_full_paint", "total_doors_hm_panel",
+                "total_doors_frame_only")
+        priced = sum(_num(agg.get(kk, 0)) for kk in keys)
+        cap = swings * 1.2
+        if (swings >= 10 and priced > cap
+                and swings >= 0.3 * priced
+                and "total_doors_full_paint" not in
+                (analysis.get("_schedule_authoritative_counts") or {})):
+            scale = cap / priced
+            for kk in keys:
+                if _num(agg.get(kk, 0)) > 0:
+                    agg[kk] = round(_num(agg[kk]) * scale, 1)
+            analysis.setdefault("notes", []).append(
+                f"[Door Swing Authority] Priced doors capped "
+                f"{priced:.0f} → {cap:.0f} — the drawings show "
+                f"~{swings:.0f} door swings geometrically and no door "
+                f"schedule overrides. Confirm the door count.")
+            print(f"   🚪 Door-swing authority: capped {priced:.0f} → "
+                  f"{cap:.0f} doors ({swings:.0f} swings measured)",
+                  flush=True)
     agg = analysis.get("aggregated_totals", {})
     priced_doors = sum(_num(agg.get(k, 0)) for k in
                        ("total_doors_full_paint", "total_doors_hm_panel",
@@ -15376,6 +15526,200 @@ def _apply_geometric_room_completion(analysis):
         "completed_rooms": len(completed),
         "added_ceiling_sqft": round(added_ceiling, 2),
         "door_swings": swings, "priced_doors": priced_doors}
+    return analysis
+
+
+_EXT_PAINT_EVIDENCE_RX = re.compile(
+    r"paint\s+(?:all\s+)?(?:the\s+)?(?:exterior|fa[cç]ade|siding|fiber|"
+    r"stucco|cmu|masonry|wood|trim)|exterior\s+(?:siding\s+)?paint|"
+    r"field.?paint|repaint", re.IGNORECASE)
+
+
+def _enforce_exterior_evidence(analysis):
+    """Flag-gated (NIGHTSHIFT_EXTERIOR_EVIDENCE_GATE, shared with the
+    in-pass tier): pricing-time enforcement that works on replayed
+    analyses. Painted-surface exterior quantities survive only when the
+    exterior dict's paint_evidence/notes — or a scope-sweep finding —
+    carries text mandating exterior painting. Otherwise: zeroed + RFI.
+    Idempotent via _exterior_evidence_gate."""
+    if not isinstance(analysis, dict):
+        return analysis
+    if os.environ.get("NIGHTSHIFT_EXTERIOR_EVIDENCE_GATE", "0").strip() \
+            not in ("1", "true", "True"):
+        return analysis
+    if analysis.get("_exterior_evidence_gate"):
+        return analysis
+    ext = analysis.get("exterior") or {}
+    painted_keys = ("exterior_paint_sqft", "hardie_siding_sqft",
+                    "cornice_lf", "window_trim_lf", "soffit_sqft",
+                    "azek_trim_lf", "corner_board_lf", "steel_lintel_lf")
+    present = {k: _num(ext.get(k, 0)) for k in painted_keys
+               if _num(ext.get(k, 0)) > 0}
+    if not present:
+        analysis["_exterior_evidence_gate"] = {"noop": "no_ext_paint"}
+        return analysis
+    blobs = [str(ext.get("paint_evidence") or ""),
+             str(ext.get("notes") or "")]
+    for f in ((analysis.get("_scope_sweep") or {}).get("findings") or []):
+        blobs.append(f"{f.get('item') or ''} {f.get('detail') or ''}")
+    evidence = any(_EXT_PAINT_EVIDENCE_RX.search(b) for b in blobs if b)
+    if evidence:
+        analysis["_exterior_evidence_gate"] = {"evidence": True,
+                                               "kept": list(present)}
+        return analysis
+    agg = analysis.setdefault("aggregated_totals", {})
+    for k in present:
+        ext[k] = 0
+        # exterior quantities also mirror into aggregates on some paths
+        for agg_key in (f"total_{k}", k):
+            if agg_key in agg:
+                agg[agg_key] = 0
+    qty_txt = ", ".join(f"{k}={v:,.0f}" for k, v in present.items())
+    _gate_add_rfi(
+        analysis, "Exterior Painting",
+        f"Exterior paintable surfaces were measured ({qty_txt}) but no "
+        f"drawing text mandates exterior painting — the elevation notes "
+        f"cover cleaning/repair scope only. $0 carried per the hard-"
+        f"numbers policy; confirm scope and we will price the measured "
+        f"quantities.")
+    analysis.setdefault("notes", []).append(
+        f"[Exterior Evidence] Zeroed {len(present)} exterior paint "
+        f"field(s) with no painting mandate ({qty_txt}); RFI shipped.")
+    print(f"   🏛  Exterior evidence (pricing tier): zeroed {qty_txt}",
+          flush=True)
+    analysis["_exterior_evidence_gate"] = {"evidence": False,
+                                           "zeroed": present}
+    return analysis
+
+
+def _reconcile_door_density(analysis):
+    """Flag-gated (NIGHTSHIFT_DOOR_DENSITY_RECONCILE, default off): a
+    unit template cannot carry more doors per unit than its room count
+    plus two (each room has one entry; +1 unit-entry, +1 closet slack).
+
+    Hudson V-block: doors priced STABLY at ~380 vs JW's 197 — 11.2
+    doors/unit on ~5-room unit templates (leaf+frame double counts and
+    connecting doors counted from both sides survive the merges). JW's
+    5.8/unit fits the structural bound. Scaling applies to the template
+    rooms' door fields (proportionally), only-reduce, never against a
+    schedule-authoritative count, always with a note + manual review.
+    Idempotent via _door_density_reconcile.
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if os.environ.get("NIGHTSHIFT_DOOR_DENSITY_RECONCILE", "0").strip() \
+            not in ("1", "true", "True"):
+        return analysis
+    if analysis.get("_door_density_reconcile"):
+        return analysis
+    if "total_doors_full_paint" in (
+            analysis.get("_schedule_authoritative_counts") or {}):
+        analysis["_door_density_reconcile"] = {"noop": "schedule_authoritative"}
+        return analysis
+
+    DOOR_KEYS = ("doors_full_paint", "doors_hm_panel", "doors_frame_only")
+    groups = {}
+    for fl in (analysis.get("floors") or []):
+        for r in (fl.get("rooms") or []):
+            if not isinstance(r, dict) or r.get("in_scope") is False:
+                continue
+            mult = _num(r.get("unit_multiplier", 1)) or 1
+            if mult < 2:
+                continue
+            core = frozenset(_unit_core_tokens(r.get("unit_type")
+                                               or r.get("room_name")))
+            if core:
+                groups.setdefault((core, mult), []).append(r)
+
+    adjusted = []
+    removed_by_key = {k: 0.0 for k in DOOR_KEYS}
+    for (core, mult), rooms in groups.items():
+        per_unit = sum(_num((r.get("elements") or {}).get(k, 0))
+                       for r in rooms for k in DOOR_KEYS)
+        cap = len(rooms) + 2
+        if per_unit <= cap or per_unit <= 0:
+            continue
+        scale = cap / per_unit
+        for r in rooms:
+            el = r.get("elements") or {}
+            for k in DOOR_KEYS:
+                v = _num(el.get(k, 0))
+                if v > 0:
+                    newv = round(v * scale, 2)
+                    removed_by_key[k] += (v - newv) * mult
+                    el[k] = newv
+        adjusted.append(f"{'/'.join(sorted(core))}: {per_unit:.0f}→{cap} "
+                        f"doors/unit ×{mult:.0f}")
+
+    # Tier 2 (Hudson replay): doors riding on INSTANCE rooms (mult 1)
+    # that dedup kept — the template pass sees nothing. Bound the total
+    # unit-like door count by total_units × NIGHTSHIFT_DOOR_DENSITY_MAX_
+    # PER_UNIT (default 7 = 5-room typical + entry + closet slack).
+    if not adjusted:
+        total_units = _num((analysis.get("project_info") or {})
+                           .get("total_units", 0))
+        try:
+            max_per_unit = float(os.environ.get(
+                "NIGHTSHIFT_DOOR_DENSITY_MAX_PER_UNIT", "7"))
+        except (TypeError, ValueError):
+            max_per_unit = 7.0
+        if total_units >= 2 and max_per_unit > 0:
+            _UNIT_RX = re.compile(
+                r"\b(suite|studio|guest\s?room|king|queen|unit)\b",
+                re.IGNORECASE)
+            unit_doors = 0.0
+            unit_rooms = []
+            for fl in (analysis.get("floors") or []):
+                for r in (fl.get("rooms") or []):
+                    if not isinstance(r, dict) or r.get("in_scope") is False:
+                        continue
+                    nm = f"{r.get('room_name') or ''} {r.get('unit_type') or ''}"
+                    if not _UNIT_RX.search(nm):
+                        continue
+                    el = r.get("elements") or {}
+                    mult = max(1, int(_num(r.get("unit_multiplier", 1)) or 1))
+                    n = sum(_num(el.get(k, 0)) for k in DOOR_KEYS)
+                    if n > 0:
+                        unit_doors += n * mult
+                        unit_rooms.append(r)
+            cap_total = total_units * max_per_unit
+            if unit_doors > cap_total and unit_rooms:
+                scale = cap_total / unit_doors
+                for r in unit_rooms:
+                    el = r.get("elements") or {}
+                    mult = max(1, int(_num(r.get("unit_multiplier", 1)) or 1))
+                    for k in DOOR_KEYS:
+                        v = _num(el.get(k, 0))
+                        if v > 0:
+                            newv = round(v * scale, 2)
+                            removed_by_key[k] += (v - newv) * mult
+                            el[k] = newv
+                adjusted.append(
+                    f"unit-instance doors {unit_doors:.0f}→{cap_total:.0f} "
+                    f"({total_units:.0f} units × {max_per_unit:.0f})")
+
+    total_removed = sum(removed_by_key.values())
+    if total_removed > 0:
+        agg = analysis.setdefault("aggregated_totals", {})
+        for k, agg_key in (("doors_full_paint", "total_doors_full_paint"),
+                           ("doors_hm_panel", "total_doors_hm_panel"),
+                           ("doors_frame_only", "total_doors_frame_only")):
+            if removed_by_key[k] > 0 and agg_key in agg:
+                agg[agg_key] = max(0, round(_num(agg.get(agg_key, 0))
+                                            - removed_by_key[k], 1))
+        analysis.setdefault("notes", []).append(
+            f"[Door Density] Unit templates carried more doors than rooms"
+            f"+2 — {total_removed:.0f} door count(s) removed as structural "
+            f"double-counts ({'; '.join(adjusted[:4])}"
+            f"{'…' if len(adjusted) > 4 else ''}). Confirm door counts "
+            f"against the door schedule.")
+        analysis["manual_review_required"] = True
+        print(f"   🚪 Door density: removed {total_removed:.0f} "
+              f"double-counted unit door(s) ({'; '.join(adjusted[:2])})",
+              flush=True)
+    analysis["_door_density_reconcile"] = {
+        "adjusted_groups": adjusted[:10],
+        "removed": round(total_removed, 1)}
     return analysis
 
 
@@ -18735,6 +19079,17 @@ def build_priced_takeoff(analysis, strict=None):
     # a floor plan must not stack. Flag-gated; no-op when off.
     analysis = _reconcile_door_sources(analysis)
 
+    # G1 door-density reconcile: unit templates cannot carry more doors
+    # than rooms+2 per unit. Flag-gated; no-op when off.
+    analysis = _reconcile_door_density(analysis)
+
+    # G2 pricing-time tier: exterior paint without recorded paint
+    # evidence zeroes + RFI even on REPLAYED analyses (the in-pass gate
+    # is unreachable when the exterior dict is already populated — the
+    # Hudson replay carried exterior_paint_sqft equal to the POWER WASH
+    # area with no paint keynote anywhere). Flag-gated; no-op when off.
+    analysis = _enforce_exterior_evidence(analysis)
+
     # Final ceiling-scope reconciliation (ACT demote + commercial aggregate
     # rebuild) before any quantity is priced. Flag-gated; no-op when off.
     analysis = _enforce_ceiling_scope_gate(analysis)
@@ -21862,6 +22217,18 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
 
     # Specialty finishes — Level 5 skim coat priced per SF (PCA Section 6D)
     level_5_sqft = _num(aggregated_totals.get('total_level_5_finish_sqft', 0))
+    # G3 (Steven, 2026-08-22): NIGHTSHIFT_LEVEL5_EXCLUDE strikes the
+    # Level-5 line entirely for estimator-style bids that absorb skim
+    # coat in wall rates (JW). Documented scope still surfaces as a note.
+    if (level_5_sqft > 0 and os.environ.get(
+            "NIGHTSHIFT_LEVEL5_EXCLUDE", "0").strip() in ("1", "true",
+                                                          "True")):
+        if isinstance(analysis, dict):
+            analysis.setdefault("notes", []).append(
+                f"[Level 5] {level_5_sqft:,.0f} SF of documented Level-5 "
+                f"finish EXCLUDED from this bid per pricing policy "
+                f"(absorbed in wall rates / by drywall sub).")
+        level_5_sqft = 0.0
 
     # Concrete sealer (garages, basements)
     concrete_sqft = _num(aggregated_totals.get('total_concrete_floor_sqft', 0))
