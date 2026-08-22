@@ -15529,6 +15529,69 @@ def _apply_geometric_room_completion(analysis):
     return analysis
 
 
+_EXT_PAINT_EVIDENCE_RX = re.compile(
+    r"paint\s+(?:all\s+)?(?:the\s+)?(?:exterior|fa[cç]ade|siding|fiber|"
+    r"stucco|cmu|masonry|wood|trim)|exterior\s+(?:siding\s+)?paint|"
+    r"field.?paint|repaint", re.IGNORECASE)
+
+
+def _enforce_exterior_evidence(analysis):
+    """Flag-gated (NIGHTSHIFT_EXTERIOR_EVIDENCE_GATE, shared with the
+    in-pass tier): pricing-time enforcement that works on replayed
+    analyses. Painted-surface exterior quantities survive only when the
+    exterior dict's paint_evidence/notes — or a scope-sweep finding —
+    carries text mandating exterior painting. Otherwise: zeroed + RFI.
+    Idempotent via _exterior_evidence_gate."""
+    if not isinstance(analysis, dict):
+        return analysis
+    if os.environ.get("NIGHTSHIFT_EXTERIOR_EVIDENCE_GATE", "0").strip() \
+            not in ("1", "true", "True"):
+        return analysis
+    if analysis.get("_exterior_evidence_gate"):
+        return analysis
+    ext = analysis.get("exterior") or {}
+    painted_keys = ("exterior_paint_sqft", "hardie_siding_sqft",
+                    "cornice_lf", "window_trim_lf", "soffit_sqft",
+                    "azek_trim_lf", "corner_board_lf", "steel_lintel_lf")
+    present = {k: _num(ext.get(k, 0)) for k in painted_keys
+               if _num(ext.get(k, 0)) > 0}
+    if not present:
+        analysis["_exterior_evidence_gate"] = {"noop": "no_ext_paint"}
+        return analysis
+    blobs = [str(ext.get("paint_evidence") or ""),
+             str(ext.get("notes") or "")]
+    for f in ((analysis.get("_scope_sweep") or {}).get("findings") or []):
+        blobs.append(f"{f.get('item') or ''} {f.get('detail') or ''}")
+    evidence = any(_EXT_PAINT_EVIDENCE_RX.search(b) for b in blobs if b)
+    if evidence:
+        analysis["_exterior_evidence_gate"] = {"evidence": True,
+                                               "kept": list(present)}
+        return analysis
+    agg = analysis.setdefault("aggregated_totals", {})
+    for k in present:
+        ext[k] = 0
+        # exterior quantities also mirror into aggregates on some paths
+        for agg_key in (f"total_{k}", k):
+            if agg_key in agg:
+                agg[agg_key] = 0
+    qty_txt = ", ".join(f"{k}={v:,.0f}" for k, v in present.items())
+    _gate_add_rfi(
+        analysis, "Exterior Painting",
+        f"Exterior paintable surfaces were measured ({qty_txt}) but no "
+        f"drawing text mandates exterior painting — the elevation notes "
+        f"cover cleaning/repair scope only. $0 carried per the hard-"
+        f"numbers policy; confirm scope and we will price the measured "
+        f"quantities.")
+    analysis.setdefault("notes", []).append(
+        f"[Exterior Evidence] Zeroed {len(present)} exterior paint "
+        f"field(s) with no painting mandate ({qty_txt}); RFI shipped.")
+    print(f"   🏛  Exterior evidence (pricing tier): zeroed {qty_txt}",
+          flush=True)
+    analysis["_exterior_evidence_gate"] = {"evidence": False,
+                                           "zeroed": present}
+    return analysis
+
+
 def _reconcile_door_density(analysis):
     """Flag-gated (NIGHTSHIFT_DOOR_DENSITY_RECONCILE, default off): a
     unit template cannot carry more doors per unit than its room count
@@ -15587,6 +15650,53 @@ def _reconcile_door_density(analysis):
                     el[k] = newv
         adjusted.append(f"{'/'.join(sorted(core))}: {per_unit:.0f}→{cap} "
                         f"doors/unit ×{mult:.0f}")
+
+    # Tier 2 (Hudson replay): doors riding on INSTANCE rooms (mult 1)
+    # that dedup kept — the template pass sees nothing. Bound the total
+    # unit-like door count by total_units × NIGHTSHIFT_DOOR_DENSITY_MAX_
+    # PER_UNIT (default 7 = 5-room typical + entry + closet slack).
+    if not adjusted:
+        total_units = _num((analysis.get("project_info") or {})
+                           .get("total_units", 0))
+        try:
+            max_per_unit = float(os.environ.get(
+                "NIGHTSHIFT_DOOR_DENSITY_MAX_PER_UNIT", "7"))
+        except (TypeError, ValueError):
+            max_per_unit = 7.0
+        if total_units >= 2 and max_per_unit > 0:
+            _UNIT_RX = re.compile(
+                r"\b(suite|studio|guest\s?room|king|queen|unit)\b",
+                re.IGNORECASE)
+            unit_doors = 0.0
+            unit_rooms = []
+            for fl in (analysis.get("floors") or []):
+                for r in (fl.get("rooms") or []):
+                    if not isinstance(r, dict) or r.get("in_scope") is False:
+                        continue
+                    nm = f"{r.get('room_name') or ''} {r.get('unit_type') or ''}"
+                    if not _UNIT_RX.search(nm):
+                        continue
+                    el = r.get("elements") or {}
+                    mult = max(1, int(_num(r.get("unit_multiplier", 1)) or 1))
+                    n = sum(_num(el.get(k, 0)) for k in DOOR_KEYS)
+                    if n > 0:
+                        unit_doors += n * mult
+                        unit_rooms.append(r)
+            cap_total = total_units * max_per_unit
+            if unit_doors > cap_total and unit_rooms:
+                scale = cap_total / unit_doors
+                for r in unit_rooms:
+                    el = r.get("elements") or {}
+                    mult = max(1, int(_num(r.get("unit_multiplier", 1)) or 1))
+                    for k in DOOR_KEYS:
+                        v = _num(el.get(k, 0))
+                        if v > 0:
+                            newv = round(v * scale, 2)
+                            removed_by_key[k] += (v - newv) * mult
+                            el[k] = newv
+                adjusted.append(
+                    f"unit-instance doors {unit_doors:.0f}→{cap_total:.0f} "
+                    f"({total_units:.0f} units × {max_per_unit:.0f})")
 
     total_removed = sum(removed_by_key.values())
     if total_removed > 0:
@@ -18972,6 +19082,13 @@ def build_priced_takeoff(analysis, strict=None):
     # G1 door-density reconcile: unit templates cannot carry more doors
     # than rooms+2 per unit. Flag-gated; no-op when off.
     analysis = _reconcile_door_density(analysis)
+
+    # G2 pricing-time tier: exterior paint without recorded paint
+    # evidence zeroes + RFI even on REPLAYED analyses (the in-pass gate
+    # is unreachable when the exterior dict is already populated — the
+    # Hudson replay carried exterior_paint_sqft equal to the POWER WASH
+    # area with no paint keynote anywhere). Flag-gated; no-op when off.
+    analysis = _enforce_exterior_evidence(analysis)
 
     # Final ceiling-scope reconciliation (ACT demote + commercial aggregate
     # rebuild) before any quantity is priced. Flag-gated; no-op when off.
