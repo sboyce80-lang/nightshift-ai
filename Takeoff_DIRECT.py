@@ -18839,6 +18839,21 @@ def build_priced_takeoff(analysis, strict=None):
     # Flag-gated; no-op when off.
     analysis = _apply_sealed_concrete_allowance(analysis)
 
+    # JW-class mandatory review (rollout constraint, Steven 2026-08-22):
+    # while the accuracy flag set ships, EVERY estimate produced under it
+    # requires reviewer sign-off — the 2026-08-22 confirmatory batch
+    # showed run-to-run count variance (Hudson doors 127→378) that the
+    # variance-reduction block must close before this training wheel
+    # comes off. Flag NIGHTSHIFT_MANDATORY_REVIEW; no-op when off.
+    if os.environ.get("NIGHTSHIFT_MANDATORY_REVIEW", "0").strip() in (
+            "1", "true", "True"):
+        if not analysis.get("manual_review_required"):
+            analysis["manual_review_required"] = True
+            analysis.setdefault("notes", []).append(
+                "[Mandatory Review] Reviewer sign-off required on every "
+                "estimate under the current accuracy rollout — no "
+                "estimate ships unreviewed regardless of confidence.")
+
     agg = analysis.get("aggregated_totals", {}) or {}
     ledger = analysis.get("_quantity_adjustments", []) or []
     by_item = {}
