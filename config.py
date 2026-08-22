@@ -141,6 +141,21 @@ PRICING_MODEL = {
         "unit": "ea", "markup": 0.06,
         "tiers": [{"min_qty": 0, "max_qty": None, "rate": 40.00}],
     },
+    "window_trim": {
+        # Stool + apron + casing as ONE op per window (JW 26-390 comps:
+        # $100/EA). Consumed by the Window Trim line (NIGHTSHIFT_WINDOW_
+        # TRIM_SCOPE).
+        "unit": "ea", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 100.00}],
+    },
+    "power_washing": {
+        # Facade cleaning sold with paint scope; quantity comes from the
+        # plans' power-wash spec block via the scope sweep (NIGHTSHIFT_
+        # POWER_WASH_ALLOWANCE). $1.46/SF × the commercial 8% markup
+        # reproduces JW 26-390's $38,827 line within 0.2% on 24,652 SF.
+        "unit": "sqft", "markup": 0.06,
+        "tiers": [{"min_qty": 0, "max_qty": None, "rate": 1.46}],
+    },
     # ── Stairs ── (Item 21)
     "stairs": {
         "unit": "ea", "markup": 0.06,

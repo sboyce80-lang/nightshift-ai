@@ -87,6 +87,28 @@ check(a["_vme_authoritative"]["applied"] is False
       and a["aggregated_totals"]["total_paintable_wall_sqft"] == 5000,
       "x5.2 vs LLM read is outside the sanity band -> abstain")
 
+# ── Starved-extraction promotion (F1c, 2026-08-20 Harlem) ──────────────────
+# Most rooms carry 0 wall area (unreadable dims): the band's LLM reference is
+# meaningless. With the flag ON, geometry promotes with an RFI; OFF abstains.
+def _starved(llm_walls=2572):
+    a = _analysis(llm_walls=llm_walls)
+    rooms = a["floors"][0]["rooms"]
+    for r in rooms[:4]:                      # 4 of 5 rooms zero-wall
+        r["dimensions"]["wall_area_sqft"] = 0
+    return a
+
+os.environ["NIGHTSHIFT_VME_STARVED_PROMOTE"] = "1"
+a = T._apply_vme_authoritative_walls(_starved())
+check(a["_vme_authoritative"]["applied"] is True,
+      "starved extraction + flag on -> geometric promotion despite band")
+check(any("starved" in str(r.get("question", "")).lower()
+          for r in (a.get("_pre_pricing_rfis") or [])),
+      "starved promotion files an RFI")
+os.environ["NIGHTSHIFT_VME_STARVED_PROMOTE"] = "0"
+a = T._apply_vme_authoritative_walls(_starved())
+check(a["_vme_authoritative"]["applied"] is False,
+      "starved extraction + flag off -> still abstains (default safe)")
+
 a = _analysis()
 a["_vme_shadow_v2"] = None
 a.pop("_vme_pdf_paths", None)

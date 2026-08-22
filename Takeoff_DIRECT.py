@@ -210,14 +210,47 @@ _EXTRACTION_OUTPUT_SCHEMA = _so_obj({
     "has_window_schedule": _SO_BOOL,
 })
 
+# Slim variant for the grammar-400 fallback ladder: rooms + project_info
+# only (no exterior block, no schedule booleans). Loses exterior detail on
+# the affected call but keeps schema-enforced JSON — vastly better than
+# unconstrained text, whose narrated responses cost whole sheets on the
+# 2026-08-20 JW batch. Exterior quantities on slim-mode runs come from the
+# dedicated exterior passes.
+_EXTRACTION_OUTPUT_SCHEMA_SLIM = _so_obj({
+    "project_info": _so_obj({
+        "total_floors_analyzed": _SO_NUM,
+        "total_rooms_found": _SO_NUM,
+        "scale_notation": _SO_STR,
+        "building_type": _SO_STR,
+        "total_stories": _SO_NUM,
+        "total_units": _SO_NUM,
+        "footprint_sqft": _SO_NUM,
+    }),
+    "floors": {"type": "array", "items": _so_obj({
+        "floor_name": _SO_STR,
+        "rooms": {"type": "array", "items": _SO_ROOM_ITEM},
+    })},
+    "notes": _SO_STR_ARR,
+    "no_floor_plans_found": _SO_BOOL,
+    "no_detailed_floor_plans_found": _SO_BOOL,
+})
+
 # Kill switch: if the API ever rejects the schema (400 naming output_config/
 # schema/format), flip to text mode for the rest of the process instead of
 # failing every call. The repair parser handles text mode as before.
-_STRUCTURED_OUTPUTS_BROKEN = False
+# Three-state ladder (2026-08-20 JW batch fix): "full" schema → grammar
+# 400 → "slim" schema (rooms-only: ~60% fewer grammar branches) → second
+# 400 → "off" (text mode). The old two-state ladder dropped straight to
+# unconstrained text, whose 68-95k-char narrated responses then failed
+# JSON repair and cost whole sheets on 5/5 batch jobs.
+_STRUCTURED_OUTPUTS_MODE = "full"   # "full" | "slim" | "off"
+_STRUCTURED_OUTPUTS_BROKEN = False  # kept for any external readers
 
 
 def _structured_outputs_enabled():
-    if _STRUCTURED_OUTPUTS_BROKEN:
+    # _STRUCTURED_OUTPUTS_BROKEN honored for backward compat — external
+    # code (and tests) set the boolean directly as a kill switch.
+    if _STRUCTURED_OUTPUTS_MODE == "off" or _STRUCTURED_OUTPUTS_BROKEN:
         return False
     return os.environ.get("NIGHTSHIFT_STRUCTURED_OUTPUTS", "1").strip() not in (
         "0", "false", "False")
@@ -228,26 +261,37 @@ def _extraction_output_kwargs():
     enforced JSON output when enabled, nothing otherwise."""
     if not _structured_outputs_enabled():
         return {}
+    schema = (_EXTRACTION_OUTPUT_SCHEMA_SLIM
+              if _STRUCTURED_OUTPUTS_MODE == "slim"
+              else _EXTRACTION_OUTPUT_SCHEMA)
     return {"output_config": {
-        "format": {"type": "json_schema", "schema": _EXTRACTION_OUTPUT_SCHEMA},
+        "format": {"type": "json_schema", "schema": schema},
     }}
 
 
 def _maybe_disable_structured_outputs(exc):
-    """If `exc` is the API rejecting our output schema, flip the kill
-    switch (process-wide) and return True so the caller can retry the
-    call in text mode instead of failing the chunk/batch."""
-    global _STRUCTURED_OUTPUTS_BROKEN
-    if _STRUCTURED_OUTPUTS_BROKEN:
+    """If `exc` is the API rejecting our output schema, step the ladder
+    down one state (full → slim → off, process-wide) and return True so
+    the caller can retry the call at the reduced level instead of
+    failing the chunk/batch."""
+    global _STRUCTURED_OUTPUTS_MODE, _STRUCTURED_OUTPUTS_BROKEN
+    if _STRUCTURED_OUTPUTS_MODE == "off":
         return False
     msg = str(exc).lower()
     if isinstance(exc, anthropic.BadRequestError) and any(
             t in msg for t in ("output_config", "json_schema", "schema",
-                               "output format", "structured")):
-        _STRUCTURED_OUTPUTS_BROKEN = True
-        print("   ⚠️  API rejected the structured-output schema — falling "
-              "back to text mode for the rest of this run "
-              f"({str(exc)[:160]})")
+                               "output format", "structured", "grammar")):
+        if _STRUCTURED_OUTPUTS_MODE == "full":
+            _STRUCTURED_OUTPUTS_MODE = "slim"
+            print("   ⚠️  API rejected the full structured-output schema — "
+                  "retrying this run with the slim (rooms-only) schema "
+                  f"({str(exc)[:120]})")
+        else:
+            _STRUCTURED_OUTPUTS_MODE = "off"
+            _STRUCTURED_OUTPUTS_BROKEN = True
+            print("   ⚠️  API rejected the slim schema too — falling back "
+                  f"to text mode for the rest of this run "
+                  f"({str(exc)[:120]})")
         return True
     return False
 
@@ -355,6 +399,61 @@ def _repair_truncated_json(candidate):
     return attempts
 
 
+def _iter_balanced_objects(text, max_objects=8, max_scans=12):
+    """Yield every balanced top-level {...} span in `text`, tolerating
+    narration before/between/after the JSON (the 2026-08-20 JW batch
+    failure mode: 68-95k-char responses opening with "I'll analyze..."
+    prose, sometimes with several fenced blocks, defeated the single
+    greedy-span stages). Scans are bounded so a pathological 95k-char
+    input can't go quadratic."""
+    spans = []
+    i, n, scans = 0, len(text), 0
+    while i < n and len(spans) < max_objects and scans < max_scans:
+        start = text.find("{", i)
+        if start < 0:
+            break
+        scans += 1
+        depth, in_str, esc, end = 0, False, False, -1
+        for j in range(start, n):
+            ch = text[j]
+            if esc:
+                esc = False
+                continue
+            if ch == "\\":
+                if in_str:
+                    esc = True
+                continue
+            if ch == '"':
+                in_str = not in_str
+                continue
+            if in_str:
+                continue
+            if ch in "{[":
+                depth += 1
+            elif ch in "}]":
+                depth -= 1
+                if depth == 0 and ch == "}":
+                    end = j
+                    break
+                if depth < 0:
+                    break
+        if end > start:
+            spans.append(text[start:end + 1])
+            i = end + 1
+        elif depth > 0:
+            break  # truncated final object — nothing balanced past here
+        else:
+            i = start + 1  # stray close before open; try the next brace
+    return spans
+
+
+# Keys that identify a real extraction/schedule payload vs. an incidental
+# JSON snippet quoted inside narration.
+_SIGNAL_KEYS = ("floors", "rooms", "room_finish_schedule", "project_info",
+                "no_floor_plans_found", "door_marks", "window_marks",
+                "sheet_id", "structural_finish_scope")
+
+
 def _parse_json_response(text, context=""):
     """Extract and parse the JSON object from a model response.
 
@@ -395,14 +494,61 @@ def _parse_json_response(text, context=""):
     obj = _try(re.sub(r",\s*([}\]])", r"\1", candidate))
     if obj is not None:
         return obj
-    # 5. Truncation close-out repair (response cut off mid-output)
-    for repaired in _repair_truncated_json(text):
-        obj = _try(repaired) or _try(re.sub(r",\s*([}\]])", r"\1", repaired))
-        if obj is not None:
-            print(f"   🩹 JSON repair recovered a truncated/malformed "
-                  f"response{' (' + context + ')' if context else ''} "
-                  f"({len(text)} chars in)")
-            return obj
+    # 4b. Multi-object scan: narration before/between/after JSON defeats
+    # the single greedy span (stage 3 grabs first-{ .. last-} across
+    # narration and multiple fenced blocks). Parse each balanced object
+    # individually; prefer payloads carrying extraction signal keys,
+    # then the largest parseable one.
+    parsed = []
+    for span in _iter_balanced_objects(text):
+        o = _try(span) or _try(re.sub(r",\s*([}\]])", r"\1", span))
+        if o is not None:
+            parsed.append(o)
+    last_resort = None
+    if parsed:
+        signal = [o for o in parsed if any(k in o for k in _SIGNAL_KEYS)]
+        if signal:
+            best = max(signal, key=lambda o: len(json.dumps(o)))
+            print(f"   🩹 JSON repair: multi-object scan recovered a payload"
+                  f"{' (' + context + ')' if context else ''} "
+                  f"({len(parsed)} object(s) in {len(text)} chars)")
+            return best
+        # No signal keys among the balanced objects — a truncated real
+        # payload may still sit beyond them (narration quoting a complete
+        # brace pair before the cut-off extraction). Hold the best
+        # balanced object as a last resort and let the truncation stages
+        # try first.
+        last_resort = max(parsed, key=lambda o: len(json.dumps(o)))
+    # 4c. Unterminated fenced block (```json opened, never closed —
+    # truncated responses): hand everything after the fence marker to the
+    # truncation close-out below by re-pointing `text` at it.
+    open_fence = re.search(r"```(?:json)?\s*(\{.*)\Z", text, re.DOTALL)
+    if open_fence:
+        text = open_fence.group(1)
+    # 5. Truncation close-out repair (response cut off mid-output).
+    # The walker anchors at the first "{" — wrong anchor when narration
+    # quotes a complete brace pair before the real (truncated) payload —
+    # so also retry anchored at the LAST place a signal key opens an
+    # object, which is where the real payload starts.
+    candidates_texts = [text]
+    starts = [m.start() for k in _SIGNAL_KEYS
+              for m in re.finditer(r"\{\s*\"" + k + r"\"", text)]
+    if starts:
+        candidates_texts.append(text[max(starts):])
+    for cand_text in candidates_texts:
+        for repaired in _repair_truncated_json(cand_text):
+            obj = _try(repaired) or _try(re.sub(r",\s*([}\]])", r"\1",
+                                                repaired))
+            if obj is not None:
+                print(f"   🩹 JSON repair recovered a truncated/malformed "
+                      f"response{' (' + context + ')' if context else ''} "
+                      f"({len(text)} chars in)")
+                return obj
+    if last_resort is not None:
+        print(f"   🩹 JSON repair: returning best balanced object "
+              f"(no signal keys)"
+              f"{' (' + context + ')' if context else ''}")
+        return last_resort
     print(f"   ⚠️  JSON parse failed after all repair attempts"
           f"{' (' + context + ')' if context else ''} — "
           f"{len(text)} chars, head: {text[:80]!r}")
@@ -3839,9 +3985,50 @@ def _call_sheet_api(client, content_blocks, output_kwargs, label,
                 try:
                     return _collect_stream_text(stream, label=label)
                 except TruncatedResponseError as _te:
-                    print(f"      ✂️  {label}: truncated at max_tokens — "
-                          f"salvaging partial response")
-                    return _te.partial_text
+                    # Continuation beats salvage: resend with the partial
+                    # as an assistant prefill so the model finishes the
+                    # SAME output instead of us close-out-repairing a cut
+                    # JSON (2026-08-20 JW batch: salvaged partials still
+                    # failed repair on 5/5 jobs). Falls back to the
+                    # partial if continuation itself errors.
+                    joined = _te.partial_text
+                    for cont in range(2):
+                        # rstrip BEFORE building the prefill and keep the
+                        # accumulator aligned with it — the API 400s on
+                        # assistant prefill ending in whitespace, and the
+                        # continuation continues the rstripped text.
+                        joined = joined.rstrip()
+                        print(f"      ✂️  {label}: truncated at max_tokens "
+                              f"({len(joined)} chars) — requesting "
+                              f"continuation {cont + 1}/2")
+                        try:
+                            with client.messages.stream(
+                                model="claude-sonnet-4-6",
+                                max_tokens=max_tokens,
+                                temperature=0,
+                                timeout=300.0,
+                                messages=[
+                                    {"role": "user",
+                                     "content": content_blocks},
+                                    {"role": "assistant",
+                                     "content": joined},
+                                ],
+                                # no output_config: grammar mode rejects
+                                # assistant prefill; a JSON prefix
+                                # continues fine unconstrained
+                            ) as cstream:
+                                try:
+                                    joined += _collect_stream_text(
+                                        cstream, label=f"{label} cont")
+                                    return joined
+                                except TruncatedResponseError as _ce:
+                                    joined += _ce.partial_text
+                        except Exception as _cexc:
+                            print(f"      ⚠️  {label}: continuation failed "
+                                  f"({type(_cexc).__name__}) — using "
+                                  f"salvaged partial")
+                            break
+                    return joined
         except anthropic.BadRequestError as e:
             if _maybe_disable_structured_outputs(e):
                 output_kwargs = {}
@@ -3882,16 +4069,135 @@ def _extract_single_sheet(client, pdf_path, page_idx0, sheet_id,
         return None
     content.extend(image_blocks)
 
-    text = _call_sheet_api(client, content, _extraction_output_kwargs(),
-                           label=f"sheet {sheet_id}")
-    if not text:
+    reads = []
+    n_reads = 1
+    try:
+        n_reads = max(1, min(3, int(os.environ.get(
+            "NIGHTSHIFT_PER_SHEET_CONSENSUS", "1"))))
+    except (TypeError, ValueError):
+        n_reads = 1
+    for attempt in range(n_reads):
+        text = _call_sheet_api(client, content, _extraction_output_kwargs(),
+                               label=f"sheet {sheet_id}"
+                               + (f" read {attempt + 1}" if n_reads > 1
+                                  else ""))
+        if not text:
+            continue
+        parsed = _parse_json_response(text)
+        if isinstance(parsed, dict):
+            reads.append(parsed)
+    if not reads:
+        print(f"      ⚠️  Sheet {sheet_id}: no parseable read "
+              f"({n_reads} attempt(s))")
         return None
-    parsed = _parse_json_response(text)
-    if not isinstance(parsed, dict):
-        print(f"      ⚠️  Sheet {sheet_id}: unparseable response "
-              f"({len(text)} chars)")
-        return None
-    return parsed
+    if len(reads) == 1:
+        return reads[0]
+    merged = _merge_sheet_consensus_reads(reads)
+    print(f"      🔁 Sheet {sheet_id}: consensus over {len(reads)} reads — "
+          f"{sum(len(f.get('rooms') or []) for f in merged.get('floors') or [])} "
+          f"room(s) after union-merge")
+    return merged
+
+
+def _merge_sheet_consensus_reads(reads):
+    """Union-merge N reads of the SAME sheet (R2, 2026-08-21: Caris doors
+    went 68→93→2 across identical-input runs — single-read sampling noise
+    is the dominant remaining error source).
+
+    Rooms are unioned by normalized room_id+name; for rooms seen in
+    multiple reads, numeric leaf fields take the MAX (a read that missed
+    a door/dim is recovered; over-extraction is what the downstream gates
+    and dedup are for) and strings take the first non-empty value.
+    project_info comes from the first read (max for unit/room counts)."""
+    import copy
+    base = copy.deepcopy(reads[0])
+
+    def _key(r):
+        return (_norm_room_id(r.get("room_id"))
+                or _norm_room_id(r.get("room_name")))
+
+    def _merge_numeric(dst, src):
+        # FILL-ONLY (ULUM R4 regression): a non-zero field is never
+        # raised — max-merge let read-2's larger wall areas win on
+        # well-extracted jobs (+34% walls) and decoupled scaled-dim
+        # marker notes (read-1) from the values they flagged (read-2).
+        # Zero/missing fields fill from the other read, which is the
+        # entire recovery benefit (Harlem dims, Caris doors).
+        for k, v in (src or {}).items():
+            if isinstance(v, (int, float)):
+                if _num(dst.get(k, 0)) == 0 and _num(v) != 0:
+                    dst[k] = v
+            elif isinstance(v, str) and v.strip() and not str(
+                    dst.get(k) or "").strip():
+                dst[k] = v
+            elif isinstance(v, dict):
+                _merge_numeric(dst.setdefault(k, {}), v)
+
+    floors = base.setdefault("floors", [])
+    room_index = {}
+    for fl in floors:
+        for r in (fl.get("rooms") or []):
+            k = _key(r)
+            if k:
+                room_index[k] = r
+    for other in reads[1:]:
+        pi = other.get("project_info") or {}
+        bpi = base.setdefault("project_info", {})
+        for k in ("total_units", "total_rooms_found", "total_stories"):
+            if _num(bpi.get(k, 0)) < _num(pi.get(k, 0)):
+                bpi[k] = pi[k]
+        for fl in (other.get("floors") or []):
+            for r in (fl.get("rooms") or []):
+                k = _key(r)
+                if k and k in room_index:
+                    tgt = room_index[k]
+                    _merge_numeric(tgt.setdefault("dimensions", {}),
+                                   r.get("dimensions"))
+                    _merge_numeric(tgt.setdefault("elements", {}),
+                                   r.get("elements"))
+                elif k:
+                    # Room only one read saw. Guard against phantom
+                    # duplication first (Hudson R4: reads named the same
+                    # rooms differently — 'Living Room' vs 'Living/
+                    # Sleeping' — and blind union inflated 77→115 rooms,
+                    # walls +65%): a fuzzy collision with an existing
+                    # room means SAME room, so field-max merge into it
+                    # instead of adding.
+                    toks = set(re.findall(
+                        r"[a-z0-9]+", str(r.get("room_name") or "").lower()))
+                    toks -= {"room", "area", "the", "a"}
+                    collided = None
+                    if toks:
+                        for ek, er in room_index.items():
+                            etoks = set(re.findall(
+                                r"[a-z0-9]+",
+                                str(er.get("room_name") or "").lower()))
+                            etoks -= {"room", "area", "the", "a"}
+                            inter = toks & etoks
+                            if etoks and (len(inter) / max(
+                                    1, min(len(toks), len(etoks)))) >= 0.5:
+                                collided = er
+                                break
+                    if collided is not None:
+                        _merge_numeric(collided.setdefault("dimensions", {}),
+                                       r.get("dimensions"))
+                        _merge_numeric(collided.setdefault("elements", {}),
+                                       r.get("elements"))
+                        continue
+                    tgt_floor = None
+                    fname = str(fl.get("floor_name") or "")
+                    for bf in floors:
+                        if str(bf.get("floor_name") or "") == fname:
+                            tgt_floor = bf
+                            break
+                    if tgt_floor is None:
+                        tgt_floor = {"floor_name": fname or "Consensus",
+                                     "rooms": []}
+                        floors.append(tgt_floor)
+                    nr = copy.deepcopy(r)
+                    tgt_floor.setdefault("rooms", []).append(nr)
+                    room_index[k] = nr
+    return base
 
 
 # ── Verification pass (replaces 3x consensus) ──────────────────────────────
@@ -7093,6 +7399,12 @@ Multi-unit residential buildings often have IDENTICAL floor plans repeated acros
 - Determine the TOTAL COUNT of each unit type from the drawings, schedules, or unit mix tables.
 - Look for unit counts in: Light & Ventilation schedules, unit mix tables, apartment number series
   (e.g., units 201-208 on 2nd floor = 8 units), door schedule unit groups, or key plans.
+- HOTELS/HOSPITALITY: the unit count is the KEY / GUESTROOM count. Look for "KEYS",
+  "GUESTROOM COUNT", "ROOM COUNT" on the cover sheet, code summary, or life-safety plans,
+  and guestroom number series per floor (e.g., rooms 201-238 = 38 keys on floor 2).
+  Set total_units to the TOTAL key count — a hotel whose guestroom typicals are drawn
+  once still has total_units = the full key count (Hudson 2026-08: typicals were
+  multiplied by units DRAWN (3) instead of the key count; walls priced 3x under).
 - CROSS-FLOOR MULTIPLICATION — explicit formula:
   unit_multiplier(type T) = (count of T on a typical floor) × (number of typical residential floors)
   * Example: 364 Main has unit numbers 201-210 (2nd floor) AND 301-310 (3rd floor) = 10 units/floor
@@ -8824,6 +9136,20 @@ def _maybe_run_exterior_pass(client, pdf_path, analysis_result):
             "retail", "dealership"
         )
     )
+    # S5 (2026-08-21 JW batch): the commercial-keyword gate blocked the
+    # elevation pass on Caris ('assisted living / residential care
+    # facility', JW exterior \$20.8k) and Hudson ('multi-family / hotel')
+    # — the same class as the Biddle residential-elev finding, from the
+    # other side. Behind NIGHTSHIFT_ELEV_PASS_ALL_TYPES, any NON-single-
+    # family building with 0 exterior sqft gets the dedicated pass;
+    # single-family keeps the residential-signal path.
+    if (not is_commercial
+            and os.environ.get("NIGHTSHIFT_ELEV_PASS_ALL_TYPES",
+                               "0").strip() in ("1", "true", "True")
+            and not any(kw in bt for kw in ("single-family", "single family",
+                                            "sfr"))):
+        is_commercial = True  # treat as elevation-pass-eligible
+
     res_signal = None
     if not is_commercial:
         if _residential_elev_pass_enabled():
@@ -14440,6 +14766,32 @@ def _schedule_wall_finish_is_wc(wall_finish):
         kw in wf for kw in ("wallcovering", "wall covering", "vwc"))
 
 
+def _wc_schedule_authoritative_enabled():
+    # Default OFF pending Homewood rerun (2026-08-20 JW batch): the finish
+    # schedule designated whole guestroom walls WC-x but the extractor
+    # GUESSED per-room splits ("~50% of wall area", "~480 SF/unit") — WC
+    # landed at 44,701 SF vs JW's 136,636 SF and the shortfall was priced
+    # as painted gyp instead ($700k swing on a $1.32M WC job). When ON:
+    # a room whose schedule row is WC-ONLY (no PT co-designation) gets
+    # wallcovering_sqft promoted to its full measured wall area — a hard
+    # number (schedule says the walls are WC; the walls are measured).
+    # Mixed WC+PT rows stay extracted-value + RFI (the split needs
+    # interior elevations).
+    return os.environ.get(
+        "NIGHTSHIFT_WC_SCHEDULE_AUTHORITATIVE", "0").strip() in (
+        "1", "true", "True")
+
+
+def _schedule_wall_finish_is_wc_only(wall_finish):
+    """True when the schedule row designates wallcovering with NO paint
+    co-designation — the case where full wall area is the defensible WC
+    quantity. 'WC-01' → True; 'WC 01 + PT 03' → False."""
+    if not _schedule_wall_finish_is_wc(wall_finish):
+        return False
+    wf = str(wall_finish).lower()
+    return not re.search(r"\bpt[- ]?\d|\bpaint", wf)
+
+
 def _schedule_ceiling_class(ceiling_finish):
     """Classify a finish-schedule ceiling code: 'painted' (GWB/GYP/plaster
     paint scope), 'not_painted' (ACT/exposed/none), 'dryfall', or None when
@@ -14803,6 +15155,798 @@ def _gate_add_rfi(analysis, category, question):
                 r.get("question") == question:
             return
     bucket.append({"category": category, "question": question})
+
+
+_UNFINISHED_FLOOR_ROOM_RX = re.compile(
+    r"basement|mechanical|mech\b|storage|utility|electrical|receiving|"
+    r"vehicle|shop|warehouse|wash", re.IGNORECASE)
+_HARD_FLOOR_FINISH_RX = re.compile(
+    r"vct|tile|carpet|wood|lvt|epoxy|terrazzo|rubber|linoleum|flagstone|"
+    r"polished", re.IGNORECASE)
+
+
+def _apply_sealed_concrete_allowance(analysis):
+    """Flag-gated (NIGHTSHIFT_SEALED_CONCRETE_ALLOWANCE, default off):
+    utility-class rooms with NO documented floor finish carry a sealed-
+    concrete ALLOWANCE (strikeable, like Level-5) instead of silence.
+
+    Policy call (Steven, 2026-08-21 six-step sequence): Harlem's biggest
+    single miss was \$13k of sealed concrete JW priced from his own
+    knowledge — the clean drawings never state a floor finish for the
+    basement/shop spaces (the callout lived on HIS markup legend). The
+    hard-numbers default (0 + RFI) stands for finished spaces; for rooms
+    whose NAME says utility class (basement/mechanical/storage/shop/wash)
+    AND whose floor finish is undocumented, an unfinished slab is the
+    only possible floor — sealing it is standard scope. Priced into
+    concrete_floor_sqft as a labeled allowance + RFI so an estimator can
+    strike it. Only-increase; skips rooms with any documented finish;
+    idempotent via _sealed_concrete_allowance.
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if os.environ.get("NIGHTSHIFT_SEALED_CONCRETE_ALLOWANCE", "0").strip() \
+            not in ("1", "true", "True"):
+        return analysis
+    if analysis.get("_sealed_concrete_allowance"):
+        return analysis
+    rfs = _get_room_finish_schedule(analysis)
+    by_num, by_name = (_build_schedule_row_maps(rfs) if rfs else ({}, {}))
+
+    applied = []
+    added = 0.0
+    for fl in (analysis.get("floors") or []):
+        for r in (fl.get("rooms") or []):
+            if not isinstance(r, dict) or r.get("in_scope") is False:
+                continue
+            el = r.setdefault("elements", {})
+            if _num(el.get("concrete_floor_sqft", 0)) > 0:
+                continue
+            nm = str(r.get("room_name") or "")
+            if not _UNFINISHED_FLOOR_ROOM_RX.search(nm):
+                continue
+            blob = " ".join([str(r.get("notes") or ""),
+                             json.dumps(r.get("materials") or {})])
+            row = _match_schedule_row(r, by_num, by_name) if rfs else None
+            if row is not None:
+                blob += " " + str(row.get("floor_finish") or "")
+            if _HARD_FLOOR_FINISH_RX.search(blob):
+                continue  # documented finish — not an unfinished slab
+            area = _num((r.get("dimensions") or {})
+                        .get("floor_area_sqft", 0))
+            if area <= 0:
+                continue
+            mult = max(1, int(_num(r.get("unit_multiplier", 1)) or 1))
+            el["concrete_floor_sqft"] = round(area, 2)
+            added += area * mult
+            applied.append(f"{nm} ({area:,.0f} SF)")
+            r["notes"] = (str(r.get("notes") or "") +
+                          " [sealed-concrete ALLOWANCE: utility-class room "
+                          "with undocumented floor finish — strike if not "
+                          "in scope]").strip()
+
+    if added > 0:
+        agg = analysis.setdefault("aggregated_totals", {})
+        agg["total_concrete_floor_sqft"] = round(
+            _num(agg.get("total_concrete_floor_sqft", 0)) + added, 2)
+        analysis.setdefault("notes", []).append(
+            f"[Sealed-Concrete Allowance] {len(applied)} utility-class "
+            f"room(s) with undocumented floor finish carry a sealed-"
+            f"concrete allowance totaling {added:,.0f} SF: "
+            f"{', '.join(applied[:6])}{'…' if len(applied) > 6 else ''}. "
+            f"Strike the line if slab sealing is not in the paint scope.")
+        _gate_add_rfi(
+            analysis, "Sealed Concrete",
+            f"The drawings do not document a floor finish for "
+            f"{len(applied)} utility-class room(s) ({added:,.0f} SF). An "
+            f"allowance for sealing the exposed slab is included — confirm "
+            f"whether slab sealing is in the painting scope.")
+        print(f"   🧱 Sealed-concrete allowance: {len(applied)} room(s), "
+              f"{added:,.0f} SF", flush=True)
+    analysis["_sealed_concrete_allowance"] = {
+        "rooms": len(applied), "added_sqft": round(added, 2)}
+    return analysis
+
+
+def _apply_geometric_room_completion(analysis):
+    """Flag-gated (NIGHTSHIFT_GEOMETRIC_ROOM_COMPLETION, default off):
+    starved rooms (extracted but with unreadable dimensions) get their
+    floor/ceiling areas from the room-geometry shadow's per-room
+    measurements — the ceiling/doors analog of VME's starved walls
+    promotion.
+
+    2026-08-21 Harlem: 26 rooms extracted from the 1-page mega-sheet, 20+
+    with zero dims. VME starved-promote fixed walls (13,213 SF, −24% vs
+    JW) but ceilings priced 264 SF vs JW's 9,009 — the room polygons that
+    would supply those areas are already measured by the room-geometry
+    shadow (label-anchored flood fill on the CAD linework). Only rooms
+    with a geometric 'ok' measurement are completed; ceiling area applies
+    only where the ceiling is painted per extraction. Door-swing counts
+    from the geometry become a quantified RFI when they exceed the priced
+    door count ≥2x (counts are symbols — swings include closets — so they
+    inform review, never price directly). Only-increase on measured
+    evidence; idempotent via _geometric_room_completion.
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if os.environ.get("NIGHTSHIFT_GEOMETRIC_ROOM_COMPLETION", "0").strip() \
+            not in ("1", "true", "True"):
+        return analysis
+    if analysis.get("_geometric_room_completion"):
+        return analysis
+    shadow = analysis.get("_room_geometry_shadow") or {}
+    pages = [p for p in (shadow.get("pages") or []) if p.get("rooms")]
+    if not pages:
+        analysis["_geometric_room_completion"] = {"noop": "no_shadow_rooms"}
+        return analysis
+
+    geo_rooms = {}
+    for p in pages:
+        for name, rec in (p.get("rooms") or {}).items():
+            if (rec.get("status") in ("ok", "measured")
+                    and _num(rec.get("area_sqft", 0)) > 0):
+                geo_rooms[_norm_room_id(name)] = _num(rec["area_sqft"])
+
+    completed = []
+    added_ceiling = 0.0
+    for fl in (analysis.get("floors") or []):
+        for r in (fl.get("rooms") or []):
+            if not isinstance(r, dict) or r.get("in_scope") is False:
+                continue
+            dims = r.setdefault("dimensions", {})
+            key = (_norm_room_id(r.get("room_id"))
+                   or _norm_room_id(r.get("room_name")))
+            area = geo_rooms.get(key) or geo_rooms.get(
+                _norm_room_id(r.get("room_name")))
+            floor_area = _num(dims.get("floor_area_sqft", 0))
+            source = None
+            if floor_area <= 0 and area:
+                # Tier 1: fully starved — floor area from the polygon.
+                dims["floor_area_sqft"] = round(area, 2)
+                floor_area = area
+                source = "polygon"
+            elif floor_area > 0:
+                source = "extracted floor area"
+            if floor_area <= 0:
+                continue
+            mats = r.get("materials") or {}
+            ceil_painted = bool(mats.get("ceiling_painted"))
+            ceil_mat = str(mats.get("ceiling") or "").upper()
+            # UNKNOWN ceiling (blank material, no negative evidence) on an
+            # enclosed room counts as paintable-with-RFI — the enclosed-
+            # room JW-convention default. Harlem: 20/26 rooms carried a
+            # BLANK ceiling material (starved extraction) and no gate
+            # touched them; JW painted 8.6k SF of those ceilings.
+            ceil_unknown = (not ceil_mat.strip() and not ceil_painted
+                            and not any(t in str(mats).upper() for t in
+                                        ("ACT", "EXPOSED", "OPEN",
+                                         "NOT PTD", "NOT PAINTED")))
+            if ((ceil_painted or ceil_unknown) and "ACT" not in ceil_mat
+                    and _num(dims.get("ceiling_area_sqft", 0)) <= 0):
+                # Tier 2: ceiling-starved — a painted flat ceiling's area
+                # IS the room's floor area (geometry corroborates when a
+                # polygon exists). Harlem: ceilings priced 264 SF vs JW's
+                # 9,009 while every room had a measured floor area.
+                mult = max(1, int(_num(r.get("unit_multiplier", 1)) or 1))
+                dims["ceiling_area_sqft"] = round(floor_area, 2)
+                if ceil_unknown:
+                    mats["ceiling"] = "GYP (assumed — geometric completion)"
+                    mats["ceiling_painted"] = True
+                    r["materials"] = mats
+                added_ceiling += floor_area * mult
+                completed.append(r.get("room_name") or r.get("room_id")
+                                 or "?")
+                unk = ("; type unknown, assumed painted — RFI"
+                       if ceil_unknown else "")
+                r["notes"] = (str(r.get("notes") or "") +
+                              f" [geometric completion: ceiling area from "
+                              f"{source}{unk}]").strip()
+
+    if added_ceiling > 0:
+        agg = analysis.setdefault("aggregated_totals", {})
+        agg["total_paintable_ceiling_sqft"] = round(
+            _num(agg.get("total_paintable_ceiling_sqft", 0))
+            + added_ceiling, 2)
+    if completed:
+        analysis.setdefault("notes", []).append(
+            f"[Geometric Room Completion] {len(completed)} starved room(s) "
+            f"completed from measured room polygons "
+            f"(+{added_ceiling:,.0f} SF painted ceiling): "
+            f"{', '.join(completed[:8])}"
+            f"{'…' if len(completed) > 8 else ''}.")
+        print(f"   📐 Geometric room completion: {len(completed)} room(s), "
+              f"+{added_ceiling:,.0f} SF ceiling", flush=True)
+
+    # Door-swing cross-check (informational, never prices).
+    swings = 0
+    for p in (shadow.get("pages") or []):
+        swings += _num((p.get("doors") or {}).get("swing_count", 0))
+    agg = analysis.get("aggregated_totals", {})
+    priced_doors = sum(_num(agg.get(k, 0)) for k in
+                       ("total_doors_full_paint", "total_doors_hm_panel",
+                        "total_doors_frame_only"))
+    if swings >= 2 * max(priced_doors, 1) and swings >= 8:
+        _gate_add_rfi(
+            analysis, "Doors",
+            f"The drawings show ~{swings:.0f} door swings geometrically but "
+            f"only {priced_doors:.0f} door(s) are priced — door extraction "
+            f"was likely starved. Confirm the door count/schedule and we "
+            f"will reprice.")
+        analysis["manual_review_required"] = True
+    analysis["_geometric_room_completion"] = {
+        "completed_rooms": len(completed),
+        "added_ceiling_sqft": round(added_ceiling, 2),
+        "door_swings": swings, "priced_doors": priced_doors}
+    return analysis
+
+
+def _reconcile_door_sources(analysis):
+    """Flag-gated (NIGHTSHIFT_DOOR_SOURCE_RECONCILE, default off): door
+    counts summed across sheet FAMILIES must not stack.
+
+    2026-08-21 Caris: 68 doors extracted from the A9.1 door-details sheet
+    (≈JW's 75) plus 25 more plan-counted on the recovered A1.2 floor plan
+    — the same physical doors, counted from two sources, priced 93. When
+    door-bearing rooms span >1 sheet family and one family is a
+    detail/schedule sheet (A9x/A6x-series or 'door' in a sheet title),
+    the total is the LARGER family's count, not the sum. Only-reduce;
+    skips when a real door schedule set counts authoritatively; manual
+    note; idempotent.
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if os.environ.get("NIGHTSHIFT_DOOR_SOURCE_RECONCILE", "0").strip() \
+            not in ("1", "true", "True"):
+        return analysis
+    if analysis.get("_door_source_reconcile"):
+        return analysis
+    stash = analysis.get("_schedule_authoritative_counts") or {}
+    if "total_doors_full_paint" in stash:
+        analysis["_door_source_reconcile"] = {"noop": "schedule_authoritative"}
+        return analysis
+
+    DOOR_KEYS = ("doors_full_paint", "doors_hm_panel", "doors_frame_only")
+    fam_tot = {}
+    for fl in (analysis.get("floors") or []):
+        for r in (fl.get("rooms") or []):
+            if not isinstance(r, dict) or r.get("in_scope") is False:
+                continue
+            el = r.get("elements") or {}
+            n = sum(_num(el.get(k, 0)) for k in DOOR_KEYS)
+            if n <= 0:
+                continue
+            sheet = str(r.get("source_sheet") or "?")
+            mult = max(1, int(_num(r.get("unit_multiplier", 1)) or 1))
+            fam = "detail" if re.match(r"A-?[69]", sheet, re.IGNORECASE) \
+                else "plan"
+            fam_tot.setdefault(fam, 0.0)
+            fam_tot[fam] += n * mult
+    if len(fam_tot) < 2:
+        analysis["_door_source_reconcile"] = {"noop": "single_family",
+                                              "families": fam_tot}
+        return analysis
+
+    total = sum(fam_tot.values())
+    keep_fam = max(fam_tot, key=fam_tot.get)
+    excess = total - fam_tot[keep_fam]
+    if excess <= 0.2 * fam_tot[keep_fam]:
+        analysis["_door_source_reconcile"] = {"noop": "within_tolerance",
+                                              "families": fam_tot}
+        return analysis
+
+    # Zero door counts on the smaller family's rooms; adjust aggregates.
+    removed = {k: 0.0 for k in DOOR_KEYS}
+    for fl in (analysis.get("floors") or []):
+        for r in (fl.get("rooms") or []):
+            if not isinstance(r, dict) or r.get("in_scope") is False:
+                continue
+            sheet = str(r.get("source_sheet") or "?")
+            fam = "detail" if re.match(r"A-?[69]", sheet, re.IGNORECASE) \
+                else "plan"
+            if fam == keep_fam:
+                continue
+            el = r.get("elements") or {}
+            mult = max(1, int(_num(r.get("unit_multiplier", 1)) or 1))
+            for k in DOOR_KEYS:
+                v = _num(el.get(k, 0))
+                if v > 0:
+                    removed[k] += v * mult
+                    el[k] = 0
+    agg = analysis.setdefault("aggregated_totals", {})
+    for k, agg_key in (("doors_full_paint", "total_doors_full_paint"),
+                       ("doors_hm_panel", "total_doors_hm_panel"),
+                       ("doors_frame_only", "total_doors_frame_only")):
+        if removed[k] > 0 and agg_key in agg:
+            agg[agg_key] = max(0, round(_num(agg.get(agg_key, 0))
+                                        - removed[k], 2))
+    dropped_n = sum(removed.values())
+    analysis.setdefault("notes", []).append(
+        f"[Door Source Reconcile] Door counts appeared on two sheet "
+        f"families ({', '.join(f'{f}: {c:.0f}' for f, c in fam_tot.items())})"
+        f" — the same doors counted twice. Kept the {keep_fam} family's "
+        f"count; removed {dropped_n:.0f} duplicate door(s). Confirm against "
+        f"the door schedule.")
+    print(f"   🚪 Door source reconcile: kept {keep_fam} "
+          f"({fam_tot[keep_fam]:.0f}), removed {dropped_n:.0f} duplicate "
+          f"door(s) from the other family", flush=True)
+    analysis["_door_source_reconcile"] = {"families": fam_tot,
+                                          "kept": keep_fam,
+                                          "removed": dropped_n}
+    return analysis
+
+
+_UNIT_STOP_TOKENS = {"suite", "room", "area", "unit", "typical", "typ",
+                     "floor", "first", "second", "third", "fourth", "fifth",
+                     "1st", "2nd", "3rd", "4th", "5th", "north", "south",
+                     "east", "west", "ff", "accessible", "ada", "the"}
+
+
+def _unit_core_tokens(text):
+    """Canonical core tokens for unit-type matching: 'King One BDR Suite
+    (First Floor - South)' and 'Accessible King 1BR Suite 226' both reduce
+    to {'king', '1br'}."""
+    t = str(text or "").lower()
+    t = re.sub(r"\bone\b", "1", t)
+    t = re.sub(r"\btwo\b", "2", t)
+    t = re.sub(r"\bthree\b", "3", t)
+    t = re.sub(r"\b(bedroom|bdr|bd)\b", "br", t)
+    t = re.sub(r"(\d)\s*br\b", r"\1br", t)
+    toks = set(re.findall(r"[a-z0-9]+", t))
+    return {x for x in toks
+            if x not in _UNIT_STOP_TOKENS and not x.isdigit()}
+
+
+def _dedup_template_instances(analysis):
+    """Flag-gated (NIGHTSHIFT_TEMPLATE_INSTANCE_DEDUP, default off): a
+    multiplied unit TEMPLATE and the drawn per-floor INSTANCES of the same
+    unit type must never both price.
+
+    2026-08-21 Homewood rerun-3: extraction emitted 'King 1BR Suite'
+    template rooms ×109 AND 449 numbered instance rooms ('King 1BR Suite
+    201 - Bathroom', …) carrying 155k SF of walls — everything priced ~2x
+    (+51% vs JW). The July multifamily batch was the same class. The
+    extraction prompt forbids the both-present shape but multi-pass /
+    per-sheet merges reassemble it.
+
+    Deterministic rule: for each unit type carrying a template (multiplier
+    ≥ 2), find instance rooms (multiplier < 2) whose unit_type or
+    name-core matches the template's core tokens. Keep whichever side's
+    implied unit count is CLOSER to project total_units (ties → template,
+    whose per-unit quantities are canonical); mark the losing side
+    in_scope=False and subtract its contributions from the aggregates
+    (schedule-authoritative keys untouched). Coexistence itself is an
+    extraction fault → manual review. Only-reduce; idempotent via
+    _template_instance_dedup.
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if os.environ.get("NIGHTSHIFT_TEMPLATE_INSTANCE_DEDUP", "0").strip() \
+            not in ("1", "true", "True"):
+        return analysis
+    if analysis.get("_template_instance_dedup"):
+        return analysis
+
+    rooms_flat = []
+    for fl in (analysis.get("floors") or []):
+        for r in (fl.get("rooms") or []):
+            if isinstance(r, dict) and r.get("in_scope") is not False:
+                rooms_flat.append(r)
+
+    # Group templates by core-token signature.
+    templates = {}
+    for r in rooms_flat:
+        mult = _num(r.get("unit_multiplier", 1)) or 1
+        if mult < 2:
+            continue
+        core = frozenset(_unit_core_tokens(r.get("unit_type")
+                                           or r.get("room_name")))
+        if not core:
+            continue
+        templates.setdefault(core, {"rooms": [], "mult": 0})
+        templates[core]["rooms"].append(r)
+        templates[core]["mult"] = max(templates[core]["mult"], mult)
+    if not templates:
+        analysis["_template_instance_dedup"] = {"noop": "no_templates"}
+        return analysis
+
+    total_units = _num((analysis.get("project_info") or {})
+                       .get("total_units", 0))
+    _ROOMS_PER_UNIT_GUESS = 3.0  # living+bath+kitchen-ish; count basis only
+
+    dropped = []
+    detail = []
+    for core, t in templates.items():
+        instances = []
+        for r in rooms_flat:
+            mult = _num(r.get("unit_multiplier", 1)) or 1
+            if mult >= 2 or r in t["rooms"]:
+                continue
+            rcore = _unit_core_tokens(r.get("unit_type"))
+            if not (core <= rcore):
+                rcore = _unit_core_tokens(r.get("room_name"))
+            if core <= rcore:
+                instances.append(r)
+        if not instances:
+            continue
+        inst_units = max(1.0, len(instances) / _ROOMS_PER_UNIT_GUESS)
+        keep_template = True
+        if total_units >= 2:
+            keep_template = (abs(t["mult"] - total_units)
+                             <= abs(inst_units - total_units))
+        losers = instances if keep_template else t["rooms"]
+        side = "instances" if keep_template else "template"
+        for r in losers:
+            r["in_scope"] = False
+            r["scope_exclusion_reason"] = (
+                "template-instance dedup: duplicate of the "
+                + ("multiplied unit template" if keep_template
+                   else "drawn unit instances"))
+            dropped.append(r)
+        detail.append(f"{'/'.join(sorted(core))}: kept "
+                      f"{'template ×%d' % t['mult'] if keep_template else 'instances'}, "
+                      f"dropped {len(losers)} {side} room(s)")
+
+    # Full-coverage arithmetic pass: when the surviving templates already
+    # claim ≥90% of the building's units, EVERY remaining unit-like
+    # numbered instance is a duplicate by arithmetic — the building has no
+    # units left for it to be. (Homewood rerun-3: the ×109 template
+    # absorbed ALL keys while drawn instances carried other type names —
+    # 'King Studio A (First Floor)' etc. — that no per-type match reaches.)
+    kept_tpl_mult = sum(
+        t["mult"] for t in templates.values()
+        if any(r.get("in_scope") is not False for r in t["rooms"]))
+    if total_units >= 2 and kept_tpl_mult >= 0.9 * total_units:
+        _UNIT_LIKE_RX = re.compile(
+            r"\b(suite|studio|guest\s?room|king|queen)\b", re.IGNORECASE)
+        for r in rooms_flat:
+            if r.get("in_scope") is False:
+                continue
+            mult = _num(r.get("unit_multiplier", 1)) or 1
+            if mult >= 2:
+                continue
+            nm = str(r.get("room_name") or "")
+            ut = str(r.get("unit_type") or "")
+            unit_like = (_UNIT_LIKE_RX.search(nm) or
+                         _UNIT_LIKE_RX.search(ut))
+            if not unit_like or "common" in ut.lower():
+                continue
+            r["in_scope"] = False
+            r["scope_exclusion_reason"] = (
+                "template-instance dedup: templates already cover "
+                f"{kept_tpl_mult:.0f} of {total_units:.0f} units — this "
+                "unit-like instance has no unit left to be")
+            dropped.append(r)
+        if len(dropped) > len(detail):
+            detail.append(
+                f"full-coverage pass: templates cover "
+                f"{kept_tpl_mult:.0f}/{total_units:.0f} units — remaining "
+                f"unit-like instances dropped")
+
+    if dropped:
+        # Subtract dropped contributions from aggregates — EXCEPT keys the
+        # schedule set authoritatively (independent of room duplication).
+        stash = analysis.get("_schedule_authoritative_counts") or {}
+        agg = analysis.setdefault("aggregated_totals", {})
+        KEYMAP = (("total_paintable_wall_sqft", "wall_area_sqft", "dims"),
+                  ("total_paintable_ceiling_sqft", "ceiling_area_sqft",
+                   "dims"),
+                  ("total_wallcovering_sqft", "wallcovering_sqft", "el"),
+                  ("total_base_trim_lf", "base_trim_lf", "el"),
+                  ("total_doors_full_paint", "doors_full_paint", "el"),
+                  ("total_doors_hm_panel", "doors_hm_panel", "el"),
+                  ("total_doors_frame_only", "doors_frame_only", "el"),
+                  ("total_windows_painted_interior",
+                   "windows_painted_interior", "el"),
+                  ("total_level_5_finish_sqft", "level_5_finish_sqft", "el"),
+                  ("total_concrete_floor_sqft", "concrete_floor_sqft", "el"),
+                  ("total_soffit_sqft", "soffit_sqft", "el"),
+                  ("total_stained_wood_sqft", "stained_wood_sqft", "el"),
+                  ("total_painted_cabinet_sqft", "painted_cabinet_sqft",
+                   "el"),
+                  ("total_painted_railing_lf", "painted_railing_lf", "el"))
+        for agg_key, room_key, src in KEYMAP:
+            if agg_key in stash:
+                continue
+            delta = 0.0
+            for r in dropped:
+                mult = _num(r.get("unit_multiplier", 1)) or 1
+                bag = (r.get("dimensions") if src == "dims"
+                       else r.get("elements")) or {}
+                delta += _num(bag.get(room_key, 0)) * max(1, mult)
+            if delta > 0 and agg_key in agg:
+                agg[agg_key] = max(0, round(_num(agg.get(agg_key, 0))
+                                            - delta, 2))
+        analysis.setdefault("notes", []).append(
+            f"[Template-Instance Dedup] {len(dropped)} duplicate room(s) "
+            f"removed — a multiplied unit template and drawn instances of "
+            f"the same unit type were BOTH present ({'; '.join(detail[:4])}"
+            f"{'…' if len(detail) > 4 else ''}). The extraction emitting "
+            f"both is itself a fault — manual review required.")
+        analysis["manual_review_required"] = True
+        print(f"   🏘️  Template-instance dedup: dropped {len(dropped)} "
+              f"duplicate room(s) ({'; '.join(detail[:3])})", flush=True)
+
+    analysis["_template_instance_dedup"] = {
+        "dropped_rooms": len(dropped), "detail": detail[:10]}
+    return analysis
+
+
+_SCALED_DIM_MARKER_RX = re.compile(
+    r"scaled (?:from|at|off)\b|dimensions are approximate|"
+    r"approximate and must be verified|do not use[^.]{0,40}(?:as )?final",
+    re.IGNORECASE)
+
+
+def _quarantine_scaled_dims(analysis):
+    """Flag-gated (NIGHTSHIFT_SCALED_DIM_QUARANTINE, default off): rooms
+    whose own extraction notes admit their dimensions were SCALED off a
+    drawing ("scaled from the RCP at 1/4\" — do not use as final") do not
+    price walls from those dimensions.
+
+    2026-08-20 JW batch (ULUM): RCP-scaled room dims were admitted into
+    quantities — the extraction itself wrote "approximate and must be
+    verified … do not use as final" — and walls landed +71% / ceilings
+    +122%, disguised by offsetting misses (+21% total). A self-admitted
+    approximation is not a hard number; per the hard-numbers policy the
+    wall area and perimeter are zeroed + RFI, ceilings left to the ceiling
+    gates (RCP is authoritative for ceiling TYPE). Only-reduce; original
+    values preserved on the room; idempotent via _scaled_dim_quarantine.
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if os.environ.get("NIGHTSHIFT_SCALED_DIM_QUARANTINE", "0").strip() not in (
+            "1", "true", "True"):
+        return analysis
+    if analysis.get("_scaled_dim_quarantine"):
+        return analysis
+
+    quarantined = []
+    removed_wall = 0.0
+    for fl in (analysis.get("floors") or []):
+        for r in (fl.get("rooms") or []):
+            if not isinstance(r, dict) or r.get("in_scope") is False:
+                continue
+            if not _SCALED_DIM_MARKER_RX.search(str(r.get("notes") or "")):
+                continue
+            dims = r.get("dimensions") or {}
+            wall = _num(dims.get("wall_area_sqft", 0))
+            if wall <= 0:
+                continue
+            mult = _extract_multiplier_from_notes(r)
+            r["_scaled_dim_quarantined"] = {
+                "wall_area_sqft": wall,
+                "perimeter_lf": _num(dims.get("perimeter_lf", 0))}
+            dims["wall_area_sqft"] = 0
+            dims["perimeter_lf"] = 0
+            removed_wall += wall * mult
+            quarantined.append(r.get("room_name") or r.get("room_id") or "?")
+            r["notes"] = (str(r.get("notes") or "") +
+                          " [scaled-dim quarantine: wall area not priced — "
+                          "dimension source self-reported as scaled/"
+                          "approximate]").strip()
+
+    if quarantined:
+        agg = analysis.setdefault("aggregated_totals", {})
+        prev = _num(agg.get("total_paintable_wall_sqft", 0))
+        agg["total_paintable_wall_sqft"] = max(
+            0, round(prev - removed_wall, 2))
+        analysis.setdefault("notes", []).append(
+            f"[Scaled-Dim Quarantine] {len(quarantined)} room(s) had wall "
+            f"quantities derived from self-reported scaled/approximate "
+            f"dimensions — {removed_wall:,.0f} SF removed from the wall "
+            f"bill pending dimensioned-plan or VME corroboration: "
+            f"{', '.join(quarantined[:8])}"
+            f"{'…' if len(quarantined) > 8 else ''}.")
+        _gate_add_rfi(
+            analysis, "Scaled Dimensions",
+            f"{len(quarantined)} room(s) ({removed_wall:,.0f} SF of walls) "
+            f"were measurable only by scaling undimensioned drawings, which "
+            f"this takeoff does not price. Provide dimensioned plans for "
+            f"these areas and we will price them.")
+        print(f"   📏 Scaled-dim quarantine: removed {removed_wall:,.0f} SF "
+              f"of scaled-dim walls across {len(quarantined)} room(s)",
+              flush=True)
+    analysis["_scaled_dim_quarantine"] = {
+        "rooms": quarantined[:20], "removed_wall_sqft": round(removed_wall, 2)}
+    return analysis
+
+
+def _enforce_unit_mix_coverage(analysis):
+    """Flag-gated (NIGHTSHIFT_UNIT_MIX_GATE, default off): detect
+    unit-typical multiplication that doesn't cover the project's unit
+    count, and fail LOUD instead of silently under-billing.
+
+    2026-08-20 JW batch (Hudson Hotel): guestroom typicals on A4.02-A4.04
+    were multiplied by the units DRAWN (1-3 each) instead of the hotel's
+    key count — walls 22,940 vs 72,382 SF, doors 62 vs 197 (~3x under,
+    silent). The inverse (multifamily 2x OVER) hit the 2026-07-03 Rider
+    batch. Either direction, the multiplication basis was never checked
+    against the authoritative unit count.
+
+    Deterministic check, no scaling (scaling without a per-type unit mix
+    would be a heuristic — hard-numbers policy forbids it): compare
+    project_info.total_units (index/code-plan extraction) against the
+    unit instances actually multiplied (per unit_type: max multiplier).
+    Mismatch beyond 1.5x either way → validation warning + quantified RFI
+    + manual review. Idempotent via _unit_mix_gate.
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if os.environ.get("NIGHTSHIFT_UNIT_MIX_GATE", "0").strip() not in (
+            "1", "true", "True"):
+        return analysis
+    if analysis.get("_unit_mix_gate"):
+        return analysis
+
+    pi = analysis.get("project_info") or {}
+    total_units = _num(pi.get("total_units", 0))
+    by_type = {}
+    for fl in (analysis.get("floors") or []):
+        for r in (fl.get("rooms") or []):
+            if not isinstance(r, dict) or r.get("in_scope") is False:
+                continue
+            ut = str(r.get("unit_type") or "").strip()
+            if not ut:
+                continue
+            mult = max(1, int(_num(r.get("unit_multiplier", 1))))
+            by_type[ut] = max(by_type.get(ut, 0), mult)
+    covered = sum(by_type.values())
+
+    rec = {"total_units": total_units, "unit_types": by_type,
+           "covered_instances": covered, "flagged": False}
+    if total_units >= 2 and covered >= 1:
+        ratio = total_units / covered
+        if ratio >= 1.5 or ratio <= (1 / 1.5):
+            rec["flagged"] = True
+            direction = ("UNDER" if ratio >= 1.5 else "OVER")
+            analysis.setdefault("notes", []).append(
+                f"[Unit-Mix Gate] Multiplication basis does not cover the "
+                f"project: index/inventory says {total_units:.0f} units but "
+                f"unit-typical extraction multiplied only {covered} "
+                f"instance(s) across {len(by_type)} type(s) "
+                f"({', '.join(f'{t}×{m}' for t, m in list(by_type.items())[:6])}). "
+                f"Quantities from unit typicals are likely {direction}-"
+                f"stated by ~{max(ratio, 1/ratio):.1f}x. No automatic "
+                f"scaling applied (per-type unit mix not extractable as a "
+                f"hard number) — manual review required.")
+            _gate_add_rfi(
+                analysis, "Unit Mix",
+                f"The drawings indicate {total_units:.0f} units but the "
+                f"takeoff's unit-typical multiplication covers only "
+                f"{covered} unit instance(s). Provide the per-floor unit "
+                f"mix (count of each unit type) and we will re-price; "
+                f"unit-derived quantities in this bid are unreliable "
+                f"until then.")
+            analysis["manual_review_required"] = True
+            print(f"   🏢 Unit-mix gate: {total_units:.0f} units vs "
+                  f"{covered} multiplied instance(s) — flagged "
+                  f"({direction}, ~{max(ratio, 1/ratio):.1f}x)", flush=True)
+    analysis["_unit_mix_gate"] = rec
+    return analysis
+
+
+_FLOOR_FINISH_POSITIVE_RX = re.compile(
+    r"\bEP[- ]?\d|epoxy\s+(?:floor|mortar|coating|resin|broadcast)|"
+    r"\bSC[- ]?(?:\d|HRI)|sealed\s+concrete|concrete\s+seal", re.IGNORECASE)
+_FLOOR_FINISH_EXCLUDED_RX = re.compile(
+    r"polished\s+concrete|\bPC[- ]?\d", re.IGNORECASE)
+_ROOM_ID_TOKEN_RX = re.compile(r"\[([A-Z]{0,3}[- ]?\d[\w.-]*)\]")
+
+
+def _norm_room_id(rid):
+    return re.sub(r"[^a-z0-9]", "", str(rid or "").lower())
+
+
+def _reconcile_floor_finishes(analysis):
+    """Flag-gated (NIGHTSHIFT_FLOOR_FINISH_RECONCILE, default off): wire
+    explicitly-documented floor coatings into the priced field.
+
+    2026-08-20 JW batch (ULUM): the sheet-level extraction note read
+    "EP-1 (Epoxy) confirmed in Kitchen [1-09] and Kitchen Storage [1-10]"
+    — hard evidence, recorded — yet both rooms priced $0 floors because
+    the per-room prompt rule ("concrete_floor_sqft ONLY on explicit
+    sealer spec") made the model leave the field 0. JW priced $18.9k of
+    floors on that job. Same class on Homewood (SC-HRI epoxy mortar,
+    $10.2k) and Harlem (sealed concrete, $13.0k).
+
+    Evidence honored (hard numbers only — no heuristics):
+      - room-level: the room's own notes/materials mention EP-x / epoxy
+        floor system / SC-x / sealed concrete;
+      - sheet-level: an analysis note carries a positive mention AND
+        bracketed room ids ([1-09]) — applied to those rooms only.
+    A hit on a room whose concrete_floor_sqft is 0 sets it to the room's
+    measured floor_area_sqft (the schedule says the WHOLE floor gets the
+    system). Polished concrete (PC-x) stays excluded per the hard-numbers
+    policy but now emits an RFI note instead of silence.
+    Only-increase on evidence; idempotent via _floor_finish_reconcile.
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if os.environ.get("NIGHTSHIFT_FLOOR_FINISH_RECONCILE", "0").strip() not in (
+            "1", "true", "True"):
+        return analysis
+    if analysis.get("_floor_finish_reconcile"):
+        return analysis
+
+    # Sheet-level notes: room ids named near a positive mention.
+    noted_ids = set()
+    polished_seen = False
+    for note in (analysis.get("notes") or []):
+        # Clause-scope the id harvest: one note often lists several
+        # finishes ("EP-1 in Kitchen [1-09]; PC-1 in Bar [1-02]") and the
+        # polished rooms must NOT inherit the epoxy clause's evidence.
+        for clause in re.split(r"[;.\n]", str(note)):
+            if _FLOOR_FINISH_EXCLUDED_RX.search(clause):
+                polished_seen = True
+                continue
+            if _FLOOR_FINISH_POSITIVE_RX.search(clause):
+                for tok in _ROOM_ID_TOKEN_RX.findall(clause):
+                    noted_ids.add(_norm_room_id(tok))
+
+    # Machine-read finish-schedule rows are the most durable evidence
+    # channel (prose notes vary run-to-run — the ULUM rerun regenerated
+    # extraction without the "EP-1 confirmed" note and epoxy dropped back
+    # to $0). A row's floor_finish naming an EP-x/sealed system is a hard
+    # number regardless of what the narrator wrote.
+    rfs = _get_room_finish_schedule(analysis)
+    by_num, by_name = (_build_schedule_row_maps(rfs) if rfs else ({}, {}))
+
+    applied = []
+    for fl in (analysis.get("floors") or []):
+        for r in (fl.get("rooms") or []):
+            if not isinstance(r, dict) or r.get("in_scope") is False:
+                continue
+            el = r.setdefault("elements", {})
+            if _num(el.get("concrete_floor_sqft", 0)) > 0:
+                continue
+            own_text = " ".join([str(r.get("notes") or ""),
+                                 json.dumps(r.get("materials") or {})])
+            if _FLOOR_FINISH_EXCLUDED_RX.search(own_text):
+                polished_seen = True
+            hit = bool(_FLOOR_FINISH_POSITIVE_RX.search(own_text))
+            if not hit and noted_ids:
+                rid = _norm_room_id(r.get("room_id"))
+                hit = bool(rid) and rid in noted_ids
+            if not hit and rfs:
+                row = _match_schedule_row(r, by_num, by_name)
+                ff = str((row or {}).get("floor_finish") or "")
+                if _FLOOR_FINISH_EXCLUDED_RX.search(ff):
+                    polished_seen = True
+                elif _FLOOR_FINISH_POSITIVE_RX.search(ff):
+                    hit = True
+            if not hit:
+                continue
+            area = _num((r.get("dimensions") or {}).get("floor_area_sqft", 0))
+            if area <= 0:
+                continue
+            el["concrete_floor_sqft"] = round(area, 2)
+            r["notes"] = (str(r.get("notes") or "") +
+                          " [floor-finish reconcile: documented coating "
+                          "wired to pricing]").strip()
+            applied.append((r.get("room_name") or r.get("room_id") or "?",
+                            round(area, 2)))
+
+    if applied:
+        agg = analysis.setdefault("aggregated_totals", {})
+        total = 0.0
+        for fl in (analysis.get("floors") or []):
+            for r in (fl.get("rooms") or []):
+                if isinstance(r, dict) and r.get("in_scope") is not False:
+                    total += _num((r.get("elements") or {})
+                                  .get("concrete_floor_sqft", 0))
+        agg["total_concrete_floor_sqft"] = round(total, 2)
+        names = ", ".join(f"{n} ({a:,.0f} SF)" for n, a in applied[:6])
+        analysis.setdefault("notes", []).append(
+            f"[Floor-Finish Reconcile] Wired {len(applied)} documented "
+            f"floor-coating room(s) into pricing: {names} — total "
+            f"{total:,.0f} SF. Evidence: explicit EP-x/SC-x/sealed-concrete "
+            f"callouts recorded by extraction but left unpriced.")
+    if polished_seen:
+        analysis.setdefault("notes", []).append(
+            "[Floor-Finish Reconcile] Polished concrete (PC-x) present but "
+            "NOT priced per hard-numbers policy — RFI: confirm whether a "
+            "sealer/coating over the polished slab is in the paint scope.")
+    analysis["_floor_finish_reconcile"] = True
+    return analysis
 
 
 def _enforce_ceiling_scope_gate(analysis):
@@ -15244,10 +16388,54 @@ def _enforce_wallcovering_schedule_gate(analysis):
         _SCHEDULE_FINISH_AUTHORITY_MIN_ROWS, len(rfs) // 2)
     matched_wc_row_ids = set()
 
+    # Match-coverage safe mode (2026-08-21 Homewood regression): the
+    # schedule's rows were keyed "211/217 (typical)" while extracted rooms
+    # carried no numbers and descriptive names — ZERO WC rows matched any
+    # room, so every extracted-WC room looked "not designated" and the
+    # gate zeroed 60k SF of real guestroom wallcovering. When most WC rows
+    # match nothing, the gate cannot distinguish "not designated" from
+    # "matching failed" — zeroing disables (RFI-only), same principle as
+    # the legend-style safeguard above.
+    wc_match_share = 0.0
+    wc_dominated = False  # must exist even with zero WC rows (Caris S4
+    #                       crash: UnboundLocalError in the room loop)
+    if wc_rows:
+        pre_matched = set()
+        for _floor in analysis.get("floors", []) or []:
+            for _room in _floor.get("rooms", []) or []:
+                if not isinstance(_room, dict):
+                    continue
+                _row = _match_schedule_row(_room, by_num, by_name)
+                if _row is not None and id(_row) in wc_row_ids:
+                    pre_matched.add(id(_row))
+        wc_match_share = len(pre_matched) / len(wc_rows)
+        # Scope the safe mode to WC-DOMINATED schedules (≥1/3 of rows and
+        # ≥3 rows designate WC): there, unmatched rows mean the naming
+        # conventions disagree and zeroing guts the job's core scope.
+        # A schedule with an incidental WC row or two (the PNC pantry
+        # case) keeps zeroing — unmatched invented WC stays the risk.
+        wc_dominated = len(wc_rows) >= max(3, len(rfs) // 3)
+        if can_zero and wc_dominated and wc_match_share < 0.5:
+            can_zero = False
+            print(f"   🧻 WC schedule gate: only {wc_match_share:.0%} of "
+                  f"{len(wc_rows)} WC row(s) matched an extracted room — "
+                  f"schedule/room naming disagree; zeroing DISABLED "
+                  f"(RFI-only mode)", flush=True)
+            analysis.setdefault("notes", []).append(
+                f"[Wallcovering] Schedule gate ran RFI-only: "
+                f"{wc_match_share:.0%} of the schedule's WC rows matched "
+                f"extracted rooms (schedule keys rooms as number lists / "
+                f"typicals; extraction names them descriptively). Extracted "
+                f"wallcovering kept; confirm room-by-room WC designation.")
+
     zeroed_rooms = []
     zeroed_sqft = 0.0
     kept_rooms = []
     kept_sqft = 0.0
+    promoted_rooms = []
+    promoted_sqft = 0.0
+    unmatched_kept_rooms = []
+    unmatched_kept_sqft = 0.0
     unquantified = []
     for floor in analysis.get("floors", []) or []:
         for room in floor.get("rooms", []) or []:
@@ -15263,6 +16451,64 @@ def _enforce_wallcovering_schedule_gate(analysis):
                         or room.get("room_id", "")).strip() or "unnamed"
             if designated:
                 matched_wc_row_ids.add(id(row))
+                # Authoritative promotion (sub-flag, default OFF): a
+                # WC-ONLY schedule row means the room's walls ARE the
+                # wallcovering quantity — promote to full measured wall
+                # area when the extractor recorded less (guessed splits,
+                # per-unit approximations). Mixed WC+PT rows are skipped:
+                # that split genuinely needs interior elevations.
+                # R3 (2026-08-21, Homewood): MIXED WC+PT rows get a
+                # configurable WC share of wall area (allowance-labeled)
+                # — JW treats guestroom walls as ~all-WC while the
+                # schedule lists 'WC 01 + PT 03 + WD 01' per room, and
+                # refusing to split left WC at 41% of JW. Set
+                # NIGHTSHIFT_WC_MIXED_SHARE to a 0-1 fraction to enable
+                # (e.g. 0.8); unset/0 keeps the strict skip.
+                _mixed_share = 0.0
+                try:
+                    _mixed_share = min(1.0, max(0.0, float(os.environ.get(
+                        "NIGHTSHIFT_WC_MIXED_SHARE", "0") or 0)))
+                except (TypeError, ValueError):
+                    _mixed_share = 0.0
+                if (_wc_schedule_authoritative_enabled()
+                        and _mixed_share > 0
+                        and _schedule_wall_finish_is_wc(row.get("wall_finish"))
+                        and not _schedule_wall_finish_is_wc_only(
+                            row.get("wall_finish"))):
+                    wall_area = _num(dims.get("wall_area_sqft", 0))
+                    target = round(wall_area * _mixed_share, 2)
+                    if target > wc:
+                        mult = _extract_multiplier_from_notes(room)
+                        promoted_sqft += (target - wc) * mult
+                        promoted_rooms.append(label)
+                        elems["wallcovering_sqft"] = target
+                        note = str(room.get("notes", ""))
+                        if "[WC mixed-share" not in note:
+                            room["notes"] = (
+                                note + f" [WC mixed-share ALLOWANCE: "
+                                f"schedule row designates WC+PT — "
+                                f"{_mixed_share:.0%} of wall area carried "
+                                f"as WC ({wc:,.0f}→{target:,.0f} SF); "
+                                f"confirm split from interior "
+                                f"elevations]").strip()
+                        wc = target
+                if (_wc_schedule_authoritative_enabled()
+                        and _schedule_wall_finish_is_wc_only(
+                            row.get("wall_finish"))):
+                    wall_area = _num(dims.get("wall_area_sqft", 0))
+                    if wall_area > wc:
+                        mult = _extract_multiplier_from_notes(room)
+                        promoted_sqft += (wall_area - wc) * mult
+                        promoted_rooms.append(label)
+                        elems["wallcovering_sqft"] = round(wall_area, 2)
+                        note = str(room.get("notes", ""))
+                        if "[WC authoritative" not in note:
+                            room["notes"] = (
+                                note + f" [WC authoritative: schedule row "
+                                f"is WC-only — promoted "
+                                f"{wc:,.0f}→{wall_area:,.0f} SF (full "
+                                f"measured wall area)]").strip()
+                        wc = wall_area
                 if wc > 0:
                     kept_rooms.append(label)
                     kept_sqft += wc * _extract_multiplier_from_notes(room)
@@ -15271,6 +16517,20 @@ def _enforce_wallcovering_schedule_gate(analysis):
                         (label, str(row.get("wall_finish", "")).strip()))
                 continue
             if wc <= 0 or not can_zero:
+                continue
+            # On a WC-DOMINATED schedule, zeroing needs POSITIVE evidence:
+            # a matched row designating a non-WC finish. An UNMATCHED room
+            # is unknown, not "not designated" — Homewood rerun-2 zeroed
+            # 71,481 SF across 213 unit-instance rooms whose numbers
+            # simply weren't in the typicals-keyed schedule. Unmatched
+            # rooms on WC-dominated schedules keep extracted WC (the
+            # unquantified/RFI machinery still surfaces them via the
+            # aggregate note below). Incidental-WC schedules (PNC pantry)
+            # keep the strict behavior.
+            if wc_dominated and row is None:
+                unmatched_kept_rooms.append(label)
+                unmatched_kept_sqft += wc * _extract_multiplier_from_notes(
+                    room)
                 continue
             mult = _extract_multiplier_from_notes(room)
             zeroed_rooms.append(label)
@@ -15297,6 +16557,20 @@ def _enforce_wallcovering_schedule_gate(analysis):
                 (f"{label} (not extracted)",
                  str(r.get("wall_finish", "")).strip()))
 
+    if promoted_sqft > 0:
+        agg = analysis.setdefault("aggregated_totals", {})
+        prev = _num(agg.get("total_wallcovering_sqft", 0))
+        agg["total_wallcovering_sqft"] = round(prev + promoted_sqft, 2)
+        analysis.setdefault("notes", []).append(
+            f"[Wallcovering] Authoritative promotion: {len(promoted_rooms)} "
+            f"WC-only room(s) promoted to full measured wall area "
+            f"(+{promoted_sqft:,.0f} SF): "
+            f"{', '.join(promoted_rooms[:8])}"
+            f"{'…' if len(promoted_rooms) > 8 else ''}. The finish schedule "
+            f"designates these walls wallcovering with no paint split — the "
+            f"measured wall area is the quantity.")
+        print(f"   🧻 WC authoritative: promoted {promoted_sqft:,.0f} SF "
+              f"across {len(promoted_rooms)} WC-only room(s)", flush=True)
     if zeroed_sqft > 0:
         agg = analysis.setdefault("aggregated_totals", {})
         prev = _num(agg.get("total_wallcovering_sqft", 0))
@@ -15312,6 +16586,17 @@ def _enforce_wallcovering_schedule_gate(analysis):
         print(f"   🧻 WC schedule gate: zeroed {zeroed_sqft:,.0f} SF in "
               f"{len(zeroed_rooms)} non-designated room(s); kept "
               f"{kept_sqft:,.0f} SF in {len(kept_rooms)} designated room(s)",
+              flush=True)
+    if unmatched_kept_sqft > 0:
+        analysis.setdefault("notes", []).append(
+            f"[Wallcovering] {len(unmatched_kept_rooms)} room(s) carrying "
+            f"{unmatched_kept_sqft:,.0f} SF of extracted wallcovering did "
+            f"not match any schedule row (typicals-keyed schedule) — WC "
+            f"KEPT (no positive non-WC designation). Confirm room-by-room "
+            f"WC extents against the finish schedule.")
+        print(f"   🧻 WC schedule gate: kept {unmatched_kept_sqft:,.0f} SF "
+              f"in {len(unmatched_kept_rooms)} unmatched room(s) — "
+              f"WC-dominated schedule, no positive non-WC designation",
               flush=True)
     if unquantified:
         rooms_txt = ", ".join(
@@ -15329,6 +16614,11 @@ def _enforce_wallcovering_schedule_gate(analysis):
         "schedule_wc_rooms": len(wc_rows),
         "numbered_rows": numbered_rows,
         "zeroing_enabled": can_zero,
+        "authoritative_enabled": _wc_schedule_authoritative_enabled(),
+        "wc_match_share": round(wc_match_share, 3),
+        "unmatched_kept_sqft": round(unmatched_kept_sqft, 2),
+        "promoted_rooms": promoted_rooms[:20],
+        "promoted_sqft": round(promoted_sqft, 2),
         "kept_rooms": kept_rooms[:20],
         "kept_sqft": round(kept_sqft, 2),
         "zeroed_rooms": zeroed_rooms[:20],
@@ -16318,10 +17608,46 @@ def _apply_vme_authoritative_walls(analysis):
         ratio = vme_walls / llm_total
         lo, hi = _VME_LLM_RATIO_BAND
         if not (lo <= ratio <= hi):
-            return _abstain(
-                f"geometric walls {vme_walls:,.0f} ({basis}) vs extracted "
-                f"{llm_total:,.0f} (x{ratio:.2f}) outside the sanity band — "
-                f"flagging for review instead of overriding")
+            # Starved-extraction promotion (flag NIGHTSHIFT_VME_STARVED_
+            # PROMOTE, default OFF): the band treats the extraction as a
+            # trustworthy reference, but when most in-scope rooms carry
+            # ZERO wall area the extraction is self-evidently starved
+            # (unreadable dims) and the band comparison is meaningless —
+            # abstaining here priced Harlem at 2,572 SF against 13,213 SF
+            # of measured geometry (JW: 15,667) on the 2026-08-20 batch.
+            # Geometry with measured provenance wins; loud RFI + the
+            # existing manual-review path still apply downstream.
+            n_rooms = zero_wall = 0
+            for _fl in (analysis.get("floors") or []):
+                for _r in (_fl.get("rooms") or []):
+                    if not isinstance(_r, dict) or _r.get("in_scope") is False:
+                        continue
+                    n_rooms += 1
+                    if _num((_r.get("dimensions") or {})
+                            .get("wall_area_sqft", 0)) <= 0:
+                        zero_wall += 1
+            starved = (n_rooms >= 5 and zero_wall / n_rooms >= 0.5
+                       and ratio > hi)
+            if starved and os.environ.get(
+                    "NIGHTSHIFT_VME_STARVED_PROMOTE", "0").strip() in (
+                    "1", "true", "True"):
+                _gate_add_rfi(
+                    analysis, "Walls (geometric)",
+                    f"Room extraction was starved on this set ({zero_wall} "
+                    f"of {n_rooms} rooms had unreadable dimensions, only "
+                    f"{llm_total:,.0f} SF of walls) — the geometric "
+                    f"measurement ({vme_walls:,.0f} SF, {basis}) was used "
+                    f"instead. Confirm ceiling heights and wall extents "
+                    f"before bid.")
+                print(f"   🧪 VME starved-promote: extraction has "
+                      f"{zero_wall}/{n_rooms} zero-wall rooms — geometric "
+                      f"{vme_walls:,.0f} SF promoted over extracted "
+                      f"{llm_total:,.0f} SF (band bypassed)", flush=True)
+            else:
+                return _abstain(
+                    f"geometric walls {vme_walls:,.0f} ({basis}) vs extracted "
+                    f"{llm_total:,.0f} (x{ratio:.2f}) outside the sanity band — "
+                    f"flagging for review instead of overriding")
 
     # Substrate allocation: geometry owns the TOTAL wall quantity; the
     # extraction's gyp/CMU proportions allocate it across the separately-
@@ -16744,6 +18070,13 @@ _SCOPE_SWEEP_KEYWORDS = (
     ("scope of work", 8), ("general notes", 6), ("alternate", 6),
     ("allowance", 6), ("specification", 4), ("legend", 3),
     ("schedule", 3), ("exposed structure", 8), ("exposed deck", 8),
+    # Exterior/elevation scope (F4, 2026-08-20 JW batch): power-washing
+    # spec blocks and exterior finish keynotes live on elevation sheets no
+    # other pass reads (Hudson A2.01: "POWER WASHING SCOPE … ±24,652 SF",
+    # $40.9k; Caris A3.1: siding/columns/fascia, $20.8k).
+    ("power wash", 10), ("pressure wash", 10), ("tuck-point", 8),
+    ("tuckpoint", 8), ("exterior elevation", 8), ("facade", 6),
+    ("elevation", 4), ("sealant", 4), ("keynote", 4),
 )
 
 
@@ -16831,6 +18164,10 @@ Report, per page:
   intumescent coating, dryfall.
 - Callouts to paint exposed structure / exposed deck / MEP / bar joists.
 - Exterior painting scope (elevations or notes calling for exterior paint).
+- Exterior CLEANING/PREP sold with paint scope: power-washing or
+  pressure-washing spec blocks (often with an SF area on elevation
+  sheets), tuck-pointing allowances (LF), sealant replacement around
+  openings — quote the stated quantity and the sheet it appears on.
 - Alternates, allowances, or unit prices that touch painting.
 - Scope-of-work notes: inclusions, exclusions, phasing, owner-supplied items,
   "paint all ..." directives.
@@ -16981,6 +18318,30 @@ def _run_scope_sweep(client, pdf_paths, analysis):
     }
     print(f"   🧹 Scope sweep: {len(pages_swept)} page(s) reviewed, "
           f"{len(all_findings)} scope observation(s)")
+
+    # Quantified-but-unpriced documented scope must not ship under a clean
+    # bill: the Hudson rerun surfaced "power washing ±24,652 SF" as an
+    # observation, every gate cleared, and a −42% base bid went out with
+    # manual_review=False. A sweep finding that carries an explicit
+    # quantity is documented scope this bid does NOT price — reviewer
+    # eyes required.
+    quantified = []
+    _qty_rx = re.compile(r"[\d,]{3,}\s*(?:SF|LF|sq\.?\s?ft)", re.IGNORECASE)
+    for f in all_findings:
+        m = _qty_rx.search(str(f.get("detail") or ""))
+        if m:
+            quantified.append(
+                f"{f.get('item') or f.get('category')}: {m.group(0)} "
+                f"({f.get('sheet') or '?'})")
+    if quantified:
+        analysis.setdefault("notes", []).append(
+            f"[Scope Sweep] {len(quantified)} documented scope item(s) with "
+            f"explicit quantities are NOT priced in this bid: "
+            f"{'; '.join(quantified[:5])}"
+            f"{'…' if len(quantified) > 5 else ''}. Manual review required.")
+        analysis["manual_review_required"] = True
+        print(f"   🧹 Scope sweep: {len(quantified)} quantified unpriced "
+              f"scope item(s) — manual review forced", flush=True)
     return analysis["_scope_sweep"]
 
 
@@ -16997,6 +18358,154 @@ def _positive_number_in(obj):
         return any(_positive_number_in(v) for v in obj)
     return isinstance(obj, (int, float)) and not isinstance(obj, bool) \
         and obj > 0
+
+
+def _locate_schedule_pages_by_text(pdf_path):
+    """0-based page indices of door/window schedule pages via the same
+    text passes as _detect_schedule_in_pdf — but returning WHERE, so the
+    rescue can extract them. Works on measured pages too (R1, 2026-08-21:
+    Hudson's window schedule sits ON a measured floor-plan sheet, which
+    the sweep never visits)."""
+    out = {"door_schedule": [], "window_schedule": []}
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+    except Exception:
+        return out
+    try:
+        for i, page in enumerate(doc):
+            txt = None
+            for kind, phrases, tokens in (
+                    ("door_schedule", _DOOR_TITLE_PHRASES,
+                     _DOOR_TABLE_TOKENS),
+                    ("window_schedule", _WINDOW_TITLE_PHRASES,
+                     _WINDOW_TABLE_TOKENS)):
+                hit = False
+                try:
+                    hit = _has_schedule_sheet_title(page, phrases)
+                except Exception:
+                    hit = False
+                if not hit:
+                    if txt is None:
+                        txt = page.get_text().lower()
+                    hit = (any(p.lower() in txt for p in phrases)
+                           and sum(1 for tok in tokens
+                                   if tok.lower() in txt) >= 2)
+                if hit:
+                    out[kind].append(i)
+    finally:
+        doc.close()
+    return out
+
+
+def _rescue_swept_schedules(client, pdf_paths, analysis):
+    """Flag-gated (NIGHTSHIFT_SWEEP_SCHEDULE_RESCUE, default off): when the
+    scope sweep LOCATES a door/window schedule page that the pre-scans
+    missed, actually EXTRACT it instead of only upgrading the detection
+    flag with "contents NOT extracted".
+
+    2026-08-21 JW batch: window counts failed on 3 jobs because the real
+    schedule pages never reached the schedule extractor — Hudson's
+    text-scan matched the cover sheet (false positive) while the sweep
+    correctly identified the schedule pages; window trim/sash lines then
+    had no component counts to price. Runs the located pages through
+    analyze_schedule_images_consensus and applies the existing
+    authoritative override path. Non-fatal on any failure.
+    """
+    if os.environ.get("NIGHTSHIFT_SWEEP_SCHEDULE_RESCUE", "0").strip() not in (
+            "1", "true", "True"):
+        return analysis
+    sweep = analysis.get("_scope_sweep") or {}
+    pages = sweep.get("pages_swept") or []
+    sd = analysis.get("schedule_data") or {}
+
+    def _have(kind):
+        if kind == "door_schedule":
+            d = sd.get("door_schedule") or {}
+            return (_num(d.get("total_doors_full_paint", 0))
+                    + _num(d.get("total_doors_hm_panel", 0))) > 0
+        w = sd.get("window_schedule") or {}
+        return _num(w.get("total_windows", 0)) > 0
+
+    # file basename -> set of 0-based page indices to extract
+    want = {}
+    for p in pages:
+        kind = str(p.get("page_kind") or "")
+        if kind not in ("door_schedule", "window_schedule"):
+            continue
+        if _have(kind):
+            continue
+        try:
+            idx0 = int(p.get("page")) - 1
+        except (TypeError, ValueError):
+            continue
+        want.setdefault(str(p.get("file") or ""), set()).add(idx0)
+
+    # R1 second channel: text-scan located schedule pages — including
+    # MEASURED pages the sweep never visits (Hudson: window schedule on a
+    # measured floor-plan sheet; the sweep-only rescue never fired).
+    for pdf_path in pdf_paths or []:
+        located = _locate_schedule_pages_by_text(pdf_path)
+        for kind, idxs in located.items():
+            if _have(kind) or not idxs:
+                continue
+            base = os.path.basename(pdf_path)
+            for i in idxs[:4]:
+                want.setdefault(base, set()).add(i)
+    if not want:
+        return analysis
+
+    for pdf_path in pdf_paths or []:
+        base = os.path.basename(pdf_path)
+        idxs = sorted(want.get(base) or [])
+        if not idxs:
+            continue
+        print(f"   🧯 Sweep schedule rescue: extracting {len(idxs)} "
+              f"schedule page(s) {[i + 1 for i in idxs]} from {base}",
+              flush=True)
+        try:
+            rescued = analyze_schedule_images_consensus(client, pdf_path,
+                                                        idxs)
+        except Exception as _exc:
+            print(f"      ⚠️  rescue extraction failed (non-fatal): "
+                  f"{type(_exc).__name__}: {str(_exc)[:100]}")
+            continue
+        if not rescued:
+            print("      ⚠️  rescue extraction returned no data")
+            continue
+        def _nonempty(kind, data):
+            # A rescued schedule read that counted NOTHING is a false
+            # positive (Hudson: 'window schedule' matches the p.1 drafting
+            # -symbols legend) — merging zeroes would arm the phantom-
+            # window zeroing override against real room counts.
+            if kind == "door_schedule":
+                return (_num(data.get("total_doors_full_paint", 0))
+                        + _num(data.get("total_doors_hm_panel", 0))) > 0
+            if kind == "window_schedule":
+                return _num(data.get("total_windows", 0)) > 0
+            return bool(data)
+
+        merged_kinds = []
+        for key in ("door_schedule", "window_schedule", "stair_info"):
+            if (rescued.get(key) and not _have(key)
+                    and _nonempty(key, rescued[key])):
+                analysis.setdefault("schedule_data", {})[key] = rescued[key]
+                sd = analysis["schedule_data"]
+                merged_kinds.append(key)
+        if not merged_kinds:
+            continue
+        if "door_schedule" in merged_kinds:
+            analysis["has_door_schedule"] = True
+        if "window_schedule" in merged_kinds:
+            analysis["has_window_schedule"] = True
+        analysis.setdefault("notes", []).append(
+            f"[Sweep Schedule Rescue] {', '.join(merged_kinds)} recovered "
+            f"from sweep-located page(s) {[i + 1 for i in idxs]} of {base} "
+            f"and applied authoritatively.")
+        # Push the rescued counts through the standard authoritative path
+        # (door/window totals, component counts, stash for recalc).
+        _apply_schedule_overrides(analysis)
+    return analysis
 
 
 def _reconcile_scope_sweep(analysis):
@@ -17216,6 +18725,16 @@ def build_priced_takeoff(analysis, strict=None):
     # default ON.
     analysis = _enforce_ledger_precedence(analysis)
 
+    # Template-instance dedup: a multiplied unit template and drawn
+    # instances of the same unit type must never both price. Runs FIRST
+    # among the room gates so everything downstream sees the deduped room
+    # set. Flag-gated; no-op when off.
+    analysis = _dedup_template_instances(analysis)
+
+    # Door source reconcile: door counts from a detail/schedule sheet and
+    # a floor plan must not stack. Flag-gated; no-op when off.
+    analysis = _reconcile_door_sources(analysis)
+
     # Final ceiling-scope reconciliation (ACT demote + commercial aggregate
     # rebuild) before any quantity is priced. Flag-gated; no-op when off.
     analysis = _enforce_ceiling_scope_gate(analysis)
@@ -17231,6 +18750,23 @@ def build_priced_takeoff(analysis, strict=None):
     # total_wallcovering_sqft from the wall bill, so phantom WC would silently
     # shrink walls too. Flag-gated; no-op when off.
     analysis = _enforce_wallcovering_schedule_gate(analysis)
+
+    # Floor-finish reconcile: documented EP-x/SC-x/sealed-concrete coatings
+    # recorded by extraction but left at 0 get wired into pricing; polished
+    # concrete emits an RFI instead of silence. Flag-gated; no-op when off.
+    analysis = _reconcile_floor_finishes(analysis)
+
+    # Unit-mix coverage check: unit-typical multiplication that doesn't
+    # cover the project's unit count flags loud (warning + RFI + manual
+    # review) instead of silently under/over-billing. Flag-gated; no-op
+    # when off.
+    analysis = _enforce_unit_mix_coverage(analysis)
+
+    # Scaled-dim quarantine: rooms whose notes admit scaled/approximate
+    # dimensions do not price walls from them (zero + RFI, hard-numbers
+    # policy). Runs BEFORE the VME wall passes so VME can re-supply the
+    # geometry authoritatively. Flag-gated; no-op when off.
+    analysis = _quarantine_scaled_dims(analysis)
 
     # Painted-cabinet price-or-RFI gate: a finish-schedule row calling for
     # field-painted cabinets must price (measured SF) or RFI — never vanish
@@ -17290,6 +18826,33 @@ def build_priced_takeoff(analysis, strict=None):
     # certification playbook). Never changes a quantity. Flag-gated;
     # no-op when off.
     analysis = _compute_room_geometry_shadow(analysis)
+
+    # Geometric room completion: starved rooms get floor/ceiling areas
+    # from the shadow's measured polygons (ceilings analog of the VME
+    # starved-walls promotion). Requires the shadow above. Flag-gated;
+    # no-op when off.
+    analysis = _apply_geometric_room_completion(analysis)
+
+    # Sealed-concrete allowance: utility-class rooms with undocumented
+    # floor finish carry a strikeable slab-sealing allowance + RFI. Runs
+    # after geometric completion so starved rooms have floor areas.
+    # Flag-gated; no-op when off.
+    analysis = _apply_sealed_concrete_allowance(analysis)
+
+    # JW-class mandatory review (rollout constraint, Steven 2026-08-22):
+    # while the accuracy flag set ships, EVERY estimate produced under it
+    # requires reviewer sign-off — the 2026-08-22 confirmatory batch
+    # showed run-to-run count variance (Hudson doors 127→378) that the
+    # variance-reduction block must close before this training wheel
+    # comes off. Flag NIGHTSHIFT_MANDATORY_REVIEW; no-op when off.
+    if os.environ.get("NIGHTSHIFT_MANDATORY_REVIEW", "0").strip() in (
+            "1", "true", "True"):
+        if not analysis.get("manual_review_required"):
+            analysis["manual_review_required"] = True
+            analysis.setdefault("notes", []).append(
+                "[Mandatory Review] Reviewer sign-off required on every "
+                "estimate under the current accuracy rollout — no "
+                "estimate ships unreviewed regardless of confidence.")
 
     agg = analysis.get("aggregated_totals", {}) or {}
     ledger = analysis.get("_quantity_adjustments", []) or []
@@ -20226,6 +21789,26 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
 
     # Interior surfaces
     wall_sqft = _num(aggregated_totals.get('total_paintable_wall_sqft', 0))
+
+    # R3 (2026-08-21, Homewood): outside the VME-authoritative path the
+    # wall bill was never reduced by wallcovering — the same wall surface
+    # billed as painted gyp AND WC install (rerun-3: 315k SF walls + 151k
+    # SF WC on a 146k-SF-surface building). Behind NIGHTSHIFT_WC_WALL_
+    # DEDUCT, wallcovered SF comes out of the painted-wall bill exactly
+    # like the VME pass does.
+    if (os.environ.get("NIGHTSHIFT_WC_WALL_DEDUCT", "0").strip()
+            in ("1", "true", "True")
+            and not ((analysis or {}).get("_vme_authoritative") or {}
+                     ).get("applied")):
+        _wc_for_deduct = _num(aggregated_totals.get(
+            'total_wallcovering_sqft', 0))
+        if _wc_for_deduct > 0 and wall_sqft > 0:
+            _wall_before = wall_sqft
+            wall_sqft = max(0.0, round(wall_sqft - _wc_for_deduct, 2))
+            print(f"   🧻 WC wall deduction: painted walls "
+                  f"{_wall_before:,.0f} − {_wc_for_deduct:,.0f} WC = "
+                  f"{wall_sqft:,.0f} SF")
+
     ceil_sqft = _num(aggregated_totals.get('total_paintable_ceiling_sqft', 0))
     cmu_wall_sqft = _num(aggregated_totals.get('total_cmu_wall_sqft', 0))
     lymewash_sqft = _num(aggregated_totals.get('total_lymewash_wall_sqft', 0))
@@ -20242,6 +21825,36 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     # Windows — painted interior only, with backward compat
     windows = _num(aggregated_totals.get('total_windows_painted_interior',
                    aggregated_totals.get('total_windows', 0)))
+
+    # Window TRIM ops (stool/apron/casing) — flag-gated
+    # (NIGHTSHIFT_WINDOW_TRIM_SCOPE, default OFF). 2026-08-20 JW batch:
+    # the schedule scan already counts paintable components per window
+    # (total_window_casings/stools/aprons/wood_returns) but nothing priced
+    # them — window trim went to $0 on all 5 jobs while JW priced
+    # stool&apron&casing per window ($90k across three jobs, sash ops
+    # aside). One window with several components = ONE trim op (max, not
+    # sum), matching how an estimator prices the line.
+    window_trim_ops = 0.0
+    if os.environ.get("NIGHTSHIFT_WINDOW_TRIM_SCOPE", "0").strip() in (
+            "1", "true", "True"):
+        window_trim_ops = max(
+            _num(aggregated_totals.get('total_window_casings_painted', 0)),
+            _num(aggregated_totals.get('total_window_stools_painted', 0)),
+            _num(aggregated_totals.get('total_window_aprons_painted', 0)),
+            _num(aggregated_totals.get('total_window_wood_returns_painted', 0)))
+
+    # Window SASH ops (flag NIGHTSHIFT_WINDOW_SASH_OPS, default OFF):
+    # sash policy softening per Steven 2026-08-21. The schedule scan
+    # already proves which windows are field-paintable wood (not owner-
+    # provided, not factory-finished) — JW priced sash on all three window
+    # jobs ($150/EA, same as pm window_sash) while the commercial
+    # exclusion zeroed ours. Priced as a labeled ALLOWANCE only when the
+    # Windows (Interior Paint) line isn't already carrying them.
+    sash_ops = 0.0
+    if (os.environ.get("NIGHTSHIFT_WINDOW_SASH_OPS", "0").strip()
+            in ("1", "true", "True") and windows <= 0):
+        sash_ops = _num(aggregated_totals.get(
+            'total_windows_field_paintable', 0))
 
     # Stairs
     stair_sections = _num(aggregated_totals.get('total_stair_sections', 0))
@@ -20517,6 +22130,11 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     door_hm_rate = _get_tiered_rate(pm['doors_hm_panel'], doors_hm)
     door_frame_rate = _get_tiered_rate(pm['doors_frame_only'], doors_frame)
     win_rate    = _get_tiered_rate(pm['windows'], windows)
+    # Window trim op rate: dedicated pm key when configured, else the
+    # standard windows rate tier (comparable per-EA op).
+    win_trim_rate = (_get_tiered_rate(pm['window_trim'], window_trim_ops)
+                     if 'window_trim' in pm
+                     else _get_tiered_rate(pm['windows'], window_trim_ops))
     stair_rate  = _get_tiered_rate(pm['stairs'], stair_sections)
     gyps_rate   = _get_tiered_rate(pm['gyp_between_stairs'], gyp_stairs)
     l5_rate     = _get_tiered_rate(pm['level_5_finish'], level_5_sqft)
@@ -20990,6 +22608,31 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
             print(f"   📐 Footprint pricing: {footprint_sqft:,.0f} SF × ${_fp_rate:.2f} = ${_footprint_interior_total:,.0f} "
                   f"(room extraction: {wall_sqft:,.0f} wall SF, quality: {_extraction_quality})")
 
+    # Power-washing allowance (flag NIGHTSHIFT_POWER_WASH_ALLOWANCE,
+    # default OFF, and only when the org configures a 'power_washing'
+    # rate): the scope sweep captures facade-cleaning spec blocks with
+    # explicit SF (Hudson A2.01 "±24,652 SF", JW priced $40.9k) — with a
+    # rate on file that documented quantity becomes a labeled allowance
+    # line instead of an RFI-only note. No rate configured → RFI stands.
+    pw_sqft = 0.0
+    pw_rate = 0.0
+    if (os.environ.get("NIGHTSHIFT_POWER_WASH_ALLOWANCE", "0").strip()
+            in ("1", "true", "True") and 'power_washing' in pm
+            and isinstance(analysis, dict)):
+        for _f in ((analysis.get("_scope_sweep") or {}).get("findings")
+                   or []):
+            _txt = f"{_f.get('item') or ''} {_f.get('detail') or ''}"
+            if not re.search(r"power\s*wash|pressure\s*wash", _txt,
+                             re.IGNORECASE):
+                continue
+            _m = re.search(r"([\d,]{3,})\s*(?:SF|sq\.?\s?ft)", _txt,
+                           re.IGNORECASE)
+            if _m:
+                pw_sqft = max(pw_sqft,
+                              float(_m.group(1).replace(",", "")))
+        if pw_sqft > 0:
+            pw_rate = _get_tiered_rate(pm['power_washing'], pw_sqft)
+
     line_items = [
         _line(f"Gyp. Walls - {wall_sqft:,.0f} sqft @ ${wall_rate:.2f}", wall_sqft,
               wall_rate, _get_markup('gyp_walls')),
@@ -21013,11 +22656,25 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
               door_frame_rate, _get_markup('doors_frame_only')),
         _line(f"Windows (Interior Paint) - {windows:.0f} EA @ ${win_rate:.2f}", windows,
               win_rate, _get_markup('windows')),
+        _line(f"Window Trim (stool/apron/casing) - {window_trim_ops:.0f} EA "
+              f"@ ${win_trim_rate:.2f}", window_trim_ops, win_trim_rate,
+              _get_markup('window_trim') if 'window_trim' in pm
+              else _get_markup('windows')),
         _line(f"Stairs - {stair_sections:.0f} sections @ ${stair_rate:.2f}", stair_sections,
               stair_rate, _get_markup('stairs')),
         _line(f"Gyp. Between Stairs - {gyp_stairs:,.0f} sqft @ ${gyps_rate:.2f}", gyp_stairs,
               gyps_rate, _get_markup('gyp_between_stairs')),
-        _line(f"Level 5 Finish - {level_5_sqft:,.0f} sqft @ ${l5_rate:.2f}", level_5_sqft,
+        # F7 (2026-08-20 JW batch): Level-5 was real documented scope on
+        # Hudson (D18) and ULUM (finish schedule) yet estimators like JW
+        # absorb it in wall rates — labeling it an ALLOWANCE makes it a
+        # strikeable line instead of silent base-bid inflation.
+        _line((f"Level 5 Finish (ALLOWANCE — per finish schedule; strike if "
+               f"carried by drywall sub) - {level_5_sqft:,.0f} sqft @ "
+               f"${l5_rate:.2f}"
+               if os.environ.get("NIGHTSHIFT_LEVEL5_ALLOWANCE", "0").strip()
+               in ("1", "true", "True")
+               else f"Level 5 Finish - {level_5_sqft:,.0f} sqft @ "
+                    f"${l5_rate:.2f}"), level_5_sqft,
               l5_rate, _get_markup('level_5_finish')),
         _line(f"Concrete Sealer - {concrete_sqft:,.0f} sqft @ ${conc_rate:.2f}", concrete_sqft,
               conc_rate, _get_markup('concrete_sealer')),
@@ -21122,6 +22779,20 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
                  "exterior_cmu": _get_markup('exterior_painting'),
                  "misc_metals": _get_markup('painted_railing') if 'painted_railing' in pm else 0.06},
     )
+
+    if pw_sqft > 0:
+        line_items.append(_line(
+            f"Power Washing (ALLOWANCE — per plans note) - "
+            f"{pw_sqft:,.0f} sqft @ ${pw_rate:.2f}", pw_sqft, pw_rate,
+            _get_markup('power_washing')))
+
+    if sash_ops > 0 and 'window_sash' in pm:
+        _sash_rate = _get_tiered_rate(pm['window_sash'], sash_ops)
+        line_items.append(_line(
+            f"Window Sash (ALLOWANCE — field-paintable wood per schedule; "
+            f"strike if factory-finished) - {sash_ops:.0f} EA @ "
+            f"${_sash_rate:.2f}", sash_ops, _sash_rate,
+            _get_markup('window_sash')))
 
     return {
         "line_items": line_items,
@@ -24113,6 +25784,10 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         try:
             _run_scope_sweep(client, pdf_paths, analysis)
             _reconcile_scope_sweep(analysis)
+            # Rescue: sweep-located door/window schedule pages the
+            # pre-scans missed get EXTRACTED (not just flag-upgraded)
+            # and applied authoritatively. Flag-gated; no-op when off.
+            _rescue_swept_schedules(client, pdf_paths, analysis)
         except Exception as _sweep_err:
             print(f"   ⚠️  Scope sweep failed (non-fatal): {_sweep_err}")
     # Canonicalize source_sheet on every room BEFORE the upload-sheet

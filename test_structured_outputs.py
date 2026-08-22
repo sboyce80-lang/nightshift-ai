@@ -172,11 +172,20 @@ def main():
             return self.message
 
     fake = FakeBRE("output_config: schema compilation failed")
-    check("schema rejection flips kill switch",
+    check("schema rejection steps ladder to slim (still enforced)",
           T._maybe_disable_structured_outputs(fake) is True
+          and T._STRUCTURED_OUTPUTS_MODE == "slim"
+          and (T._extraction_output_kwargs()["output_config"]["format"]
+               ["schema"] is T._EXTRACTION_OUTPUT_SCHEMA_SLIM))
+    check("second rejection steps ladder to off (text mode)",
+          T._maybe_disable_structured_outputs(fake) is True
+          and T._STRUCTURED_OUTPUTS_MODE == "off"
           and T._extraction_output_kwargs() == {})
+    T._STRUCTURED_OUTPUTS_MODE = "full"
+    T._STRUCTURED_OUTPUTS_BROKEN = False  # reset
     check("non-schema 400 does not flip",
           T._maybe_disable_structured_outputs(FakeBRE("request too large")) is False)
+    T._STRUCTURED_OUTPUTS_MODE = "full"
     T._STRUCTURED_OUTPUTS_BROKEN = False  # reset
 
     check("prompt cache control is 1h ephemeral",

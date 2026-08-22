@@ -369,6 +369,128 @@ T._recalculate_totals(a2)
 check("_base_trim_schedule_confirmed" not in a2,
       "no-schedule: base-trim confirm must be inert")
 
+# ---------------------------------------------------------------------------
+# WC authoritative promotion (F2a, 2026-08-20 JW batch / Homewood) — WC-only
+# schedule rows promote to full measured wall area; mixed WC+PT rows do not.
+# ---------------------------------------------------------------------------
+os.environ["NIGHTSHIFT_WC_SCHEDULE_GATE"] = "1"
+os.environ["NIGHTSHIFT_WC_SCHEDULE_AUTHORITATIVE"] = "1"
+sched = _sched6(**{"101": {"wall_finish": "WC-01"},
+                   "102": {"wall_finish": "WC 01 + PT 03"},
+                   "103": {"wall_finish": "WC-10"}})
+rooms = [
+    _room(101, "Office A", wc=240),      # WC-only, guessed split -> promote to 500
+    _room(102, "Office B", wc=240),      # mixed WC+PT -> keep extracted 240
+    _room(103, "Corridor", wc=0),        # WC-only, unquantified -> promote to 500
+]
+a = _an(rooms, sched, agg={"total_wallcovering_sqft": 480})
+T._enforce_wallcovering_schedule_gate(a)
+rec = a.get("_wc_schedule_gate", {})
+check(rooms[0]["elements"]["wallcovering_sqft"] == 500,
+      f"WC-auth: WC-only room not promoted to wall area "
+      f"({rooms[0]['elements']['wallcovering_sqft']})")
+check(rooms[1]["elements"]["wallcovering_sqft"] == 240,
+      "WC-auth: mixed WC+PT room must keep extracted value")
+check(rooms[2]["elements"]["wallcovering_sqft"] == 500,
+      "WC-auth: unquantified WC-only room must promote, not RFI")
+check(rec.get("promoted_sqft") == 760,
+      f"WC-auth: promoted_sqft should be 760, got {rec.get('promoted_sqft')}")
+check(a["aggregated_totals"]["total_wallcovering_sqft"] == 1240,
+      f"WC-auth: aggregate should be 480+760=1240, got "
+      f"{a['aggregated_totals']['total_wallcovering_sqft']}")
+check("[WC authoritative" in rooms[0]["notes"],
+      "WC-auth: promoted room missing provenance note")
+# flag OFF -> no promotion (baseline behavior preserved)
+os.environ["NIGHTSHIFT_WC_SCHEDULE_AUTHORITATIVE"] = "0"
+rooms2 = [_room(101, "Office A", wc=240)]
+a2 = _an(rooms2, sched, agg={"total_wallcovering_sqft": 240})
+T._enforce_wallcovering_schedule_gate(a2)
+check(rooms2[0]["elements"]["wallcovering_sqft"] == 240,
+      "WC-auth off: room must keep extracted value")
+
+# ---------------------------------------------------------------------------
+# WC match-coverage safe mode (2026-08-21 Homewood regression): schedule keys
+# rooms as "211/217 (typical)", extraction names them descriptively with no
+# numbers -> 0% match -> zeroing must DISABLE (RFI-only), extracted WC kept.
+# ---------------------------------------------------------------------------
+os.environ["NIGHTSHIFT_WC_SCHEDULE_GATE"] = "1"
+os.environ["NIGHTSHIFT_WC_SCHEDULE_AUTHORITATIVE"] = "0"
+sched_typ = []
+for i in range(6):
+    r = _row(101 + i, f"Living/Sleeping - King Type {i}")
+    r["room_number"] = f"2{i}1/2{i}7 (typical)"
+    r["wall_finish"] = "WC 01 (Wallcovering), PT 03 (Paint)"
+    sched_typ.append(r)
+rooms = [
+    {"room_id": "F1-143", "room_name": "King Studio A (First Floor)",
+     "in_scope": True, "materials": {"walls": "GYP"},
+     "dimensions": {"wall_area_sqft": 500},
+     "elements": {"wallcovering_sqft": 480}, "notes": ""},
+]
+a = _an(rooms, sched_typ, agg={"total_wallcovering_sqft": 480})
+T._enforce_wallcovering_schedule_gate(a)
+rec = a.get("_wc_schedule_gate", {})
+check(rooms[0]["elements"]["wallcovering_sqft"] == 480,
+      f"WC safe-mode: unmatched-schedule room lost its extracted WC "
+      f"({rooms[0]['elements']['wallcovering_sqft']})")
+check(a["aggregated_totals"]["total_wallcovering_sqft"] == 480,
+      "WC safe-mode: aggregate must be untouched")
+check(rec.get("zeroing_enabled") is False and rec.get("wc_match_share") == 0.0,
+      f"WC safe-mode: zeroing must be disabled at 0% match ({rec.get('wc_match_share')})")
+check(any("RFI-only" in str(n) for n in a.get("notes", [])),
+      "WC safe-mode: explanatory note missing")
+
+# WC-dominated + matching healthy: an UNMATCHED room keeps extracted WC
+# (positive-evidence zeroing — Homewood rerun-2: 71k SF of unit instances
+# zeroed for merely not being in the typicals-keyed schedule).
+sched_dom = [_row(n, f"Suite {n}", wall="WC-01") for n in
+             (101, 102, 103, 104, 105, 106)]
+rooms = [_room(n, f"Suite {n}", wc=400) for n in
+         (101, 102, 103, 104, 105)]        # 5/6 rows matched (share 0.83)
+rooms.append(_room(999, "Suite 999", wc=350))  # unmatched -> KEPT now
+a = _an(rooms, sched_dom, agg={"total_wallcovering_sqft": 2350})
+T._enforce_wallcovering_schedule_gate(a)
+rec = a.get("_wc_schedule_gate", {})
+check(rooms[5]["elements"]["wallcovering_sqft"] == 350,
+      "WC positive-evidence: unmatched room on WC-dominated schedule lost WC")
+check(a["aggregated_totals"]["total_wallcovering_sqft"] == 2350,
+      f"WC positive-evidence: aggregate should stay 2350 "
+      f"({a['aggregated_totals']['total_wallcovering_sqft']})")
+check(rec.get("unmatched_kept_sqft") == 350,
+      f"WC positive-evidence: record ({rec.get('unmatched_kept_sqft')})")
+
+# R3: mixed WC+PT rows promote to the configured share of wall area.
+os.environ["NIGHTSHIFT_WC_SCHEDULE_GATE"] = "1"
+os.environ["NIGHTSHIFT_WC_SCHEDULE_AUTHORITATIVE"] = "1"
+os.environ["NIGHTSHIFT_WC_MIXED_SHARE"] = "0.8"
+sched_mix = _sched6(**{"101": {"wall_finish": "WC 01 (Wallcovering), PT 03 (Paint)"}})
+rooms = [_room(101, "Office A", wc=100)]  # wall_area 500 -> 80% = 400
+a = _an(rooms, sched_mix, agg={"total_wallcovering_sqft": 100})
+T._enforce_wallcovering_schedule_gate(a)
+check(rooms[0]["elements"]["wallcovering_sqft"] == 400,
+      f"WC mixed-share: expected 400, got "
+      f"{rooms[0]['elements']['wallcovering_sqft']}")
+check("[WC mixed-share" in rooms[0]["notes"],
+      "WC mixed-share: allowance note missing")
+check(a["aggregated_totals"]["total_wallcovering_sqft"] == 400,
+      f"WC mixed-share: aggregate {a['aggregated_totals']['total_wallcovering_sqft']}")
+os.environ["NIGHTSHIFT_WC_MIXED_SHARE"] = "0"
+rooms2 = [_room(101, "Office A", wc=100)]
+a2 = _an(rooms2, sched_mix, agg={"total_wallcovering_sqft": 100})
+T._enforce_wallcovering_schedule_gate(a2)
+check(rooms2[0]["elements"]["wallcovering_sqft"] == 100,
+      "WC mixed-share off: extracted value must stand")
+
+# Zero WC rows (Caris S4 crash): gate must run clean, no UnboundLocalError.
+sched_nowc = [_row(n, f"Office {n}") for n in (101, 102, 103, 104, 105, 106)]
+rooms = [_room(101, "Office 101", wc=120)]
+a = _an(rooms, sched_nowc, agg={"total_wallcovering_sqft": 120})
+try:
+    T._enforce_wallcovering_schedule_gate(a)
+    check(True, "zero-WC-rows schedule runs without crashing")
+except Exception as e:
+    check(False, f"zero-WC-rows schedule crashed: {e!r}")
+
 print("=== PASS ===" if not fails else
       "=== ISSUES: " + "; ".join(fails) + " ===")
 raise SystemExit(1 if fails else 0)
