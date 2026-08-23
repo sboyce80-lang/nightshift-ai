@@ -15592,6 +15592,69 @@ def _enforce_exterior_evidence(analysis):
     return analysis
 
 
+_STAIR_SHEET_FLOOR_RX = re.compile(
+    r"stair(?:well)?s?\s*(?:plans?|sections?|enclosure\s+plans?)|"
+    r"stair\s*(?:&|and)\s*section", re.IGNORECASE)
+
+
+def _dedup_cross_sheet_stairs(analysis):
+    """Flag-gated (NIGHTSHIFT_STAIR_CROSS_SHEET_DEDUP, default off): a
+    dedicated stairwell plans/sections sheet describes the SAME physical
+    flights that appear on every floor plan. Fishkill 397 (2026-08-23):
+    floor plans A101-A104 counted 7 stair sections and the A303 stairwell
+    sheet counted the same two stairs again as 9 — 16 priced vs Rider's 8
+    (exactly 2x). When a stair-sheet pseudo-floor exists, its section
+    counts are authoritative and floor-plan rooms' stair_sections zero.
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if os.environ.get("NIGHTSHIFT_STAIR_CROSS_SHEET_DEDUP", "0").strip() \
+            not in ("1", "true", "True"):
+        return analysis
+    if analysis.get("_stair_cross_sheet_dedup"):
+        return analysis
+    if analysis.get("_stair_sheet_authoritative"):
+        # The targeted stair-sheet (or tagged rescue) count already SET
+        # the aggregate both-directions authoritatively — deduping room
+        # counts must not overwrite it.
+        analysis["_stair_cross_sheet_dedup"] = {"noop": "authoritative_set"}
+        return analysis
+    floors = analysis.get("floors") or []
+    stair_floor_rooms, plan_rooms = [], []
+    for fl in floors:
+        is_stair_sheet = bool(_STAIR_SHEET_FLOOR_RX.search(
+            str(fl.get("floor_name") or "")))
+        for rm in (fl.get("rooms") or []):
+            el = rm.get("elements") or {}
+            if _num(el.get("stair_sections", 0)) <= 0:
+                continue
+            (stair_floor_rooms if is_stair_sheet else plan_rooms).append(rm)
+    if not stair_floor_rooms or not plan_rooms:
+        analysis["_stair_cross_sheet_dedup"] = {"noop": "single_series"}
+        return analysis
+    removed = 0.0
+    for rm in plan_rooms:
+        el = rm.setdefault("elements", {})
+        removed += _num(el.get("stair_sections", 0))
+        el["stair_sections"] = 0
+    kept = sum(_num((r.get("elements") or {}).get("stair_sections", 0))
+               for r in stair_floor_rooms)
+    agg = analysis.setdefault("aggregated_totals", {})
+    cur = _num(agg.get("total_stair_sections", 0))
+    if cur > 0:
+        agg["total_stair_sections"] = max(kept, cur - removed)
+    analysis.setdefault("notes", []).append(
+        f"[Stair Cross-Sheet Dedup] Stairwell plans/sections sheet is "
+        f"authoritative: kept {kept:.0f} section(s) from the stair sheet, "
+        f"removed {removed:.0f} duplicate section(s) counted on floor "
+        f"plans.")
+    print(f"   🪜 Stair cross-sheet dedup: kept {kept:.0f} (stair sheet), "
+          f"removed {removed:.0f} (floor-plan duplicates)", flush=True)
+    analysis["_stair_cross_sheet_dedup"] = {
+        "kept_stair_sheet": kept, "removed_floor_plan": removed}
+    return analysis
+
+
 def _reconcile_door_density(analysis):
     """Flag-gated (NIGHTSHIFT_DOOR_DENSITY_RECONCILE, default off): a
     unit template cannot carry more doors per unit than its room count
@@ -18833,6 +18896,19 @@ def _rescue_swept_schedules(client, pdf_paths, analysis):
         for key in ("door_schedule", "window_schedule", "stair_info"):
             if (rescued.get(key) and not _have(key)
                     and _nonempty(key, rescued[key])):
+                if (key == "stair_info"
+                        and _num(rescued[key].get(
+                            "total_stair_sections", 0)) > 0
+                        and not rescued[key].get("source")):
+                    # The rescue read these counts off located stair/
+                    # section sheets — same authority as the targeted
+                    # stair-sheet pass. Without this tag the "applied
+                    # authoritatively" note was a lie: the SET branch in
+                    # _apply_schedule_overrides requires source ==
+                    # "stair_sheets", so Fishkill's rescued count of 6
+                    # lost to a doubled room count of 16.
+                    rescued[key]["source"] = "stair_sheets"
+                    rescued[key]["sweep_rescued"] = True
                 analysis.setdefault("schedule_data", {})[key] = rescued[key]
                 sd = analysis["schedule_data"]
                 merged_kinds.append(key)
@@ -19082,6 +19158,11 @@ def build_priced_takeoff(analysis, strict=None):
     # G1 door-density reconcile: unit templates cannot carry more doors
     # than rooms+2 per unit. Flag-gated; no-op when off.
     analysis = _reconcile_door_density(analysis)
+
+    # Stair cross-sheet dedup: a dedicated stairwell plans/sections sheet
+    # and the floor plans describe the same flights — count them once.
+    # Flag-gated; no-op when off.
+    analysis = _dedup_cross_sheet_stairs(analysis)
 
     # G2 pricing-time tier: exterior paint without recorded paint
     # evidence zeroes + RFI even on REPLAYED analyses (the in-pass gate
