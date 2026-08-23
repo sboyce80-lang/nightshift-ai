@@ -8923,6 +8923,59 @@ def _identify_elevation_pages(pdf_path):
         if idx not in seen:
             seen.add(idx)
             unique.append(idx)
+
+    # NIGHTSHIFT_ELEV_REQUIRE_SHEETS (default off): the pass may only run
+    # when at least one selected page is a REAL elevation sheet (BofA-class
+    # guard: sets with no exterior drawings must not feed the LLM cue-
+    # matched cover/section pages to invent quantities from). "Real" =
+    # a page carrying 2+ distinct directional elevation titles (checked
+    # FIRST — real elevation sheets legitimately reference many other
+    # sheet ids, 13 on Caris A2.x), or an A-2xx/A-3xx sheet id on a page
+    # that isn't a drawing index (indexes cite dozens of ids; Fishkill's
+    # cover cites 105).
+    if os.environ.get("NIGHTSHIFT_ELEV_REQUIRE_SHEETS", "0").strip() \
+            in ("1", "true", "True"):
+        directional = ("north elevation", "south elevation",
+                       "east elevation", "west elevation",
+                       "front elevation", "rear elevation",
+                       "side elevation")
+        strong = False
+        try:
+            doc2 = fitz.open(pdf_path)
+            for idx in unique:
+                lower = (doc2[idx].get_text() or "").lower()
+                if sum(1 for c in directional if c in lower) >= 2:
+                    strong = True
+                    break
+                distinct_sheet_ids = len(set(
+                    m.group(0).upper()
+                    for m in _SHEET_NUMBER_RE.finditer(lower)))
+                if distinct_sheet_ids >= 25:
+                    continue  # drawing index / cover sheet
+                for m in _SHEET_NUMBER_RE.finditer(lower):
+                    if m.group(1).upper() != 'A':
+                        continue
+                    base = m.group(2).split('.')[0]
+                    try:
+                        n = int(base)
+                    except ValueError:
+                        continue
+                    if ((200 <= n < 400)
+                            or (n in (2, 3) and '.' in m.group(2))) \
+                            and "elevation" in lower:
+                        strong = True
+                        break
+                if strong:
+                    break
+            doc2.close()
+        except Exception:
+            strong = True  # guard must fail open, not kill the pass
+        if not strong:
+            print("   🏛  Elevation-sheet guard: no true elevation sheet "
+                  "among candidate pages — exterior pass abstains "
+                  "(quantities need measured elevations; RFI path keeps "
+                  "the ask visible)")
+            return []
     return unique
 
 
@@ -15534,6 +15587,83 @@ _EXT_PAINT_EVIDENCE_RX = re.compile(
     r"stucco|cmu|masonry|wood|trim)|exterior\s+(?:siding\s+)?paint|"
     r"field.?paint|repaint", re.IGNORECASE)
 
+# Negative finish evidence: the drawings explicitly say a product arrives
+# finished and is NOT field-painted. Fishkill 397 (2026-08-22): job-level
+# positive evidence (painted AZEK, black lintels) kept a $48k Hardie line
+# whose own note reads "factory-finished fiber cement product not
+# field-painted" — evidence must bind per item, and negative beats
+# positive for the item it names.
+_EXT_FACTORY_FINISH_RX = re.compile(
+    r"factory[\s-]?(?:finish(?:ed)?|applied|primed and finished)|"
+    r"not\s+field[\s-]?painted|pre[\s-]?finished", re.IGNORECASE)
+
+# Material-family tokens per exterior quantity key: a negative-finish
+# sentence zeroes a key only when it names that key's material.
+_EXT_ITEM_FAMILIES = {
+    "hardie_siding_sqft": ("hardie", "siding", "fiber cement", "cladding"),
+    "exterior_paint_sqft": ("siding", "cladding", "façade", "facade",
+                            "panel"),
+    "soffit_sqft": ("soffit",),
+    "azek_trim_lf": ("azek",),
+    "cornice_lf": ("cornice",),
+    "corner_board_lf": ("corner board",),
+    "window_trim_lf": ("window trim",),
+    "steel_lintel_lf": ("lintel",),
+}
+
+
+def _ext_negative_evidence_keys(present_keys, blobs):
+    """Return {key: quoted_sentence} for keys whose material family is
+    named in a sentence carrying negative finish evidence."""
+    out = {}
+    for blob in blobs:
+        if not blob:
+            continue
+        for sentence in re.split(r"[.;|]", str(blob)):
+            if not _EXT_FACTORY_FINISH_RX.search(sentence):
+                continue
+            low = sentence.lower()
+            for k in present_keys:
+                if k in out:
+                    continue
+                if any(tok in low for tok in _EXT_ITEM_FAMILIES.get(k, ())):
+                    out[k] = sentence.strip()[:160]
+    return out
+
+
+# Word-order-agnostic paint token for per-item evidence. Honey Farms
+# (2026-08-23): the note "James Hardie V-Groove fiber cement siding
+# painted PT01 (Benjamin Moore OC-117)" is explicit paint evidence, but
+# _EXT_PAINT_EVIDENCE_RX only matches "paint <material>" order — the gate
+# zeroed $15k of scope Rider actually bids. Per-item rule: the item's
+# material family and a paint token co-occurring in one sentence, either
+# order, grants that item positive evidence. A sentence carrying negative
+# finish evidence can never grant a positive (Fishkill's "...siding ...
+# not field-painted" names both).
+_EXT_PAINT_TOKEN_RX = re.compile(
+    r"\bpaint(?:ed|ing)?\b|\brepaint\b|\bfield.?paint", re.IGNORECASE)
+
+
+def _ext_positive_evidence_keys(present_keys, blobs):
+    """Return {key: quoted_sentence} for keys whose material family
+    co-occurs with a paint token in a non-negative sentence."""
+    out = {}
+    for blob in blobs:
+        if not blob:
+            continue
+        for sentence in re.split(r"[.;|]", str(blob)):
+            if _EXT_FACTORY_FINISH_RX.search(sentence):
+                continue
+            if not _EXT_PAINT_TOKEN_RX.search(sentence):
+                continue
+            low = sentence.lower()
+            for k in present_keys:
+                if k in out:
+                    continue
+                if any(tok in low for tok in _EXT_ITEM_FAMILIES.get(k, ())):
+                    out[k] = sentence.strip()[:160]
+    return out
+
 
 def _enforce_exterior_evidence(analysis):
     """Flag-gated (NIGHTSHIFT_EXTERIOR_EVIDENCE_GATE, shared with the
@@ -15562,10 +15692,93 @@ def _enforce_exterior_evidence(analysis):
              str(ext.get("notes") or "")]
     for f in ((analysis.get("_scope_sweep") or {}).get("findings") or []):
         blobs.append(f"{f.get('item') or ''} {f.get('detail') or ''}")
+    # Finish-schedule rows are first-class paint evidence — Honey's
+    # "SD-01 Siding: V-Groove ... painted to match" lives in the schedule,
+    # not the exterior notes. Legends echo material + finish in one row,
+    # which is exactly the sentence shape the per-item matcher reads.
+    for sched_src in (analysis.get("room_finish_schedule"),
+                      (analysis.get("schedule_data") or {}).get(
+                          "finish_schedule")):
+        if sched_src:
+            try:
+                blobs.append(json.dumps(sched_src)[:20000])
+            except Exception:
+                blobs.append(str(sched_src)[:20000])
+
+    # Per-item negative evidence beats job-level positive evidence: zero
+    # any key whose material the drawings declare factory-finished / not
+    # field-painted, regardless of paint evidence elsewhere on the job.
+    negative = _ext_negative_evidence_keys(list(present), blobs)
+    if negative:
+        agg = analysis.setdefault("aggregated_totals", {})
+        for k, quote in negative.items():
+            ext[k] = 0
+            for agg_key in (f"total_{k}", k):
+                if agg_key in agg:
+                    agg[agg_key] = 0
+        neg_txt = ", ".join(f"{k}={present[k]:,.0f}" for k in negative)
+        _gate_add_rfi(
+            analysis, "Exterior Painting",
+            f"Measured exterior quantities ({neg_txt}) were excluded: the "
+            f"drawings state the product is factory-finished / not "
+            f"field-painted (e.g. \"{next(iter(negative.values()))}\"). "
+            f"Confirm if field painting is nevertheless intended.")
+        analysis.setdefault("notes", []).append(
+            f"[Exterior Evidence] Zeroed factory-finished item(s): "
+            f"{neg_txt}.")
+        print(f"   🏛  Exterior evidence: factory-finish note zeroed "
+              f"{neg_txt}", flush=True)
+        for k in negative:
+            present.pop(k, None)
+        if not present:
+            analysis["_exterior_evidence_gate"] = {
+                "evidence": False, "zeroed_negative": negative}
+            return analysis
+
+    # Per-item positive evidence (material + paint token, one sentence,
+    # either order). When at least one item is individually evidenced,
+    # evidence resolves PER ITEM: evidenced items keep, the rest zero
+    # with a quantified RFI — a "Painted AZEK" callout no longer carries
+    # an unevidenced siding line (Dutchess $27k), and a "siding painted
+    # PT01" schedule note keeps siding the old word-order regex missed
+    # (Honey $15k).
+    positive = _ext_positive_evidence_keys(list(present), blobs)
+    if positive:
+        unevidenced = {k: v for k, v in present.items() if k not in positive}
+        if unevidenced:
+            agg = analysis.setdefault("aggregated_totals", {})
+            for k in unevidenced:
+                ext[k] = 0
+                for agg_key in (f"total_{k}", k):
+                    if agg_key in agg:
+                        agg[agg_key] = 0
+            un_txt = ", ".join(f"{k}={v:,.0f}"
+                               for k, v in unevidenced.items())
+            kept_txt = ", ".join(positive)
+            _gate_add_rfi(
+                analysis, "Exterior Painting",
+                f"Exterior items with an explicit painting callout were "
+                f"priced ({kept_txt}); measured quantities without one "
+                f"({un_txt}) are carried at $0. Confirm scope and we "
+                f"will price the measured quantities.")
+            analysis.setdefault("notes", []).append(
+                f"[Exterior Evidence] Per-item: kept {kept_txt}; zeroed "
+                f"unevidenced {un_txt}.")
+            print(f"   🏛  Exterior evidence (per-item): kept {kept_txt}; "
+                  f"zeroed {un_txt}", flush=True)
+        analysis["_exterior_evidence_gate"] = {
+            "evidence": True, "mode": "per_item",
+            "kept": {k: positive[k] for k in positive},
+            "zeroed_unevidenced": list(unevidenced),
+            "zeroed_negative": negative}
+        return analysis
+
     evidence = any(_EXT_PAINT_EVIDENCE_RX.search(b) for b in blobs if b)
     if evidence:
         analysis["_exterior_evidence_gate"] = {"evidence": True,
-                                               "kept": list(present)}
+                                               "mode": "job_level",
+                                               "kept": list(present),
+                                               "zeroed_negative": negative}
         return analysis
     agg = analysis.setdefault("aggregated_totals", {})
     for k in present:
@@ -15588,7 +15801,8 @@ def _enforce_exterior_evidence(analysis):
     print(f"   🏛  Exterior evidence (pricing tier): zeroed {qty_txt}",
           flush=True)
     analysis["_exterior_evidence_gate"] = {"evidence": False,
-                                           "zeroed": present}
+                                           "zeroed": present,
+                                           "zeroed_negative": negative}
     return analysis
 
 

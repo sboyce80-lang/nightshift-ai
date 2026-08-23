@@ -489,6 +489,38 @@ def _is_low_scope_manual_review(analysis):
     return any(marker in reason for marker in LOW_SCOPE_REASON_MARKERS)
 
 
+# Documented negative-finish / carried-by-others evidence in an adjustment
+# reason. Deliberately narrow: generic "seems high" or "typical range"
+# language must NOT match.
+_SCOPE_REMOVAL_REASON_RX = re.compile(
+    r"factory[\s-]?(?:finish(?:ed)?|applied)|not\s+field[\s-]?painted|"
+    r"pre[\s-]?finished|by\s+others|separate\s+contract|"
+    r"not\s+in\s+(?:the\s+)?paint(?:ing)?\s+scope", re.IGNORECASE)
+
+_EXTERIOR_CATEGORY_RX = re.compile(
+    r"ext\.|exterior|siding|cornice|azek|lintel|soffit|corner board",
+    re.IGNORECASE)
+
+
+def _is_documented_scope_removal(adjustment):
+    """True only for a reduction-to-zero of an exterior line whose reason
+    cites factory-finish / by-others documentation (see call site)."""
+    try:
+        to_v = _num(adjustment.get("to_value", 0))
+        from_v = _num(adjustment.get("from_value", 0))
+    except Exception:
+        return False
+    if to_v != 0 or from_v <= 0:
+        return False
+    if os.environ.get("NIGHTSHIFT_WILL_SCOPE_REMOVAL", "0").strip() \
+            not in ("1", "true", "True"):
+        return False
+    if not _EXTERIOR_CATEGORY_RX.search(str(adjustment.get("category") or "")):
+        return False
+    return bool(_SCOPE_REMOVAL_REASON_RX.search(
+        str(adjustment.get("reason") or "")))
+
+
 def _validate_adjustment(adjustment, line_items_by_category, analysis=None):
     """Validate a single proposed adjustment against the guardrails.
 
@@ -874,7 +906,19 @@ def run_will_synthesis(analysis, cost_estimate, rfi_items=None, validation=None,
             # calculated quantities toward "typical" ranges. Every proposed
             # quantity adjustment is converted to an RFI so the concern is
             # surfaced for human confirmation instead of applied.
-            is_valid, reason = False, "hard_numbers_only_policy"
+            #
+            # Exception (NIGHTSHIFT_WILL_SCOPE_REMOVAL, default off): the
+            # policy exists to stop scope INFLATION; it must not protect
+            # fabricated scope from removal. Fishkill 397 (2026-08-22):
+            # Will's documented "HardiePanel is factory-finished, not
+            # field-painted → 0" was auto-rejected here and a phantom $48k
+            # exterior line survived. A reduction-to-zero on an exterior
+            # line whose stated reason cites factory-finish/by-others
+            # documentation is a scope CORRECTION, not a reshape.
+            if _is_documented_scope_removal(adj):
+                is_valid, reason = True, ""
+            else:
+                is_valid, reason = False, "hard_numbers_only_policy"
         else:
             is_valid, reason = _validate_adjustment(adj, line_items_by_category, analysis)
         if is_valid:
