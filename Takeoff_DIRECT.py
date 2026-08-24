@@ -15188,6 +15188,142 @@ def _build_schedule_row_maps(rfs):
     return by_num, by_name
 
 
+# ── Paint schedule gate (M3: schedule-authoritative wall paint scope) ──────
+# Honey Farms 2026-08-24: KS painted 15,686 SF of walls vs Rider's 4,580 —
+# Rider prices only what the finish schedule designates PT-xx; cooler/
+# freezer panel walls, tiled restroom walls, and stainless closures are
+# not paint scope. The WC gate already proves the architecture: schedule
+# designations beat whole-room assumptions, only-reduce, RFI the rest.
+
+_PAINTED_WALL_FINISH_RX = re.compile(
+    r"\bpt[-\s]?\d|\bpaint(?:ed|ing)?\b|epoxy|acrylic|eggshell|"
+    r"semi-?gloss|\beg-?shel\b", re.IGNORECASE)
+_NONPAINT_WALL_FINISH_RX = re.compile(
+    r"panel\b|stainless|tile\b|\btl[-\s]?\d|frp|glass|curtain\s*wall|"
+    r"storefront|cooler|freezer|unfinished|exposed\s+(?:cmu|masonry|"
+    r"concrete|structure)|wood\s+veneer|plastic\s+laminate|\bpl[-\s]?\d",
+    re.IGNORECASE)
+
+_GENERIC_NAME_TOKENS = {"room", "area", "main", "space", "typ", "typical",
+                        "floor", "level", "and", "the", "of"}
+
+
+def _area_name_tokens(name):
+    toks = set(re.sub(r"[^a-z0-9]+", " ", str(name or "").lower()).split())
+    return {t for t in toks if len(t) >= 4 and t not in
+            _GENERIC_NAME_TOKENS}
+
+
+def _match_area_row(room, rows):
+    """Area-keyed schedule matcher (rows keyed by names like 'Sales
+    Floor / Main Retail Area', no numbers): a room matches a row when
+    they share a distinctive (>=4 char, non-generic) name token. Used
+    only to APPLY a designation, never invent scope."""
+    rtoks = _area_name_tokens(room.get("room_name"))
+    if not rtoks:
+        return None
+    best, best_n = None, 0
+    for row in rows:
+        rowtoks = _area_name_tokens(row.get("room_name"))
+        n = len(rtoks & rowtoks)
+        if n > best_n:
+            best, best_n = row, n
+    return best if best_n >= 1 else None
+
+
+def _wall_finish_class(wall_finish):
+    """'painted' | 'nonpaint' | 'unknown' for a schedule wall_finish."""
+    s = str(wall_finish or "").strip()
+    if not s:
+        return "unknown"
+    painted = bool(_PAINTED_WALL_FINISH_RX.search(s))
+    nonpaint = bool(_NONPAINT_WALL_FINISH_RX.search(s))
+    if painted:
+        return "painted"      # mixed rows keep paint scope
+    if nonpaint:
+        return "nonpaint"
+    return "unknown"
+
+
+def _enforce_paint_schedule_gate(analysis):
+    """Flag-gated (NIGHTSHIFT_PAINT_SCHEDULE_GATE, default off): rooms
+    whose finish-schedule row designates a NON-painted wall system
+    (panel, tile, stainless, FRP, exposed) stop carrying whole-room wall
+    paint. Only-reduce: painted/mixed/unknown/unmatched rooms keep their
+    extracted walls; zeroed SF ships as a quantified RFI. Stands down
+    when VME owns the wall total (mixed bases). Idempotent."""
+    if not isinstance(analysis, dict):
+        return analysis
+    if os.environ.get("NIGHTSHIFT_PAINT_SCHEDULE_GATE", "0").strip() \
+            not in ("1", "true", "True"):
+        return analysis
+    if analysis.get("_paint_schedule_gate"):
+        return analysis
+    rfs = _get_room_finish_schedule(analysis)
+    if len(rfs) < _SCHEDULE_FINISH_AUTHORITY_MIN_ROWS:
+        analysis["_paint_schedule_gate"] = {"noop": "schedule_too_thin"}
+        return analysis
+    classes = {id(r): _wall_finish_class(r.get("wall_finish"))
+               for r in rfs}
+    nonpaint_rows = [r for r in rfs if classes[id(r)] == "nonpaint"]
+    if not nonpaint_rows:
+        # Every row is painted/unknown — the schedule carries no
+        # exclusion information; whole-room default stands.
+        analysis["_paint_schedule_gate"] = {"noop": "no_nonpaint_rows"}
+        return analysis
+    if (analysis.get("_vme_authoritative") or {}).get("applied"):
+        analysis["_paint_schedule_gate"] = {"noop": "vme_owns_walls"}
+        return analysis
+    by_num, by_name = _build_schedule_row_maps(rfs)
+    zeroed = []
+    zeroed_sqft = 0.0
+    for floor in analysis.get("floors", []) or []:
+        for room in floor.get("rooms", []) or []:
+            if not isinstance(room, dict) or not room.get("in_scope", True):
+                continue
+            dims = room.get("dimensions") or {}
+            wall = _num(dims.get("wall_area_sqft", 0))
+            if wall <= 0:
+                continue
+            row = _match_schedule_row(room, by_num, by_name) \
+                or _match_area_row(room, rfs)
+            if row is None or classes.get(id(row)) != "nonpaint":
+                continue
+            label = str(room.get("room_name", "") or "unnamed").strip()
+            finish = str(row.get("wall_finish", ""))[:60]
+            mult = _extract_multiplier_from_notes(room)
+            zeroed.append(f"{label} ({finish})")
+            zeroed_sqft += wall * mult
+            room.setdefault("dimensions", {})["wall_area_sqft"] = 0
+            room["notes"] = (str(room.get("notes", "")) +
+                             f" [Paint schedule gate: wall finish is "
+                             f"'{finish}' — not paint scope; "
+                             f"{wall:,.0f} SF removed]").strip()
+    if not zeroed:
+        analysis["_paint_schedule_gate"] = {"noop": "no_matches"}
+        return analysis
+    agg = analysis.setdefault("aggregated_totals", {})
+    prev = _num(agg.get("total_paintable_wall_sqft", 0))
+    agg["total_paintable_wall_sqft"] = max(
+        0.0, round(prev - zeroed_sqft, 2))
+    _gate_add_rfi(
+        analysis, "Wall Finishes",
+        f"The finish schedule designates non-painted wall systems in "
+        f"{len(zeroed)} room(s) — {', '.join(zeroed[:6])}"
+        f"{'…' if len(zeroed) > 6 else ''} — so {zeroed_sqft:,.0f} SF of "
+        f"extracted wall area is excluded from the paint bill. Confirm "
+        f"if any of these walls nevertheless receive field paint.")
+    analysis.setdefault("notes", []).append(
+        f"[Paint Schedule Gate] Removed {zeroed_sqft:,.0f} SF of wall "
+        f"paint from {len(zeroed)} room(s) whose schedule row designates "
+        f"a non-painted wall system.")
+    print(f"   🎨 Paint schedule gate: removed {zeroed_sqft:,.0f} SF "
+          f"across {len(zeroed)} non-painted room(s)", flush=True)
+    analysis["_paint_schedule_gate"] = {
+        "zeroed_rooms": len(zeroed), "zeroed_sqft": round(zeroed_sqft, 1)}
+    return analysis
+
+
 def _match_schedule_row(room, by_num, by_name):
     tok = _room_num_token(room.get("room_id")) or _room_num_token(
         room.get("room_number"))
@@ -19756,6 +19892,12 @@ def build_priced_takeoff(analysis, strict=None):
     # total_wallcovering_sqft from the wall bill, so phantom WC would silently
     # shrink walls too. Flag-gated; no-op when off.
     analysis = _enforce_wallcovering_schedule_gate(analysis)
+
+    # Paint schedule gate (M3): rooms whose schedule row designates a
+    # NON-painted wall system stop carrying whole-room wall paint. Same
+    # placement rationale as the WC gate — runs before the VME wall
+    # passes; stands down when VME owns the wall total. Flag-gated.
+    analysis = _enforce_paint_schedule_gate(analysis)
 
     # Floor-finish reconcile: documented EP-x/SC-x/sealed-concrete coatings
     # recorded by extraction but left at 0 get wired into pricing; polished
