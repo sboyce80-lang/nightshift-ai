@@ -9123,6 +9123,17 @@ def _apply_elevation_breakdown(ext_data):
             documented[key] += area
         else:
             estimated[key] += area
+        # Siding rate ladder (2026-08-24, Steven-approved Rider-derived
+        # rates): V-groove profile prices at its own rate ($2.20/SF vs
+        # panel $4.85 — Honey priced 2.2x high on rate alone). Track the
+        # V-groove share of the siding rows for calculate_costs.
+        if key == "hardie_siding_sqft" and re.search(
+                r"v[\s-]?groove", str(r.get("material") or ""),
+                re.IGNORECASE):
+            ext_data.setdefault("siding_class_sqft", {})
+            ext_data["siding_class_sqft"]["v_groove"] = round(
+                ext_data["siding_class_sqft"].get("v_groove", 0.0)
+                + area, 1)
         audited.append({"elevation": r.get("elevation"),
                         "material": r.get("material"), "key": key,
                         "area": round(area, 1),
@@ -23396,6 +23407,17 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     wt_rate     = _get_tiered_rate(pm['exterior_window_trim'], window_trim_lf)
     ext_paint_rate = _get_tiered_rate(pm['exterior_painting'], ext_paint_sqft) if 'exterior_painting' in pm else 1.80
     hardie_rate = _get_tiered_rate(pm['exterior_hardie_siding'], hardie_sqft) if 'exterior_hardie_siding' in pm else 4.85
+    # Siding rate ladder: the structured elevation pass classifies
+    # V-groove profile rows separately (Rider prices V-groove at $2.20/SF
+    # vs panel $4.85 — Honey 2026-08-24). The V-groove share leaves the
+    # Hardie-panel line and prices on its own line at its own rate.
+    vgroove_sqft = min(hardie_sqft, _num(
+        (exterior or {}).get('siding_class_sqft', {}).get('v_groove', 0)))
+    if vgroove_sqft > 0:
+        hardie_sqft = round(hardie_sqft - vgroove_sqft, 1)
+    vgroove_rate = _get_tiered_rate(pm['exterior_vgroove_siding'],
+                                    vgroove_sqft) \
+        if 'exterior_vgroove_siding' in pm else 2.20
     azek_rate   = _get_tiered_rate(pm['exterior_azek_trim'], azek_lf) if 'exterior_azek_trim' in pm else 9.00
     corner_rate = _get_tiered_rate(pm['exterior_corner_board'], corner_lf) if 'exterior_corner_board' in pm else 9.00
     lintel_rate = _get_tiered_rate(pm['exterior_steel_lintel'], steel_lintel_lf_ext) if 'exterior_steel_lintel' in pm else 32.00
@@ -23914,6 +23936,8 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
               ext_paint_rate, _get_markup('exterior_painting') if 'exterior_painting' in pm else 0.04),
         _line(f"Ext. Hardie Siding{_ffa_sfx('hardie_siding_sqft')} - {hardie_sqft:,.0f} sqft @ ${hardie_rate:.2f}", hardie_sqft,
               hardie_rate, _get_markup('exterior_hardie_siding') if 'exterior_hardie_siding' in pm else 0.05),
+        _line(f"Ext. V-Groove Siding{_ffa_sfx('hardie_siding_sqft')} - {vgroove_sqft:,.0f} sqft @ ${vgroove_rate:.2f}", vgroove_sqft,
+              vgroove_rate, _get_markup('exterior_hardie_siding') if 'exterior_hardie_siding' in pm else 0.05),
         _line(f"Ext. Azek Trim - {azek_lf:,.0f} LF @ ${azek_rate:.2f}", azek_lf,
               azek_rate, _get_markup('exterior_azek_trim') if 'exterior_azek_trim' in pm else 0.05),
         _line(f"Ext. Corner Boards - {corner_lf:,.0f} LF @ ${corner_rate:.2f}", corner_lf,
