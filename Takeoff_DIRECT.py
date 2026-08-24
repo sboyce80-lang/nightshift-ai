@@ -15045,6 +15045,69 @@ def _match_schedule_row(room, by_num, by_name):
     return by_name.get(nm)
 
 
+# ── Unit-typical type-token matching (Homewood WC transfer) ────────────────
+# A hotel/multifamily finish schedule keys rows by unit TYPICAL ("Living/
+# Sleeping - King Connector Suite, 211/217 (typical)") while extraction
+# names instances descriptively ("King Connector Suite (Third Floor)") —
+# number- and exact-name matching both miss, so no instance ever receives
+# the schedule's WC designation and the mixed-share promotion (R3) never
+# fires. Homewood 2026-08-24: WC stuck at 77.6k SF of ~50%-of-wall guesses
+# vs JW's 136.6k. Type-token matching: same bed type + same suite kind
+# (+ same variant letter when both carry one) + same room part
+# (bathroom rows only match bathroom rooms).
+
+_TYPICAL_BED_RX = re.compile(r"\b(king|queen|double|dbl)\b", re.IGNORECASE)
+_TYPICAL_KIND_RX = re.compile(
+    r"\b(studio|connector|one\s*b(?:e)?dr(?:oom)?|1\s*b(?:e)?dr(?:oom)?|"
+    r"two\s*bedroom|2\s*bedroom|suite)\b", re.IGNORECASE)
+_TYPICAL_VARIANT_RX = re.compile(
+    r"(?:\b|-)([a-e])(?:\b|-|$)(?!\w)", re.IGNORECASE)
+
+
+def _typical_signature(name):
+    """(bed, kind, variant, is_bath) tokens for a typical/instance name,
+    or None when the name carries no unit-type identity."""
+    low = " " + re.sub(r"[^a-z0-9]+", " ", str(name or "").lower()) + " "
+    bed = _TYPICAL_BED_RX.search(low)
+    kind = _TYPICAL_KIND_RX.search(low)
+    if not bed or not kind:
+        return None
+    kind_tok = re.sub(r"\s+", "", kind.group(1).lower())
+    kind_tok = {"1bdr": "onebdr", "1bedroom": "onebdr",
+                "onebdr": "onebdr", "onebedroom": "onebdr",
+                "2bedroom": "twobedroom"}.get(kind_tok, kind_tok)
+    # variant letter: only trust a standalone A-E adjacent to the kind
+    # token region (King Studio B / Studio-A-FF), never inside words
+    tail = low[kind.end():kind.end() + 8]
+    var = _TYPICAL_VARIANT_RX.match(tail.strip()[:3] or "")
+    is_bath = "bath" in low
+    return (bed.group(1).lower().replace("dbl", "double"), kind_tok,
+            var.group(1).lower() if var else "", is_bath)
+
+
+def _match_typical_row(room, wc_rows):
+    """Fallback matcher: room instance -> WC-designated typical row by
+    unit-type signature. Rows and rooms must agree on bed type, suite
+    kind, and room part; a variant letter must agree when BOTH sides
+    carry one (a row without a letter matches any variant)."""
+    sig = _typical_signature(str(room.get("room_name", "")))
+    if not sig:
+        return None
+    best = None
+    for row in wc_rows:
+        rsig = _typical_signature(str(row.get("room_name", "")))
+        if not rsig:
+            continue
+        if rsig[0] != sig[0] or rsig[1] != sig[1] or rsig[3] != sig[3]:
+            continue
+        if rsig[2] and sig[2] and rsig[2] != sig[2]:
+            continue
+        if rsig[2] == sig[2]:
+            return row  # exact variant agreement wins immediately
+        best = best or row
+    return best
+
+
 def _vme_primary_enabled():
     # Default OFF pending validation: when the deterministic vector
     # measurement engine measures a job's walls with full reliability (every
@@ -17067,6 +17130,21 @@ def _enforce_wallcovering_schedule_gate(analysis):
             wc = _num(elems.get("wallcovering_sqft", 0)) or _num(
                 dims.get("wallcovering_sqft", 0))
             row = _match_schedule_row(room, by_num, by_name)
+            # NIGHTSHIFT_WC_TYPICAL_MATCH (default off): on WC-dominated
+            # typicals-keyed schedules, fall back to unit-type signature
+            # matching so instances inherit their typical row's WC
+            # designation — which arms the existing mixed-share /
+            # WC-only promotions that number-matching never reaches.
+            # Promotion-only: a type-matched row is used to RAISE WC per
+            # the schedule, never to zero it (can_zero already off in
+            # low-match mode).
+            if (row is None and wc_dominated
+                    and os.environ.get("NIGHTSHIFT_WC_TYPICAL_MATCH",
+                                       "0").strip()
+                    in ("1", "true", "True")):
+                trow = _match_typical_row(room, wc_rows)
+                if trow is not None:
+                    row = trow
             designated = row is not None and id(row) in wc_row_ids
             label = str(room.get("room_name", "")
                         or room.get("room_id", "")).strip() or "unnamed"
