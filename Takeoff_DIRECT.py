@@ -23142,6 +23142,31 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
         if _wc_for_deduct > 0 and wall_sqft > 0:
             _wall_before = wall_sqft
             wall_sqft = max(0.0, round(wall_sqft - _wc_for_deduct, 2))
+            # NIGHTSHIFT_WC_DEDUCT_FLOOR (default off): under the mixed
+            # WC share s, every wallcovered room's walls are BY THE
+            # SCHEDULE'S OWN DESIGNATION s WC + (1-s) paint — so after
+            # deducting WC, at least wc*(1-s)/s of painted wall must
+            # survive. Homewood round-2 (2026-08-24): promoted WC 95.6k
+            # >= extracted walls and the deduct clamped painted gyp to
+            # $0 (-$238k) on a job whose schedule says WC 01 + PT 03 on
+            # the same walls.
+            if (os.environ.get("NIGHTSHIFT_WC_DEDUCT_FLOOR", "0").strip()
+                    in ("1", "true", "True")):
+                try:
+                    _s = float(os.environ.get(
+                        "NIGHTSHIFT_WC_MIXED_SHARE", "0") or 0)
+                except (TypeError, ValueError):
+                    _s = 0.0
+                if 0.0 < _s < 1.0:
+                    _floor = min(_wall_before,
+                                 round(_wc_for_deduct * (1.0 - _s) / _s,
+                                       2))
+                    if wall_sqft < _floor:
+                        print(f"   🧻 WC deduct floor: painted remainder "
+                              f"raised {wall_sqft:,.0f} → {_floor:,.0f} "
+                              f"SF (share {_s:.0%}: WC+PT rooms keep "
+                              f"their painted split)")
+                        wall_sqft = _floor
             print(f"   🧻 WC wall deduction: painted walls "
                   f"{_wall_before:,.0f} − {_wc_for_deduct:,.0f} WC = "
                   f"{wall_sqft:,.0f} SF")
