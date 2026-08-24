@@ -9000,6 +9000,116 @@ def _identify_elevation_pages(pdf_path):
     return unique
 
 
+def _elev_structured_measure_enabled():
+    return os.environ.get("NIGHTSHIFT_ELEV_STRUCTURED_MEASURE",
+                          "0").strip() in ("1", "true", "True")
+
+
+_ELEV_STRUCTURED_SECTION = """MEASUREMENT DISCIPLINE (structured breakdown REQUIRED):
+Every sqft of painted cladding you report MUST be justified as a row in
+"elevation_breakdown": one row per elevation per material band, each with
+width_ft x height_ft - openings_deduct_sqft = area_sqft. The height MUST
+come from documented numbers on the drawings: level datums (e.g. "EL.
+542'-0\\" to EL. 530'-0\\" = 12.0 ft"), a printed dimension string, or a
+floor-to-floor height stated in the sections - quote that source in
+"height_basis". The width MUST come from a printed plan/elevation
+dimension or gridline span - quote it in "width_basis". If you cannot
+find a documented basis for a row, still include the row but set
+"basis": "estimated" (documented rows use "basis": "documented").
+Estimated rows will NOT be priced - they become an RFI - so never pad
+documented rows to compensate. The *_sqft totals in the top-level JSON
+must EQUAL the sum of the matching breakdown rows (all rows, documented
++ estimated).
+"""
+
+_ELEV_AREA_KEY_BY_MATERIAL = (
+    (("hardie", "fiber cement", "v-groove", "v groove", "board and batten",
+      "board-and-batten", "lap siding", "shake", "shaker"),
+     "hardie_siding_sqft"),
+    (("soffit",), "soffit_sqft"),
+)
+
+
+def _elev_material_key(material):
+    low = str(material or "").lower()
+    for toks, key in _ELEV_AREA_KEY_BY_MATERIAL:
+        if any(t in low for t in toks):
+            return key
+    return "exterior_paint_sqft"
+
+
+def _apply_elevation_breakdown(ext_data):
+    """Deterministic validator for NIGHTSHIFT_ELEV_STRUCTURED_MEASURE:
+    area totals are REBUILT from documented breakdown rows (width x
+    height - openings, all recomputed here — the model's row area is
+    ignored when it disagrees with its own arithmetic). Estimated rows
+    collect into ext_data['unmeasured_estimates'] for the RFI path and
+    are never priced. No breakdown at all -> totals kept, flagged
+    unvalidated (fail-open; the evidence gates still apply)."""
+    rows = ext_data.get("elevation_breakdown")
+    if not isinstance(rows, list) or not rows:
+        ext_data["_structured_measure"] = {"status": "no_breakdown"}
+        return ext_data
+    documented = {}
+    estimated = {}
+    audited = []
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        key = _elev_material_key(r.get("material"))
+        w = max(0.0, _num(r.get("width_ft", 0)))
+        h = max(0.0, _num(r.get("height_ft", 0)))
+        ded = max(0.0, _num(r.get("openings_deduct_sqft", 0)))
+        area = max(0.0, w * h - ded)
+        basis = str(r.get("basis") or "").strip().lower()
+        h_basis = str(r.get("height_basis") or "")
+        # a "documented" claim needs a quoted numeric source behind it
+        has_doc_height = bool(re.search(r"el\.?\s*\d|\d+\s*'-?\s*\d*\"?|"
+                                        r"\d+(?:\.\d+)?\s*ft", h_basis,
+                                        re.IGNORECASE))
+        is_doc = basis == "documented" and has_doc_height and w > 0 and h > 0
+        (documented if is_doc else estimated).setdefault(key, 0.0)
+        if is_doc:
+            documented[key] += area
+        else:
+            estimated[key] += area
+        audited.append({"elevation": r.get("elevation"),
+                        "material": r.get("material"), "key": key,
+                        "area": round(area, 1),
+                        "documented": is_doc})
+    # Live calibration (2026-08-24, Fishkill + Honey vs Rider's measured
+    # takeoffs): the decomposed row-sums land within ~±12% of Rider
+    # (5,749 vs 6,197; 3,431 vs 3,914) while the freeform single number
+    # ran 1.3-2.4x over. Scale-measured rows are how estimators measure
+    # elevations too — so BOTH documented and estimated rows PRICE (with
+    # recomputed arithmetic); the split is recorded and a scale-share
+    # note ships when scaled rows dominate.
+    for key in ("hardie_siding_sqft", "exterior_paint_sqft", "soffit_sqft"):
+        claimed = _num(ext_data.get(key, 0))
+        doc = round(documented.get(key, 0.0), 1)
+        est = round(estimated.get(key, 0.0), 1)
+        if claimed > 0 or doc > 0 or est > 0:
+            ext_data[key] = round(doc + est, 1)
+            if est > 0:
+                ext_data.setdefault("scale_measured_sqft", {})[key] = est
+    ext_data["_structured_measure"] = {
+        "status": "applied", "rows": audited,
+        "documented": {k: round(v, 1) for k, v in documented.items()},
+        "estimated": {k: round(v, 1) for k, v in estimated.items()}}
+    tot_doc = sum(documented.values())
+    tot_est = sum(estimated.values())
+    note = (f"[Elevation Measure] Exterior areas rebuilt from "
+            f"{len(audited)} per-elevation breakdown row(s): "
+            f"{tot_doc:,.0f} SF from documented dims, {tot_est:,.0f} SF "
+            f"scale-measured.")
+    if tot_est > max(tot_doc, 0.0):
+        note += (" Majority of exterior area is scale-measured — confirm "
+                 "elevation dimensions before award (RFI).")
+    ext_data["notes"] = (str(ext_data.get("notes") or "") + " " + note
+                        ).strip()
+    return ext_data
+
+
 def _extract_exterior_scope(client, pdf_path):
     """Extract exterior painting scope from elevation sheets only.
 
@@ -9082,8 +9192,16 @@ CRITICAL — RETAIL / TENANT-FIT-OUT GOTCHAS:
    - If the elevations show storefront glazing on the front and CMU/painted
      metal on rear/sides, count ONLY the rear and side painted areas.
 
+__STRUCTURED_MEASURE_SECTION__
 Return ONLY this JSON (one object, no commentary):
 {
+  "elevation_breakdown": [
+    {"elevation": "North", "material": "hardie",
+     "width_ft": 0, "width_basis": "<quoted dim/gridline>",
+     "height_ft": 0, "height_basis": "<quoted EL./dim>",
+     "openings_deduct_sqft": 0, "area_sqft": 0,
+     "basis": "documented"}
+  ],
   "exterior_paint_sqft": 0,
   "hardie_siding_sqft": 0,
   "cornice_lf": 0,
@@ -9107,11 +9225,22 @@ If the elevations show no painted exterior surfaces, return all zeros with a
 note explaining why (e.g. "Storefront glazing on all four sides; no painted
 exterior scope visible.")."""
 
+    # NIGHTSHIFT_ELEV_STRUCTURED_MEASURE (default off): exterior areas
+    # must arrive as per-elevation width×height rows tied to documented
+    # dimensions (level datums, printed dims); estimated rows are not
+    # priced. Fishkill 2026-08-24: the freeform estimate reported 12.4k
+    # SF of siding vs Rider's measured 6.2k — a 2x that flips the bid
+    # from -18% to +39% depending on the allowance policy alone.
+    _structured = _elev_structured_measure_enabled()
+    exterior_prompt = exterior_prompt.replace(
+        "__STRUCTURED_MEASURE_SECTION__",
+        _ELEV_STRUCTURED_SECTION if _structured else "")
+
     try:
         result_parts = []
         with client.messages.stream(
             model="claude-sonnet-4-6",
-            max_tokens=2000,
+            max_tokens=3000 if _structured else 2000,
             temperature=0,
             timeout=300.0,
             messages=[{
@@ -9143,6 +9272,9 @@ exterior scope visible.")."""
 
         ext_data = json_match
         ext_data["source_pages"] = [i + 1 for i in elevation_indices]
+
+        if _structured:
+            ext_data = _apply_elevation_breakdown(ext_data)
 
         sqft = _num(ext_data.get("exterior_paint_sqft", 0))
         hardie = _num(ext_data.get("hardie_siding_sqft", 0))
