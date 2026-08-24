@@ -27371,11 +27371,16 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                     and os.environ.get(
                         "NIGHTSHIFT_SALES_FLOOR_ACT_EVIDENCE",
                         "0").strip() in ("1", "true", "True")):
+                # Evidence must be DOCUMENT text about this room: its own
+                # notes + ceiling material. Analysis-wide notes are
+                # excluded — TSC round-2 (2026-08-24): a "[Scope Sweep]
+                # ... dryfall paint callout on unmeasured page" note
+                # satisfied the regex and re-armed the flip, but sweep
+                # findings are RFI-material by contract, never a
+                # quantity basis (and the check's own prior note would
+                # self-arm on any replay).
                 _blob = " ".join([
-                    str(_largest_room.get("notes") or ""), _ceil,
-                    " ".join(str(n) for n in
-                             (analysis.get("notes") or [])[:400]),
-                ])
+                    str(_largest_room.get("notes") or ""), _ceil])
                 _act_evidence_ok = _act_flip_has_evidence(_blob)
 
             if _is_act and not _ceil_painted and not _act_evidence_ok:
