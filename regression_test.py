@@ -251,7 +251,9 @@ REFERENCE_CASES = {
             # Rider Jan'26: 25 window casings
             "total_windows_painted_interior": (25, 0.20),
             # Rider Jan'26 interior subtotal: $22,758.26
-            "cost_estimate_subtotal": (22758, 0.10),
+            # Jan 26 revision, final section of the takeoff xlsx (rows 20-37;
+            # the sheet stacks a superseded draft above it). 2026-08-24.
+            "cost_estimate_subtotal": (21072, 0.10),
         },
         "assertions": [
             # Baseline run extracted from 3 of 9 sheets and produced 4-6× over-extraction.
