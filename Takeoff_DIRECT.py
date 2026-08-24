@@ -3437,6 +3437,27 @@ def _sheet_verification_enabled():
         "0", "false", "False")
 
 
+def _act_flip_has_evidence(blob):
+    """True when document text supports painting the sales-floor deck
+    (dryfall / paint-to-deck callouts). Exposed/unpainted evidence — or
+    plain silence — returns False so the ACT→DRYFALL auto-flip becomes
+    RFI-only under NIGHTSHIFT_SALES_FLOOR_ACT_EVIDENCE (TSC Fusion
+    2026-08-24: 'EXP.' RCP note, $16.9k dryfall fabricated)."""
+    low = str(blob or "").lower()
+    pos = re.search(
+        r"dryfall|paint(?:ed)?[\s-]{0,12}(?:to\s+)?deck|"
+        r"painted\s+(?:deck|structure|exposed)|deck\s+paint", low)
+    neg = re.search(
+        r"\bexp\b|\bexp\.|exposed[^.;]{0,40}"
+        r"(?:unpainted|not\s+painted|no\s+paint)|"
+        r"no\s+ceiling\s+paint", low)
+    if not pos:
+        return False
+    if neg and not pos:
+        return False
+    return True
+
+
 def _sheet_checkpoint_enabled():
     """Per-sheet result checkpointing within per-sheet mode (default on)."""
     return os.environ.get("NIGHTSHIFT_SHEET_CHECKPOINT", "1").strip() not in (
@@ -27126,7 +27147,50 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             _ceil_painted = _as_bool(_mats.get("ceiling_painted"))
             _is_act = ("act" in _ceil or "acoustic" in _ceil
                        or "suspended" in _ceil or "drop" in _ceil)
-            if _is_act and not _ceil_painted:
+            # NIGHTSHIFT_SALES_FLOOR_ACT_EVIDENCE (default off): the
+            # auto-flip below assumes big retail boxes paint to deck —
+            # TSC Fusion (2026-08-24 marathon) fabricated $16.9k of
+            # dryfall on a sales floor whose RCP explicitly notes
+            # 'EXP.' (exposed, unpainted; Rider's takeoff carries 0 SF
+            # of ceilings). With the flag on, the flip requires document
+            # evidence of painted-deck scope; exposed/unpainted evidence
+            # or silence downgrades to RFI-only.
+            _act_evidence_ok = True
+            if (_is_act and not _ceil_painted
+                    and os.environ.get(
+                        "NIGHTSHIFT_SALES_FLOOR_ACT_EVIDENCE",
+                        "0").strip() in ("1", "true", "True")):
+                _blob = " ".join([
+                    str(_largest_room.get("notes") or ""), _ceil,
+                    " ".join(str(n) for n in
+                             (analysis.get("notes") or [])[:400]),
+                ])
+                _act_evidence_ok = _act_flip_has_evidence(_blob)
+
+            if _is_act and not _ceil_painted and not _act_evidence_ok:
+                _room_label = (_largest_room.get("room_name")
+                               or _largest_room.get("room_id")
+                               or "largest room")
+                rfi_msg = (
+                    f"The largest in-scope room ({_room_label}, "
+                    f"{_largest_fa:,.0f} sqft) on this commercial/retail "
+                    f"job is tagged ACT/not-painted and the drawings carry "
+                    f"no painted-deck evidence (an 'EXP.'/exposed note may "
+                    f"even contradict it). NO dryfall scope has been "
+                    f"priced. Confirm the sales-floor ceiling: open-to-"
+                    f"deck painted (we will add ~{_largest_fa:,.0f} sqft "
+                    f"of dryfall) or ACT/exposed-unpainted (as priced).")
+                analysis.setdefault("notes", []).append(
+                    f"[Sales-Floor-ACT Check] RFI-only (evidence guard): "
+                    f"{rfi_msg}")
+                analysis.setdefault("_pre_pricing_rfis", []).append({
+                    "category": "Scope Conflict", "question": rfi_msg,
+                    "action_required": "Confirm sales-floor ceiling type.",
+                    "severity": "high",
+                    "source": "sales_floor_act_check"})
+                print(f"   🏬 Sales-Floor-ACT: no painted-deck evidence — "
+                      f"RFI-only, no dryfall added", flush=True)
+            elif _is_act and not _ceil_painted:
                 _room_label = (_largest_room.get("room_name")
                                or _largest_room.get("room_id") or "largest room")
                 # Auto-correct: flip ceiling to DRYFALL and add the SF.
