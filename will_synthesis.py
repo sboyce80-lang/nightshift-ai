@@ -517,8 +517,19 @@ def _is_documented_scope_removal(adjustment):
         return False
     if not _EXTERIOR_CATEGORY_RX.search(str(adjustment.get("category") or "")):
         return False
-    return bool(_SCOPE_REMOVAL_REASON_RX.search(
-        str(adjustment.get("reason") or "")))
+    reason = str(adjustment.get("reason") or "")
+    # With the factory-finish ALLOWANCE policy on, factory-finish reasons
+    # no longer justify auto-removal — the allowance line carries that
+    # caveat deliberately (strike is the customer's move, not Will's).
+    # By-others / separate-contract reasons still qualify.
+    if os.environ.get("NIGHTSHIFT_FACTORY_FINISH_ALLOWANCE", "0").strip() \
+            in ("1", "true", "True"):
+        if not re.search(r"by\s+others|separate\s+contract|"
+                         r"not\s+in\s+(?:the\s+)?paint(?:ing)?\s+scope",
+                         reason, re.IGNORECASE):
+            return False
+        return True
+    return bool(_SCOPE_REMOVAL_REASON_RX.search(reason))
 
 
 def _validate_adjustment(adjustment, line_items_by_category, analysis=None):
