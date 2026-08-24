@@ -15772,6 +15772,33 @@ def _enforce_exterior_evidence(analysis):
     # any key whose material the drawings declare factory-finished / not
     # field-painted, regardless of paint evidence elsewhere on the job.
     negative = _ext_negative_evidence_keys(list(present), blobs)
+    # NIGHTSHIFT_FACTORY_FINISH_ALLOWANCE (default off): estimators bid
+    # factory-finish-noted siding anyway on 3 of 3 golden jobs (Caris:
+    # JW bid 4,762 SF the veto zeroed, -$24.4k; Fishkill: Rider bid
+    # 5,818 SF, $28.2k; Dutchess drawings literally say "factory-primed,
+    # field-painted"). With the flag on, negative-evidence items PRICE as
+    # a labeled strikeable allowance instead of $0+RFI — the number stays
+    # on the page, the caveat stays attached, review still fires.
+    if negative and os.environ.get(
+            "NIGHTSHIFT_FACTORY_FINISH_ALLOWANCE", "0").strip() in (
+            "1", "true", "True"):
+        ext["_factory_finish_allowance"] = dict(negative)
+        neg_txt = ", ".join(f"{k}={present[k]:,.0f}" for k in negative)
+        _gate_add_rfi(
+            analysis, "Exterior Painting",
+            f"The drawings note factory finish for measured exterior "
+            f"item(s) ({neg_txt}) — e.g. "
+            f"\"{next(iter(negative.values()))}\". Field paint is COMMONLY "
+            f"still bid on this scope, so it is carried as a labeled "
+            f"allowance line; strike it if the factory finish stands.")
+        analysis.setdefault("notes", []).append(
+            f"[Exterior Evidence] Factory-finish noted item(s) carried as "
+            f"strikeable ALLOWANCE (not zeroed): {neg_txt}.")
+        print(f"   🏛  Exterior evidence: factory-finish item(s) carried "
+              f"as allowance: {neg_txt}", flush=True)
+        for k in negative:
+            present.pop(k, None)  # exempt from unevidenced zeroing below
+        negative = {}
     if negative:
         agg = analysis.setdefault("aggregated_totals", {})
         for k, quote in negative.items():
@@ -22729,6 +22756,14 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     corner_lf = _num(exterior.get('corner_board_lf', 0))
     steel_lintel_lf_ext = _num(exterior.get('steel_lintel_lf', 0))
 
+    # Factory-finish allowance labeling: items the evidence gate carried
+    # as a strikeable allowance print the caveat on the line itself.
+    _ffa = (exterior or {}).get('_factory_finish_allowance') or {}
+
+    def _ffa_sfx(key):
+        return (" (ALLOWANCE — factory finish noted; strike if excluded)"
+                if key in _ffa else "")
+
     # Extended-scope operator options (flag-gated lines emitted below).
     # Room-derived (epoxy / interior precast) come from aggregated_totals;
     # bollards / pipe handrails come from the exterior elevation pass.
@@ -23530,9 +23565,9 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
               corn_rate, _get_markup('exterior_cornice')),
         _line(f"Exterior Window Trim - {window_trim_lf:,.0f} LF @ ${wt_rate:.2f}", window_trim_lf,
               wt_rate, _get_markup('exterior_window_trim')),
-        _line(f"Exterior Painting - {ext_paint_sqft:,.0f} sqft @ ${ext_paint_rate:.2f}", ext_paint_sqft,
+        _line(f"Exterior Painting{_ffa_sfx('exterior_paint_sqft')} - {ext_paint_sqft:,.0f} sqft @ ${ext_paint_rate:.2f}", ext_paint_sqft,
               ext_paint_rate, _get_markup('exterior_painting') if 'exterior_painting' in pm else 0.04),
-        _line(f"Ext. Hardie Siding - {hardie_sqft:,.0f} sqft @ ${hardie_rate:.2f}", hardie_sqft,
+        _line(f"Ext. Hardie Siding{_ffa_sfx('hardie_siding_sqft')} - {hardie_sqft:,.0f} sqft @ ${hardie_rate:.2f}", hardie_sqft,
               hardie_rate, _get_markup('exterior_hardie_siding') if 'exterior_hardie_siding' in pm else 0.05),
         _line(f"Ext. Azek Trim - {azek_lf:,.0f} LF @ ${azek_rate:.2f}", azek_lf,
               azek_rate, _get_markup('exterior_azek_trim') if 'exterior_azek_trim' in pm else 0.05),
@@ -23540,7 +23575,7 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
               corner_rate, _get_markup('exterior_corner_board') if 'exterior_corner_board' in pm else 0.05),
         _line(f"Ext. Steel Lintels - {steel_lintel_lf_ext:,.0f} LF @ ${lintel_rate:.2f}", steel_lintel_lf_ext,
               lintel_rate, _get_markup('exterior_steel_lintel') if 'exterior_steel_lintel' in pm else 0.05),
-        _line(f"Ext. Soffit/Fascia - {ext_soffit_sqft:,.0f} sqft @ ${ext_soffit_rate:.2f}", ext_soffit_sqft,
+        _line(f"Ext. Soffit/Fascia{_ffa_sfx('soffit_sqft')} - {ext_soffit_sqft:,.0f} sqft @ ${ext_soffit_rate:.2f}", ext_soffit_sqft,
               ext_soffit_rate, _get_markup('exterior_soffit_fascia') if 'exterior_soffit_fascia' in pm else 0.06),
         _line(f"Ext. HM Doors - {ext_doors_ea:.0f} EA @ ${ext_door_rate:.2f}", ext_doors_ea,
               ext_door_rate, _get_markup('doors_hm_panel')),
