@@ -16345,6 +16345,129 @@ def _transfer_typical_doors(analysis):
     return analysis
 
 
+_ROOM_NUM_IN_NAME_RX = re.compile(r"\b(\d{2,4})\b")
+_DEDUP_GENERIC_TOKENS = {"room", "area", "main", "the", "and", "of",
+                         "floor", "level"}
+
+
+def _room_identity(room):
+    """(kind, key) identity for same-floor dedup: numbered rooms key on
+    their number; unnumbered rooms key on significant name tokens."""
+    for src in (room.get("room_number"), room.get("room_id"),
+                room.get("room_name")):
+        m = _ROOM_NUM_IN_NAME_RX.search(str(src or ""))
+        if m:
+            return ("num", m.group(1))
+    toks = frozenset(
+        t for t in re.sub(r"[^a-z0-9]+", " ",
+                          str(room.get("room_name") or "").lower()).split()
+        if len(t) >= 3 and t not in _DEDUP_GENERIC_TOKENS)
+    return ("name", toks)
+
+
+def _room_detail_score(room):
+    dims = room.get("dimensions") or {}
+    els = room.get("elements") or {}
+    n = sum(1 for v in dims.values() if _num(v) > 0)
+    n += sum(1 for v in els.values() if _num(v) > 0)
+    src = str(room.get("source_sheet") or "")
+    if re.match(r"A-?\d", src, re.IGNORECASE):
+        n += 3  # architectural sheet beats equipment/reference sheets
+    return (n, _num(dims.get("wall_area_sqft", 0)))
+
+
+def _dedup_same_floor_rooms(analysis):
+    """Flag-gated (NIGHTSHIFT_SAME_FLOOR_ROOM_DEDUP, default off): the
+    same physical room extracted from multiple sheets lands repeatedly
+    on ONE floor under naming variants — Honey 2026-08-24: 'Cooler',
+    'Cooler (108)', '105 Cooler', '108 Cooler' (4 rows, 2 real coolers),
+    Freezer x4, Restroom x4, 'Sales Floor' + 'Sales Floor / Main Retail
+    Area' — 21 rooms for a ~12-room store, walls 3.4x Rider. Cross-floor
+    dedup never fires because everything is on '1st Floor'.
+
+    Rules (conservative): same floor + same NUMBER = one room; an
+    UNNUMBERED room whose significant tokens are a subset of another
+    same-floor room's tokens is the generic re-read of it. The most
+    detailed version survives (architectural-sheet source preferred);
+    dropped rooms' wall/ceiling SF leaves the aggregates with a note."""
+    if not isinstance(analysis, dict):
+        return analysis
+    if os.environ.get("NIGHTSHIFT_SAME_FLOOR_ROOM_DEDUP", "0").strip() \
+            not in ("1", "true", "True"):
+        return analysis
+    if analysis.get("_same_floor_room_dedup"):
+        return analysis
+    dropped = []
+    dropped_wall = dropped_ceil = 0.0
+    for fl in analysis.get("floors") or []:
+        rooms = [r for r in (fl.get("rooms") or []) if isinstance(r, dict)]
+        if len(rooms) < 2:
+            continue
+        groups = {}
+        for r in rooms:
+            kind, key = _room_identity(r)
+            groups.setdefault((kind, key), []).append(r)
+        # fold unnumbered token-subset rooms into their superset group:
+        # a group's token signature is the union of its members' name
+        # tokens; an unnumbered group folds when its tokens are a
+        # non-empty subset of exactly ONE other group's signature
+        # (ambiguous subsets stay separate — two real coolers must not
+        # swallow the generic 'Cooler' into the wrong one arbitrarily
+        # unless only one candidate exists).
+        def _group_tokens(members):
+            out = set()
+            for r2 in members:
+                out |= set(re.sub(
+                    r"[^a-z0-9]+", " ",
+                    str(r2.get("room_name") or "").lower()).split())
+            return out
+        sig = {k: _group_tokens(v) for k, v in groups.items()}
+        for nk in [k for k in list(groups) if k[0] == "name" and k[1]]:
+            targets = [k for k in groups
+                       if k != nk and set(nk[1]) <= sig.get(k, set())]
+            if len(targets) == 1 and nk in groups:
+                groups[targets[0]].extend(groups.pop(nk))
+        for key, members in groups.items():
+            if len(members) < 2:
+                continue
+            members.sort(key=_room_detail_score, reverse=True)
+            keeper, dups = members[0], members[1:]
+            for d in dups:
+                dims = d.get("dimensions") or {}
+                dropped_wall += _num(dims.get("wall_area_sqft", 0))
+                dropped_ceil += _num(dims.get("ceiling_area_sqft", 0))
+                dropped.append(str(d.get("room_name") or "unnamed"))
+                d["in_scope"] = False
+                d["_dedup_dropped"] = True
+                d["notes"] = (str(d.get("notes", "")) +
+                              " [Same-floor dedup: duplicate of '"
+                              + str(keeper.get("room_name") or "")
+                              + "' — removed from scope]").strip()
+            fl["rooms"] = [r for r in rooms
+                           if not r.get("_dedup_dropped")] + \
+                [r for r in (fl.get("rooms") or [])
+                 if not isinstance(r, dict)]
+    if not dropped:
+        analysis["_same_floor_room_dedup"] = {"noop": "no_duplicates"}
+        return analysis
+    agg = analysis.setdefault("aggregated_totals", {})
+    for k, sub in (("total_paintable_wall_sqft", dropped_wall),
+                   ("total_paintable_ceiling_sqft", dropped_ceil)):
+        if _num(agg.get(k, 0)) > 0 and sub > 0:
+            agg[k] = max(0.0, round(_num(agg.get(k, 0)) - sub, 2))
+    analysis.setdefault("notes", []).append(
+        f"[Same-Floor Dedup] Removed {len(dropped)} duplicate room "
+        f"read(s) (−{dropped_wall:,.0f} SF walls, −{dropped_ceil:,.0f} "
+        f"SF ceilings): {', '.join(dropped[:8])}"
+        f"{'…' if len(dropped) > 8 else ''}.")
+    print(f"   🧹 Same-floor dedup: removed {len(dropped)} duplicate "
+          f"room(s), −{dropped_wall:,.0f} SF walls", flush=True)
+    analysis["_same_floor_room_dedup"] = {
+        "dropped": len(dropped), "wall_sqft": round(dropped_wall, 1),
+        "ceiling_sqft": round(dropped_ceil, 1)}
+    return analysis
+
+
 def _dedup_cross_sheet_stairs(analysis):
     """Flag-gated (NIGHTSHIFT_STAIR_CROSS_SHEET_DEDUP, default off): a
     dedicated stairwell plans/sections sheet describes the SAME physical
@@ -19913,6 +20036,11 @@ def build_priced_takeoff(analysis, strict=None):
     # among the room gates so everything downstream sees the deduped room
     # set. Flag-gated; no-op when off.
     analysis = _dedup_template_instances(analysis)
+
+    # Same-floor room dedup: one physical room extracted from multiple
+    # sheets must not stack scope. Runs FIRST among the room-mutating
+    # gates so every downstream count sees deduped rooms. Flag-gated.
+    analysis = _dedup_same_floor_rooms(analysis)
 
     # Door typical transfer: unit instances inherit their typical's door
     # counts BEFORE source/density reconciles run. Flag-gated; no-op off.
