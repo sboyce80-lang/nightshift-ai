@@ -4110,6 +4110,29 @@ def _call_sheet_api(client, content_blocks, output_kwargs, label,
     return None
 
 
+def _sheet_read_is_degenerate(sheet_analysis):
+    """True when a plan-sheet read returned rooms but NONE carry any
+    dimension — the signature of a mid-run schema-fallback mangling
+    (Honey 103pp, 2026-08-24: a slim-retry draw produced 10 dimension-
+    less rooms / 0 SF walls across 9 sheets, then CHECKPOINTED the empty
+    reads so every replay inherited them). A read with zero rooms and an
+    explanation is legitimate (site/refrigeration/tank sheets) and stays
+    cacheable; only rooms-without-dims marks the read bad."""
+    if not isinstance(sheet_analysis, dict):
+        return False
+    rooms = [rm for fl in (sheet_analysis.get("floors") or [])
+             for rm in (fl.get("rooms") or []) if isinstance(rm, dict)]
+    if not rooms:
+        return False
+    for rm in rooms:
+        dims = rm.get("dimensions") or {}
+        if any(_num(dims.get(k, 0)) > 0 for k in (
+                "wall_area_sqft", "floor_area_sqft", "ceiling_area_sqft",
+                "perimeter_lf", "length_ft", "width_ft")):
+            return False
+    return True
+
+
 def _extract_single_sheet(client, pdf_path, page_idx0, sheet_id,
                           static_prompt, sheet_context):
     """ONE extraction call for ONE plan sheet. Returns the parsed analysis
@@ -4795,6 +4818,27 @@ def _analyze_pdf_per_sheet(client, pdf_path, scope_notes="",
             print(f"      📄 Sheet {sheet_id} (p{page_no}): extracting...")
             sheet_analysis = _extract_single_sheet(
                 client, pdf_path, pg, sheet_id, static_prompt, sheet_context)
+            if sheet_analysis is not None \
+                    and _sheet_read_is_degenerate(sheet_analysis):
+                # Rooms with no dimensions at all: retry the read once —
+                # the usual cause is a schema-ladder downgrade mangling
+                # this specific call, and the next call often lands.
+                print(f"         ⚠️  degenerate read (rooms without "
+                      f"dims) — retrying sheet {sheet_id} once")
+                retry = _extract_single_sheet(
+                    client, pdf_path, pg, sheet_id, static_prompt,
+                    sheet_context)
+                if retry is not None \
+                        and not _sheet_read_is_degenerate(retry):
+                    sheet_analysis = retry
+                else:
+                    # Still degenerate: treat as FAILED (feeds the
+                    # end-of-run retry) and never checkpoint — a cached
+                    # empty read poisons every replay.
+                    failed_pages.append(pg)
+                    _ledger_mark(pdf_path, [pg], "failed",
+                                 f"degenerate read x2 (sheet {sheet_id})")
+                    continue
             if sheet_analysis is None:
                 failed_pages.append(pg)
                 _ledger_mark(pdf_path, [pg], "failed",
@@ -4843,6 +4887,12 @@ def _analyze_pdf_per_sheet(client, pdf_path, scope_notes="",
             sheet_analysis = _extract_single_sheet(
                 client, pdf_path, pg, sheet_id, static_prompt, sheet_context)
             if sheet_analysis is None:
+                return False
+            if _sheet_read_is_degenerate(sheet_analysis):
+                # End-of-run retry also degenerate: report failure so the
+                # coverage hole stays visible; never cache the empty read.
+                print(f"         ⚠️  retry still degenerate (rooms "
+                      f"without dims) — leaving sheet as failed")
                 return False
             anchored, n_rooms = _stamp_sheet_provenance(
                 sheet_analysis, sheet_id, page_no, parsed)
