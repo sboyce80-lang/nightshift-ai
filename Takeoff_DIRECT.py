@@ -15874,6 +15874,100 @@ _STAIR_SHEET_FLOOR_RX = re.compile(
     r"stair\s*(?:&|and)\s*section", re.IGNORECASE)
 
 
+_TYPICAL_FLOOR_RX = re.compile(r"\btypical\b|\benlarged\s+unit\b",
+                               re.IGNORECASE)
+
+
+def _transfer_typical_doors(analysis):
+    """Flag-gated (NIGHTSHIFT_DOOR_TYPICAL_TRANSFER, default off): unit
+    INSTANCES inherit door counts from their unit TYPICAL when the
+    instance carries none. Homewood 2026-08-24: A4.x typicals carry 1-9
+    doors per suite type but the guest-floor instances carry zero, so
+    doors totaled 116 vs JW's 393 (~109 units x 2.5-3 + commons). Same
+    identity machinery as the WC typical match (_typical_signature).
+    Density reconcile (G1) runs downstream and still caps overshoot."""
+    if not isinstance(analysis, dict):
+        return analysis
+    if os.environ.get("NIGHTSHIFT_DOOR_TYPICAL_TRANSFER", "0").strip() \
+            not in ("1", "true", "True"):
+        return analysis
+    if analysis.get("_door_typical_transfer"):
+        return analysis
+    floors = analysis.get("floors") or []
+    # Per-typical door totals: sum doors across each typical pseudo-floor
+    # (living + bath rooms of one unit), keyed by unit-type signature
+    # (bath flag dropped — the unit owns all its doors). Duplicate
+    # typicals of one signature keep the MAX (ADA variants of the same
+    # type re-draw the same unit).
+    typ_doors = {}
+    for fl in floors:
+        if not _TYPICAL_FLOOR_RX.search(str(fl.get("floor_name") or "")):
+            continue
+        per_sig = {}
+        for rm in (fl.get("rooms") or []):
+            sig = _typical_signature(str(rm.get("room_name") or "")) \
+                or _typical_signature(str(fl.get("floor_name") or ""))
+            if not sig:
+                continue
+            key = (sig[0], sig[1], sig[2])
+            el = rm.get("elements") or {}
+            fp = _num(el.get("doors_full_paint", 0))
+            hm = _num(el.get("doors_hm_panel", 0))
+            cur = per_sig.setdefault(key, [0.0, 0.0])
+            cur[0] += fp
+            cur[1] += hm
+        for key, (fp, hm) in per_sig.items():
+            prev = typ_doors.get(key)
+            if prev is None or (fp + hm) > (prev[0] + prev[1]):
+                typ_doors[key] = (fp, hm)
+    if not typ_doors:
+        analysis["_door_typical_transfer"] = {"noop": "no_typicals"}
+        return analysis
+    filled = 0
+    added_fp = added_hm = 0.0
+    for fl in floors:
+        if _TYPICAL_FLOOR_RX.search(str(fl.get("floor_name") or "")):
+            continue
+        for rm in (fl.get("rooms") or []):
+            sig = _typical_signature(str(rm.get("room_name") or ""))
+            if not sig or sig[3]:
+                continue  # bath instances belong to their unit's living rm
+            key = (sig[0], sig[1], sig[2])
+            src = typ_doors.get(key) or typ_doors.get((sig[0], sig[1], ""))
+            if not src:
+                continue
+            el = rm.setdefault("elements", {})
+            if _num(el.get("doors_full_paint", 0)) > 0 \
+                    or _num(el.get("doors_hm_panel", 0)) > 0:
+                continue  # instance already carries its own count
+            mult = _num(rm.get("quantity") or 1) or 1
+            el["doors_full_paint"] = src[0]
+            el["doors_hm_panel"] = src[1]
+            filled += 1
+            added_fp += src[0] * mult
+            added_hm += src[1] * mult
+    if not filled:
+        analysis["_door_typical_transfer"] = {"noop": "no_bare_instances"}
+        return analysis
+    agg = analysis.setdefault("aggregated_totals", {})
+    agg["total_doors_full_paint"] = _num(
+        agg.get("total_doors_full_paint", 0)) + added_fp
+    agg["total_doors_hm_panel"] = _num(
+        agg.get("total_doors_hm_panel", 0)) + added_hm
+    analysis.setdefault("notes", []).append(
+        f"[Door Typical Transfer] {filled} unit instance(s) inherited "
+        f"door counts from their unit typical (+{added_fp:.0f} full-paint, "
+        f"+{added_hm:.0f} HM). Instances carried no door counts; the "
+        f"typicals define the unit's doors.")
+    print(f"   🚪 Door typical transfer: {filled} instance(s), "
+          f"+{added_fp:.0f} fp / +{added_hm:.0f} hm", flush=True)
+    analysis["_door_typical_transfer"] = {
+        "filled_instances": filled, "added_fp": added_fp,
+        "added_hm": added_hm,
+        "typicals": {" ".join(k).strip(): v for k, v in typ_doors.items()}}
+    return analysis
+
+
 def _dedup_cross_sheet_stairs(analysis):
     """Flag-gated (NIGHTSHIFT_STAIR_CROSS_SHEET_DEDUP, default off): a
     dedicated stairwell plans/sections sheet describes the SAME physical
@@ -19442,6 +19536,10 @@ def build_priced_takeoff(analysis, strict=None):
     # among the room gates so everything downstream sees the deduped room
     # set. Flag-gated; no-op when off.
     analysis = _dedup_template_instances(analysis)
+
+    # Door typical transfer: unit instances inherit their typical's door
+    # counts BEFORE source/density reconciles run. Flag-gated; no-op off.
+    analysis = _transfer_typical_doors(analysis)
 
     # Door source reconcile: door counts from a detail/schedule sheet and
     # a floor plan must not stack. Flag-gated; no-op when off.
