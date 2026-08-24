@@ -15045,6 +15045,69 @@ def _match_schedule_row(room, by_num, by_name):
     return by_name.get(nm)
 
 
+# ── Unit-typical type-token matching (Homewood WC transfer) ────────────────
+# A hotel/multifamily finish schedule keys rows by unit TYPICAL ("Living/
+# Sleeping - King Connector Suite, 211/217 (typical)") while extraction
+# names instances descriptively ("King Connector Suite (Third Floor)") —
+# number- and exact-name matching both miss, so no instance ever receives
+# the schedule's WC designation and the mixed-share promotion (R3) never
+# fires. Homewood 2026-08-24: WC stuck at 77.6k SF of ~50%-of-wall guesses
+# vs JW's 136.6k. Type-token matching: same bed type + same suite kind
+# (+ same variant letter when both carry one) + same room part
+# (bathroom rows only match bathroom rooms).
+
+_TYPICAL_BED_RX = re.compile(r"\b(king|queen|double|dbl)\b", re.IGNORECASE)
+_TYPICAL_KIND_RX = re.compile(
+    r"\b(studio|connector|one\s*b(?:e)?dr(?:oom)?|1\s*b(?:e)?dr(?:oom)?|"
+    r"two\s*bedroom|2\s*bedroom|suite)\b", re.IGNORECASE)
+_TYPICAL_VARIANT_RX = re.compile(
+    r"(?:\b|-)([a-e])(?:\b|-|$)(?!\w)", re.IGNORECASE)
+
+
+def _typical_signature(name):
+    """(bed, kind, variant, is_bath) tokens for a typical/instance name,
+    or None when the name carries no unit-type identity."""
+    low = " " + re.sub(r"[^a-z0-9]+", " ", str(name or "").lower()) + " "
+    bed = _TYPICAL_BED_RX.search(low)
+    kind = _TYPICAL_KIND_RX.search(low)
+    if not bed or not kind:
+        return None
+    kind_tok = re.sub(r"\s+", "", kind.group(1).lower())
+    kind_tok = {"1bdr": "onebdr", "1bedroom": "onebdr",
+                "onebdr": "onebdr", "onebedroom": "onebdr",
+                "2bedroom": "twobedroom"}.get(kind_tok, kind_tok)
+    # variant letter: only trust a standalone A-E adjacent to the kind
+    # token region (King Studio B / Studio-A-FF), never inside words
+    tail = low[kind.end():kind.end() + 8]
+    var = _TYPICAL_VARIANT_RX.match(tail.strip()[:3] or "")
+    is_bath = "bath" in low
+    return (bed.group(1).lower().replace("dbl", "double"), kind_tok,
+            var.group(1).lower() if var else "", is_bath)
+
+
+def _match_typical_row(room, wc_rows):
+    """Fallback matcher: room instance -> WC-designated typical row by
+    unit-type signature. Rows and rooms must agree on bed type, suite
+    kind, and room part; a variant letter must agree when BOTH sides
+    carry one (a row without a letter matches any variant)."""
+    sig = _typical_signature(str(room.get("room_name", "")))
+    if not sig:
+        return None
+    best = None
+    for row in wc_rows:
+        rsig = _typical_signature(str(row.get("room_name", "")))
+        if not rsig:
+            continue
+        if rsig[0] != sig[0] or rsig[1] != sig[1] or rsig[3] != sig[3]:
+            continue
+        if rsig[2] and sig[2] and rsig[2] != sig[2]:
+            continue
+        if rsig[2] == sig[2]:
+            return row  # exact variant agreement wins immediately
+        best = best or row
+    return best
+
+
 def _vme_primary_enabled():
     # Default OFF pending validation: when the deterministic vector
     # measurement engine measures a job's walls with full reliability (every
@@ -15809,6 +15872,100 @@ def _enforce_exterior_evidence(analysis):
 _STAIR_SHEET_FLOOR_RX = re.compile(
     r"stair(?:well)?s?\s*(?:plans?|sections?|enclosure\s+plans?)|"
     r"stair\s*(?:&|and)\s*section", re.IGNORECASE)
+
+
+_TYPICAL_FLOOR_RX = re.compile(r"\btypical\b|\benlarged\s+unit\b",
+                               re.IGNORECASE)
+
+
+def _transfer_typical_doors(analysis):
+    """Flag-gated (NIGHTSHIFT_DOOR_TYPICAL_TRANSFER, default off): unit
+    INSTANCES inherit door counts from their unit TYPICAL when the
+    instance carries none. Homewood 2026-08-24: A4.x typicals carry 1-9
+    doors per suite type but the guest-floor instances carry zero, so
+    doors totaled 116 vs JW's 393 (~109 units x 2.5-3 + commons). Same
+    identity machinery as the WC typical match (_typical_signature).
+    Density reconcile (G1) runs downstream and still caps overshoot."""
+    if not isinstance(analysis, dict):
+        return analysis
+    if os.environ.get("NIGHTSHIFT_DOOR_TYPICAL_TRANSFER", "0").strip() \
+            not in ("1", "true", "True"):
+        return analysis
+    if analysis.get("_door_typical_transfer"):
+        return analysis
+    floors = analysis.get("floors") or []
+    # Per-typical door totals: sum doors across each typical pseudo-floor
+    # (living + bath rooms of one unit), keyed by unit-type signature
+    # (bath flag dropped — the unit owns all its doors). Duplicate
+    # typicals of one signature keep the MAX (ADA variants of the same
+    # type re-draw the same unit).
+    typ_doors = {}
+    for fl in floors:
+        if not _TYPICAL_FLOOR_RX.search(str(fl.get("floor_name") or "")):
+            continue
+        per_sig = {}
+        for rm in (fl.get("rooms") or []):
+            sig = _typical_signature(str(rm.get("room_name") or "")) \
+                or _typical_signature(str(fl.get("floor_name") or ""))
+            if not sig:
+                continue
+            key = (sig[0], sig[1], sig[2])
+            el = rm.get("elements") or {}
+            fp = _num(el.get("doors_full_paint", 0))
+            hm = _num(el.get("doors_hm_panel", 0))
+            cur = per_sig.setdefault(key, [0.0, 0.0])
+            cur[0] += fp
+            cur[1] += hm
+        for key, (fp, hm) in per_sig.items():
+            prev = typ_doors.get(key)
+            if prev is None or (fp + hm) > (prev[0] + prev[1]):
+                typ_doors[key] = (fp, hm)
+    if not typ_doors:
+        analysis["_door_typical_transfer"] = {"noop": "no_typicals"}
+        return analysis
+    filled = 0
+    added_fp = added_hm = 0.0
+    for fl in floors:
+        if _TYPICAL_FLOOR_RX.search(str(fl.get("floor_name") or "")):
+            continue
+        for rm in (fl.get("rooms") or []):
+            sig = _typical_signature(str(rm.get("room_name") or ""))
+            if not sig or sig[3]:
+                continue  # bath instances belong to their unit's living rm
+            key = (sig[0], sig[1], sig[2])
+            src = typ_doors.get(key) or typ_doors.get((sig[0], sig[1], ""))
+            if not src:
+                continue
+            el = rm.setdefault("elements", {})
+            if _num(el.get("doors_full_paint", 0)) > 0 \
+                    or _num(el.get("doors_hm_panel", 0)) > 0:
+                continue  # instance already carries its own count
+            mult = _num(rm.get("quantity") or 1) or 1
+            el["doors_full_paint"] = src[0]
+            el["doors_hm_panel"] = src[1]
+            filled += 1
+            added_fp += src[0] * mult
+            added_hm += src[1] * mult
+    if not filled:
+        analysis["_door_typical_transfer"] = {"noop": "no_bare_instances"}
+        return analysis
+    agg = analysis.setdefault("aggregated_totals", {})
+    agg["total_doors_full_paint"] = _num(
+        agg.get("total_doors_full_paint", 0)) + added_fp
+    agg["total_doors_hm_panel"] = _num(
+        agg.get("total_doors_hm_panel", 0)) + added_hm
+    analysis.setdefault("notes", []).append(
+        f"[Door Typical Transfer] {filled} unit instance(s) inherited "
+        f"door counts from their unit typical (+{added_fp:.0f} full-paint, "
+        f"+{added_hm:.0f} HM). Instances carried no door counts; the "
+        f"typicals define the unit's doors.")
+    print(f"   🚪 Door typical transfer: {filled} instance(s), "
+          f"+{added_fp:.0f} fp / +{added_hm:.0f} hm", flush=True)
+    analysis["_door_typical_transfer"] = {
+        "filled_instances": filled, "added_fp": added_fp,
+        "added_hm": added_hm,
+        "typicals": {" ".join(k).strip(): v for k, v in typ_doors.items()}}
+    return analysis
 
 
 def _dedup_cross_sheet_stairs(analysis):
@@ -17067,6 +17224,21 @@ def _enforce_wallcovering_schedule_gate(analysis):
             wc = _num(elems.get("wallcovering_sqft", 0)) or _num(
                 dims.get("wallcovering_sqft", 0))
             row = _match_schedule_row(room, by_num, by_name)
+            # NIGHTSHIFT_WC_TYPICAL_MATCH (default off): on WC-dominated
+            # typicals-keyed schedules, fall back to unit-type signature
+            # matching so instances inherit their typical row's WC
+            # designation — which arms the existing mixed-share /
+            # WC-only promotions that number-matching never reaches.
+            # Promotion-only: a type-matched row is used to RAISE WC per
+            # the schedule, never to zero it (can_zero already off in
+            # low-match mode).
+            if (row is None and wc_dominated
+                    and os.environ.get("NIGHTSHIFT_WC_TYPICAL_MATCH",
+                                       "0").strip()
+                    in ("1", "true", "True")):
+                trow = _match_typical_row(room, wc_rows)
+                if trow is not None:
+                    row = trow
             designated = row is not None and id(row) in wc_row_ids
             label = str(room.get("room_name", "")
                         or room.get("room_id", "")).strip() or "unnamed"
@@ -19364,6 +19536,10 @@ def build_priced_takeoff(analysis, strict=None):
     # among the room gates so everything downstream sees the deduped room
     # set. Flag-gated; no-op when off.
     analysis = _dedup_template_instances(analysis)
+
+    # Door typical transfer: unit instances inherit their typical's door
+    # counts BEFORE source/density reconciles run. Flag-gated; no-op off.
+    analysis = _transfer_typical_doors(analysis)
 
     # Door source reconcile: door counts from a detail/schedule sheet and
     # a floor plan must not stack. Flag-gated; no-op when off.
