@@ -9171,6 +9171,79 @@ def _apply_elevation_breakdown(ext_data):
     return ext_data
 
 
+_ELEV_CONSENSUS_NUM_KEYS = (
+    "exterior_paint_sqft", "hardie_siding_sqft", "cornice_lf",
+    "window_trim_lf", "soffit_sqft", "railing_lf", "azek_trim_lf",
+    "corner_board_lf", "steel_lintel_lf", "exterior_door_count",
+    "bollard_count", "pipe_handrail_lf")
+
+
+def _extract_exterior_scope_consensus(client, pdf_path):
+    """N-draw consensus wrapper for the exterior pass
+    (NIGHTSHIFT_ELEV_PASS_CONSENSUS, default 1 = single draw, legacy).
+
+    2026-08-25 overnight board: the single-draw pass is a lottery —
+    Fishkill drew a full exterior (+7.0% in band) then an EMPTY one
+    (−29.2%) at identical code; Dutchess oscillated ±$22k; Caris drew
+    empty. Draws are cheap (small filtered PDF). Rules: an empty draw
+    (all numeric fields 0/None) is discarded unless every draw is empty;
+    each numeric field takes the MEDIAN across surviving draws; the
+    text/rows fields (notes, paint_evidence, breakdown, siding classes)
+    come from the surviving draw whose siding+paint total is closest to
+    the median total, so evidence quotes stay consistent with the
+    quantities they justify."""
+    try:
+        n = int(os.environ.get("NIGHTSHIFT_ELEV_PASS_CONSENSUS", "1") or 1)
+    except (TypeError, ValueError):
+        n = 1
+    n = max(1, min(5, n))
+    if n == 1:
+        return _extract_exterior_scope(client, pdf_path)
+    draws = []
+    for i in range(n):
+        d = _extract_exterior_scope(client, pdf_path)
+        if isinstance(d, dict):
+            draws.append(d)
+    if not draws:
+        return None
+
+    def _total(d):
+        return sum(_num(d.get(k, 0)) for k in _ELEV_CONSENSUS_NUM_KEYS)
+
+    non_empty = [d for d in draws if _total(d) > 0]
+    pool = non_empty or draws
+    if len(pool) == 1:
+        base = dict(pool[0])
+        base["_elev_consensus"] = {"draws": len(draws),
+                                   "non_empty": len(non_empty),
+                                   "mode": "single_survivor"}
+        return base
+    import statistics as _st
+    medians = {k: round(_st.median(_num(d.get(k, 0)) for d in pool), 1)
+               for k in _ELEV_CONSENSUS_NUM_KEYS}
+    med_total = _st.median(_total(d) for d in pool)
+    rep = min(pool, key=lambda d: abs(_total(d) - med_total))
+    base = dict(rep)
+    base.update(medians)
+    # siding class shares scale with the median siding total so the
+    # V-groove split can't exceed the consensus quantity
+    cls = dict(base.get("siding_class_sqft") or {})
+    rep_siding = _num(rep.get("hardie_siding_sqft", 0))
+    if cls and rep_siding > 0 and medians["hardie_siding_sqft"] > 0:
+        scale = medians["hardie_siding_sqft"] / rep_siding
+        base["siding_class_sqft"] = {
+            k: round(v * scale, 1) for k, v in cls.items()}
+    base["_elev_consensus"] = {
+        "draws": len(draws), "non_empty": len(non_empty),
+        "per_draw_totals": [round(_total(d)) for d in draws],
+        "mode": "median"}
+    print(f"   🏛  Exterior consensus: {len(draws)} draw(s), "
+          f"{len(non_empty)} non-empty, totals "
+          f"{[round(_total(d)) for d in draws]} -> median applied",
+          flush=True)
+    return base
+
+
 def _extract_exterior_scope(client, pdf_path):
     """Extract exterior painting scope from elevation sheets only.
 
@@ -9512,7 +9585,7 @@ def _maybe_run_exterior_pass(client, pdf_path, analysis_result):
     if res_signal:
         print(f"      (residential trigger: {res_signal})")
     time.sleep(10)
-    ext_data = _extract_exterior_scope(client, pdf_path)
+    ext_data = _extract_exterior_scope_consensus(client, pdf_path)
     if ext_data:
         # G2 exterior-evidence gate (NIGHTSHIFT_EXTERIOR_EVIDENCE_GATE,
         # default off): painted-surface quantities require QUOTED text
