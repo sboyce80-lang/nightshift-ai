@@ -100,6 +100,25 @@ check(abs((13939 - rec["wall_sqft"]) - agg) < 0.6,
       f"aggregate mirror inconsistent: {agg} vs {rec}")
 os.environ.pop("NIGHTSHIFT_SAME_FLOOR_ROOM_DEDUP", None)
 
+
+print("— same-sheet guard (364 Main multifamily) —")
+os.environ["NIGHTSHIFT_SAME_FLOOR_ROOM_DEDUP"] = "1"
+multi = {"floors": [{"floor_name": "2nd Floor", "rooms": [
+    rm("Bedroom", 400, "A102"), rm("Bedroom", 410, "A102"),
+    rm("Bedroom", 390, "A102"), rm("Bedroom", 405, "A102"),
+    rm("Living Room", 500, "A102"), rm("Living Room", 505, "A102"),
+    rm("Bedroom", 400, "A502"),  # true cross-sheet re-read
+]}], "aggregated_totals": {"total_paintable_wall_sqft": 3010.0}}
+a = T._dedup_same_floor_rooms(multi)
+names = [r["room_name"] for r in a["floors"][0]["rooms"]]
+check(names.count("Bedroom") == 4,
+      f"real same-sheet bedrooms merged: {names}")
+check(names.count("Living Room") == 2,
+      f"real same-sheet living rooms merged: {names}")
+check(a["_same_floor_room_dedup"]["dropped"] == 1,
+      f"cross-sheet re-read not dropped: {a['_same_floor_room_dedup']}")
+os.environ.pop("NIGHTSHIFT_SAME_FLOOR_ROOM_DEDUP", None)
+
 print("=== PASS ===" if not fails else
       "=== ISSUES: " + "; ".join(fails) + " ===")
 raise SystemExit(1 if fails else 0)
