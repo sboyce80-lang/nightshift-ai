@@ -16407,6 +16407,42 @@ def _dedup_same_floor_rooms(analysis):
         for r in rooms:
             kind, key = _room_identity(r)
             groups.setdefault((kind, key), []).append(r)
+        # SAME-SHEET GUARD (364 Main, 2026-08-25): N same-named rooms on
+        # ONE sheet are N real rooms (a multifamily floor plan has many
+        # 'Bedroom's) — re-reads of one physical room come from DIFFERENT
+        # sheets. A group whose members all share a source sheet never
+        # merges; mixed groups merge only across sheets (one survivor
+        # per sheet stays when a sheet contributes several).
+        for gk in list(groups):
+            members = groups[gk]
+            if len(members) < 2:
+                continue
+            by_sheet = {}
+            for r in members:
+                by_sheet.setdefault(
+                    str(r.get("source_sheet") or ""), []).append(r)
+            if len(by_sheet) == 1:
+                # nothing cross-sheet: N real rooms, protected from the
+                # fold step via the un-foldable "keep" kind
+                groups.pop(gk)
+                for i, r in enumerate(members):
+                    groups[("keep", (gk, i))] = [r]
+                continue
+            # keep every room from the best (architectural, most rooms
+            # with dims) sheet; other sheets' same-identity rooms are
+            # the re-reads
+            def _sheet_rank(item):
+                sheet, rms = item
+                arch = 1 if re.match(r"A-?\d", sheet, re.IGNORECASE) else 0
+                detail = sum(_room_detail_score(r)[0] for r in rms)
+                return (arch, detail, len(rms))
+            best_sheet = max(by_sheet.items(), key=_sheet_rank)[0]
+            keepers = by_sheet[best_sheet]
+            dups_only = [r for s, rms in by_sheet.items()
+                         if s != best_sheet for r in rms]
+            groups[gk] = [keepers[0]] + dups_only
+            for i, extra in enumerate(keepers[1:]):
+                groups[("keep", (gk, i))] = [extra]
         # fold unnumbered token-subset rooms into their superset group:
         # a group's token signature is the union of its members' name
         # tokens; an unnumbered group folds when its tokens are a
@@ -16424,7 +16460,8 @@ def _dedup_same_floor_rooms(analysis):
         sig = {k: _group_tokens(v) for k, v in groups.items()}
         for nk in [k for k in list(groups) if k[0] == "name" and k[1]]:
             targets = [k for k in groups
-                       if k != nk and set(nk[1]) <= sig.get(k, set())]
+                       if k != nk and k[0] != "keep"
+                       and set(nk[1]) <= sig.get(k, set())]
             if len(targets) == 1 and nk in groups:
                 groups[targets[0]].extend(groups.pop(nk))
         for key, members in groups.items():
