@@ -28248,6 +28248,27 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                 analysis["manual_review_required"] = True
                 analysis["manual_review_reason"] = flag_msg
                 analysis.setdefault("notes", []).append(flag_msg)
+                # Cold-draw marker (2026-08-25 overnight board: Hudson
+                # drew 22.9k walls vs 38.9k the day before at identical
+                # code, −44% — then the cold draw was CHECKPOINTED and
+                # every replay inherited it). A machine-readable flag
+                # lets harness/requeue tooling retry once, and clearing
+                # this job's sheet checkpoints guarantees the retry gets
+                # FRESH draws instead of replaying the cold ones.
+                analysis["_cold_draw_suspect"] = {
+                    "paintable": round(_total_paintable, 1),
+                    "basis": round(_basis, 1), "ratio": round(ratio, 2)}
+                try:
+                    import shutil as _sh
+                    for _p in (pdf_paths or []):
+                        _ck = _sheet_checkpoint_dir(_p)
+                        if _ck and os.path.isdir(str(_ck)):
+                            _sh.rmtree(str(_ck), ignore_errors=True)
+                    print("   ♻️  Cold-draw suspect: sheet checkpoints "
+                          "cleared so a retry re-extracts fresh")
+                except Exception as _ck_err:
+                    print(f"   ⚠️  checkpoint clear failed (non-fatal): "
+                          f"{_ck_err}")
                 print(f"\n🚨 PRE-FINALIZE SANITY CHECK FAILED")
                 print(f"   Paintable: {_total_paintable:,.0f} sqft "
                       f"(walls {_wall:,.0f}, gyp ceil {_ceil_gyp:,.0f}, "
@@ -28256,6 +28277,35 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                       f"(ratio {ratio:.1f}×, expected 3-6×)")
                 print(f"   ⚠️  Flagged for manual review — proposal will print "
                       f"but should NOT be sent without reviewer sign-off.")
+
+    # Doors-zero cold-draw detector: a job with 10+ in-scope rooms and
+    # ZERO doors of any class is a cold draw, not a doorless building
+    # (Caris 2026-08-25: doors 0/75 twice in a row off replayed reads).
+    _cd_rooms = sum(1 for _f in analysis.get("floors", []) or []
+                    for _r in (_f.get("rooms") or [])
+                    if isinstance(_r, dict) and _r.get("in_scope", True))
+    _cd_agg = analysis.get("aggregated_totals", {}) or {}
+    _cd_doors = (_num(_cd_agg.get("total_doors_full_paint", 0))
+                 + _num(_cd_agg.get("total_doors_hm_panel", 0)))
+    if (_cd_rooms >= 10 and _cd_doors <= 0
+            and not analysis.get("_cold_draw_suspect")):
+        analysis["_cold_draw_suspect"] = {
+            "trigger": "doors_zero", "rooms": _cd_rooms}
+        analysis["manual_review_required"] = True
+        analysis.setdefault("notes", []).append(
+            f"[MANUAL REVIEW REQUIRED] {_cd_rooms} in-scope rooms with "
+            f"ZERO doors extracted — cold extraction draw suspected; "
+            f"checkpoints cleared for a fresh retry.")
+        try:
+            import shutil as _sh2
+            for _p in (pdf_paths or []):
+                _ck2 = _sheet_checkpoint_dir(_p)
+                if _ck2 and os.path.isdir(str(_ck2)):
+                    _sh2.rmtree(str(_ck2), ignore_errors=True)
+            print(f"   ♻️  Doors-zero cold draw ({_cd_rooms} rooms): "
+                  f"checkpoints cleared", flush=True)
+        except Exception:
+            pass
 
     # --- Provenance choke point (Phase 2.3): classify every priced quantity as
     # measured / schedule / derived / assumed from the adjustment ledger, store
