@@ -9567,6 +9567,14 @@ def _maybe_run_exterior_pass(client, pdf_path, analysis_result):
             and not any(kw in bt for kw in ("single-family", "single family",
                                             "sfr"))):
         is_commercial = True  # treat as elevation-pass-eligible
+    # Trigger hardening (2026-08-25): an EMPTY/unreadable building_type
+    # must not skip the pass under ALL_TYPES — classification is itself
+    # a per-draw read, and a skipped pass is a silent $20k+ hole. Only
+    # an explicit single-family classification opts out above.
+    if (not is_commercial and not bt.strip()
+            and os.environ.get("NIGHTSHIFT_ELEV_PASS_ALL_TYPES",
+                               "0").strip() in ("1", "true", "True")):
+        is_commercial = True
 
     res_signal = None
     if not is_commercial:
@@ -9596,34 +9604,16 @@ def _maybe_run_exterior_pass(client, pdf_path, analysis_result):
         # surface fields zero and a quantified RFI ships instead.
         # Structural counts (doors/bollards/railings) are physical
         # objects, not paint judgments — they pass through.
-        if (os.environ.get("NIGHTSHIFT_EXTERIOR_EVIDENCE_GATE",
-                           "0").strip() in ("1", "true", "True")):
-            ev = str(ext_data.get("paint_evidence") or "").strip()
-            has_paint_ev = (ev and ev.upper() != "NONE"
-                            and re.search(r"paint|coat|stain|finish",
-                                          ev, re.IGNORECASE))
-            painted_keys = ("exterior_paint_sqft", "hardie_siding_sqft",
-                            "cornice_lf", "window_trim_lf", "soffit_sqft",
-                            "azek_trim_lf", "corner_board_lf",
-                            "steel_lintel_lf")
-            zeroed_ext = {k: _num(ext_data.get(k, 0)) for k in painted_keys
-                          if _num(ext_data.get(k, 0)) > 0}
-            if zeroed_ext and not has_paint_ev:
-                for k in zeroed_ext:
-                    ext_data[k] = 0
-                qty_txt = ", ".join(f"{k}={v:,.0f}"
-                                    for k, v in zeroed_ext.items())
-                _gate_add_rfi(
-                    analysis_result, "Exterior Painting",
-                    f"Elevation measurement found paintable exterior "
-                    f"surfaces ({qty_txt}) but NO drawing text mandates "
-                    f"exterior painting (notes cover cleaning/repair "
-                    f"scope only) — $0 carried per the hard-numbers "
-                    f"policy. Confirm whether facade painting is in "
-                    f"scope and we will price the measured quantities.")
-                print(f"   🏛  Exterior evidence gate: zeroed "
-                      f"{len(zeroed_ext)} unpainted-evidence field(s) "
-                      f"({qty_txt}) — RFI shipped", flush=True)
+        # In-pass evidence tier RETIRED (2026-08-25): this job-level
+        # zero pre-empted the per-item pricing-tier gate — Caris's
+        # measured siding (2.5k SF, factory-finish note, paint_evidence
+        # NONE per the prompt's own instruction) was zeroed HERE before
+        # the per-item negative-veto → strikeable-allowance path could
+        # resolve it (−$24k vs JW's bid). _enforce_exterior_evidence
+        # runs on every analysis at pricing time under the SAME flag
+        # and strictly supersedes this check (per-item positive/negative
+        # evidence, finish-schedule text, allowance policy). Quantities
+        # pass through untouched here.
 
         # Merge non-zero numeric fields into the existing exterior dict
         # (preserve any prior values; only fill gaps).

@@ -73,14 +73,22 @@ class TestExteriorEvidenceGate(unittest.TestCase):
             td._maybe_run_exterior_pass(None, "/x/p.pdf", a)
         return a
 
-    def test_no_evidence_zeroes_and_rfis(self):
+    def test_no_evidence_passes_through_then_pricing_tier_zeroes(self):
+        # 2026-08-25: the in-pass zero is retired — quantities pass
+        # through so the per-item pricing-tier gate (same flag) can
+        # resolve them (negative veto -> allowance, positive keep, or
+        # zero+RFI). The end state for a no-evidence job is unchanged.
         a = self._run({"exterior_paint_sqft": 16000,
                        "cornice_lf": 200,
                        "paint_evidence": "NONE",
                        "notes": "power wash and tuck-point only"})
+        self.assertEqual(a["exterior"].get("exterior_paint_sqft", 0), 16000)
+        a = td._enforce_exterior_evidence(a)
         self.assertEqual(a["exterior"].get("exterior_paint_sqft", 0), 0)
-        self.assertTrue(any(r.get("category") == "Exterior Painting"
-                            for r in (a.get("_pre_pricing_rfis") or [])))
+        self.assertTrue(any("Exterior" in str(r.get("category"))
+                            for r in (a.get("_pre_pricing_rfis") or []))
+                        or any("Exterior Evidence" in str(n)
+                               for n in a.get("notes", [])))
 
     def test_quoted_paint_evidence_passes(self):
         a = self._run({"exterior_paint_sqft": 4762,
