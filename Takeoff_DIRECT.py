@@ -15257,9 +15257,24 @@ _WC_KNOWN_FINISH_TOKENS = {
 
 
 def _wc_unknown_token_safe_enabled():
-    return os.environ.get(
-        "NIGHTSHIFT_WC_UNKNOWN_TOKEN_SAFE", "0").strip() in (
-        "1", "true", "True")
+    return _wc_unknown_token_mode() in ("keep", "paint")
+
+
+def _wc_unknown_token_mode():
+    """NIGHTSHIFT_WC_UNKNOWN_TOKEN_SAFE modes: '0'/'' = off (legacy
+    zeroing); '1'/'keep' = keep extracted WC (round-1 behavior);
+    'paint' = reclassify the WC area to PAINTED WALLS + RFI. Caris
+    round-1 K=3 board: keeping 5,220 SF as $9/SF wallcovering install
+    overshot +19.9% — JW's own bid PAINTS those FF hallways at $0.80
+    (their takeoff has no WC line at all). Paint is the conservative
+    middle path: the walls are real, the treatment is the customer's
+    convention call, and paint is the cheaper reading pending the RFI."""
+    v = os.environ.get("NIGHTSHIFT_WC_UNKNOWN_TOKEN_SAFE", "0").strip()
+    if v in ("1", "true", "True", "keep"):
+        return "keep"
+    if v.lower() == "paint":
+        return "paint"
+    return "off"
 
 
 def _wall_finish_unknown_tokens(wall_finish):
@@ -17975,6 +17990,8 @@ def _enforce_wallcovering_schedule_gate(analysis):
     unmatched_kept_sqft = 0.0
     unknown_kept_rooms = []
     unknown_kept_sqft = 0.0
+    unknown_paint_rooms = []
+    unknown_paint_sqft = 0.0
     unquantified = []
     for floor in analysis.get("floors", []) or []:
         for room in floor.get("rooms", []) or []:
@@ -18090,14 +18107,43 @@ def _enforce_wallcovering_schedule_gate(analysis):
             # finish string carries tokens the lexicon doesn't know is
             # NOT positive non-WC evidence — the extraction pass read
             # the sheet's legend in context and assigned this WC; the
-            # parser's partial reading must not override it. Keep + RFI.
+            # parser's partial reading must not override it. 'keep'
+            # mode keeps the WC; 'paint' mode reclassifies the area to
+            # painted walls (the conservative middle path — the walls
+            # are real, the treatment is a customer-convention RFI).
             if row is not None and _wc_unknown_token_safe_enabled():
                 _unk = _wall_finish_unknown_tokens(row.get("wall_finish"))
                 if _unk:
-                    unknown_kept_rooms.append(
-                        (label, "/".join(sorted(_unk))))
-                    unknown_kept_sqft += (
-                        wc * _extract_multiplier_from_notes(room))
+                    _mult = _extract_multiplier_from_notes(room)
+                    if _wc_unknown_token_mode() == "paint":
+                        elems["wallcovering_sqft"] = 0
+                        if "wallcovering_sqft" in dims:
+                            dims["wallcovering_sqft"] = 0
+                        # Room wall_area normally already carries the
+                        # full wall (WC was a designation on top of it,
+                        # removed from the paint bill by the pricing
+                        # deduct / VME's internal deduct — both of which
+                        # no-op once WC is zeroed here). Only repair the
+                        # rooms whose extraction recorded LESS wall than
+                        # WC (Caris Office 468<540, Library 544<648).
+                        _wa = _num(dims.get("wall_area_sqft", 0))
+                        if _wa < wc:
+                            dims["wall_area_sqft"] = round(wc, 2)
+                        note = str(room.get("notes", ""))
+                        if "[WC unknown-token" not in note:
+                            room["notes"] = (
+                                note + f" [WC unknown-token reclass: "
+                                f"{wc:,.0f} SF priced as PAINTED WALL — "
+                                f"schedule finish token(s) "
+                                f"{'/'.join(sorted(_unk))} unrecognized; "
+                                f"confirm paint vs wallcovering]").strip()
+                        unknown_paint_rooms.append(
+                            (label, "/".join(sorted(_unk))))
+                        unknown_paint_sqft += wc * _mult
+                    else:
+                        unknown_kept_rooms.append(
+                            (label, "/".join(sorted(_unk))))
+                        unknown_kept_sqft += wc * _mult
                     continue
             mult = _extract_multiplier_from_notes(room)
             zeroed_rooms.append(label)
@@ -18165,6 +18211,38 @@ def _enforce_wallcovering_schedule_gate(analysis):
               f"in {len(unmatched_kept_rooms)} unmatched room(s) — "
               f"WC-dominated schedule, no positive non-WC designation",
               flush=True)
+    if unknown_paint_sqft > 0:
+        agg = analysis.setdefault("aggregated_totals", {})
+        agg["total_wallcovering_sqft"] = round(max(
+            0.0, _num(agg.get("total_wallcovering_sqft", 0))
+            - unknown_paint_sqft), 2)
+        # Painted-walls agg is deliberately NOT increased: the rooms'
+        # wall areas are already in it (the WC removal from the paint
+        # bill happens at pricing/VME deduct time, which no-ops now that
+        # WC is zero), and on VME-authoritative jobs the walls agg is
+        # replaced by geometry downstream regardless.
+        rooms_txt = ", ".join(
+            f"{name} [{tok}]" for name, tok in unknown_paint_rooms[:8])
+        analysis.setdefault("notes", []).append(
+            f"[Wallcovering] {len(unknown_paint_rooms)} room(s) matched "
+            f"schedule rows with UNRECOGNIZED finish token(s) — their "
+            f"{unknown_paint_sqft:,.0f} SF is PRICED AS PAINTED WALL "
+            f"(the conservative reading; {rooms_txt}"
+            f"{'…' if len(unknown_paint_rooms) > 8 else ''}). Confirm "
+            f"paint vs wallcovering per the finish legend.")
+        _gate_add_rfi(
+            analysis, "Wallcovering",
+            f"The finish schedule's wall-finish codes for "
+            f"{len(unknown_paint_rooms)} room(s) include token(s) our "
+            f"reader does not recognize ({rooms_txt}"
+            f"{'…' if len(unknown_paint_rooms) > 8 else ''}). Their "
+            f"{unknown_paint_sqft:,.0f} SF is priced as PAINTED WALL — "
+            f"if the legend designates wallcovering, the install line "
+            f"changes materially; confirm what the token stands for.")
+        print(f"   🧻 WC schedule gate: reclassified "
+              f"{unknown_paint_sqft:,.0f} SF to painted wall in "
+              f"{len(unknown_paint_rooms)} unknown-token room(s) "
+              f"(RFI added)", flush=True)
     if unknown_kept_sqft > 0:
         rooms_txt = ", ".join(
             f"{name} [{tok}]" for name, tok in unknown_kept_rooms[:8])
@@ -18215,6 +18293,8 @@ def _enforce_wallcovering_schedule_gate(analysis):
         "zeroed_sqft": round(zeroed_sqft, 2),
         "unknown_token_kept_rooms": unknown_kept_rooms[:20],
         "unknown_token_kept_sqft": round(unknown_kept_sqft, 2),
+        "unknown_token_paint_rooms": unknown_paint_rooms[:20],
+        "unknown_token_paint_sqft": round(unknown_paint_sqft, 2),
         "unquantified_rooms": [n for n, _ in unquantified][:20],
     }
     return analysis
