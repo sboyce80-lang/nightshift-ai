@@ -3838,6 +3838,12 @@ def _sheet_checkpoint_key(static_prompt, sheet_context, verify_enabled):
     h.update(b"|consensus=%d|%s" % (
         _effective_consensus_n(),
         _CONSENSUS_MERGE_CODE_VERSION.encode()))
+    # Job-level draw tag (draw-median consensus): each of the K job draws
+    # must extract fresh rather than replay a sibling draw's checkpoints,
+    # while a retry WITHIN a draw still resumes that draw's own work.
+    _draw_tag = os.environ.get("NIGHTSHIFT_JOB_DRAW_TAG", "").strip()
+    if _draw_tag:
+        h.update(b"|draw=%s" % _draw_tag.encode("utf-8", "replace"))
     return h.hexdigest()[:16]
 
 
@@ -26133,6 +26139,237 @@ def _merge_building_inventory(prior_inv, delta_inv):
 
 
 
+# ── Job-level draw-median consensus (variance program, 2026-08-25) ─────────
+# The 8/24-25 board proved the remaining error on most goldens is
+# extraction-DRAW variance, not mechanism: 7/9 jobs banded at least once at
+# an identical posture while single draws swung ±40%. Per-sheet consensus is
+# fill-only (never lowers a hot read) and count paths bypass it — a
+# job-level median is the only layer that can reject a hot draw.
+#
+# NIGHTSHIFT_JOB_DRAW_MEDIAN=K (default 0 = off) runs K complete,
+# independent extraction draws (each namespaced in the sheet-checkpoint key
+# via NIGHTSHIFT_JOB_DRAW_TAG) and keeps the draw whose composition —
+# walls / ceilings / doors / wallcovering / exterior / rooms / subtotal —
+# sits closest to the component-wise median in log space. Draws still
+# flagged _cold_draw_suspect after their own retry are excluded from the
+# vote when at least two clean draws remain. The selected draw's artifacts
+# are returned unchanged apart from an appended [Draw Median] note and the
+# machine-readable analysis["_job_draw_median"] report.
+
+_DRAW_MEDIAN_WEIGHTS = {
+    # Dollar-dominant components get extra weight; everything else 1.0.
+    "walls_sqft": 2.0, "subtotal": 2.0, "doors": 1.5,
+    "wallcovering_sqft": 1.5,
+}
+
+
+def _job_draw_median_k(pdf_paths, interactive=False):
+    """Effective K for job-level draw-median consensus. 1 = off.
+
+    Guards: recursion (a draw must never spawn draws), interactive
+    sessions, and — mirroring the per-sheet DD rule — an optional page cap
+    (NIGHTSHIFT_DRAW_MEDIAN_MAX_PAGES) so jumbo sets don't triple a
+    multi-hour heavy-lane run."""
+    if interactive or os.environ.get("NIGHTSHIFT_JOB_DRAW_ACTIVE"):
+        return 1
+    try:
+        k = int(os.environ.get("NIGHTSHIFT_JOB_DRAW_MEDIAN", "0") or 0)
+    except (TypeError, ValueError):
+        k = 0
+    k = max(0, min(5, k))
+    if k < 2:
+        return 1
+    try:
+        max_pages = int(os.environ.get(
+            "NIGHTSHIFT_DRAW_MEDIAN_MAX_PAGES", "0") or 0)
+    except (TypeError, ValueError):
+        max_pages = 0
+    if max_pages > 0:
+        total_pages = 0
+        for p in pdf_paths or []:
+            try:
+                with open(p, "rb") as fh:
+                    total_pages += len(PyPDF2.PdfReader(fh).pages)
+            except Exception:
+                continue
+        if total_pages >= max_pages:
+            print(f"   🎲 Draw-median: {total_pages} pages ≥ cap "
+                  f"{max_pages} — single draw")
+            return 1
+    return k
+
+
+def _draw_composition(result):
+    """Composition vector of one draw, for median distance scoring."""
+    analysis = (result or {}).get("analysis") or {}
+    agg = analysis.get("aggregated_totals") or {}
+    ext = analysis.get("exterior") or {}
+    cost = (result or {}).get("cost_estimate") or {}
+    return {
+        "walls_sqft": _num(agg.get("total_paintable_wall_sqft"))
+        + _num(agg.get("total_cmu_wall_sqft")),
+        "ceilings_sqft": _num(agg.get("total_paintable_ceiling_sqft"))
+        + _num(agg.get("total_dryfall_ceiling_sqft")),
+        "doors": _num(agg.get("total_doors_full_paint"))
+        + _num(agg.get("total_doors_hm_panel"))
+        + _num(agg.get("total_doors_frame_only")),
+        "wallcovering_sqft": _num(agg.get("total_wallcovering_sqft")),
+        "base_trim_lf": _num(agg.get("total_base_trim_lf")),
+        "exterior_sqft": _num(ext.get("exterior_paint_sqft"))
+        + _num(ext.get("hardie_siding_sqft")),
+        "rooms": float(sum(len(f.get("rooms") or [])
+                           for f in (analysis.get("floors") or [])
+                           if isinstance(f, dict))),
+        "subtotal": _num(cost.get("subtotal")),
+    }
+
+
+def _draw_median_select(comps):
+    """Index of the composition closest to the component-wise median.
+
+    Distance is weighted |log| ratio to the median per component (+1
+    smoothing so a zero read against a real median is a large, finite
+    penalty). Components whose median is 0 carry no signal and are
+    skipped. Returns (index, report)."""
+    import statistics
+    keys = sorted({k for c in comps for k in c})
+    medians = {k: statistics.median(
+        [max(0.0, float(c.get(k) or 0.0)) for c in comps]) for k in keys}
+    scores = []
+    for c in comps:
+        s = 0.0
+        for k in keys:
+            med = medians[k]
+            if med <= 0:
+                continue
+            v = max(0.0, float(c.get(k) or 0.0))
+            s += _DRAW_MEDIAN_WEIGHTS.get(k, 1.0) * abs(
+                math.log((v + 1.0) / (med + 1.0)))
+        scores.append(round(s, 4))
+    best = min(range(len(comps)), key=lambda i: scores[i])
+    return best, {"medians": {k: round(v, 1) for k, v in medians.items()},
+                  "scores": scores}
+
+
+def _run_job_draw_median(k, pdf_paths, run_kwargs):
+    """Run K independent draws of run_analysis and return the median one."""
+    print("\n" + "=" * 80)
+    print(f"🎲 JOB DRAW-MEDIAN CONSENSUS: {k} independent extraction draws")
+    print("=" * 80)
+    draws = []
+    prev_tag = os.environ.get("NIGHTSHIFT_JOB_DRAW_TAG")
+    os.environ["NIGHTSHIFT_JOB_DRAW_ACTIVE"] = "1"
+    try:
+        for d in range(1, k + 1):
+            os.environ["NIGHTSHIFT_JOB_DRAW_TAG"] = f"d{d}"
+            print(f"\n🎲 ── Draw {d}/{k} ──")
+            res = run_analysis(pdf_paths, **run_kwargs)
+            suspect = (res.get("analysis") or {}).get("_cold_draw_suspect")
+            if suspect:
+                # The pipeline already cleared this job's checkpoints when
+                # it flagged the draw — one fresh retry per draw, keep the
+                # second result either way (same contract as the harness).
+                print(f"   ♻️  Draw {d} cold-draw suspect {suspect} — "
+                      f"one fresh retry")
+                res = run_analysis(pdf_paths, **run_kwargs)
+                (res.get("analysis") or {}).setdefault(
+                    "_cold_draw_first_attempt", suspect)
+            draws.append(res)
+    finally:
+        os.environ.pop("NIGHTSHIFT_JOB_DRAW_ACTIVE", None)
+        if prev_tag is None:
+            os.environ.pop("NIGHTSHIFT_JOB_DRAW_TAG", None)
+        else:
+            os.environ["NIGHTSHIFT_JOB_DRAW_TAG"] = prev_tag
+
+    comps = [_draw_composition(r) for r in draws]
+    clean = [i for i, r in enumerate(draws)
+             if not (r.get("analysis") or {}).get("_cold_draw_suspect")]
+    vote = clean if len(clean) >= 2 else list(range(len(draws)))
+    sel_in_vote, rep = _draw_median_select([comps[i] for i in vote])
+    sel = vote[sel_in_vote]
+    excluded = [i + 1 for i in range(len(draws)) if i not in vote]
+
+    chosen = draws[sel]
+    analysis = chosen.get("analysis") or {}
+    subs = [c.get("subtotal") or 0.0 for c in comps]
+    report = {
+        "k": k, "selected_draw": sel + 1,
+        "vote_draws": [i + 1 for i in vote],
+        "excluded_cold_draws": excluded,
+        "compositions": comps,
+        "medians": rep["medians"],
+        "distance_scores": rep["scores"],
+    }
+    # Subtotal spread across voting draws: the reviewer-facing variance
+    # signal. A wide spread means the median PICKED a plausible draw but
+    # the job itself is unstable — hold it for review even when the
+    # blanket mandatory-review flag is off.
+    vote_subs = [subs[i] for i in vote if subs[i] > 0]
+    spread_pct = None
+    if len(vote_subs) >= 2 and min(vote_subs) > 0:
+        spread_pct = (max(vote_subs) - min(vote_subs)) / (
+            sum(vote_subs) / len(vote_subs)) * 100
+        report["subtotal_spread_pct"] = round(spread_pct, 1)
+    try:
+        spread_limit = float(os.environ.get(
+            "NIGHTSHIFT_DRAW_SPREAD_REVIEW_PCT", "40") or 40)
+    except (TypeError, ValueError):
+        spread_limit = 40.0
+    analysis["_job_draw_median"] = report
+    note = (f"[Draw Median] {k} independent extraction draws; draw "
+            f"{sel + 1} selected as composition median. Subtotals: "
+            + ", ".join(f"${s:,.0f}" for s in subs)
+            + (f"; draw(s) {excluded} excluded as cold-draw suspects"
+               if excluded else "") + ".")
+    analysis.setdefault("notes", []).append(note)
+    if spread_pct is not None and spread_pct > spread_limit:
+        spread_msg = (
+            f"[MANUAL REVIEW REQUIRED] Draw-median subtotal spread is "
+            f"{spread_pct:.0f}% across {len(vote_subs)} plausible draws "
+            f"(limit {spread_limit:.0f}%) — the extraction is unstable on "
+            f"this set; a reviewer should confirm the selected takeoff.")
+        analysis["manual_review_required"] = True
+        if not analysis.get("manual_review_reason"):
+            analysis["manual_review_reason"] = spread_msg
+        analysis.setdefault("notes", []).append(spread_msg)
+
+    print("\n" + "=" * 80)
+    print(f"🎲 DRAW-MEDIAN RESULT: draw {sel + 1}/{k} selected")
+    for i, c in enumerate(comps):
+        marks = ("← SELECTED" if i == sel else
+                 ("excluded (cold)" if (i + 1) in excluded else ""))
+        print(f"   draw {i + 1}: walls {c['walls_sqft']:>9,.0f}  "
+              f"doors {c['doors']:>4,.0f}  wc {c['wallcovering_sqft']:>8,.0f}  "
+              f"subtotal ${c['subtotal']:>11,.2f}  "
+              f"dist {rep['scores'][vote.index(i)] if i in vote else '—'}"
+              f"  {marks}")
+    if spread_pct is not None:
+        print(f"   subtotal spread: {spread_pct:.1f}%"
+              + (" — over limit, held for review"
+                 if spread_pct > spread_limit else ""))
+    print("=" * 80)
+
+    # Persist the report into the selected draw's saved JSON so the
+    # delivered artifact carries it (the PDF was rendered pre-selection;
+    # the internal report reads the JSON).
+    jp = chosen.get("output_json_path")
+    if jp and os.path.exists(jp):
+        try:
+            with open(jp) as f:
+                data = json.load(f)
+            data["analysis"] = analysis
+            data["manual_review_required"] = bool(
+                analysis.get("manual_review_required"))
+            data["manual_review_reason"] = analysis.get(
+                "manual_review_reason")
+            with open(jp, "w") as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            print(f"   ⚠️  Draw-median JSON rewrite failed (non-fatal): {e}")
+    return chosen
+
+
 def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                   corrections_path=None, use_cache=False, multi_pass=False,
                   image_fallback=True, schedule_estimation=True,
@@ -26164,6 +26401,21 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     """
     if not pdf_paths:
         raise ValueError("No PDF paths provided")
+
+    # Job-level draw-median consensus (NIGHTSHIFT_JOB_DRAW_MEDIAN=K):
+    # orchestrate K independent draws of this same function and return the
+    # composition-median one. The env guard inside _job_draw_median_k
+    # keeps the K child calls from recursing.
+    _k_draws = _job_draw_median_k(pdf_paths, interactive=interactive)
+    if _k_draws >= 2:
+        return _run_job_draw_median(_k_draws, pdf_paths, dict(
+            contact_name=contact_name, contact_email=contact_email,
+            scope_notes=scope_notes, corrections_path=corrections_path,
+            use_cache=use_cache, multi_pass=multi_pass,
+            image_fallback=image_fallback,
+            schedule_estimation=schedule_estimation,
+            rate_overrides=rate_overrides, interactive=False,
+            pre_skipped_files=pre_skipped_files))
 
     # --- Pre-flight checks ---
     # Verify PDF files exist and are readable
