@@ -59,13 +59,18 @@ NEW_FIX_FLAGS = {
 }
 
 JOBS = {
+    # Interior-only convention (Steven, 2026-08-25): Dutchess and 364
+    # score against bids that EXCLUDE exterior/window scope; Fishkill's
+    # bid includes it. Per-job, never class-wide.
     "dutchess_livestock": {"cls": "rider", "pdf": os.path.join(
         MAIN, "golden", "plans", "Dutchess_Livestock_Bidding_Documents.pdf"),
-        "bid": 21072.45},
+        "bid": 21072.45,
+        "extra_env": {"NIGHTSHIFT_INTERIOR_ONLY_CONVENTION": "1"}},
     "fishkill_397": {"cls": "rider", "pdf": os.path.join(
         MAIN, "spike_samples", "397Fishkill.pdf"), "bid": 129448.0},
     "364_main": {"cls": "rider", "pdf": os.path.join(
-        MAIN, "spike_samples", "364Main.pdf"), "bid": 162456.0},
+        MAIN, "spike_samples", "364Main.pdf"), "bid": 162456.0,
+        "extra_env": {"NIGHTSHIFT_INTERIOR_ONLY_CONVENTION": "1"}},
     "tsc_fusion_highland": {"cls": "rider", "pdf": os.path.join(
         MAIN, "golden", "plans", "TSC_Fusion_Highland_Rev2.pdf"),
         "bid": None},
@@ -108,6 +113,7 @@ def main():
     job_key = sys.argv[1]
     spec = JOBS[job_key]
     flags = build_flags(spec["cls"])
+    flags.update(spec.get("extra_env") or {})
     for k, v in flags.items():
         os.environ[k] = v
     out_dir = os.path.join(HERE, "results")

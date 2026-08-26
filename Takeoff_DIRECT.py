@@ -16147,6 +16147,68 @@ def _ext_positive_evidence_keys(present_keys, blobs):
     return out
 
 
+def _enforce_interior_only_convention(analysis):
+    """Flag-gated (NIGHTSHIFT_INTERIOR_ONLY_CONVENTION, default off):
+    the customer's bid convention is INTERIOR ONLY — exterior scope and
+    window trim/sash ops found on the drawings price at $0 and surface
+    as a strikeable-convention RFI instead (Steven, 2026-08-25: Dutchess
+    +100% and 364 Main +20% were almost entirely exterior/window scope
+    their Rider bids exclude; Fishkill's Rider bid INCLUDES exterior, so
+    this is per-customer convention, never a class default). Quantities
+    are stashed in the record so a reviewer can reinstate the scope.
+    Interior painted windows stay — they are interior scope. Idempotent
+    via _interior_only_convention."""
+    if not isinstance(analysis, dict):
+        return analysis
+    if os.environ.get("NIGHTSHIFT_INTERIOR_ONLY_CONVENTION", "0").strip() \
+            not in ("1", "true", "True"):
+        return analysis
+    if analysis.get("_interior_only_convention"):
+        return analysis
+    ext = analysis.get("exterior") or {}
+    ext_keys = ("exterior_paint_sqft", "hardie_siding_sqft", "cornice_lf",
+                "window_trim_lf", "soffit_sqft", "azek_trim_lf",
+                "corner_board_lf", "steel_lintel_lf", "railing_lf",
+                "stain_siding_sqft", "stain_trim_lf", "stain_railing_lf")
+    agg = analysis.get("aggregated_totals") or {}
+    win_keys = ("total_window_casings_painted",
+                "total_window_stools_painted",
+                "total_window_aprons_painted",
+                "total_window_wood_returns_painted",
+                "total_windows_field_paintable")
+    struck = {}
+    for k in ext_keys:
+        v = _num(ext.get(k, 0))
+        if v > 0:
+            struck[k] = v
+            ext[k] = 0
+    for k in win_keys:
+        v = _num(agg.get(k, 0))
+        if v > 0:
+            struck[f"agg.{k}"] = v
+            agg[k] = 0
+    analysis["_interior_only_convention"] = {
+        "applied": bool(struck), "struck_quantities": struck}
+    if struck:
+        qty_txt = "; ".join(
+            f"{k.replace('agg.', '')}={v:,.0f}" for k, v in struck.items())
+        analysis.setdefault("notes", []).append(
+            f"[Interior-Only Convention] Exterior/window-op scope found "
+            f"on the drawings is PRICED AT $0 per this customer's "
+            f"interior-only bid convention ({qty_txt}). Strikeable: "
+            f"reinstate any of these measured quantities if the bid "
+            f"scope includes them.")
+        _gate_add_rfi(
+            analysis, "Scope Convention",
+            f"The drawings show exterior/window-op scope "
+            f"({qty_txt}) that this bid EXCLUDES per the interior-only "
+            f"convention. Confirm the exclusion — these quantities are "
+            f"measured and can be reinstated as priced lines.")
+        print(f"   🚫 Interior-only convention: {len(struck)} exterior/"
+              f"window quantity(ies) struck to $0 (RFI added)")
+    return analysis
+
+
 def _enforce_exterior_evidence(analysis):
     """Flag-gated (NIGHTSHIFT_EXTERIOR_EVIDENCE_GATE, shared with the
     in-pass tier): pricing-time enforcement that works on replayed
@@ -20228,6 +20290,12 @@ def build_priced_takeoff(analysis, strict=None):
     # Hudson replay carried exterior_paint_sqft equal to the POWER WASH
     # area with no paint keynote anywhere). Flag-gated; no-op when off.
     analysis = _enforce_exterior_evidence(analysis)
+
+    # Interior-only bid convention (per-customer, Steven 2026-08-25):
+    # exterior/window-op scope prices $0 + strikeable RFI. Flag-gated;
+    # no-op when off. After the evidence gate so its record reflects
+    # what evidence-surviving scope the convention struck.
+    analysis = _enforce_interior_only_convention(analysis)
 
     # Final ceiling-scope reconciliation (ACT demote + commercial aggregate
     # rebuild) before any quantity is priced. Flag-gated; no-op when off.
