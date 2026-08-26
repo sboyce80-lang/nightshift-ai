@@ -16491,8 +16491,42 @@ def _dedup_same_floor_rooms(analysis):
                 by_sheet.setdefault(
                     str(r.get("source_sheet") or ""), []).append(r)
             if len(by_sheet) == 1:
-                # nothing cross-sheet: N real rooms, protected from the
-                # fold step via the un-foldable "keep" kind
+                if gk[0] == "num":
+                    # Consensus-merged reads of ONE sheet can emit naming
+                    # variants of the same numbered room on that sheet
+                    # (Honey A011: 'Office 101' + 'Office (101)', 2026-08-25)
+                    # — same floor + same number IS one room, so the guard
+                    # must not protect these. But a shared digit alone is
+                    # not identity ('Unit 101 Bedroom' / 'Unit 101 Bath'):
+                    # fold only token-compatible variants; token-disjoint
+                    # rooms sharing a number stay distinct.
+                    members.sort(key=_room_detail_score, reverse=True)
+
+                    def _sig_toks(rm):
+                        return set(
+                            t for t in re.sub(
+                                r"[^a-z0-9]+", " ",
+                                str(rm.get("room_name") or "").lower()
+                            ).split()
+                            if len(t) >= 3 and not t.isdigit()
+                            and t not in _DEDUP_GENERIC_TOKENS)
+                    keeper = members[0]
+                    kt = _sig_toks(keeper)
+                    foldable, rest = [keeper], []
+                    for rm in members[1:]:
+                        rt = _sig_toks(rm)
+                        if rt and kt and (rt <= kt or kt <= rt):
+                            foldable.append(rm)
+                        else:
+                            rest.append(rm)
+                    groups[gk] = foldable
+                    for i, rm in enumerate(rest):
+                        groups[("keep", (gk, i))] = [rm]
+                    continue
+                # name-keyed: nothing cross-sheet means N real rooms
+                # (a multifamily floor plan has many 'Bedroom's) —
+                # protected from the fold step via the un-foldable
+                # "keep" kind
                 groups.pop(gk)
                 for i, r in enumerate(members):
                     groups[("keep", (gk, i))] = [r]
