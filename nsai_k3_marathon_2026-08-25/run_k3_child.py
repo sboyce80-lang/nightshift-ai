@@ -123,6 +123,9 @@ def build_flags(cls):
     # Round 2: unknown-token rooms price as painted walls (Caris was
     # +19.9% at 'keep' — JW's own bid paints the FF hallways)
     flags["NIGHTSHIFT_WC_UNKNOWN_TOKEN_SAFE"] = "paint"
+    # Round 2: unit-typical coverage pinned to the declared unit count
+    # (Hudson 47 covered vs 34 keys — structural draw variance)
+    flags["NIGHTSHIFT_UNIT_MIX_PIN"] = "1"
     flags["NIGHTSHIFT_MANDATORY_REVIEW"] = "1"
     return flags
 

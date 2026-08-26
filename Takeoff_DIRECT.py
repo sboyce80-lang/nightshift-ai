@@ -17047,6 +17047,27 @@ def _unit_core_tokens(text):
             if x not in _UNIT_STOP_TOKENS and not x.isdigit()}
 
 
+# Room-quantity → aggregate-key mapping shared by the room-structure
+# gates (template-instance dedup, unit-mix pin): each entry is
+# (aggregate key, room field, source bag) where source is the room's
+# dimensions ('dims') or elements ('el').
+_ROOM_AGG_KEYMAP = (
+    ("total_paintable_wall_sqft", "wall_area_sqft", "dims"),
+    ("total_paintable_ceiling_sqft", "ceiling_area_sqft", "dims"),
+    ("total_wallcovering_sqft", "wallcovering_sqft", "el"),
+    ("total_base_trim_lf", "base_trim_lf", "el"),
+    ("total_doors_full_paint", "doors_full_paint", "el"),
+    ("total_doors_hm_panel", "doors_hm_panel", "el"),
+    ("total_doors_frame_only", "doors_frame_only", "el"),
+    ("total_windows_painted_interior", "windows_painted_interior", "el"),
+    ("total_level_5_finish_sqft", "level_5_finish_sqft", "el"),
+    ("total_concrete_floor_sqft", "concrete_floor_sqft", "el"),
+    ("total_soffit_sqft", "soffit_sqft", "el"),
+    ("total_stained_wood_sqft", "stained_wood_sqft", "el"),
+    ("total_painted_cabinet_sqft", "painted_cabinet_sqft", "el"),
+    ("total_painted_railing_lf", "painted_railing_lf", "el"))
+
+
 def _dedup_template_instances(analysis):
     """Flag-gated (NIGHTSHIFT_TEMPLATE_INSTANCE_DEDUP, default off): a
     multiplied unit TEMPLATE and the drawn per-floor INSTANCES of the same
@@ -17178,23 +17199,7 @@ def _dedup_template_instances(analysis):
         # schedule set authoritatively (independent of room duplication).
         stash = analysis.get("_schedule_authoritative_counts") or {}
         agg = analysis.setdefault("aggregated_totals", {})
-        KEYMAP = (("total_paintable_wall_sqft", "wall_area_sqft", "dims"),
-                  ("total_paintable_ceiling_sqft", "ceiling_area_sqft",
-                   "dims"),
-                  ("total_wallcovering_sqft", "wallcovering_sqft", "el"),
-                  ("total_base_trim_lf", "base_trim_lf", "el"),
-                  ("total_doors_full_paint", "doors_full_paint", "el"),
-                  ("total_doors_hm_panel", "doors_hm_panel", "el"),
-                  ("total_doors_frame_only", "doors_frame_only", "el"),
-                  ("total_windows_painted_interior",
-                   "windows_painted_interior", "el"),
-                  ("total_level_5_finish_sqft", "level_5_finish_sqft", "el"),
-                  ("total_concrete_floor_sqft", "concrete_floor_sqft", "el"),
-                  ("total_soffit_sqft", "soffit_sqft", "el"),
-                  ("total_stained_wood_sqft", "stained_wood_sqft", "el"),
-                  ("total_painted_cabinet_sqft", "painted_cabinet_sqft",
-                   "el"),
-                  ("total_painted_railing_lf", "painted_railing_lf", "el"))
+        KEYMAP = _ROOM_AGG_KEYMAP
         for agg_key, room_key, src in KEYMAP:
             if agg_key in stash:
                 continue
@@ -17345,6 +17350,95 @@ def _enforce_unit_mix_coverage(analysis):
 
     rec = {"total_units": total_units, "unit_types": by_type,
            "covered_instances": covered, "flagged": False}
+
+    # M2 PIN (sub-flag NIGHTSHIFT_UNIT_MIX_PIN, default off): when the
+    # unit-typical multipliers cover MORE units than the building has,
+    # the same units are being double-counted across typicals — Hudson
+    # K=3 round 1 (2026-08-26): 'Unit A' ×34 (the whole hotel's key
+    # count) priced alongside separately-drawn C/D/E/F/G units, ~47
+    # covered vs 34 keys, and each draw resolved the ambiguity
+    # differently (rooms 64/130/78, walls 89k/179k/40k — structure no
+    # median can reconcile). Σ(multipliers) must equal the declared unit
+    # count: the catch-all (largest-multiplier) typicals absorb the
+    # reduction, largest first, each type keeping ≥1. This removes
+    # double-count — it never invents scope — and every adjustment is
+    # subtracted from the aggregates via the shared room KEYMAP.
+    if (os.environ.get("NIGHTSHIFT_UNIT_MIX_PIN", "0").strip()
+            in ("1", "true", "True")
+            and total_units >= 2 and covered > total_units):
+        excess = int(round(covered - total_units))
+        reductions = {}
+        for ut, m in sorted(by_type.items(), key=lambda kv: -kv[1]):
+            if excess <= 0:
+                break
+            take = min(excess, int(m) - 1)
+            if take > 0:
+                reductions[ut] = take
+                excess -= take
+        if reductions and excess <= 0:
+            stash = analysis.get("_schedule_authoritative_counts") or {}
+            agg = analysis.setdefault("aggregated_totals", {})
+            adjusted = []
+            for fl in (analysis.get("floors") or []):
+                for r in (fl.get("rooms") or []):
+                    if not isinstance(r, dict) or r.get("in_scope") is False:
+                        continue
+                    ut = str(r.get("unit_type") or "").strip()
+                    take = reductions.get(ut)
+                    if not take:
+                        continue
+                    mult = max(1, int(_num(r.get("unit_multiplier", 1))))
+                    if mult != by_type.get(ut) or mult - take < 1:
+                        continue
+                    dims = r.get("dimensions") or {}
+                    els = r.get("elements") or {}
+                    for agg_key, room_key, src in _ROOM_AGG_KEYMAP:
+                        if agg_key in stash:
+                            continue
+                        bag = dims if src == "dims" else els
+                        v = _num(bag.get(room_key, 0))
+                        if v > 0 and agg_key in agg:
+                            agg[agg_key] = max(0, round(
+                                _num(agg.get(agg_key, 0)) - v * take, 2))
+                    r["unit_multiplier"] = mult - take
+                    r["notes"] = (str(r.get("notes") or "")
+                                  + f" [unit-mix pin: ×{mult} → "
+                                  f"×{mult - take} so unit typicals sum "
+                                  f"to the {total_units:.0f}-unit "
+                                  f"count]").strip()
+                    adjusted.append(r.get("room_name") or ut)
+            if adjusted:
+                rec["pinned"] = {
+                    "reductions": reductions,
+                    "rooms_adjusted": len(adjusted),
+                    "covered_before": covered,
+                    "covered_after": int(total_units)}
+                by_type = {ut: m - reductions.get(ut, 0)
+                           for ut, m in by_type.items()}
+                covered = sum(by_type.values())
+                rec["unit_types"] = by_type
+                rec["covered_instances"] = covered
+                analysis.setdefault("notes", []).append(
+                    f"[Unit-Mix Pin] Unit-typical multipliers covered "
+                    f"{rec['pinned']['covered_before']} units in a "
+                    f"{total_units:.0f}-unit building — the catch-all "
+                    f"typical(s) were double-counting separately-drawn "
+                    f"units. Multipliers reduced "
+                    f"({', '.join(f'{u} −{t}' for u, t in reductions.items())}) "
+                    f"so unit coverage sums to the declared count; "
+                    f"confirm the per-type unit mix (RFI).")
+                _gate_add_rfi(
+                    analysis, "Unit Mix",
+                    f"The drawings declare {total_units:.0f} units; unit-"
+                    f"typical multiplication covered "
+                    f"{rec['pinned']['covered_before']}. The overage was "
+                    f"removed from the largest typical(s) "
+                    f"({', '.join(reductions)}). Provide the per-floor "
+                    f"unit mix to confirm the split between unit types.")
+                print(f"   🏢 Unit-mix pin: coverage "
+                      f"{rec['pinned']['covered_before']} → "
+                      f"{int(total_units)} units "
+                      f"({len(adjusted)} room(s) adjusted)", flush=True)
     if total_units >= 2 and covered >= 1:
         ratio = total_units / covered
         if ratio >= 1.5 or ratio <= (1 / 1.5):
