@@ -28277,15 +28277,36 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     _cd_agg = analysis.get("aggregated_totals", {}) or {}
     _cd_doors = (_num(_cd_agg.get("total_doors_full_paint", 0))
                  + _num(_cd_agg.get("total_doors_hm_panel", 0)))
-    if (_cd_rooms >= 10 and _cd_doors <= 0
-            and not analysis.get("_cold_draw_suspect")):
-        analysis["_cold_draw_suspect"] = {
-            "trigger": "doors_zero", "rooms": _cd_rooms}
+    _cd_walls = _num(_cd_agg.get("total_paintable_wall_sqft", 0)) \
+        + _num(_cd_agg.get("total_cmu_wall_sqft", 0))
+    _cd_bt = str(analysis.get("project_info", {})
+                 .get("building_type", "")).lower()
+    _cd_lodging = any(k in _cd_bt for k in (
+        "hotel", "hospitality", "multi-family", "multifamily",
+        "apartment", "senior", "assisted", "lodging", "residential care"))
+    _cd_trigger = None
+    if _cd_rooms >= 10 and _cd_doors <= 0:
+        _cd_trigger = {"trigger": "doors_zero", "rooms": _cd_rooms}
+    # Doors-per-room band (Hudson 2026-08-25: 54 doors / 126+ rooms on a
+    # hotel draw that ran -44%): lodging/multifamily carries at least
+    # ~0.5 doors per room; far below that is a cold count draw.
+    elif (_cd_lodging and _cd_rooms >= 30
+          and _cd_doors < _cd_rooms * 0.5):
+        _cd_trigger = {"trigger": "doors_per_room_low",
+                       "rooms": _cd_rooms, "doors": _cd_doors}
+    # Walls-per-room floor (ULUM cold draw): 10+ rooms averaging under
+    # 80 SF of wall each is not a building, it is a cold extraction.
+    elif _cd_rooms >= 10 and _cd_walls < _cd_rooms * 80:
+        _cd_trigger = {"trigger": "walls_per_room_low",
+                       "rooms": _cd_rooms,
+                       "walls": round(_cd_walls, 1)}
+    if (_cd_trigger and not analysis.get("_cold_draw_suspect")):
+        analysis["_cold_draw_suspect"] = _cd_trigger
         analysis["manual_review_required"] = True
         analysis.setdefault("notes", []).append(
-            f"[MANUAL REVIEW REQUIRED] {_cd_rooms} in-scope rooms with "
-            f"ZERO doors extracted — cold extraction draw suspected; "
-            f"checkpoints cleared for a fresh retry.")
+            f"[MANUAL REVIEW REQUIRED] Cold extraction draw suspected "
+            f"({analysis['_cold_draw_suspect']}); checkpoints cleared "
+            f"for a fresh retry.")
         try:
             import shutil as _sh2
             for _p in (pdf_paths or []):
