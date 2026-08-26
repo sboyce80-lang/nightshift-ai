@@ -19298,6 +19298,31 @@ def _apply_vme_authoritative_walls(analysis):
     if basis is None:
         return _abstain(f"{fallback_why}; {scoped_why}")
 
+    # Wall-quantity CONVENTION (per-customer, 2026-08-26): run-basis LF
+    # counts each partition once — the Rider convention (their verified
+    # takeoffs are RUN LF × height; 364 Main validated +1.6% on it). JW
+    # bids each painted FACE: Caris ground truth carries 39,752 SF of
+    # wall paint where our run-basis priced 15,667 — and run × 2 −
+    # openings lands ≈ their number exactly (2,607 LF × 9 × 2 − WC ≈
+    # 41.7k). NIGHTSHIFT_WALL_BASIS_FACES multiplies the geometric gross
+    # by NIGHTSHIFT_WALL_FACES_FACTOR (default 2.0) before the WC
+    # deduct. Never a class default in prod — customer-profile data.
+    if os.environ.get("NIGHTSHIFT_WALL_BASIS_FACES", "0").strip() in (
+            "1", "true", "True"):
+        try:
+            _faces = float(os.environ.get(
+                "NIGHTSHIFT_WALL_FACES_FACTOR", "2.0") or 2.0)
+        except (TypeError, ValueError):
+            _faces = 2.0
+        _faces = min(2.5, max(1.0, _faces))
+        vme_gross *= _faces
+        rec["faces_factor"] = _faces
+        analysis.setdefault("notes", []).append(
+            f"[VME] Wall quantity billed on the FACES convention "
+            f"(geometric run × {_faces:g}): each painted wall face is "
+            f"counted, matching this customer's takeoff convention. "
+            f"Run-basis (single-count) is available on request.")
+
     vme_walls = max(0.0, round(vme_gross - wc, 2))
     if llm_total > 0:
         ratio = vme_walls / llm_total

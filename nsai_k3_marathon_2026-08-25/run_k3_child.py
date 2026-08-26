@@ -99,6 +99,15 @@ JOBS = {
 }
 
 
+JW_ONLY_FLAGS = {
+    # Round 2 (2026-08-26): JW bids each painted wall FACE (Caris ground
+    # truth 39,752 SF vs run-basis 15,667); Rider counts run once
+    # (364 validated +1.6% on run). Customer convention, never a
+    # class default in prod.
+    "NIGHTSHIFT_WALL_BASIS_FACES": "1",
+}
+
+
 def build_flags(cls):
     flags = dict(BASELINE_FLAGS)
     for line in open(os.path.join(BATCH, "rerun_batch.sh")):
@@ -109,6 +118,11 @@ def build_flags(cls):
         for k in CLASS_GATED:
             flags[k] = "0"
     flags.update(NEW_FIX_FLAGS)
+    if cls == "jw":
+        flags.update(JW_ONLY_FLAGS)
+    # Round 2: unknown-token rooms price as painted walls (Caris was
+    # +19.9% at 'keep' — JW's own bid paints the FF hallways)
+    flags["NIGHTSHIFT_WC_UNKNOWN_TOKEN_SAFE"] = "paint"
     flags["NIGHTSHIFT_MANDATORY_REVIEW"] = "1"
     return flags
 
