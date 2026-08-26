@@ -56,6 +56,10 @@ NEW_FIX_FLAGS = {
     # join the enclosed-room painted default. Parent CEILING_ASSUME_
     # PAINTED is class-gated to JW, so this is inert on rider-class.
     "NIGHTSHIFT_CEILING_ASSUME_PAINTED_ACT": "1",
+    # Caris WC (2026-08-25 K=3 validation): a matched schedule row with
+    # unrecognized finish tokens is not positive non-WC evidence — the
+    # gate zeroed 8-10k SF of legend-designated wallcovering every draw.
+    "NIGHTSHIFT_WC_UNKNOWN_TOKEN_SAFE": "1",
 }
 
 JOBS = {

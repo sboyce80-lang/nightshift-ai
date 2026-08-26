@@ -15236,6 +15236,45 @@ def _schedule_wall_finish_is_wc(wall_finish):
         kw in wf for kw in ("wallcovering", "wall covering", "vwc"))
 
 
+# Finish-string tokens the WC gate UNDERSTANDS as non-WC designations.
+# Zeroing extracted wallcovering requires the row to be fully understood:
+# a token outside this lexicon (Caris 'GYP BD / BB PNT / FF' — the
+# extraction pass read the sheet legend and assigned these hallways WC;
+# the row parser didn't know 'FF' and the gate zeroed 8-10k SF across
+# every K=3 draw, 2026-08-25) means the row proves nothing about WC.
+_WC_KNOWN_FINISH_TOKENS = {
+    "gyp", "gwb", "bd", "board", "plas", "plaster", "pnt", "paint",
+    "painted", "pt", "wd", "wood", "veneer", "stain", "rb", "rubber",
+    "base", "bb", "ss", "stone", "engineered", "ct", "tile", "porcelain",
+    "ceramic", "pl", "laminate", "plastic", "res", "resilient", "act",
+    "acoustic", "ep", "epx", "epoxy", "frp", "cmu", "mr", "exposed",
+    "open", "sealed", "conc", "concrete", "existing", "match", "typ",
+    "typical", "and", "with", "per", "see", "note", "notes",
+    # recognized designation codes (the is-WC check reads these; a bare
+    # code split from its number is understood, not unknown)
+    "wc", "vwc", "wallcovering", "covering", "sc", "sf", "wb",
+}
+
+
+def _wc_unknown_token_safe_enabled():
+    return os.environ.get(
+        "NIGHTSHIFT_WC_UNKNOWN_TOKEN_SAFE", "0").strip() in (
+        "1", "true", "True")
+
+
+def _wall_finish_unknown_tokens(wall_finish):
+    """Tokens in a finish string outside the known lexicon (numbers,
+    separators, and numbered codes like PT-3/WC01 ignored).
+    'GYP BD / BB PNT / FF' -> {'ff'}; 'GYP BD PNT' -> set()."""
+    toks = re.sub(r"[^a-z0-9]+", " ",
+                  str(wall_finish or "").lower()).split()
+    return {t for t in toks
+            if not t.isdigit()
+            and t not in _WC_KNOWN_FINISH_TOKENS
+            and not re.fullmatch(
+                r"(pt|wc|ep|sc|wd|rb|ct|ss|pl|sf|wb)\d+", t)}
+
+
 def _wc_schedule_authoritative_enabled():
     # Default OFF pending Homewood rerun (2026-08-20 JW batch): the finish
     # schedule designated whole guestroom walls WC-x but the extractor
@@ -17934,6 +17973,8 @@ def _enforce_wallcovering_schedule_gate(analysis):
     promoted_sqft = 0.0
     unmatched_kept_rooms = []
     unmatched_kept_sqft = 0.0
+    unknown_kept_rooms = []
+    unknown_kept_sqft = 0.0
     unquantified = []
     for floor in analysis.get("floors", []) or []:
         for room in floor.get("rooms", []) or []:
@@ -18045,6 +18086,19 @@ def _enforce_wallcovering_schedule_gate(analysis):
                 unmatched_kept_sqft += wc * _extract_multiplier_from_notes(
                     room)
                 continue
+            # Unknown-token safe mode (flag-gated): a matched row whose
+            # finish string carries tokens the lexicon doesn't know is
+            # NOT positive non-WC evidence — the extraction pass read
+            # the sheet's legend in context and assigned this WC; the
+            # parser's partial reading must not override it. Keep + RFI.
+            if row is not None and _wc_unknown_token_safe_enabled():
+                _unk = _wall_finish_unknown_tokens(row.get("wall_finish"))
+                if _unk:
+                    unknown_kept_rooms.append(
+                        (label, "/".join(sorted(_unk))))
+                    unknown_kept_sqft += (
+                        wc * _extract_multiplier_from_notes(room))
+                    continue
             mult = _extract_multiplier_from_notes(room)
             zeroed_rooms.append(label)
             zeroed_sqft += wc * mult
@@ -18111,6 +18165,29 @@ def _enforce_wallcovering_schedule_gate(analysis):
               f"in {len(unmatched_kept_rooms)} unmatched room(s) — "
               f"WC-dominated schedule, no positive non-WC designation",
               flush=True)
+    if unknown_kept_sqft > 0:
+        rooms_txt = ", ".join(
+            f"{name} [{tok}]" for name, tok in unknown_kept_rooms[:8])
+        analysis.setdefault("notes", []).append(
+            f"[Wallcovering] {len(unknown_kept_rooms)} room(s) carrying "
+            f"{unknown_kept_sqft:,.0f} SF of extracted wallcovering "
+            f"matched schedule rows with UNRECOGNIZED finish token(s) — "
+            f"WC KEPT ({rooms_txt}"
+            f"{'…' if len(unknown_kept_rooms) > 8 else ''}). An unknown "
+            f"token is not a non-WC designation.")
+        _gate_add_rfi(
+            analysis, "Wallcovering",
+            f"The finish schedule's wall-finish codes for "
+            f"{len(unknown_kept_rooms)} room(s) include token(s) our "
+            f"reader does not recognize ({rooms_txt}"
+            f"{'…' if len(unknown_kept_rooms) > 8 else ''}). These rooms "
+            f"are PRICED AS WALLCOVERING per the schedule's legend as "
+            f"read on the drawings — confirm the finish legend (what "
+            f"does the token stand for?) so the WC/paint split can be "
+            f"verified.")
+        print(f"   🧻 WC schedule gate: kept {unknown_kept_sqft:,.0f} SF "
+              f"in {len(unknown_kept_rooms)} room(s) with unrecognized "
+              f"finish tokens (RFI added)", flush=True)
     if unquantified:
         rooms_txt = ", ".join(
             f"{name} ({code})" for name, code in unquantified[:8])
@@ -18136,6 +18213,8 @@ def _enforce_wallcovering_schedule_gate(analysis):
         "kept_sqft": round(kept_sqft, 2),
         "zeroed_rooms": zeroed_rooms[:20],
         "zeroed_sqft": round(zeroed_sqft, 2),
+        "unknown_token_kept_rooms": unknown_kept_rooms[:20],
+        "unknown_token_kept_sqft": round(unknown_kept_sqft, 2),
         "unquantified_rooms": [n for n, _ in unquantified][:20],
     }
     return analysis
