@@ -192,6 +192,48 @@ a2 = T._apply_ceiling_assume_painted(a)
 check(a2["aggregated_totals"]["total_paintable_ceiling_sqft"] == 2025.0,
       "idempotent")
 
+print("\nCeiling assume-painted: ACT (assumed) sub-flag")
+
+
+def _analysis_act():
+    a = _analysis()
+    a["floors"][0]["rooms"].append(
+        {"room_name": "Corridor", "in_scope": True,
+         "materials": {"ceiling": "ACT (assumed)",
+                       "ceiling_painted": False},
+         "dimensions": {"ceiling_area_sqft": 800}})
+    return a
+
+
+os.environ["NIGHTSHIFT_CEILING_ASSUME_PAINTED"] = "1"
+os.environ.pop("NIGHTSHIFT_CEILING_ASSUME_PAINTED_ACT", None)
+a_no_sub = T._apply_ceiling_assume_painted(_analysis_act())
+_corr = a_no_sub["floors"][0]["rooms"][5]
+check(_corr["materials"]["ceiling_painted"] is False,
+      "sub-flag off: ACT (assumed) room must stay unpainted")
+
+os.environ["NIGHTSHIFT_CEILING_ASSUME_PAINTED_ACT"] = "1"
+a_sub = T._apply_ceiling_assume_painted(_analysis_act())
+_corr = a_sub["floors"][0]["rooms"][5]
+check(_corr["materials"]["ceiling_painted"] is True,
+      "sub-flag on: ACT (assumed) room flips to painted")
+check(_corr["materials"]["ceiling"].startswith("GYP (assumed"),
+      f"ACT-assumed room reclassified to assumed GYP: "
+      f"{_corr['materials']['ceiling']}")
+check(a_sub["floors"][0]["rooms"][2]["materials"]["ceiling_painted"]
+      is False, "evidence-based 'ACT per RCP' still untouched")
+check(a_sub["aggregated_totals"]["total_paintable_ceiling_sqft"]
+      == 120.0 + 1440 + 465 + 800,
+      f"agg adds exposed+ACT-assumed areas: "
+      f"{a_sub['aggregated_totals']['total_paintable_ceiling_sqft']}")
+
+os.environ["NIGHTSHIFT_CEILING_ASSUME_PAINTED"] = "0"
+a_parent_off = T._apply_ceiling_assume_painted(_analysis_act())
+check(a_parent_off.get("_ceiling_assume_painted") is None,
+      "parent flag off gates the sub-flag entirely")
+os.environ.pop("NIGHTSHIFT_CEILING_ASSUME_PAINTED_ACT", None)
+os.environ["NIGHTSHIFT_CEILING_ASSUME_PAINTED"] = "1"
+
 print("\nShadow hook fail-safety")
 os.environ["NIGHTSHIFT_ROOM_GEOMETRY_SHADOW"] = "1"
 a_np = T._compute_room_geometry_shadow({"floors": [], "notes": []})

@@ -18651,6 +18651,20 @@ def _ceiling_assume_painted_enabled():
         "1", "true", "True")
 
 
+def _ceiling_assume_act_enabled():
+    """Sub-flag (NIGHTSHIFT_CEILING_ASSUME_PAINTED_ACT, default off):
+    extend the enclosed-room painted default to 'ACT (assumed)' rooms —
+    the room-FUNCTION heuristic's other guess, the same zero-evidence
+    state as assumed-exposed. Harlem 2026-08: 16 of 39 rooms carried
+    ACT (assumed) and priced $0 ceiling while the estimator's note read
+    'all ceilings assumed drywall, no details given' (−46% ceilings).
+    Only meaningful with the parent flag on; evidence-based ACT (RCP or
+    schedule row — no marker) is never touched."""
+    return os.environ.get(
+        "NIGHTSHIFT_CEILING_ASSUME_PAINTED_ACT", "0").strip() in (
+        "1", "true", "True")
+
+
 def _room_geometry_shadow_enabled():
     return os.environ.get(
         "NIGHTSHIFT_ROOM_GEOMETRY_SHADOW", "0").strip() in (
@@ -18695,8 +18709,11 @@ def _apply_ceiling_assume_painted(analysis):
             mat = str(mats.get("ceiling") or "").lower()
             if "assumed" not in mat:
                 continue  # evidence-based classification — respect it
-            if not any(k in mat for k in ("open", "exposed", "unpainted",
-                                          "none", "unfinished")):
+            is_exposed = any(k in mat for k in ("open", "exposed",
+                                                "unpainted", "none",
+                                                "unfinished"))
+            is_act_assumed = "act" in mat and _ceiling_assume_act_enabled()
+            if not is_exposed and not is_act_assumed:
                 continue
             area = _num((rm.get("dimensions") or {}).get(
                 "ceiling_area_sqft", 0))
@@ -18705,6 +18722,12 @@ def _apply_ceiling_assume_painted(analysis):
             mult = mult_f * max(1, int(_num(rm.get("unit_multiplier", 1))
                                        or 1))
             mats["ceiling_painted"] = True
+            if is_act_assumed and not is_exposed:
+                # Reclassify so downstream ACT-specific gates (dedup,
+                # dryfall conversion) don't treat this as real tile —
+                # the estimator convention is assumed DRYWALL.
+                mats["ceiling"] = ("GYP (assumed — enclosed-room default; "
+                                   "room-function heuristic said ACT)")
             rm["materials"] = mats
             note = str(rm.get("notes", ""))
             tag = "[ceiling assumed PAINTED per enclosed-room default"
