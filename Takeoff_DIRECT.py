@@ -9239,6 +9239,24 @@ def _extract_exterior_scope_consensus(client, pdf_path):
         scale = medians["hardie_siding_sqft"] / rep_siding
         base["siding_class_sqft"] = {
             k: round(v * scale, 1) for k, v in cls.items()}
+    # Evidence text is TESTIMONY, not a quantity: a paint mandate ANY
+    # draw read off the sheet is on the sheet. Taking the representative
+    # draw's text alone re-introduced the single-draw lottery downstream
+    # — the pricing-tier evidence gate zeroed Caris's measured siding on
+    # the job draws whose representative missed the mandate quote
+    # (2026-08-25 K=3 validation: job-level exterior 3,496/0/0 while
+    # this pass measured ~3.3-3.9k SF in ALL THREE). Union distinct
+    # evidence strings across surviving draws so downstream evidence
+    # gates see every mandate any draw captured.
+    for _tk in ("paint_evidence", "notes"):
+        _seen, _parts = set(), []
+        for d in pool:
+            _t = str(d.get(_tk) or "").strip()
+            if _t and _t not in _seen:
+                _seen.add(_t)
+                _parts.append(_t)
+        if _parts:
+            base[_tk] = " | ".join(_parts)
     base["_elev_consensus"] = {
         "draws": len(draws), "non_empty": len(non_empty),
         "per_draw_totals": [round(_total(d)) for d in draws],
