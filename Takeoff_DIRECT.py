@@ -26293,6 +26293,21 @@ def _run_job_draw_median(k, pdf_paths, run_kwargs):
     chosen = draws[sel]
     analysis = chosen.get("analysis") or {}
     subs = [c.get("subtotal") or 0.0 for c in comps]
+    # Scope disagreement: a component that is nonzero in only a MINORITY
+    # of voting draws is a mechanism that fired in some draws and not
+    # others (elevation pass, WC chain, schedule discovery) — not scale
+    # noise. The median rightly won't price minority scope, but the
+    # reviewer must see that it existed (archived-rounds backtest,
+    # 2026-08-25: Caris's one good draw was the only one whose elevation
+    # pass fired; a silent median buries that draw).
+    scope_disagreements = []
+    for key in sorted({k2 for c in comps for k2 in c}):
+        nz = [i for i in vote if (comps[i].get(key) or 0) > 0]
+        if nz and len(nz) * 2 < len(vote):
+            scope_disagreements.append({
+                "component": key, "nonzero_draws": [i + 1 for i in nz],
+                "values": {i + 1: round(comps[i].get(key) or 0, 1)
+                           for i in nz}})
     report = {
         "k": k, "selected_draw": sel + 1,
         "vote_draws": [i + 1 for i in vote],
@@ -26300,6 +26315,7 @@ def _run_job_draw_median(k, pdf_paths, run_kwargs):
         "compositions": comps,
         "medians": rep["medians"],
         "distance_scores": rep["scores"],
+        "scope_disagreements": scope_disagreements,
     }
     # Subtotal spread across voting draws: the reviewer-facing variance
     # signal. A wide spread means the median PICKED a plausible draw but
@@ -26323,6 +26339,14 @@ def _run_job_draw_median(k, pdf_paths, run_kwargs):
             + (f"; draw(s) {excluded} excluded as cold-draw suspects"
                if excluded else "") + ".")
     analysis.setdefault("notes", []).append(note)
+    for sd in scope_disagreements:
+        analysis.setdefault("notes", []).append(
+            f"[Draw Median] Scope disagreement: {sd['component']} was "
+            f"nonzero only in draw(s) {sd['nonzero_draws']} of "
+            f"{len(vote)} plausible draws ({sd['values']}) — a "
+            f"sometimes-firing mechanism, not scale noise. The selected "
+            f"draw follows the majority; reviewer should confirm whether "
+            f"that scope is real.")
     if spread_pct is not None and spread_pct > spread_limit:
         spread_msg = (
             f"[MANUAL REVIEW REQUIRED] Draw-median subtotal spread is "

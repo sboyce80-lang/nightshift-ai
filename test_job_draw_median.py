@@ -227,6 +227,29 @@ check(saved["analysis"].get("_job_draw_median", {}).get(
 check(any("[Draw Median]" in n for n in saved["analysis"]["notes"]),
       "note not persisted to JSON")
 
+print("\n13) Minority-nonzero component surfaces as scope disagreement")
+_clear_env()
+_calls = []
+# exterior fires in draw 2 only; walls/doors/subtotal agree
+_d1 = _fake_result(30000, 90, 0, 150000, ext=0)
+_d2 = _fake_result(30500, 91, 0, 171000, ext=4800)
+_d3 = _fake_result(29500, 89, 0, 149000, ext=0)
+_seq = [_d1, _d2, _d3]
+T.run_analysis = _fake_run
+try:
+    out = T._run_job_draw_median(3, ["x.pdf"], {})
+finally:
+    T.run_analysis = _real_run
+_sds = out["analysis"]["_job_draw_median"]["scope_disagreements"]
+check(any(s["component"] == "exterior_sqft"
+          and s["nonzero_draws"] == [2] for s in _sds),
+      f"exterior 1-of-3 not reported: {_sds}")
+check(any("Scope disagreement" in n for n in out["analysis"]["notes"]),
+      "scope-disagreement note missing")
+check(out["cost_estimate"]["subtotal"] in (149000, 150000),
+      f"majority (no-exterior) draw should win: "
+      f"{out['cost_estimate']['subtotal']}")
+
 print("\n12) Page cap sums across multiple PDFs")
 _clear_env()
 if sample:
