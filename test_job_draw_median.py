@@ -93,7 +93,10 @@ os.environ["NIGHTSHIFT_DRAW_MEDIAN_MAX_PAGES"] = "1"
 sample = None
 for cand in (os.path.join(HERE, "spike_samples", "364Main.pdf"),
              os.path.join(HERE, "golden", "plans",
-                          "TSC_Fusion_Highland_Rev2.pdf")):
+                          "TSC_Fusion_Highland_Rev2.pdf"),
+             # canonical-repo fallback for worktree runs; CI skips
+             os.path.join(os.path.dirname(HERE), "nightshift-repo",
+                          "spike_samples", "364Main.pdf")):
     if os.path.exists(cand):
         sample = cand
         break
@@ -195,6 +198,50 @@ finally:
 check(not out["analysis"].get("manual_review_required"),
       "tight-spread job wrongly held")
 _clear_env()
+
+print("\n11) Selected draw's saved JSON gets the report persisted")
+_clear_env()
+import json as _json
+import tempfile
+_calls = []
+_tmp = tempfile.NamedTemporaryFile(
+    mode="w", suffix=".json", delete=False)
+_mid = _fake_result(30000, 90, 0, 150000)
+_json.dump({"analysis": dict(_mid["analysis"]), "cost_estimate":
+            {"subtotal": 150000}, "manual_review_required": False,
+            "manual_review_reason": None}, _tmp)
+_tmp.close()
+_mid["output_json_path"] = _tmp.name
+_seq = [_fake_result(29000, 88, 0, 147000), _mid,
+        _fake_result(31000, 92, 0, 153000)]
+T.run_analysis = _fake_run
+try:
+    out = T._run_job_draw_median(3, ["x.pdf"], {})
+finally:
+    T.run_analysis = _real_run
+saved = _json.load(open(_tmp.name))
+os.unlink(_tmp.name)
+check(saved["analysis"].get("_job_draw_median", {}).get(
+    "selected_draw") == 2, f"report not persisted to JSON: "
+    f"{list(saved['analysis'].keys())}")
+check(any("[Draw Median]" in n for n in saved["analysis"]["notes"]),
+      "note not persisted to JSON")
+
+print("\n12) Page cap sums across multiple PDFs")
+_clear_env()
+if sample:
+    import PyPDF2 as _pp
+    with open(sample, "rb") as _fh:
+        _n = len(_pp.PdfReader(_fh).pages)
+    os.environ["NIGHTSHIFT_JOB_DRAW_MEDIAN"] = "3"
+    os.environ["NIGHTSHIFT_DRAW_MEDIAN_MAX_PAGES"] = str(_n + 1)
+    check(T._job_draw_median_k([sample]) == 3,
+          f"single file under cap must draw (n={_n})")
+    check(T._job_draw_median_k([sample, sample]) == 1,
+          f"two files over cap must not draw (2x{_n})")
+    _clear_env()
+else:
+    print("  (no local sample PDF — multi-PDF cap check skipped)")
 
 print()
 if fails:
