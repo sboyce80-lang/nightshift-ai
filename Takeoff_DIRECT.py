@@ -23874,6 +23874,19 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
             _siding_factory_finished = False
     _suppress_siding = _siding_factory_finished or _scope_says_no_paint
 
+    # The per-item exterior evidence gate is the AUTHORITY on what
+    # survives: it reads per-item positive/negative evidence (schedule
+    # rows included) and either zeroes, keeps, or carries items as a
+    # labeled allowance. When it has ruled, this legacy per-JOB keyword
+    # scan must stand down — Honey K=3 round 1 (2026-08-27): the gate
+    # kept 3,714 SF of field-painted hardie as an allowance, then
+    # 'pre-finished metal downspouts' / 'Longboard pre-finished soffit'
+    # in the notes blob tripped 'prefinish' here and zeroed the siding
+    # at pricing (allowance line printed 0 sqft).
+    if isinstance(analysis, dict) and analysis.get("_exterior_evidence_gate"):
+        if _siding_factory_finished and not _scope_says_no_paint:
+            _suppress_siding = False
+
     if _suppress_siding:
         if hardie_sqft > 0:
             hardie_sqft = 0
