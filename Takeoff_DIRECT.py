@@ -15536,6 +15536,212 @@ def _match_schedule_row(room, by_num, by_name):
     return by_name.get(nm)
 
 
+# ── Schedule scope clip (Honey class, 2026-08-27) ──────────────────────────
+# Two schedule-driven wall reductions, both hard numbers off the finish
+# schedule, both finish-driven clips the VME path must honor the way it
+# honors wallcovering (geometry can't see finishes):
+#   1. HEIGHT BANDS (NIGHTSHIFT_SCHEDULE_HEIGHT_SPLIT): "PT01 above
+#      4'-0" AFF; TL04 up to 4'-0"" — only the band above the tile
+#      wainscot is paint scope. painted = wall × (h − band)/h.
+#   2. SCHEDULED-ROOMS-ONLY (NIGHTSHIFT_SCHEDULE_SCOPE_AUTHORITATIVE,
+#      per-customer convention): rooms absent from an authoritative
+#      finish schedule carry no wall paint (Honey: Rider bids only the
+#      6 scheduled areas — BOH/Prep/Office walls are not in the bid).
+
+_BAND_BELOW_RX = re.compile(
+    r"(?:up\s+to|below|to)\s+(\d{1,2})\s*(?:['′]|\s*-\s*\d{1,2}\s*[\"″]|ft|"
+    r"feet)?\s*(?:aff)?", re.IGNORECASE)
+_BAND_NONPAINT_RX = re.compile(
+    r"\b(tl\s?-?\d|tile|wainscot|frp|panel|stainless|ss\s?-?\d)\b",
+    re.IGNORECASE)
+_BAND_PAINT_ABOVE_RX = re.compile(
+    r"\b(?:pt\s?-?\d+|paint(?:ed)?)\b[^;]{0,80}\babove\b|"
+    r"\babove\b[^;]{0,40}\b(?:pt\s?-?\d+|paint(?:ed)?)\b",
+    re.IGNORECASE)
+
+
+def _schedule_band_ft(wall_finish):
+    """Wainscot band height (ft) when a row designates paint ABOVE a
+    non-paint band. 'PT01 above 4'-0\" AFF; TL04 up to 4'-0\"' -> 4.0;
+    plain painted or non-paint rows -> 0."""
+    wf = str(wall_finish or "")
+    if not _BAND_PAINT_ABOVE_RX.search(wf):
+        return 0.0
+    for m in _BAND_BELOW_RX.finditer(wf):
+        ctx = wf[max(0, m.start() - 60):m.end() + 20]
+        if _BAND_NONPAINT_RX.search(ctx):
+            try:
+                v = float(m.group(1))
+            except (TypeError, ValueError):
+                continue
+            if 1.0 <= v <= 8.0:
+                return v
+    return 0.0
+
+
+def _schedule_row_tokens(row):
+    return set(t for t in re.sub(
+        r"[^a-z0-9]+", " ", str(row.get("room_name") or "").lower()).split()
+        if len(t) >= 3 and t not in _DEDUP_GENERIC_TOKENS)
+
+
+def _apply_schedule_scope_clip(analysis):
+    """Height-band + scheduled-rooms-only wall reductions (both
+    flag-gated, default off). Only-reduce; per-room notes; quantified
+    RFIs; record stored for the VME finish-clip. Idempotent."""
+    if not isinstance(analysis, dict):
+        return analysis
+    band_on = os.environ.get(
+        "NIGHTSHIFT_SCHEDULE_HEIGHT_SPLIT", "0").strip() in (
+        "1", "true", "True")
+    scope_on = os.environ.get(
+        "NIGHTSHIFT_SCHEDULE_SCOPE_AUTHORITATIVE", "0").strip() in (
+        "1", "true", "True")
+    if not band_on and not scope_on:
+        return analysis
+    if analysis.get("_schedule_scope_clip"):
+        return analysis
+    rfs = _get_room_finish_schedule(analysis)
+    if len(rfs) < _SCHEDULE_FINISH_AUTHORITY_MIN_ROWS:
+        analysis["_schedule_scope_clip"] = {"noop": "schedule_too_thin"}
+        return analysis
+    by_num, by_name = {}, {}
+    for r in rfs:
+        tok = _room_num_token(r.get("room_number"))
+        if tok:
+            by_num.setdefault(tok, r)
+        nm = re.sub(r"[^a-z0-9]+", " ",
+                    str(r.get("room_name", "")).lower()).strip()
+        if nm:
+            by_name.setdefault(nm, r)
+    row_toks = [(r, _schedule_row_tokens(r)) for r in rfs]
+
+    def _match(room):
+        row = _match_schedule_row(room, by_num, by_name)
+        if row is not None:
+            return row
+        rt = set(t for t in re.sub(
+            r"[^a-z0-9]+", " ",
+            str(room.get("room_name") or "").lower()).split()
+            if len(t) >= 3 and t not in _DEDUP_GENERIC_TOKENS)
+        if not rt:
+            return None
+        hits = [r for r, toks in row_toks
+                if toks and (rt <= toks or toks <= rt)]
+        return hits[0] if len(hits) == 1 else None
+
+    # Pass 1: collect actions WITHOUT mutating — the coverage guard must
+    # rule before any room changes (a stand-down after mutation would
+    # leave half-applied state).
+    matched_rows = set()
+    band_actions, unsched_actions = [], []
+    no_height = []
+    for fl in (analysis.get("floors") or []):
+        for room in (fl.get("rooms") or []):
+            if not isinstance(room, dict) or not room.get("in_scope", True):
+                continue
+            dims = room.get("dimensions") or {}
+            wall = _num(dims.get("wall_area_sqft", 0))
+            if wall <= 0:
+                continue
+            label = str(room.get("room_name") or "room").strip()
+            mult = max(1, int(_num(room.get("unit_multiplier", 1)) or 1))
+            row = _match(room)
+            if row is not None:
+                matched_rows.add(id(row))
+                band = _schedule_band_ft(row.get("wall_finish")) \
+                    if band_on else 0.0
+                if band > 0:
+                    h = _num(dims.get("ceiling_height_feet", 0))
+                    if h <= band:
+                        no_height.append(label)
+                        continue
+                    band_actions.append((room, label, wall,
+                                         round(wall * (band / h), 2),
+                                         band, mult))
+                continue
+            if scope_on:
+                unsched_actions.append((room, label, wall, mult))
+
+    # Match-coverage guard for the aggressive rule: if fewer than half
+    # the schedule's rows matched any room, the naming conventions
+    # disagree and "absent from the schedule" is meaningless.
+    if scope_on and rfs and (len(matched_rows) / len(rfs)) < 0.5:
+        analysis["_schedule_scope_clip"] = {
+            "noop": f"match coverage {len(matched_rows)}/{len(rfs)} — "
+                    f"scope rule stands down"}
+        return analysis
+
+    # Pass 2: apply.
+    band_rooms, band_sqft = [], 0.0
+    unsched_rooms, unsched_sqft = [], 0.0
+    for room, label, wall, ded, band, mult in band_actions:
+        dims = room.get("dimensions") or {}
+        dims["wall_area_sqft"] = round(wall - ded, 2)
+        room["notes"] = (str(room.get("notes") or "")
+                         + f" [schedule height split: paint above "
+                         f"{band:g}' wainscot — wall {wall:,.0f} → "
+                         f"{wall - ded:,.0f} SF]").strip()
+        band_rooms.append(label)
+        band_sqft += ded * mult
+    for room, label, wall, mult in unsched_actions:
+        dims = room.get("dimensions") or {}
+        dims["wall_area_sqft"] = 0
+        room["notes"] = (str(room.get("notes") or "")
+                         + " [schedule scope: room absent from the "
+                         "authoritative finish schedule — wall paint "
+                         "not in this bid (RFI)]").strip()
+        unsched_rooms.append(label)
+        unsched_sqft += wall * mult
+
+    total_clip = band_sqft + unsched_sqft
+    if total_clip > 0:
+        agg = analysis.setdefault("aggregated_totals", {})
+        agg["total_paintable_wall_sqft"] = max(0.0, round(
+            _num(agg.get("total_paintable_wall_sqft", 0)) - total_clip, 2))
+    rec = {"band_sqft": round(band_sqft, 2),
+           "band_rooms": band_rooms[:20],
+           "unscheduled_sqft": round(unsched_sqft, 2),
+           "unscheduled_rooms": unsched_rooms[:20],
+           "no_height_rooms": no_height[:20],
+           "total_clip_sqft": round(total_clip, 2)}
+    analysis["_schedule_scope_clip"] = rec
+    if band_sqft > 0:
+        analysis.setdefault("notes", []).append(
+            f"[Schedule Height Split] {len(band_rooms)} room(s) carry "
+            f"paint only above a schedule-designated wainscot band — "
+            f"{band_sqft:,.0f} SF of below-band wall removed from the "
+            f"paint bill: {', '.join(band_rooms[:6])}"
+            f"{'…' if len(band_rooms) > 6 else ''}.")
+    if unsched_sqft > 0:
+        analysis.setdefault("notes", []).append(
+            f"[Schedule Scope] {len(unsched_rooms)} room(s) absent from "
+            f"the authoritative finish schedule carry no wall paint "
+            f"({unsched_sqft:,.0f} SF excluded): "
+            f"{', '.join(unsched_rooms[:6])}"
+            f"{'…' if len(unsched_rooms) > 6 else ''}.")
+        _gate_add_rfi(
+            analysis, "Paint Scope",
+            f"The finish schedule does not list {len(unsched_rooms)} "
+            f"extracted room(s) ({', '.join(unsched_rooms[:6])}"
+            f"{'…' if len(unsched_rooms) > 6 else ''}, "
+            f"{unsched_sqft:,.0f} SF of walls). Per the schedule-scope "
+            f"convention these are EXCLUDED — confirm whether any are "
+            f"in the paint scope.")
+    if no_height:
+        _gate_add_rfi(
+            analysis, "Paint Scope",
+            f"{len(no_height)} room(s) have a schedule wainscot band but "
+            f"no measured ceiling height ({', '.join(no_height[:6])}) — "
+            f"the band split could not be applied; full wall height is "
+            f"priced pending heights.")
+    if total_clip > 0:
+        print(f"   📏 Schedule scope clip: −{total_clip:,.0f} SF "
+              f"(band {band_sqft:,.0f}, unscheduled {unsched_sqft:,.0f})",
+              flush=True)
+    return analysis
+
+
 # ── Unit-typical type-token matching (Homewood WC transfer) ────────────────
 # A hotel/multifamily finish schedule keys rows by unit TYPICAL ("Living/
 # Sleeping - King Connector Suite, 211/217 (typical)") while extraction
@@ -19418,6 +19624,19 @@ def _apply_vme_authoritative_walls(analysis):
             f"Run-basis (single-count) is available on request.")
 
     vme_walls = max(0.0, round(vme_gross - wc, 2))
+    # Schedule scope clip is finish-driven, exactly like wallcovering:
+    # geometry measures ALL walls; the schedule says which band/rooms are
+    # paint scope. Deduct the recorded clip from the geometric total
+    # (Honey: whole-floor VME billed full-height walls of unscheduled
+    # BOH/storage rooms Rider's bid excludes).
+    _clip = _num((analysis.get("_schedule_scope_clip") or {}).get(
+        "total_clip_sqft", 0))
+    if _clip > 0:
+        vme_walls = max(0.0, round(vme_walls - _clip, 2))
+        analysis.setdefault("notes", []).append(
+            f"[VME] Geometric wall total reduced {_clip:,.0f} SF by the "
+            f"schedule scope clip (wainscot bands / unscheduled rooms) — "
+            f"finish-driven scope the geometry cannot see.")
     if llm_total > 0:
         ratio = vme_walls / llm_total
         lo, hi = _VME_LLM_RATIO_BAND
@@ -20614,6 +20833,12 @@ def build_priced_takeoff(analysis, strict=None):
     # placement rationale as the WC gate — runs before the VME wall
     # passes; stands down when VME owns the wall total. Flag-gated.
     analysis = _enforce_paint_schedule_gate(analysis)
+
+    # Schedule scope clip: wainscot height bands + scheduled-rooms-only
+    # (per-customer) wall reductions off the finish schedule. Runs after
+    # the paint gate; its record also drives the VME finish-clip.
+    # Flag-gated; no-op when off.
+    analysis = _apply_schedule_scope_clip(analysis)
 
     # Floor-finish reconcile: documented EP-x/SC-x/sealed-concrete coatings
     # recorded by extraction but left at 0 get wired into pricing; polished

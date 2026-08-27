@@ -78,9 +78,13 @@ JOBS = {
     "tsc_fusion_highland": {"cls": "rider", "pdf": os.path.join(
         MAIN, "golden", "plans", "TSC_Fusion_Highland_Rev2.pdf"),
         "bid": None},
+    # Schedule-scope convention (Honey, 2026-08-27): Rider's bid paints
+    # only the scheduled areas of this retail fitout — per-job, like
+    # Dutchess's interior-only.
     "honey_farms_malta": {"cls": "rider", "pdf": os.path.join(
         MAIN, "golden", "plans", "Honey_Farms_Malta_100pct_Pricing_Set.pdf"),
-        "bid": 28564.0},
+        "bid": 28564.0,
+        "extra_env": {"NIGHTSHIFT_SCHEDULE_SCOPE_AUTHORITATIVE": "1"}},
     "jw_harlem_valley": {"cls": "jw", "pdf": os.path.join(
         BATCH, "harlem_valley", "plans_clean.pdf"), "bid": 43490.84,
         "ref": "harlem_valley"},
@@ -128,6 +132,8 @@ def build_flags(cls):
     flags["NIGHTSHIFT_UNIT_MIX_PIN"] = "1"
     # Round 2: small flaky sets draw K=5 (Dutchess walls 9,329/3,300/110)
     flags["NIGHTSHIFT_DRAW_MEDIAN_K_SMALL"] = "5"
+    # Round 2: wainscot height bands are universal hard numbers
+    flags["NIGHTSHIFT_SCHEDULE_HEIGHT_SPLIT"] = "1"
     flags["NIGHTSHIFT_MANDATORY_REVIEW"] = "1"
     return flags
 
