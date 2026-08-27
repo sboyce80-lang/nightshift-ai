@@ -29,7 +29,9 @@ def check(cond, msg):
 def _clear_env():
     for k in ("NIGHTSHIFT_JOB_DRAW_MEDIAN", "NIGHTSHIFT_JOB_DRAW_ACTIVE",
               "NIGHTSHIFT_JOB_DRAW_TAG", "NIGHTSHIFT_DRAW_MEDIAN_MAX_PAGES",
-              "NIGHTSHIFT_DRAW_SPREAD_REVIEW_PCT"):
+              "NIGHTSHIFT_DRAW_SPREAD_REVIEW_PCT",
+              "NIGHTSHIFT_DRAW_MEDIAN_K_SMALL",
+              "NIGHTSHIFT_DRAW_MEDIAN_SMALL_MAX_PAGES"):
         os.environ.pop(k, None)
 
 
@@ -249,6 +251,46 @@ check(any("Scope disagreement" in n for n in out["analysis"]["notes"]),
 check(out["cost_estimate"]["subtotal"] in (149000, 150000),
       f"majority (no-exterior) draw should win: "
       f"{out['cost_estimate']['subtotal']}")
+
+print("\n14) Final-composition implausibility excludes gate-hollowed draws")
+_clear_env()
+_calls = []
+# draw 3: gates stripped walls to ~nothing (110 SF / 30 rooms) but no
+# pipeline cold-draw flag (the Dutchess ordering gap)
+_seq = [_fake_result(9329, 28, 0, 24174, rooms=32),
+        _fake_result(3300, 29, 0, 14782, rooms=31),
+        _fake_result(110, 29, 0, 9981, rooms=30)]
+T.run_analysis = _fake_run
+try:
+    out = T._run_job_draw_median(3, ["x.pdf"], {})
+finally:
+    T.run_analysis = _real_run
+rep = out["analysis"]["_job_draw_median"]
+check(3 in [int(x) for x in rep["excluded_cold_draws"]],
+      f"hollowed draw must leave the vote: {rep['excluded_cold_draws']}")
+check(rep["excluded_reasons"].get(3) == "final_composition_implausible",
+      f"exclusion reason missing: {rep.get('excluded_reasons')}")
+check(out["cost_estimate"]["subtotal"] in (24174, 14782),
+      f"selection must come from plausible draws: "
+      f"{out['cost_estimate']['subtotal']}")
+
+print("\n15) Small sets raise K when configured")
+_clear_env()
+os.environ["NIGHTSHIFT_JOB_DRAW_MEDIAN"] = "3"
+os.environ["NIGHTSHIFT_DRAW_MEDIAN_K_SMALL"] = "5"
+if sample:
+    import PyPDF2 as _pp2
+    with open(sample, "rb") as _fh2:
+        _n2 = len(_pp2.PdfReader(_fh2).pages)
+    os.environ["NIGHTSHIFT_DRAW_MEDIAN_SMALL_MAX_PAGES"] = str(_n2)
+    check(T._job_draw_median_k([sample]) == 5,
+          f"small set must draw K=5 (n={_n2})")
+    os.environ["NIGHTSHIFT_DRAW_MEDIAN_SMALL_MAX_PAGES"] = str(_n2 - 1)
+    check(T._job_draw_median_k([sample]) == 3,
+          "above the small threshold keeps base K")
+else:
+    print("  (no local sample PDF — small-K check skipped)")
+_clear_env()
 
 print("\n12) Page cap sums across multiple PDFs")
 _clear_env()

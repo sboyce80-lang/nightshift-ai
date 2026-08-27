@@ -126,6 +126,8 @@ def build_flags(cls):
     # Round 2: unit-typical coverage pinned to the declared unit count
     # (Hudson 47 covered vs 34 keys — structural draw variance)
     flags["NIGHTSHIFT_UNIT_MIX_PIN"] = "1"
+    # Round 2: small flaky sets draw K=5 (Dutchess walls 9,329/3,300/110)
+    flags["NIGHTSHIFT_DRAW_MEDIAN_K_SMALL"] = "5"
     flags["NIGHTSHIFT_MANDATORY_REVIEW"] = "1"
     return flags
 

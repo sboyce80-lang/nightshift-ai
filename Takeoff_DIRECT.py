@@ -26605,7 +26605,13 @@ def _job_draw_median_k(pdf_paths, interactive=False):
             "NIGHTSHIFT_DRAW_MEDIAN_MAX_PAGES", "0") or 0)
     except (TypeError, ValueError):
         max_pages = 0
-    if max_pages > 0:
+    try:
+        k_small = int(os.environ.get(
+            "NIGHTSHIFT_DRAW_MEDIAN_K_SMALL", "0") or 0)
+    except (TypeError, ValueError):
+        k_small = 0
+    k_small = max(0, min(5, k_small))
+    if max_pages > 0 or k_small > k:
         total_pages = 0
         for p in pdf_paths or []:
             try:
@@ -26613,10 +26619,23 @@ def _job_draw_median_k(pdf_paths, interactive=False):
                     total_pages += len(PyPDF2.PdfReader(fh).pages)
             except Exception:
                 continue
-        if total_pages >= max_pages:
+        if max_pages > 0 and total_pages >= max_pages:
             print(f"   🎲 Draw-median: {total_pages} pages ≥ cap "
                   f"{max_pages} — single draw")
             return 1
+        # Small flaky sets get MORE draws — they are the cheapest to
+        # redraw and the most extraction-unstable (Dutchess round 1:
+        # walls 9,329/3,300/110 across three draws of a tiny set).
+        if k_small > k:
+            try:
+                small_max = int(os.environ.get(
+                    "NIGHTSHIFT_DRAW_MEDIAN_SMALL_MAX_PAGES", "12") or 12)
+            except (TypeError, ValueError):
+                small_max = 12
+            if 0 < total_pages <= small_max:
+                print(f"   🎲 Draw-median: small set ({total_pages} "
+                      f"pages) — K raised to {k_small}")
+                return k_small
     return k
 
 
@@ -26672,6 +26691,24 @@ def _draw_median_select(comps):
                   "scores": scores}
 
 
+def _final_composition_implausible(comp):
+    """Post-gate plausibility for the draw vote. The in-pipeline
+    cold-draw detectors evaluate PRE-gate aggregates — Dutchess K=3
+    round 1 (2026-08-27): draw 3's walls survived the detector at
+    extraction time, then the scaled-dim quarantine stripped them to
+    110 SF across 30 rooms and the dead draw stayed in the vote,
+    dragging the median to a −29.8% miss. The same bands re-applied to
+    the FINAL composition catch what the gates hollowed out."""
+    rooms = float(comp.get("rooms") or 0)
+    walls = float(comp.get("walls_sqft") or 0)
+    doors = float(comp.get("doors") or 0)
+    if rooms >= 10 and walls < rooms * 80:
+        return True
+    if rooms >= 10 and doors <= 0:
+        return True
+    return False
+
+
 def _run_job_draw_median(k, pdf_paths, run_kwargs):
     """Run K independent draws of run_analysis and return the median one."""
     print("\n" + "=" * 80)
@@ -26705,7 +26742,8 @@ def _run_job_draw_median(k, pdf_paths, run_kwargs):
 
     comps = [_draw_composition(r) for r in draws]
     clean = [i for i, r in enumerate(draws)
-             if not (r.get("analysis") or {}).get("_cold_draw_suspect")]
+             if not (r.get("analysis") or {}).get("_cold_draw_suspect")
+             and not _final_composition_implausible(comps[i])]
     vote = clean if len(clean) >= 2 else list(range(len(draws)))
     sel_in_vote, rep = _draw_median_select([comps[i] for i in vote])
     sel = vote[sel_in_vote]
@@ -26714,6 +26752,14 @@ def _run_job_draw_median(k, pdf_paths, run_kwargs):
     chosen = draws[sel]
     analysis = chosen.get("analysis") or {}
     subs = [c.get("subtotal") or 0.0 for c in comps]
+    excluded_reasons = {}
+    for i in range(len(draws)):
+        if i in vote:
+            continue
+        if (draws[i].get("analysis") or {}).get("_cold_draw_suspect"):
+            excluded_reasons[i + 1] = "cold_draw_suspect"
+        elif _final_composition_implausible(comps[i]):
+            excluded_reasons[i + 1] = "final_composition_implausible"
     # Scope disagreement: a component that is nonzero in only a MINORITY
     # of voting draws is a mechanism that fired in some draws and not
     # others (elevation pass, WC chain, schedule discovery) — not scale
@@ -26733,6 +26779,7 @@ def _run_job_draw_median(k, pdf_paths, run_kwargs):
         "k": k, "selected_draw": sel + 1,
         "vote_draws": [i + 1 for i in vote],
         "excluded_cold_draws": excluded,
+        "excluded_reasons": excluded_reasons,
         "compositions": comps,
         "medians": rep["medians"],
         "distance_scores": rep["scores"],
