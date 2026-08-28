@@ -9268,6 +9268,59 @@ def _extract_exterior_scope_consensus(client, pdf_path):
     return base
 
 
+# Deterministic exterior evidence (round 3, 2026-08-28): Caris r2 measured
+# exterior in ALL 5 draws but the evidence gate's verdict split 3 ways —
+# whether a draw read the factory-finish note off the sheet was a per-draw
+# dice roll, and the 2 draws that read it were both in band (+3.0/+9.5)
+# while the 3 that didn't ran −16/−18. The note is IN THE PDF TEXT LAYER;
+# reading it must not involve dice.
+_DET_EXT_PAINT_RX = re.compile(
+    r"(?:field[\s-]*paint\w*|paint\w*[^.\n]{0,40}\b(?:siding|hardie|"
+    r"fascia|trim|soffit|cornice|lintel|corner\s*board)|(?:siding|hardie|"
+    r"fascia|trim|soffit|cornice|lintel|corner\s*board)[^.\n]{0,40}"
+    r"\bpaint\w*|\bPT[- ]?\d\b[^.\n]{0,40}\b(?:siding|trim|fascia)|"
+    r"(?:siding|trim|fascia)[^.\n]{0,40}\bPT[- ]?\d\b)", re.IGNORECASE)
+_DET_EXT_FACTORY_RX = re.compile(
+    r"(?:factory[\s-]*(?:finish\w*|primed|applied)|pre[\s-]*finish\w*|"
+    r"prefinish\w*|finish\w*\s+by\s+(?:manufacturer|others))",
+    re.IGNORECASE)
+
+
+def _deterministic_elev_text_evidence(pdf_path, elevation_indices):
+    """Flag-gated (NIGHTSHIFT_ELEV_TEXT_EVIDENCE, default off): regex the
+    elevation pages' embedded text for paint mandates and factory-finish
+    notes. Pure text-layer read — identical result every draw. Returns a
+    dict of quoted matches (possibly empty) or None on failure."""
+    if os.environ.get("NIGHTSHIFT_ELEV_TEXT_EVIDENCE", "0").strip() not in (
+            "1", "true", "True"):
+        return None
+    try:
+        text_parts = []
+        with open(pdf_path, "rb") as fh:
+            reader = PyPDF2.PdfReader(fh)
+            for idx in elevation_indices:
+                if 0 <= idx < len(reader.pages):
+                    try:
+                        text_parts.append(
+                            reader.pages[idx].extract_text() or "")
+                    except Exception:
+                        continue
+        text = "\n".join(text_parts)
+        if not text.strip():
+            return {"empty_text_layer": True}
+        paint_hits = [m.group(0).strip()[:120]
+                      for m in _DET_EXT_PAINT_RX.finditer(text)][:8]
+        factory_hits = [m.group(0).strip()[:120]
+                        for m in _DET_EXT_FACTORY_RX.finditer(text)][:8]
+        return {"paint_mandates": paint_hits,
+                "factory_finish_notes": factory_hits,
+                "pages": [i + 1 for i in elevation_indices]}
+    except Exception as e:
+        print(f"   ⚠️  Deterministic elevation text scan failed "
+              f"(non-fatal): {type(e).__name__}: {str(e)[:80]}")
+        return None
+
+
 def _extract_exterior_scope(client, pdf_path):
     """Extract exterior painting scope from elevation sheets only.
 
@@ -9430,6 +9483,13 @@ exterior scope visible.")."""
 
         ext_data = json_match
         ext_data["source_pages"] = [i + 1 for i in elevation_indices]
+        # Deterministic text-layer evidence rides with every pass draw —
+        # identical content each time, so the evidence gate's verdict
+        # stops depending on which draw happened to read the note.
+        _det = _deterministic_elev_text_evidence(pdf_path,
+                                                 elevation_indices)
+        if _det is not None:
+            ext_data["deterministic_text_evidence"] = _det
 
         if _structured:
             ext_data = _apply_elevation_breakdown(ext_data)
@@ -16512,6 +16572,15 @@ def _enforce_exterior_evidence(analysis):
         return analysis
     blobs = [str(ext.get("paint_evidence") or ""),
              str(ext.get("notes") or "")]
+    # Deterministic text-layer evidence (identical every draw): quoted
+    # paint mandates and factory-finish notes regex'd straight from the
+    # elevation pages' embedded text. Present whenever the scan flag is
+    # on — the gate's verdict must not depend on which draw's LLM read
+    # happened to transcribe the note.
+    _det_ev = ext.get("deterministic_text_evidence") or {}
+    for _hit in ((_det_ev.get("paint_mandates") or [])
+                 + (_det_ev.get("factory_finish_notes") or [])):
+        blobs.append(str(_hit))
     for f in ((analysis.get("_scope_sweep") or {}).get("findings") or []):
         blobs.append(f"{f.get('item') or ''} {f.get('detail') or ''}")
     # Finish-schedule rows are first-class paint evidence — Honey's
