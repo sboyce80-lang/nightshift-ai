@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Request Access &mdash; Knight Shift</title>
+    <title>{% if plg_enabled %}Create Your Account{% else %}Request Access{% endif %} &mdash; Knight Shift</title>
     <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
     <style>
         .onboard-shell {
@@ -68,11 +68,20 @@
 <body class="dark-theme">
     <main class="onboard-shell">
         <div class="onboard-card">
+            {% if plg_enabled %}
+            <h1>Create your account</h1>
+            <p class="lede">
+                Almost done. Tell us a bit about you and your company and
+                you're in &mdash; with {{ plg_free_bid_limit }} free bids to
+                try Knight Shift on your own projects.
+            </p>
+            {% else %}
             <h1>Request Access</h1>
             <p class="lede">
                 Almost done. Tell us a bit about you and your company &mdash;
                 we'll review and email you when your account is approved.
             </p>
+            {% endif %}
 
             {% with messages = get_flashed_messages(with_categories=true) %}
             {% if messages %}<div class="flash-messages">
@@ -93,9 +102,28 @@
                 <input type="text" id="company_name" name="company_name" required maxlength="200"
                        value="{{ company_name }}" placeholder="Acme Painting LLC">
 
+                {% if plg_enabled %}
+                <label for="title">Your title</label>
+                <input type="text" id="title" name="title" maxlength="128"
+                       value="{{ user_title or '' }}" placeholder="Estimator / Owner / PM">
+
+                <label for="phone">Phone number</label>
+                <input type="text" id="phone" name="phone" required maxlength="64"
+                       value="{{ phone or '' }}" placeholder="(555) 555-1234">
+
+                <label for="company_size">Company size</label>
+                <select id="company_size" name="company_size"
+                        style="width:100%;padding:10px 12px;border-radius:6px;border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.03);color:#f1f5f9;font-size:0.95rem;box-sizing:border-box;">
+                    <option value="" {% if not company_size %}selected{% endif %}>Select&hellip;</option>
+                    {% for size in ["1-5", "6-20", "21-50", "51-200", "200+"] %}
+                    <option value="{{ size }}" {% if company_size == size %}selected{% endif %}>{{ size }} employees</option>
+                    {% endfor %}
+                </select>
+                {% endif %}
+
                 <div class="submit-row">
                     <button type="submit" class="submit-btn dark-submit-btn">
-                        Submit access request
+                        {% if plg_enabled %}Create account &mdash; start bidding free{% else %}Submit access request{% endif %}
                     </button>
                 </div>
             </form>

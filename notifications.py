@@ -32,6 +32,9 @@ from config import (
     RESEND_FROM_EMAIL,
     RESEND_FROM_NAME,
     ADMIN_EMAILS,
+    PLG_SIGNUP_NOTIFY_EMAILS,
+    PLG_SALES_EMAILS,
+    PLG_SALES_CONTACT_EMAIL,
 )
 
 logger = logging.getLogger("nightshift.notifications")
@@ -164,6 +167,116 @@ created until you sign in.
 — Knight Shift
 """
     return _send([email], f"You've been added to {org_name} on Knight Shift", body)
+
+
+# ---------------------------------------------------------------------------
+# PLG self-serve (freemium) lifecycle emails
+# ---------------------------------------------------------------------------
+
+def notify_freemium_welcome(email: str, name: str, org_name: str,
+                            app_url: str, bid_limit: int) -> bool:
+    """Welcome a self-serve signup whose access was auto-approved."""
+    body = f"""Hi {name or 'there'},
+
+Welcome to Knight Shift — your account for {org_name} is ready to go.
+
+You have {bid_limit} free bids to try the system on your own projects.
+Upload a bid set (plans + finish schedules as PDFs) and we'll email you a
+full takeoff and estimate, usually the same day:
+
+  {app_url}
+
+Tips for the best results:
+  - Include the finish schedules and floor plans, not just a cover sheet.
+  - One project per submission.
+
+Questions at any point? Just reply to this email — a real person reads it.
+
+— Knight Shift
+"""
+    return _send([email], f"Welcome to Knight Shift — {bid_limit} free bids inside", body)
+
+
+def notify_internal_plg_signup(user_email: str, user_name: str, user_title: str,
+                               org_name: str, org_domain, phone: str,
+                               company_size: str, auto_approved: bool) -> bool:
+    """Tell the team a self-serve signup just landed (auto-approved or not)."""
+    to = PLG_SIGNUP_NOTIFY_EMAILS or ADMIN_EMAILS
+    if not to:
+        logger.error("No PLG_SIGNUP_NOTIFY_EMAILS/ADMIN_EMAILS configured — "
+                     "dropping PLG signup alert for %r", org_name)
+        return False
+
+    status = ("auto-approved on the freemium plan" if auto_approved
+              else "NOT auto-approved (free-email signup) — on the manual waitlist")
+    body = f"""New self-serve signup ({status}).
+
+  Name:          {user_name or '(not provided)'}
+  Title:         {user_title or '(not provided)'}
+  Email:         {user_email}
+  Phone:         {phone or '(not provided)'}
+  Company:       {org_name}
+  Company size:  {company_size or '(not provided)'}
+  Domain:        {org_domain or '(personal email)'}
+
+— Knight Shift
+"""
+    return _send(sorted(to), f"PLG signup: {org_name}", body)
+
+
+def notify_freemium_exhausted(email: str, name: str, org_name: str,
+                              bid_limit: int) -> bool:
+    """Tell a freemium user they've used their last free bid — active CTA."""
+    body = f"""Hi {name or 'there'},
+
+You've just run the last of your {bid_limit} free bids on Knight Shift —
+thanks for putting the system through its paces.
+
+To keep bidding with unlimited takeoffs, let's find the right plan for
+{org_name}. Reply to this email or write us directly:
+
+  {PLG_SALES_CONTACT_EMAIL}
+
+Tell us roughly how many bids you run a month and we'll come back with
+pricing the same day. Your completed estimates stay available in your
+account either way.
+
+— Knight Shift
+"""
+    return _send([email],
+                 f"You've used your {bid_limit} free bids — let's talk pricing",
+                 body)
+
+
+def notify_internal_freemium_milestone(org_name: str, owner_emails,
+                                       bids_used: int, bid_limit: int,
+                                       exhausted: bool) -> bool:
+    """Alert sales that a freemium org is heavily using (or out of) bids.
+
+    Fired at FREEMIUM_HOT_LEAD_THRESHOLD (call them while they're still
+    bidding) and again at exhaustion.
+    """
+    to = PLG_SALES_EMAILS or ADMIN_EMAILS
+    if not to:
+        logger.error("No PLG_SALES_EMAILS/ADMIN_EMAILS configured — dropping "
+                     "freemium milestone alert for %r", org_name)
+        return False
+
+    stage = ("EXHAUSTED — paywall is now up" if exhausted
+             else f"hot lead — {bids_used} of {bid_limit} free bids used")
+    owners = ", ".join(sorted(owner_emails)) or "(unknown)"
+    body = f"""Freemium usage alert: {org_name} — {stage}.
+
+  Bids used:  {bids_used} / {bid_limit}
+  Owner(s):   {owners}
+
+{'They just hit the paywall; the exhausted email with our contact address went out. Follow up today.' if exhausted else 'They are actively bidding right now — a call today beats an email after they hit the wall.'}
+
+— Knight Shift
+"""
+    subject = (f"Freemium exhausted: {org_name}" if exhausted
+               else f"Hot lead: {org_name} ({bids_used}/{bid_limit} bids)")
+    return _send(sorted(to), subject, body)
 
 
 def notify_user_of_denial(email: str, name: str, org_name: str) -> bool:

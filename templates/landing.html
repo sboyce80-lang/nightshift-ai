@@ -987,7 +987,7 @@
             </nav>
             <div class="nav-cta">
                 <button type="button" class="btn btn-ghost" id="btn-login" disabled>Log&nbsp;in</button>
-                <button type="button" class="btn btn-primary" id="btn-signup" disabled>Request&nbsp;Access</button>
+                <button type="button" class="btn btn-primary" id="btn-signup" disabled>{% if plg_enabled %}Sign&nbsp;Up&nbsp;Free{% else %}Request&nbsp;Access{% endif %}</button>
             </div>
         </div>
     </header>
@@ -1011,7 +1011,7 @@
                         and gives you a real takeoff in minutes. No more midnight bidding.
                     </p>
                     <div class="hero-ctas">
-                        <button type="button" class="btn btn-primary btn-lg" id="hero-cta-signup" disabled>Get on the Waitlist</button>
+                        <button type="button" class="btn btn-primary btn-lg" id="hero-cta-signup" disabled>{% if plg_enabled %}Start Free &mdash; {{ plg_free_bid_limit }} Bids on Us{% else %}Get on the Waitlist{% endif %}</button>
                         <a href="#demo" class="btn btn-ghost btn-lg">Book a Live Demo &rarr;</a>
                     </div>
                     <div class="hero-supported">
@@ -1323,10 +1323,17 @@
                     <p class="lead">No commitment. We&rsquo;ll ping you when your seat in the beta opens. Want to wait? Get in line. Want to see it crush a bid on a live call? Book the demo.</p>
                     <div class="demo-options">
                         <div class="demo-option">
+                            {% if plg_enabled %}
+                            <span class="tag">Track 01 // Start Now</span>
+                            <h4>Try It Free</h4>
+                            <p>Sign up with your work email and get {{ plg_free_bid_limit }} free bids &mdash; no card, no call required.</p>
+                            <button type="button" class="btn btn-primary" id="waitlist-cta" disabled>Sign Up Free</button>
+                            {% else %}
                             <span class="tag">Track 01 // Get in Line</span>
                             <h4>Request Beta Access</h4>
                             <p>Tell us about your shop. We&rsquo;ll reach out the moment your slot opens.</p>
                             <button type="button" class="btn btn-primary" id="waitlist-cta" disabled>Request Access</button>
+                            {% endif %}
                         </div>
                         <div class="demo-option">
                             <span class="tag">Track 02 // Already a Member</span>

@@ -99,6 +99,28 @@ class Organization(Base):
     is_beta_approved: Mapped[bool] = mapped_column(
         Boolean, nullable=False, default=False, server_default="false",
     )
+
+    # Plan tier for the PLG self-serve motion. 'freemium' orgs are capped at
+    # FREEMIUM_BID_LIMIT lifetime bids; 'beta' and 'paid' orgs are never
+    # quota-gated. Migration 0023 backfills every pre-existing org to 'beta'
+    # so the freemium gate can never fire on a current customer. The quota
+    # gate additionally checks PLG_SELF_SERVE_ENABLED, so even a mistakenly
+    # 'freemium' org is unaffected while the flag is off.
+    plan: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="freemium", server_default="freemium",
+    )
+    # Self-reported company size from the PLG onboarding form ("1-5", "6-20", ...).
+    company_size: Mapped[Optional[str]] = mapped_column(String(32), nullable=True)
+
+    # Idempotency claims for the freemium lifecycle emails (same UPDATE ...
+    # WHERE ... IS NULL pattern as submissions.emailed_at): a requeued worker
+    # run must never send a second "you're out of bids" or hot-lead email.
+    freemium_exhausted_emailed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
+    freemium_hot_lead_emailed_at: Mapped[Optional[datetime]] = mapped_column(
+        DateTime(timezone=True), nullable=True,
+    )
     # Per-org rolling-24h submission cap. NULL means use the env default.
     daily_submission_cap: Mapped[Optional[int]] = mapped_column(
         Integer, nullable=True,
@@ -203,6 +225,10 @@ class User(Base):
     email: Mapped[str] = mapped_column(String(320), nullable=False, unique=True, index=True)
     name: Mapped[Optional[str]] = mapped_column(String(255))
     clerk_user_id: Mapped[Optional[str]] = mapped_column(String(64), unique=True, index=True)
+
+    # Job title from the PLG onboarding form ("Estimator", "Owner", ...).
+    # Person attribute, not an org one — two users in the same org differ.
+    title: Mapped[Optional[str]] = mapped_column(String(128), nullable=True)
 
     # Which org the user is currently acting as. Set on first sign-in to
     # their auto-provisioned org; the multi-org context switcher updates
