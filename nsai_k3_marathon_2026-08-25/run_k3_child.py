@@ -91,9 +91,13 @@ JOBS = {
     "jw_hudson_hotel": {"cls": "jw", "pdf": os.path.join(
         BATCH, "hudson_hotel", "plans_clean.pdf"), "bid": 146023.71,
         "ref": "hudson_hotel"},
+    # Faces wall basis is a CARIS fact (their ground truth: 39,752 SF
+    # of wall paint vs run-basis 15,667; run×2−WC ≈ 41.7k), not a
+    # JW-wide convention — Harlem's own target sits at run basis.
     "jw_caris_hyde_park": {"cls": "jw", "pdf": os.path.join(
         BATCH, "caris_hyde_park", "plans_clean.pdf"), "bid": 87608.82,
-        "ref": "caris_hyde_park"},
+        "ref": "caris_hyde_park",
+        "extra_env": {"NIGHTSHIFT_WALL_BASIS_FACES": "1"}},
     "jw_under_canvas_ulum": {"cls": "jw", "pdf": os.path.join(
         BATCH, "under_canvas_ulum", "plans_clean.pdf"), "bid": 41575.45,
         "ref": "under_canvas_ulum"},
@@ -104,11 +108,13 @@ JOBS = {
 
 
 JW_ONLY_FLAGS = {
-    # Round 2 (2026-08-26): JW bids each painted wall FACE (Caris ground
-    # truth 39,752 SF vs run-basis 15,667); Rider counts run once
-    # (364 validated +1.6% on run). Customer convention, never a
-    # class default in prod.
-    "NIGHTSHIFT_WALL_BASIS_FACES": "1",
+    # (2026-08-28 mid-round amendment: WALL_BASIS_FACES moved from
+    # JW-wide to Caris-only extra_env. Harlem r2 regressed +4.9 → +17.1
+    # with faces ON while its walls were already on target without it,
+    # and Homewood banded +0.9 in r1 WITHOUT faces — the ×2 is a
+    # per-JOB fact (Caris ground truth), not a JW-wide convention.
+    # Harlem's r2 cell is tainted by the old posture; re-run it after
+    # ULUM completes.)
 }
 
 
