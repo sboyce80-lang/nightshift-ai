@@ -97,7 +97,11 @@ JOBS = {
     "jw_caris_hyde_park": {"cls": "jw", "pdf": os.path.join(
         BATCH, "caris_hyde_park", "plans_clean.pdf"), "bid": 87608.82,
         "ref": "caris_hyde_park",
-        "extra_env": {"NIGHTSHIFT_WALL_BASIS_FACES": "1"}},
+        # ELEV_TEXT_EVIDENCE added post-cell for the re-run: the r2 cell
+        # split 3 ways on reading the PREFINISHED note; the text-layer
+        # scan makes every draw see it (2026-08-28).
+        "extra_env": {"NIGHTSHIFT_WALL_BASIS_FACES": "1",
+                      "NIGHTSHIFT_ELEV_TEXT_EVIDENCE": "1"}},
     "jw_under_canvas_ulum": {"cls": "jw", "pdf": os.path.join(
         BATCH, "under_canvas_ulum", "plans_clean.pdf"), "bid": 41575.45,
         "ref": "under_canvas_ulum"},
