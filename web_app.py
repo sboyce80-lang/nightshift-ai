@@ -78,6 +78,7 @@ from notifications import (
     notify_freemium_welcome,
     notify_internal_plg_signup,
     notifications_configured,
+    PRICING_REPLY_TEMPLATE,
 )
 from generate_estimate_pdf import is_estimate_filename
 from bbox_spike import is_annotated_drawings_filename
@@ -571,11 +572,16 @@ def index():
         )
 
     if snap["freemium_exhausted"]:
+        mailto_body = (
+            f"Hi Knight Shift — we'd like pricing for {snap['org_name']}.\n\n"
+            f"{PRICING_REPLY_TEMPLATE}\n"
+        )
         return render_template(
             "paywall.html",
             org_name=snap["org_name"],
             bid_limit=snap["freemium_bid_limit"],
             sales_email=PLG_SALES_CONTACT_EMAIL,
+            mailto_body=mailto_body,
         )
 
     return render_template(

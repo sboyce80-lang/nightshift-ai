@@ -186,12 +186,54 @@ def test_lifecycle_idempotency():
         config.PLG_SELF_SERVE_ENABLED = False
 
 
+def test_sales_cc():
+    print("sales alert CC:")
+    captured = {}
+
+    class _FakeResp:
+        status_code = 200
+        def json(self):
+            return {"id": "test"}
+
+    def fake_post(url, headers=None, json=None, timeout=None):
+        captured.update(json or {})
+        return _FakeResp()
+
+    import requests as _requests
+    real_post = _requests.post
+    real_key = notifications.RESEND_API_KEY
+    real_from = notifications.RESEND_FROM_EMAIL
+    real_to = notifications.PLG_SALES_EMAILS
+    real_cc = notifications.PLG_SALES_CC_EMAILS
+    _requests.post = fake_post
+    notifications.RESEND_API_KEY = "test-key"
+    notifications.RESEND_FROM_EMAIL = "noreply@test"
+    notifications.PLG_SALES_EMAILS = frozenset({"admin@x.com"})
+    notifications.PLG_SALES_CC_EMAILS = frozenset(
+        {"steve@x.com", "admin@x.com"})  # admin@ dup must be dropped from CC
+    try:
+        notifications.notify_internal_freemium_milestone(
+            "Acme", ["owner@acme.com"], 5, 5, exhausted=True)
+        check("To is the sales list", captured.get("to"), ["admin@x.com"])
+        check("CC set minus To dupes", captured.get("cc"), ["steve@x.com"])
+        check("reply template in exhausted customer email",
+              "Approximate annual revenue:" in
+              notifications.PRICING_REPLY_TEMPLATE, True)
+    finally:
+        _requests.post = real_post
+        notifications.RESEND_API_KEY = real_key
+        notifications.RESEND_FROM_EMAIL = real_from
+        notifications.PLG_SALES_EMAILS = real_to
+        notifications.PLG_SALES_CC_EMAILS = real_cc
+
+
 def main():
     Base.metadata.create_all(engine)
     test_bid_counting()
     test_quota_gate()
     test_free_email_domain()
     test_lifecycle_idempotency()
+    test_sales_cc()
     print(f"\n{PASS} passed, {FAIL} failed")
     return 1 if FAIL else 0
 
