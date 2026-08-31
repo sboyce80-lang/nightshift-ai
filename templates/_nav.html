@@ -13,6 +13,23 @@
         </a>
         <div class="brand-spacer"></div>
 
+        {# Freemium bids-remaining badge — injected app-wide by the
+           _inject_freemium_quota context processor; None hides it. #}
+        {% if freemium_quota %}
+        {% if freemium_quota.exhausted %}
+        <a href="{{ url_for('index') }}"
+           style="display:inline-flex;align-items:center;gap:6px;margin-right:14px;padding:5px 12px;border-radius:999px;border:1px solid rgba(248,113,113,0.45);background:rgba(248,113,113,0.12);color:#fca5a5;font-size:0.78rem;font-weight:600;text-decoration:none;white-space:nowrap;"
+           title="You've used all {{ freemium_quota.limit }} free bids — contact us to keep bidding">
+            0 free bids left &mdash; talk to us
+        </a>
+        {% else %}
+        <span style="display:inline-flex;align-items:center;gap:6px;margin-right:14px;padding:5px 12px;border-radius:999px;border:1px solid rgba(6,182,212,0.4);background:rgba(6,182,212,0.1);color:#67e8f9;font-size:0.78rem;font-weight:600;white-space:nowrap;"
+              title="Free plan: failed runs never count against your bids">
+            {{ freemium_quota.remaining }} of {{ freemium_quota.limit }} free bids left
+        </span>
+        {% endif %}
+        {% endif %}
+
         {# Account menu — populated client-side by Clerk bootstrap. The
            legacy #auth-status and #sign-out-link IDs are preserved so the
            per-page bootstrap JS keeps working without per-page changes. #}
