@@ -644,6 +644,9 @@ def _env_email_list(name):
 
 PLG_SIGNUP_NOTIFY_EMAILS = _env_email_list("PLG_SIGNUP_NOTIFY_EMAILS")
 PLG_SALES_EMAILS = _env_email_list("PLG_SALES_EMAILS")
+# CC'd on every internal freemium sales alert (hot-lead + exhausted) for
+# visibility — the To: list (PLG_SALES_EMAILS) owns the follow-up.
+PLG_SALES_CC_EMAILS = _env_email_list("PLG_SALES_CC_EMAILS")
 
 # Admins — comma-separated lowercase emails. Admins can prioritize jobs
 # (jump to front of queue) on the /jobs page.

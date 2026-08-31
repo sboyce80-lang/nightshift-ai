@@ -90,7 +90,7 @@
 
             <div class="paywall-actions">
                 <a class="paywall-btn paywall-btn-primary"
-                   href="mailto:{{ sales_email }}?subject=Knight%20Shift%20pricing%20for%20{{ org_name|urlencode }}">
+                   href="mailto:{{ sales_email }}?subject=Knight%20Shift%20pricing%20for%20{{ org_name|urlencode }}&body={{ mailto_body|urlencode }}">
                     Talk to us about pricing
                 </a>
                 <a class="paywall-btn paywall-btn-ghost" href="{{ url_for('jobs_list') }}">

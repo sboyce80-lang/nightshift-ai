@@ -34,6 +34,7 @@ from config import (
     ADMIN_EMAILS,
     PLG_SIGNUP_NOTIFY_EMAILS,
     PLG_SALES_EMAILS,
+    PLG_SALES_CC_EMAILS,
     PLG_SALES_CONTACT_EMAIL,
 )
 
@@ -48,7 +49,7 @@ def notifications_configured() -> bool:
     return bool(RESEND_API_KEY and RESEND_FROM_EMAIL)
 
 
-def _send(to_addrs, subject: str, body: str) -> bool:
+def _send(to_addrs, subject: str, body: str, cc_addrs=None) -> bool:
     if not RESEND_API_KEY:
         logger.error(
             "Resend not configured (RESEND_API_KEY missing) — "
@@ -69,6 +70,10 @@ def _send(to_addrs, subject: str, body: str) -> bool:
         "subject": subject,
         "text": body,
     }
+    # Don't double-deliver to anyone already on the To: line.
+    cc = [a for a in (cc_addrs or []) if a not in set(to_addrs)]
+    if cc:
+        payload["cc"] = cc
 
     try:
         resp = requests.post(
@@ -173,6 +178,20 @@ created until you sign in.
 # PLG self-serve (freemium) lifecycle emails
 # ---------------------------------------------------------------------------
 
+# The details a freemium user fills in so the pricing conversation starts
+# with data instead of discovery ping-pong. Shared by the exhausted email
+# ("reply with…") and the paywall page's pre-filled mailto body — keep the
+# two in sync by editing only this constant. Deliberately short: every
+# extra field costs replies.
+PRICING_REPLY_TEMPLATE = """Company name:
+Approximate annual revenue:
+Estimates you run per year:
+Estimates you run per week:
+Average project size ($):
+Number of estimators on staff:
+Primary work type (commercial TI / multifamily / healthcare / new build / other):
+Best phone number and time to call:"""
+
 def notify_freemium_welcome(email: str, name: str, org_name: str,
                             app_url: str, bid_limit: int) -> bool:
     """Welcome a self-serve signup whose access was auto-approved."""
@@ -233,13 +252,12 @@ You've just run the last of your {bid_limit} free bids on Knight Shift —
 thanks for putting the system through its paces.
 
 To keep bidding with unlimited takeoffs, let's find the right plan for
-{org_name}. Reply to this email or write us directly:
+{org_name}. Reply to this email (or write us at {PLG_SALES_CONTACT_EMAIL})
+with the details below and we'll come back with pricing the same day:
 
-  {PLG_SALES_CONTACT_EMAIL}
+{PRICING_REPLY_TEMPLATE}
 
-Tell us roughly how many bids you run a month and we'll come back with
-pricing the same day. Your completed estimates stay available in your
-account either way.
+Your completed estimates stay available in your account either way.
 
 — Knight Shift
 """
@@ -276,7 +294,7 @@ def notify_internal_freemium_milestone(org_name: str, owner_emails,
 """
     subject = (f"Freemium exhausted: {org_name}" if exhausted
                else f"Hot lead: {org_name} ({bids_used}/{bid_limit} bids)")
-    return _send(sorted(to), subject, body)
+    return _send(sorted(to), subject, body, cc_addrs=sorted(PLG_SALES_CC_EMAILS))
 
 
 def notify_user_of_denial(email: str, name: str, org_name: str) -> bool:
