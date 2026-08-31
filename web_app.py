@@ -33,7 +33,7 @@ import uuid
 import logging
 import tempfile
 
-from flask import Flask, request, render_template, redirect, url_for, flash, jsonify, send_from_directory
+from flask import Flask, request, render_template, redirect, url_for, flash, jsonify, send_from_directory, g
 from werkzeug.utils import secure_filename
 from werkzeug.middleware.proxy_fix import ProxyFix
 
@@ -324,6 +324,37 @@ def _inject_clerk_context():
         "plg_enabled": PLG_SELF_SERVE_ENABLED,
         "plg_free_bid_limit": FREEMIUM_BID_LIMIT,
     }
+
+
+@app.context_processor
+def _inject_freemium_quota():
+    """Expose `freemium_quota` to every template so the shared nav
+    (_nav.html) can show a bids-remaining badge on all authenticated pages,
+    not just the estimate form. None (badge hidden) unless the PLG flag is
+    on, the request is authenticated, and the org is on the freemium plan.
+    """
+    if not PLG_SELF_SERVE_ENABLED:
+        return {"freemium_quota": None}
+    uid = getattr(g, "user_id", None)
+    if uid is None:
+        return {"freemium_quota": None}
+    try:
+        with session_scope() as session:
+            user = session.get(User, uid)
+            org = user.current_organization if user else None
+            if org is None or org.plan != "freemium":
+                return {"freemium_quota": None}
+            used, limit, blocked = freemium_quota_state(session, org)
+            return {"freemium_quota": {
+                "used": used,
+                "limit": limit,
+                "remaining": max(0, limit - used),
+                "exhausted": blocked,
+            }}
+    except Exception as exc:
+        # A broken badge must never take down a page render.
+        logger.debug("freemium quota inject failed: %s", exc)
+        return {"freemium_quota": None}
 
 
 # ---------------------------------------------------------------------------
