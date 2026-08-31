@@ -1,0 +1,109 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Free Bids Used &mdash; Knight Shift</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <style>
+        .paywall-shell {
+            min-height: 80vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 2rem;
+        }
+        .paywall-card {
+            width: 100%;
+            max-width: 560px;
+            background: rgba(15,23,42,0.55);
+            border: 1px solid rgba(255,255,255,0.08);
+            border-radius: 12px;
+            padding: 2rem;
+            text-align: center;
+            box-shadow: 0 12px 32px rgba(0,0,0,0.35);
+        }
+        .paywall-card h1 {
+            color: #fff;
+            margin: 0 0 0.75rem;
+        }
+        .paywall-card p {
+            color: rgba(203,213,225,0.85);
+            line-height: 1.55;
+        }
+        .paywall-meter {
+            margin: 1.5rem 0;
+            padding: 1rem;
+            background: rgba(255,255,255,0.04);
+            border-radius: 8px;
+            color: #cbd5e1;
+            font-size: 0.95rem;
+        }
+        .paywall-meter strong { color: #fff; }
+        .paywall-actions {
+            margin-top: 1.5rem;
+            display: flex;
+            gap: 0.75rem;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+        .paywall-btn {
+            padding: 12px 22px;
+            border-radius: 6px;
+            font-size: 0.95rem;
+            text-decoration: none;
+            cursor: pointer;
+        }
+        .paywall-btn-primary {
+            background: #06b6d4;
+            border: 1px solid #06b6d4;
+            color: #06202a;
+            font-weight: 700;
+        }
+        .paywall-btn-ghost {
+            border: 1px solid rgba(255,255,255,0.18);
+            background: rgba(255,255,255,0.06);
+            color: #f1f5f9;
+        }
+        .paywall-fineprint {
+            margin-top: 1.25rem;
+            color: rgba(203,213,225,0.55);
+            font-size: 0.82rem;
+        }
+    </style>
+</head>
+<body class="dark-theme">
+    <main class="paywall-shell">
+        <div class="paywall-card">
+            <h1>You've used all {{ bid_limit }} free bids</h1>
+            <p>
+                Thanks for putting Knight Shift through its paces on real
+                projects, <strong style="color:#fff;">{{ org_name }}</strong>.
+                To keep bidding with unlimited takeoffs, reach out and we'll
+                find the right plan for your volume &mdash; we respond the
+                same day.
+            </p>
+
+            <div class="paywall-meter">
+                Free bids used: <strong>{{ bid_limit }} / {{ bid_limit }}</strong>
+            </div>
+
+            <div class="paywall-actions">
+                <a class="paywall-btn paywall-btn-primary"
+                   href="mailto:{{ sales_email }}?subject=Knight%20Shift%20pricing%20for%20{{ org_name|urlencode }}">
+                    Talk to us about pricing
+                </a>
+                <a class="paywall-btn paywall-btn-ghost" href="{{ url_for('jobs_list') }}">
+                    View my completed estimates
+                </a>
+            </div>
+
+            <p class="paywall-fineprint">
+                Or email us directly at {{ sales_email }} &mdash; tell us
+                roughly how many bids you run a month. Your completed
+                estimates stay available in your account.
+            </p>
+        </div>
+    </main>
+</body>
+</html>

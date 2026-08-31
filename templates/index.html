@@ -26,6 +26,14 @@
             </div>{% endif %}
             {% endwith %}
 
+            {% if is_freemium %}
+            <div style="margin:0 0 1rem;padding:0.7rem 1rem;border:1px solid rgba(6,182,212,0.35);border-radius:8px;background:rgba(6,182,212,0.08);color:#cbd5e1;font-size:0.9rem;">
+                Free plan: <strong style="color:#fff;">{{ freemium_bid_limit - freemium_bids_used }}
+                of {{ freemium_bid_limit }} free bids remaining</strong>.
+                Failed runs never count against your bids.
+            </div>
+            {% endif %}
+
             <div class="two-col">
                 <!-- LEFT: New Estimate form -->
                 <section class="panel">

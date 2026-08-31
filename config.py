@@ -596,6 +596,55 @@ BETA_DAILY_SUBMISSION_CAP_DEFAULT = int(
     os.environ.get("BETA_DAILY_SUBMISSION_CAP_DEFAULT", "5")
 )
 
+# ---------------------------------------------------------------------------
+# PLG self-serve motion (freemium)
+# ---------------------------------------------------------------------------
+# Master switch. When OFF (default), signup keeps the manual beta-approval
+# waitlist and none of the freemium gates/emails fire — deploying this code
+# changes nothing until the flag is flipped.
+PLG_SELF_SERVE_ENABLED = os.environ.get(
+    "PLG_SELF_SERVE_ENABLED", "0").strip().lower() in ("1", "true", "yes", "on")
+
+# Lifetime (not monthly) free-bid allowance for plan='freemium' orgs. A "bid"
+# is any submission that didn't fail or get cancelled — failed runs never
+# consume a credit.
+FREEMIUM_BID_LIMIT = int(os.environ.get("FREEMIUM_BID_LIMIT", "5"))
+
+# Internal hot-lead alert fires when a freemium org starts this many bids —
+# call them BEFORE they hit the paywall, while they're actively bidding.
+FREEMIUM_HOT_LEAD_THRESHOLD = int(
+    os.environ.get("FREEMIUM_HOT_LEAD_THRESHOLD", "4"))
+
+# Freemium upload caps. Each free bid burns real COGS (hours on the heavy
+# worker + LLM tokens), so free users don't get the 600 MB / 25-file limits
+# paying customers do.
+FREEMIUM_MAX_PDF_SIZE_MB = int(os.environ.get("FREEMIUM_MAX_PDF_SIZE_MB", "100"))
+FREEMIUM_MAX_PDFS = int(os.environ.get("FREEMIUM_MAX_PDFS", "5"))
+
+# Abuse guard: free-email signups (gmail/yahoo/...) each land in their own
+# personal org, so with instant approval one person could farm unlimited free
+# bids. When True (default), personal-org signups are NOT auto-approved —
+# they fall back to the manual waitlist with a "use your work email" hint.
+PLG_BLOCK_FREE_EMAIL_AUTO_APPROVE = os.environ.get(
+    "PLG_BLOCK_FREE_EMAIL_AUTO_APPROVE", "1").strip().lower() in ("1", "true", "yes", "on")
+
+# Where the paywall / exhausted email points the user. Shown verbatim in
+# customer-facing copy.
+PLG_SALES_CONTACT_EMAIL = os.environ.get(
+    "PLG_SALES_CONTACT_EMAIL", "hello@knightshiftai.com")
+
+# Internal recipient lists (comma-separated; both fall back to ADMIN_EMAILS
+# when unset so alerts are never silently dropped).
+def _env_email_list(name):
+    return frozenset(
+        e.strip().lower()
+        for e in os.environ.get(name, "").split(",")
+        if e.strip()
+    )
+
+PLG_SIGNUP_NOTIFY_EMAILS = _env_email_list("PLG_SIGNUP_NOTIFY_EMAILS")
+PLG_SALES_EMAILS = _env_email_list("PLG_SALES_EMAILS")
+
 # Admins — comma-separated lowercase emails. Admins can prioritize jobs
 # (jump to front of queue) on the /jobs page.
 ADMIN_EMAILS = frozenset(

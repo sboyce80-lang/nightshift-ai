@@ -312,6 +312,81 @@ def release_email_claim(submission_id):
                        submission_id, exc)
 
 
+def maybe_send_freemium_lifecycle_emails(submission_id):
+    """After a bid finishes (completed OR needs_review — both consume a
+    freemium credit), fire the freemium lifecycle emails when thresholds
+    are crossed:
+
+      - FREEMIUM_HOT_LEAD_THRESHOLD bids used → internal sales alert (call
+        them while they're still bidding, before they hit the wall).
+      - FREEMIUM_BID_LIMIT reached → customer "you're out of free bids"
+        email with the sales contact + internal exhausted alert.
+
+    Both sends sit behind atomic idempotency claims on the org row
+    (UPDATE ... WHERE ... IS NULL), so a warm-shutdown requeue can never
+    double-send. Best-effort: never raises into the job flow.
+    """
+    from config import (PLG_SELF_SERVE_ENABLED, FREEMIUM_BID_LIMIT,
+                        FREEMIUM_HOT_LEAD_THRESHOLD)
+    if not PLG_SELF_SERVE_ENABLED:
+        return
+    try:
+        from orgs import count_freemium_bids
+        from notifications import (notify_freemium_exhausted,
+                                   notify_internal_freemium_milestone)
+
+        with session_scope() as session:
+            sub = session.get(Submission, submission_id)
+            if sub is None:
+                return
+            org = session.get(Organization, sub.org_id)
+            if org is None or org.plan != "freemium":
+                return
+            org_id = org.id
+            org_name = org.name
+            used = count_freemium_bids(session, org_id)
+            owner_contacts = [
+                (m.user.email, m.user.name or "")
+                for m in org.memberships
+                if m.role == "owner" and m.user and m.user.email
+            ]
+
+        if used >= FREEMIUM_BID_LIMIT:
+            claimed = False
+            with session_scope() as session:
+                stmt = (
+                    Organization.__table__.update()
+                    .where(Organization.id == org_id)
+                    .where(Organization.freemium_exhausted_emailed_at.is_(None))
+                    .values(freemium_exhausted_emailed_at=datetime.now(timezone.utc))
+                )
+                claimed = session.execute(stmt).rowcount == 1
+            if claimed:
+                for email, name in owner_contacts:
+                    notify_freemium_exhausted(
+                        email, name, org_name, FREEMIUM_BID_LIMIT)
+                notify_internal_freemium_milestone(
+                    org_name, [e for e, _ in owner_contacts],
+                    used, FREEMIUM_BID_LIMIT, exhausted=True)
+        elif used >= FREEMIUM_HOT_LEAD_THRESHOLD:
+            claimed = False
+            with session_scope() as session:
+                stmt = (
+                    Organization.__table__.update()
+                    .where(Organization.id == org_id)
+                    .where(Organization.freemium_hot_lead_emailed_at.is_(None))
+                    .values(freemium_hot_lead_emailed_at=datetime.now(timezone.utc))
+                )
+                claimed = session.execute(stmt).rowcount == 1
+            if claimed:
+                notify_internal_freemium_milestone(
+                    org_name, [e for e, _ in owner_contacts],
+                    used, FREEMIUM_BID_LIMIT, exhausted=False)
+    except Exception as exc:
+        logger.error("Freemium lifecycle emails failed for %s: %s",
+                     submission_id, exc)
+
+
 # Submissions older than this still in queued/processing on worker startup
 # are treated as abandoned. 4h leaves a wide margin past the longest
 # realistic DD-scale takeoff (~1.5h) so live jobs are never false-positived.
@@ -776,6 +851,8 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
                     "Submission %s marked needs_review — subtotal $%s "
                     "(NOT auto-sent)",
                     submission_id, f"{subtotal:,.2f}")
+                # A needs_review run still consumed a freemium credit.
+                maybe_send_freemium_lifecycle_emails(submission_id)
                 return {"submission_id": submission_id,
                         "subtotal": subtotal,
                         "needs_review": True}
@@ -820,6 +897,8 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
             except Exception as admin_exc:
                 logger.error("Admin JSON archive email failed for %s: %s",
                              submission_id, admin_exc)
+
+            maybe_send_freemium_lifecycle_emails(submission_id)
 
             return {"submission_id": submission_id, "subtotal": subtotal}
 

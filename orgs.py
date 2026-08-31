@@ -16,11 +16,12 @@ Rules:
 """
 
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Tuple
 
 from sqlalchemy.orm import Session
 
-from models import Organization, OrganizationMembership, User
+import config
+from models import Organization, OrganizationMembership, Submission, User
 
 
 # Free-email providers that should land each user in their own personal org
@@ -108,3 +109,53 @@ def provision_org_for_user(session: Session, user: User) -> Organization:
     ))
     user.current_organization_id = org.id
     return org
+
+
+# ---------------------------------------------------------------------------
+# Freemium quota (PLG self-serve motion)
+# ---------------------------------------------------------------------------
+
+def is_free_email_domain(email: str) -> bool:
+    """True when `email` is on a free provider (or has no domain at all)."""
+    domain = _domain_of(email or "")
+    return (not domain) or (domain in FREE_EMAIL_DOMAINS)
+
+
+def count_freemium_bids(session: Session, org_id: int) -> int:
+    """Lifetime bid count for the freemium quota.
+
+    A "bid" is a ROOT submission (parent_submission_id IS NULL) that didn't
+    fail or get cancelled — i.e. queued/processing/needs_review/completed.
+    Failed runs never consume a credit (the pipeline fail-safes are our
+    fault, not the user's), and revisions of an already-counted bid are the
+    same project, not a new one. The 24h daily cap still bounds revision
+    volume.
+    """
+    return (
+        session.query(Submission)
+        .filter(
+            Submission.org_id == org_id,
+            Submission.parent_submission_id.is_(None),
+            Submission.status.notin_(("failed", "cancelled")),
+        )
+        .count()
+    )
+
+
+def freemium_quota_state(session: Session,
+                         org: Optional[Organization]) -> Tuple[int, int, bool]:
+    """Return (bids_used, limit, blocked) for `org`.
+
+    blocked is True only when the PLG flag is on, the org is on the
+    'freemium' plan, and its lifetime bid count has reached the limit.
+    'beta' and 'paid' orgs (and everything while the flag is off) always
+    come back (0, limit, False) — the gate is inert for them.
+
+    Reads config at call time (not import time) so the flag is
+    monkeypatchable in tests.
+    """
+    limit = config.FREEMIUM_BID_LIMIT
+    if not config.PLG_SELF_SERVE_ENABLED or org is None or org.plan != "freemium":
+        return 0, limit, False
+    used = count_freemium_bids(session, org.id)
+    return used, limit, used >= limit

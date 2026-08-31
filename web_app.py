@@ -56,6 +56,9 @@ from config import (
     RQ_JOB_TIMEOUT, RQ_RESULT_TTL,
     BETA_DAILY_SUBMISSION_CAP_DEFAULT,
     CLERK_PUBLISHABLE_KEY,
+    PLG_SELF_SERVE_ENABLED, FREEMIUM_BID_LIMIT,
+    FREEMIUM_MAX_PDF_SIZE_MB, FREEMIUM_MAX_PDFS,
+    PLG_BLOCK_FREE_EMAIL_AUTO_APPROVE, PLG_SALES_CONTACT_EMAIL,
 )
 import storage
 from datetime import datetime, timezone, timedelta
@@ -63,12 +66,17 @@ from datetime import datetime, timezone, timedelta
 from db import session_scope
 from models import User, Submission, File, Organization, OrganizationMembership
 from auth import require_auth, current_user_id, clerk_frontend_api_host, is_admin
-from orgs import FREE_EMAIL_DOMAINS, _domain_of
+from orgs import (
+    FREE_EMAIL_DOMAINS, _domain_of,
+    is_free_email_domain, freemium_quota_state,
+)
 from notifications import (
     notify_admin_of_new_signup,
     notify_user_of_approval,
     notify_user_of_denial,
     notify_user_of_org_invite,
+    notify_freemium_welcome,
+    notify_internal_plg_signup,
     notifications_configured,
 )
 from generate_estimate_pdf import is_estimate_filename
@@ -311,6 +319,10 @@ def _inject_clerk_context():
     return {
         "clerk_publishable_key": CLERK_PUBLISHABLE_KEY,
         "clerk_frontend_api_host": host,
+        # PLG self-serve: templates switch copy ("Request Access" vs
+        # "Start Free — X Bids") on this flag.
+        "plg_enabled": PLG_SELF_SERVE_ENABLED,
+        "plg_free_bid_limit": FREEMIUM_BID_LIMIT,
     }
 
 
@@ -435,6 +447,7 @@ def _try_signed_in_user_snapshot():
                 if user is None:
                     return None, None
             org = user.current_organization
+            fm_used, fm_limit, fm_blocked = freemium_quota_state(session, org)
             snapshot = {
                 "user_id": user.id,
                 "org_id": org.id if org else None,
@@ -442,6 +455,12 @@ def _try_signed_in_user_snapshot():
                 "is_beta_approved": bool(org and org.is_beta_approved),
                 "approval_requested_at": (org.approval_requested_at if org else None),
                 "denied_at": (org.denied_at if org else None),
+                "is_freemium": bool(
+                    PLG_SELF_SERVE_ENABLED and org and org.plan == "freemium"
+                ),
+                "freemium_bids_used": fm_used,
+                "freemium_bid_limit": fm_limit,
+                "freemium_exhausted": fm_blocked,
             }
             # Pre-fetch effective rates while the session is still open.
             rates, markup, adv_rates, adv_enabled = (
@@ -520,6 +539,14 @@ def index():
             requested_at=snap["approval_requested_at"],
         )
 
+    if snap["freemium_exhausted"]:
+        return render_template(
+            "paywall.html",
+            org_name=snap["org_name"],
+            bid_limit=snap["freemium_bid_limit"],
+            sales_email=PLG_SALES_CONTACT_EMAIL,
+        )
+
     return render_template(
         "index.html",
         rate_fields=RATE_FIELDS,
@@ -530,6 +557,9 @@ def index():
         advanced_enabled=snap["advanced_enabled"],
         has_org_overrides=snap["has_org_overrides"],
         org_name=snap["org_name"],
+        is_freemium=snap["is_freemium"],
+        freemium_bids_used=snap["freemium_bids_used"],
+        freemium_bid_limit=snap["freemium_bid_limit"],
     )
 
 
@@ -556,9 +586,23 @@ def mobile():
     return render_template("mobile.html")
 
 
+def _freemium_paywall_message():
+    return (
+        f"You've used all {FREEMIUM_BID_LIMIT} of your free bids. To keep "
+        f"bidding with unlimited takeoffs, reach out to Knight Shift AI at "
+        f"{PLG_SALES_CONTACT_EMAIL} to discuss pricing — we'll respond the "
+        f"same day."
+    )
+
+
 def _check_submission_gates(user_id):
-    """Run beta-approval + daily-cap gates for the current user. Returns
-    (org_id, error_message). Caller redirects on error_message."""
+    """Run beta-approval + freemium-quota + daily-cap gates for the current
+    user. Returns (org_id, error_message). Caller redirects on error_message.
+
+    Every path that creates work (uploads/init, submit, resubmit) MUST go
+    through this helper — the 2026-06 prototype gated only one of the three
+    submit spots and that gap is exactly what this consolidation closes.
+    """
     with session_scope() as session:
         user = session.get(User, user_id)
         org_id = user.current_organization_id if user else None
@@ -573,6 +617,12 @@ def _check_submission_gates(user_id):
                 "Your organization is on the Nightshift AI beta waitlist. "
                 "We'll email you as soon as your access is approved."
             )
+
+        # Freemium lifetime quota (inert unless PLG_SELF_SERVE_ENABLED and
+        # the org is on the freemium plan).
+        _used, _limit, blocked = freemium_quota_state(session, org)
+        if blocked:
+            return org_id, _freemium_paywall_message()
 
         cap = org.daily_submission_cap or BETA_DAILY_SUBMISSION_CAP_DEFAULT
         cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
@@ -589,6 +639,18 @@ def _check_submission_gates(user_id):
             )
 
     return org_id, None
+
+
+def _freemium_upload_caps(org_id):
+    """Return (max_files, max_size_mb) for this org's uploads. Freemium orgs
+    get tighter caps than the platform-wide limits."""
+    if PLG_SELF_SERVE_ENABLED and org_id is not None:
+        with session_scope() as session:
+            org = session.get(Organization, org_id)
+            if org is not None and org.plan == "freemium":
+                return (min(FREEMIUM_MAX_PDFS, MAX_PDFS_PER_EMAIL),
+                        min(FREEMIUM_MAX_PDF_SIZE_MB, MAX_PDF_SIZE_MB))
+    return MAX_PDFS_PER_EMAIL, MAX_PDF_SIZE_MB
 
 
 @app.route("/api/uploads/init", methods=["POST"])
@@ -619,8 +681,9 @@ def api_uploads_init():
     files_in = payload.get("files") or []
     if not isinstance(files_in, list) or not files_in:
         return jsonify({"error": "Missing files."}), 400
-    if len(files_in) > MAX_PDFS_PER_EMAIL:
-        return jsonify({"error": f"Maximum {MAX_PDFS_PER_EMAIL} files allowed."}), 400
+    max_files, max_size_mb = _freemium_upload_caps(org_id)
+    if len(files_in) > max_files:
+        return jsonify({"error": f"Maximum {max_files} files allowed."}), 400
 
     submission_id = str(uuid.uuid4())
     seen_filenames = set()
@@ -640,8 +703,8 @@ def api_uploads_init():
                 return jsonify({"error": f"Only PDF files are accepted. Rejected: {raw_name}"}), 400
             if size <= 0:
                 return jsonify({"error": f"{raw_name}: invalid size."}), 400
-            if size > MAX_PDF_SIZE_MB * 1024 * 1024:
-                return jsonify({"error": f"{raw_name} exceeds the {MAX_PDF_SIZE_MB} MB size limit."}), 400
+            if size > max_size_mb * 1024 * 1024:
+                return jsonify({"error": f"{raw_name} exceeds the {max_size_mb} MB size limit."}), 400
 
             filename = secure_filename(raw_name) or f"upload_{idx + 1}.pdf"
             # Prevent collisions if the user picks two files with the same name.
@@ -808,35 +871,17 @@ def submit():
         flash("Your account is not yet fully set up. Please contact support.", "error")
         return redirect(url_for("index"))
 
-    # 1b. Beta gate. Reject before touching R2 so we don't waste an upload.
-    with session_scope() as session:
-        org = session.get(Organization, org_id)
-        if org is None or not org.is_beta_approved:
-            logger.info("submit blocked: org %s not beta-approved (user %s)", org_id, user_id)
-            flash(
-                "Your organization is on the Nightshift AI beta waitlist. "
-                "We'll email you as soon as your access is approved.",
-                "error",
-            )
-            return redirect(url_for("index"))
+    # 1b. Beta gate + freemium quota + daily cap — shared with uploads/init
+    # and resubmit so no submit path can miss a gate. Reject before touching
+    # R2 so we don't waste an upload.
+    _gate_org_id, gate_err = _check_submission_gates(user_id)
+    if gate_err:
+        logger.info("submit blocked for org %s (user %s): %s",
+                    org_id, user_id, gate_err)
+        flash(gate_err, "error")
+        return redirect(url_for("index"))
 
-        cap = org.daily_submission_cap or BETA_DAILY_SUBMISSION_CAP_DEFAULT
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-        recent_count = (
-            session.query(Submission)
-            .filter(Submission.org_id == org_id, Submission.submitted_at >= cutoff)
-            .count()
-        )
-        if recent_count >= cap:
-            logger.info("submit blocked: org %s hit daily cap %d (user %s)",
-                        org_id, cap, user_id)
-            flash(
-                f"Your organization has reached its daily submission limit "
-                f"({cap} per 24 hours). Please try again later or contact support "
-                f"to request a higher limit.",
-                "error",
-            )
-            return redirect(url_for("index"))
+    max_files, max_size_mb = _freemium_upload_caps(org_id)
 
     # 2. Get uploaded files. Two paths:
     #    (a) New: browser uploaded directly to R2 via /api/uploads/* and posts
@@ -871,8 +916,8 @@ def submit():
         if not entries:
             flash("Please upload at least one PDF file.", "error")
             return redirect(url_for("index"))
-        if len(entries) > MAX_PDFS_PER_EMAIL:
-            flash(f"Maximum {MAX_PDFS_PER_EMAIL} files allowed.", "error")
+        if len(entries) > max_files:
+            flash(f"Maximum {max_files} files allowed.", "error")
             return redirect(url_for("index"))
 
         try:
@@ -895,8 +940,8 @@ def submit():
                 if size_bytes <= 0:
                     flash(f"{filename}: upload appears empty. Please try again.", "error")
                     return redirect(url_for("index"))
-                if size_bytes > MAX_PDF_SIZE_MB * 1024 * 1024:
-                    flash(f"{filename} exceeds the {MAX_PDF_SIZE_MB} MB size limit.", "error")
+                if size_bytes > max_size_mb * 1024 * 1024:
+                    flash(f"{filename} exceeds the {max_size_mb} MB size limit.", "error")
                     return redirect(url_for("index"))
 
                 total_size_bytes += size_bytes
@@ -924,8 +969,8 @@ def submit():
             flash("Please upload at least one PDF file.", "error")
             return redirect(url_for("index"))
 
-        if len(valid_files) > MAX_PDFS_PER_EMAIL:
-            flash(f"Maximum {MAX_PDFS_PER_EMAIL} files allowed.", "error")
+        if len(valid_files) > max_files:
+            flash(f"Maximum {max_files} files allowed.", "error")
             return redirect(url_for("index"))
 
         submission_id = str(uuid.uuid4())
@@ -943,8 +988,8 @@ def submit():
                     f.save(local_path)
 
                     size_bytes = os.path.getsize(local_path)
-                    if size_bytes > MAX_PDF_SIZE_MB * 1024 * 1024:
-                        flash(f"{filename} exceeds the {MAX_PDF_SIZE_MB} MB size limit.", "error")
+                    if size_bytes > max_size_mb * 1024 * 1024:
+                        flash(f"{filename} exceeds the {max_size_mb} MB size limit.", "error")
                         return redirect(url_for("index"))
 
                     total_pages += _count_pdf_pages(local_path)
@@ -1132,35 +1177,15 @@ def resubmit(parent_id):
               "error")
         return redirect(url_for("index"))
 
-    # Beta gate + daily cap apply to merge re-runs the same as fresh submissions.
-    with session_scope() as session:
-        org = session.get(Organization, org_id)
-        if org is None or not org.is_beta_approved:
-            logger.info("resubmit blocked: org %s not beta-approved (user %s)",
-                        org_id, user_id)
-            flash(
-                "Your organization is on the Nightshift AI beta waitlist. "
-                "We'll email you as soon as your access is approved.",
-                "error",
-            )
-            return redirect(url_for("index"))
-
-        cap = org.daily_submission_cap or BETA_DAILY_SUBMISSION_CAP_DEFAULT
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=24)
-        recent_count = (
-            session.query(Submission)
-            .filter(Submission.org_id == org_id, Submission.submitted_at >= cutoff)
-            .count()
-        )
-        if recent_count >= cap:
-            logger.info("resubmit blocked: org %s hit daily cap %d (user %s)",
-                        org_id, cap, user_id)
-            flash(
-                f"Your organization has reached its daily submission limit "
-                f"({cap} per 24 hours). Please try again later.",
-                "error",
-            )
-            return redirect(url_for("index"))
+    # Beta gate + freemium quota + daily cap apply to merge re-runs the same
+    # as fresh submissions (revisions don't consume a freemium credit, but an
+    # exhausted org can't keep re-running old projects either).
+    _gate_org_id, gate_err = _check_submission_gates(user_id)
+    if gate_err:
+        logger.info("resubmit blocked for org %s (user %s): %s",
+                    org_id, user_id, gate_err)
+        flash(gate_err, "error")
+        return redirect(url_for("index"))
 
     # Parent lookup + access checks (org-scoped so a teammate can revise).
     with session_scope() as session:
@@ -3040,7 +3065,17 @@ def members_role(membership_id):
 @app.route("/onboarding", methods=["GET", "POST"])
 @require_auth
 def onboarding():
-    """Capture explicit Name + Company on first sign-in and notify admins.
+    """Capture signup details on first sign-in.
+
+    Flag off (default): Name + Company only, manual beta-approval waitlist —
+    unchanged legacy behavior.
+
+    PLG_SELF_SERVE_ENABLED: also captures title/phone/company size and
+    AUTO-APPROVES the org onto the freemium plan (FREEMIUM_BID_LIMIT
+    lifetime bids). Free-email signups are excluded from auto-approval when
+    PLG_BLOCK_FREE_EMAIL_AUTO_APPROVE is set (each free-email signup gets
+    its own personal org, so instant approval would mean unlimited quota
+    farming) — they fall back to the manual waitlist.
 
     Skipped when the user's org is already beta-approved (returning users
     who land here via a stale link bounce home).
@@ -3060,11 +3095,17 @@ def onboarding():
                 user_name=user.name or "" if user else "",
                 user_email=user.email if user else "",
                 company_name=(org.name if org else ""),
+                user_title=(user.title or "" if user else ""),
+                phone=(org.phone or "" if org else ""),
+                company_size=(org.company_size or "" if org else ""),
             )
 
     # POST
     submitted_name = (request.form.get("name") or "").strip()
     submitted_company = (request.form.get("company_name") or "").strip()
+    submitted_title = (request.form.get("title") or "").strip()
+    submitted_phone = (request.form.get("phone") or "").strip()
+    submitted_size = (request.form.get("company_size") or "").strip()
 
     if not submitted_name:
         flash("Please enter your name.", "error")
@@ -3075,8 +3116,16 @@ def onboarding():
     if len(submitted_company) > 200 or len(submitted_name) > 200:
         flash("Name and company must each be under 200 characters.", "error")
         return redirect(url_for("onboarding"))
+    if len(submitted_title) > 128 or len(submitted_phone) > 64 \
+            or len(submitted_size) > 32:
+        flash("One of the fields is too long.", "error")
+        return redirect(url_for("onboarding"))
+    if PLG_SELF_SERVE_ENABLED and not submitted_phone:
+        flash("Please enter a phone number.", "error")
+        return redirect(url_for("onboarding"))
 
     notify_payload = None
+    auto_approved = False
     with session_scope() as session:
         user = session.get(User, uid)
         if user is None:
@@ -3097,38 +3146,97 @@ def onboarding():
 
         user.name = submitted_name
         org.name = submitted_company
+        if submitted_title:
+            user.title = submitted_title
+        if submitted_phone:
+            org.phone = submitted_phone
+        if submitted_size:
+            org.company_size = submitted_size
 
         first_request = org.approval_requested_at is None
         org.approval_requested_at = datetime.now(timezone.utc)
 
-        # Capture a snapshot for the email send (which we do AFTER commit so a
+        if PLG_SELF_SERVE_ENABLED:
+            free_email_blocked = (
+                PLG_BLOCK_FREE_EMAIL_AUTO_APPROVE
+                and is_free_email_domain(user.email)
+            )
+            if not free_email_blocked:
+                org.is_beta_approved = True
+                org.plan = "freemium"
+                auto_approved = True
+
+        # Capture a snapshot for the email sends (done AFTER commit so a
         # send failure doesn't roll back the application).
-        if first_request:
+        if first_request or auto_approved:
             notify_payload = {
                 "user_email": user.email,
                 "user_name": user.name,
+                "user_title": user.title or "",
                 "org_name": org.name,
                 "org_email_domain": org.email_domain,
+                "phone": org.phone or "",
+                "company_size": org.company_size or "",
             }
 
     if notify_payload:
-        admin_url = url_for("admin_orgs", _external=True)
+        if PLG_SELF_SERVE_ENABLED:
+            try:
+                notify_internal_plg_signup(
+                    user_email=notify_payload["user_email"],
+                    user_name=notify_payload["user_name"],
+                    user_title=notify_payload["user_title"],
+                    org_name=notify_payload["org_name"],
+                    org_domain=notify_payload["org_email_domain"],
+                    phone=notify_payload["phone"],
+                    company_size=notify_payload["company_size"],
+                    auto_approved=auto_approved,
+                )
+            except Exception as exc:
+                logger.error("PLG signup notification failed: %s", exc)
+            if auto_approved:
+                try:
+                    notify_freemium_welcome(
+                        email=notify_payload["user_email"],
+                        name=notify_payload["user_name"],
+                        org_name=notify_payload["org_name"],
+                        app_url=url_for("index", _external=True),
+                        bid_limit=FREEMIUM_BID_LIMIT,
+                    )
+                except Exception as exc:
+                    logger.error("Freemium welcome email failed: %s", exc)
+        else:
+            admin_url = url_for("admin_orgs", _external=True)
 
-        # Lightweight stand-in objects with the attribute shape the helper
-        # expects. Avoids passing detached ORM rows out of the session_scope.
-        class _U: pass
-        class _O: pass
-        u, o = _U(), _O()
-        u.name = notify_payload["user_name"]
-        u.email = notify_payload["user_email"]
-        o.name = notify_payload["org_name"]
-        o.email_domain = notify_payload["org_email_domain"]
-        try:
-            notify_admin_of_new_signup(u, o, admin_url)
-        except Exception as exc:
-            logger.error("Admin signup notification failed: %s", exc)
+            # Lightweight stand-in objects with the attribute shape the helper
+            # expects. Avoids passing detached ORM rows out of the session_scope.
+            class _U: pass
+            class _O: pass
+            u, o = _U(), _O()
+            u.name = notify_payload["user_name"]
+            u.email = notify_payload["user_email"]
+            o.name = notify_payload["org_name"]
+            o.email_domain = notify_payload["org_email_domain"]
+            try:
+                notify_admin_of_new_signup(u, o, admin_url)
+            except Exception as exc:
+                logger.error("Admin signup notification failed: %s", exc)
 
-    flash("Thanks — your access request has been received.", "success")
+    if auto_approved:
+        flash(
+            f"You're in — your account is ready with {FREEMIUM_BID_LIMIT} "
+            f"free bids. Upload your first bid set to get started.",
+            "success",
+        )
+    elif PLG_SELF_SERVE_ENABLED:
+        flash(
+            "Thanks — your request has been received. Personal-email signups "
+            "are reviewed manually; sign up with your company email for "
+            "instant access.",
+            "success",
+        )
+    else:
+        flash("Thanks — your access request has been received.", "success")
     return redirect(url_for("index"))
 
 
@@ -3202,6 +3310,9 @@ def admin_orgs_approve(org_id):
             return redirect(url_for("admin_orgs"))
 
         org.is_beta_approved = True
+        # A hand-approved org is a trusted beta customer, never freemium —
+        # manual approval must not leave them subject to the lifetime quota.
+        org.plan = "beta"
         # If approval is granted before the user ever submitted /onboarding
         # (rare path — admin pre-approves a known org), backfill the request
         # timestamp so the org doesn't reappear on the pending list.
