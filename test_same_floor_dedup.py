@@ -119,6 +119,26 @@ check(a["_same_floor_room_dedup"]["dropped"] == 1,
       f"cross-sheet re-read not dropped: {a['_same_floor_room_dedup']}")
 os.environ.pop("NIGHTSHIFT_SAME_FLOOR_ROOM_DEDUP", None)
 
+print("— numbered variants on ONE sheet (Honey Office 101, consensus "
+      "read variants) —")
+os.environ["NIGHTSHIFT_SAME_FLOOR_ROOM_DEDUP"] = "1"
+one_sheet = {"floors": [{"floor_name": "1st Floor", "rooms": [
+    rm("Office (101)", 564, "A011"),
+    rm("Office 101", 344, "A011"),      # consensus naming variant
+    rm("Unit 205 Bedroom", 400, "A011", num="205"),
+    rm("Unit 205 Bath", 150, "A011", num="205"),  # same digits, real rooms
+]}], "aggregated_totals": {"total_paintable_wall_sqft": 1458.0}}
+a = T._dedup_same_floor_rooms(one_sheet)
+names = [r["room_name"] for r in a["floors"][0]["rooms"]]
+check(names.count("Office (101)") == 1 and "Office 101" not in names,
+      f"same-number same-sheet naming variant must fold: {names}")
+check("Unit 205 Bedroom" in names and "Unit 205 Bath" in names,
+      f"token-disjoint rooms sharing a number must survive: {names}")
+check(a["aggregated_totals"]["total_paintable_wall_sqft"] == 1114.0,
+      f"dup walls removed from agg: "
+      f"{a['aggregated_totals']['total_paintable_wall_sqft']}")
+os.environ.pop("NIGHTSHIFT_SAME_FLOOR_ROOM_DEDUP", None)
+
 print("=== PASS ===" if not fails else
       "=== ISSUES: " + "; ".join(fails) + " ===")
 raise SystemExit(1 if fails else 0)

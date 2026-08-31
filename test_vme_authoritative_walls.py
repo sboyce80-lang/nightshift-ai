@@ -192,6 +192,33 @@ check("_vme_authoritative" not in a
       "flag off -> completely inert")
 os.environ.pop("NIGHTSHIFT_VME_AUTHORITATIVE_WALLS", None)
 
+# ── Faces convention (JW): geometric gross x2 before the WC deduct ─────────
+print("\nFaces basis (Caris/JW convention)")
+os.environ["NIGHTSHIFT_VME_AUTHORITATIVE_WALLS"] = "1"
+os.environ["NIGHTSHIFT_WALL_BASIS_FACES"] = "1"
+# LLM reference doubled so the x0.4-2.5 sanity band accepts the 2x gross
+# (real JW jobs: the per-room LLM sum is already faces-like)
+a = T._apply_vme_authoritative_walls(_analysis(llm_walls=24042))
+rec = a["_vme_authoritative"]
+expected = round(2422.5 * 10.83 * 2 - 103, 2)
+check(rec["applied"] is True and rec.get("faces_factor") == 2.0,
+      f"faces promotion: {rec}")
+check(a["aggregated_totals"]["total_paintable_wall_sqft"] == expected,
+      f"walls = LF x height x 2 - WC ({expected}): "
+      f"{a['aggregated_totals']['total_paintable_wall_sqft']}")
+check(any("FACES convention" in str(n) for n in a["notes"]),
+      "faces note missing")
+os.environ["NIGHTSHIFT_WALL_FACES_FACTOR"] = "1.9"
+a = T._apply_vme_authoritative_walls(_analysis(llm_walls=24042))
+check(a["_vme_authoritative"].get("faces_factor") == 1.9,
+      f"factor override: {a['_vme_authoritative']}")
+os.environ.pop("NIGHTSHIFT_WALL_BASIS_FACES", None)
+os.environ.pop("NIGHTSHIFT_WALL_FACES_FACTOR", None)
+a = T._apply_vme_authoritative_walls(_analysis())
+check(a["_vme_authoritative"].get("faces_factor") is None,
+      "faces flag off -> run basis unchanged")
+os.environ.pop("NIGHTSHIFT_VME_AUTHORITATIVE_WALLS", None)
+
 
 print("\n=== ALL PASS ===" if not fails else f"\n=== {len(fails)} FAIL ===")
 import sys

@@ -78,6 +78,29 @@ try:
     DRAWS[:] = []
     out = T._extract_exterior_scope_consensus(None, "x.pdf")
     check(out is None, "no-draw case not None")
+
+    # evidence union: a paint mandate read by ANY surviving draw reaches
+    # the consensus result even when the representative draw missed it
+    # (Caris 2026-08-25: evidence-gate zeroed measured siding on job
+    # draws whose representative lacked the mandate quote)
+    os.environ["NIGHTSHIFT_ELEV_PASS_CONSENSUS"] = "3"
+    quiet = {"hardie_siding_sqft": 5100, "azek_trim_lf": 590,
+             "exterior_door_count": 4, "notes": "east elevation",
+             "paint_evidence": ""}
+    loud = {"hardie_siding_sqft": 6100, "azek_trim_lf": 650,
+            "exterior_door_count": 4, "notes": "keynote 7: paint siding",
+            "paint_evidence": "KEYNOTE 7 — PAINT ALL SIDING PT-1"}
+    mid = {"hardie_siding_sqft": 5600, "azek_trim_lf": 620,
+           "exterior_door_count": 4, "notes": "west elevation",
+           "paint_evidence": ""}
+    DRAWS[:] = [dict(quiet), dict(loud), dict(mid)]
+    out = T._extract_exterior_scope_consensus(None, "x.pdf")
+    check("PAINT ALL SIDING" in str(out.get("paint_evidence")),
+          f"mandate from non-representative draw lost: "
+          f"{out.get('paint_evidence')}")
+    check("east elevation" in str(out.get("notes"))
+          and "keynote 7" in str(out.get("notes")),
+          f"notes not unioned: {out.get('notes')}")
 finally:
     T._extract_exterior_scope = orig
     os.environ.pop("NIGHTSHIFT_ELEV_PASS_CONSENSUS", None)
