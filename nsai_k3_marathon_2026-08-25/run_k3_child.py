@@ -144,6 +144,15 @@ def build_flags(cls):
     flags["NIGHTSHIFT_DRAW_MEDIAN_K_SMALL"] = "5"
     # Round 2: wainscot height bands are universal hard numbers
     flags["NIGHTSHIFT_SCHEDULE_HEIGHT_SPLIT"] = "1"
+    # Round 3: Dutchess is 21pp — above the old 12-page threshold, so
+    # it only drew K=3 on the flakiest set in the corpus. Raise to 25.
+    flags["NIGHTSHIFT_DRAW_MEDIAN_SMALL_MAX_PAGES"] = "25"
+    # Round 3: geometry may only price the whole job when it measured
+    # the whole job (Hudson: 1 floor page of a 4-story hotel).
+    flags["NIGHTSHIFT_VME_REQUIRE_FLOOR_COVERAGE"] = "1"
+    # Round 3: deterministic elevation evidence everywhere (validated
+    # on Caris: +19.9 -> +2.6 with identical extractions).
+    flags["NIGHTSHIFT_ELEV_TEXT_EVIDENCE"] = "1"
     flags["NIGHTSHIFT_MANDATORY_REVIEW"] = "1"
     return flags
 

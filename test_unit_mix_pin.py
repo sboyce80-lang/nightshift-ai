@@ -98,23 +98,57 @@ rec = a["_unit_mix_gate"]
 check(rec.get("pinned", {}).get("covered_before") == 42
       and rec["pinned"]["covered_after"] == 34,
       f"coverage not pinned: {rec}")
-check(rec["unit_types"].get("Unit A") == 26,
-      f"Unit A must absorb the -8: {rec['unit_types']}")
+# PROPORTIONAL: pool is Unit A x34 + D/F/G x6 = 40; excess 8 splits
+# 34/40 -> 6 (A) and 6/40 -> 1 (D/F/G), remainder 1 to the largest
+# headroom (A) => A 34->27, D/F/G 6->5. The catch-all is NOT emptied.
+check(rec["unit_types"].get("Unit A") == 27,
+      f"Unit A takes its proportional share, not all: {rec['unit_types']}")
+check(rec["unit_types"].get("Unit D/F/G") == 5,
+      f"drawn-unit typical shares the reduction: {rec['unit_types']}")
+check(sum(rec["unit_types"].values()) == 34,
+      f"coverage must sum to the unit count: {rec['unit_types']}")
 rooms = a["floors"][0]["rooms"]
-check(all(r["unit_multiplier"] == 26 for r in rooms),
+check(all(r["unit_multiplier"] == 27 for r in rooms),
       f"typical rooms not adjusted: "
       f"{[r['unit_multiplier'] for r in rooms]}")
-# walls drop by (400+150) * 8; ceilings by 250*8; doors by 2*8
 agg = a["aggregated_totals"]
-check(agg["total_paintable_wall_sqft"] == 550.0 * 26 + 4580,
-      f"wall agg not reduced by the removed multiplier: {agg}")
-check(agg["total_paintable_ceiling_sqft"] == 250.0 * 26,
+check(agg["total_paintable_wall_sqft"] == 550.0 * 27 + 500 + 450 * 5 + 480 + 900,
+      f"wall agg not reduced by the removed multipliers: {agg}")
+check(agg["total_paintable_ceiling_sqft"] == 250.0 * 27,
       f"ceiling agg wrong: {agg}")
-check(agg["total_doors_full_paint"] == 2 * 26,
+check(agg["total_doors_full_paint"] == 2 * 27,
       f"door agg wrong: {agg}")
-check(a["floors"][1]["rooms"][0]["unit_multiplier"] == 1
-      and a["floors"][2]["rooms"][0]["unit_multiplier"] == 6,
-      "drawn units must keep their multipliers")
+check(a["floors"][1]["rooms"][0]["unit_multiplier"] == 1,
+      "singleton drawn units keep their multiplier")
+
+print("\n2b) Hudson shape: catch-alls keep the bulk of their units")
+_clear()
+os.environ["NIGHTSHIFT_UNIT_MIX_GATE"] = "1"
+os.environ["NIGHTSHIFT_UNIT_MIX_PIN"] = "1"
+hud = {
+    "project_info": {"total_units": 34},
+    "floors": [{"floor_name": "F", "rooms": [
+        {"room_name": "Unit A Guest", "unit_type": "Unit A",
+         "unit_multiplier": 34, "in_scope": True,
+         "dimensions": {"wall_area_sqft": 400.0}, "elements": {}},
+        {"room_name": "Unit B Guest", "unit_type": "Unit B",
+         "unit_multiplier": 17, "in_scope": True,
+         "dimensions": {"wall_area_sqft": 380.0}, "elements": {}},
+        {"room_name": "Unit C", "unit_type": "Unit C",
+         "unit_multiplier": 32, "in_scope": True,
+         "dimensions": {"wall_area_sqft": 360.0}, "elements": {}},
+    ]}],
+    "aggregated_totals": {"total_paintable_wall_sqft":
+                          400 * 34 + 380 * 17 + 360 * 32},
+    "notes": [],
+}
+a = T._enforce_unit_mix_coverage(hud)
+ut = a["_unit_mix_gate"]["unit_types"]
+check(sum(ut.values()) == 34, f"pinned to 34: {ut}")
+check(min(ut.values()) > 1,
+      f"NO typical may be emptied to 1 (the r2 Hudson failure): {ut}")
+check(ut["Unit A"] > ut["Unit B"] and ut["Unit C"] > ut["Unit B"],
+      f"relative sizes preserved: {ut}")
 check(any("Unit-Mix Pin" in str(n) for n in a["notes"]),
       "pin note missing")
 

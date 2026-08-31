@@ -292,6 +292,59 @@ else:
     print("  (no local sample PDF — small-K check skipped)")
 _clear_env()
 
+print("\n16) A single clean draw beats a field of implausible ones")
+_clear_env()
+_calls = []
+# Dutchess shape: 1 healthy draw + 2 hollow (gates stripped the walls)
+_seq = [_fake_result(9372, 29, 0, 28848, rooms=33),
+        _fake_result(705, 29, 0, 11159, rooms=28),
+        _fake_result(870, 29, 0, 13649, rooms=27)]
+T.run_analysis = _fake_run
+try:
+    out = T._run_job_draw_median(3, ["x.pdf"], {})
+finally:
+    T.run_analysis = _real_run
+rep = out["analysis"]["_job_draw_median"]
+check(rep["vote_draws"] == [1],
+      f"the lone clean draw must be the whole vote: {rep['vote_draws']}")
+check(out["cost_estimate"]["subtotal"] == 28848,
+      f"hollow draw must not be priced: {out['cost_estimate']}")
+
+print("\n17) All draws implausible -> priced but forced to review")
+_clear_env()
+_calls = []
+_seq = [_fake_result(705, 29, 0, 11159, rooms=28),
+        _fake_result(870, 29, 0, 13649, rooms=27),
+        _fake_result(800, 29, 0, 12000, rooms=27)]
+T.run_analysis = _fake_run
+try:
+    out = T._run_job_draw_median(3, ["x.pdf"], {})
+finally:
+    T.run_analysis = _real_run
+rep = out["analysis"]["_job_draw_median"]
+check(rep.get("all_draws_implausible") is True,
+      f"all-bad field must be recorded: {rep}")
+check(out["analysis"].get("manual_review_required") is True,
+      "all-bad field must force manual review")
+
+print("\n18) Zero-ceiling draws are judged against their siblings")
+_hudson = [
+    {"rooms": 88, "walls_sqft": 40063, "doors": 89, "ceilings_sqft": 0},
+    {"rooms": 71, "walls_sqft": 25808, "doors": 164, "ceilings_sqft": 4919},
+    {"rooms": 146, "walls_sqft": 44730, "doors": 140, "ceilings_sqft": 5160},
+]
+check(T._hollow_against_field(_hudson[0], _hudson),
+      "zero ceilings while siblings measured thousands = hollow")
+check(not T._hollow_against_field(_hudson[1], _hudson),
+      "a draw with ceilings is fine")
+_noceil = [{"rooms": 40, "walls_sqft": 20000, "doors": 13,
+            "ceilings_sqft": 0} for _ in range(3)]
+check(not any(T._hollow_against_field(c, _noceil) for c in _noceil),
+      "a job with no ceiling scope must not be flagged")
+check(not T._final_composition_implausible(
+    {"rooms": 88, "walls_sqft": 40063, "doors": 89, "ceilings_sqft": 0}),
+    "the absolute band no longer judges ceilings")
+
 print("\n12) Page cap sums across multiple PDFs")
 _clear_env()
 if sample:

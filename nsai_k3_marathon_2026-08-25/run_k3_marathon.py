@@ -13,15 +13,17 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 WT = os.path.dirname(HERE)                       # the worktree root
 MAIN = os.path.join(os.path.dirname(WT), "nightshift-repo")
 PY = os.path.join(MAIN, ".venv", "bin", "python")
-TIMEOUT_S = 12 * 3600                            # 3 draws of a 3.5h job
+TIMEOUT_S = 20 * 3600  # r2: ULUM hit the old 12h cap on a cold 49pp set
 
 # Ascending expected runtime (K=1 minutes x3): tsc 35, harlem 16,
 # fishkill 45, caris 50, hudson 47, 364 48, dutchess 48, honey 115,
 # ulum 214, homewood 183.
-SEQUENCE = ["jw_harlem_valley", "tsc_fusion_highland", "fishkill_397",
-            "jw_caris_hyde_park", "jw_hudson_hotel", "364_main",
-            "dutchess_livestock", "honey_farms_malta",
-            "jw_homewood_suites", "jw_under_canvas_ulum"]
+# ROUND 3 (2026-08-30) — scoped to the four cells the round-3 fixes
+# target; the API balance ($269) does not cover a full 10-job board
+# (~$200-300 est). The five banded cells carry no new information at
+# this posture and return in a later confirmation board.
+SEQUENCE = ["jw_harlem_valley", "dutchess_livestock",
+            "jw_hudson_hotel", "jw_under_canvas_ulum"]
 
 
 def log(m):
@@ -40,7 +42,7 @@ def write_report():
     sha = subprocess.run(["git", "rev-parse", "--short", "HEAD"],
                          cwd=WT, capture_output=True, text=True
                          ).stdout.strip()
-    lines = [f"# K=3 draw-median board — 2026-08-25 · {sha} · "
+    lines = [f"# K=3 draw-median board — ROUND 3 2026-08-30 · {sha} · "
              f"marathon posture + JOB_DRAW_MEDIAN=3", "",
              "| job | class | KS subtotal | target bid | Δ | ±10% | mr | "
              "sel draw | spread | mean qty err |",
