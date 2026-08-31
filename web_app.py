@@ -59,6 +59,7 @@ from config import (
     PLG_SELF_SERVE_ENABLED, FREEMIUM_BID_LIMIT,
     FREEMIUM_MAX_PDF_SIZE_MB, FREEMIUM_MAX_PDFS,
     PLG_BLOCK_FREE_EMAIL_AUTO_APPROVE, PLG_SALES_CONTACT_EMAIL,
+    scale_timeout_for_consensus,
 )
 import storage
 from datetime import datetime, timezone, timedelta
@@ -279,13 +280,20 @@ def _pick_queue(total_pages, max_size_bytes):
 
 
 def _pick_timeout(total_pages, max_size_bytes):
-    """Per-submission RQ job_timeout, scaled to payload.
+    """Per-submission RQ job_timeout, scaled to payload AND to how many
+    times each plan sheet will be read.
 
     A flat 2h timeout was too tight for 4-PDF DD-scale sets (one SUMMIT
     submission was killed at the 91-min mark with no completion in sight)
     and far too generous for small jobs (which then squat the queue when
     truly hung). Tier the limit so big payloads get room and small ones
     fail fast.
+
+    The tiers below predate per-sheet consensus, which multiplies
+    extraction wall time by N. 364 Main (2026-08-31, 23 pages / 19.5 MB)
+    landed in the 1h tier, ran K=3, and was SIGKILL'd on sheet 17 of 20 —
+    so the tier is now scaled by config.effective_consensus_n(), the same
+    function the extraction path uses to pick N.
 
     Returns seconds. Falls back to RQ_JOB_TIMEOUT (the env-configurable
     safety net) if anything goes sideways.
@@ -294,15 +302,17 @@ def _pick_timeout(total_pages, max_size_bytes):
         max_mb = max_size_bytes / (1024 * 1024)
         # DD-scale (300+ MB or 50+ pages): 4h
         if max_mb >= 300 or total_pages >= 50:
-            return 4 * 3600
+            base = 4 * 3600
         # Large (100-300 MB): 2h
-        if max_mb >= 100 or total_pages >= 25:
-            return 2 * 3600
+        elif max_mb >= 100 or total_pages >= 25:
+            base = 2 * 3600
         # Medium (30-100 MB or 10+ pages): 1h
-        if max_mb >= 30 or total_pages >= 10:
-            return 3600
+        elif max_mb >= 30 or total_pages >= 10:
+            base = 3600
         # Small everything else: 60 min
-        return 3600
+        else:
+            base = 3600
+        return scale_timeout_for_consensus(base, total_pages)
     except Exception:
         return RQ_JOB_TIMEOUT
 

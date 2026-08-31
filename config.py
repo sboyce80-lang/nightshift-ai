@@ -689,6 +689,76 @@ CLERK_AUTHORIZED_PARTIES = [
     if o.strip()
 ]
 
+# ---------------------------------------------------------------------------
+# Per-sheet consensus (N-read) sizing
+# ---------------------------------------------------------------------------
+# Per-sheet consensus re-reads every plan sheet N times and union-merges the
+# reads to kill single-read sampling noise. It costs roughly N x the
+# extraction wall time, so the extraction path and the enqueue-time RQ
+# job_timeout MUST agree on the same N. They did not on 2026-08-31: 364 Main
+# (23 pages / 19.5 MB) was enqueued with the flat 1h tier, ran K=3, was still
+# on sheet 17 of 20 at the 55-minute mark, and got SIGKILL'd by RQ. These two
+# helpers are the single source of truth for both sides.
+
+# DD-class cutoff: at or above this page count, consensus is forced back to a
+# single read. Lowered 30 -> 20 on 2026-08-31 — ULUM (49pp) was already known
+# to be bid-grade single-read (-5.6%) and consistently -16/-17% under
+# consensus, and 364 Main (23pp) then spent 80+ minutes on K=3 reads it did
+# not benefit from either. Mid-size sets' variance is cross-sheet, not
+# per-read.
+CONSENSUS_DD_MIN_PAGES_DEFAULT = 20
+
+# Ceiling on the consensus-scaled job_timeout. A hung job still has to give
+# the (single-instance) heavy worker back eventually.
+CONSENSUS_TIMEOUT_CAP_SECONDS = 4 * 3600
+
+
+def effective_consensus_n(total_pages=0):
+    """Reads per plan sheet for a job of ``total_pages`` pages.
+
+    NIGHTSHIFT_PER_SHEET_CONSENSUS (default 1 = off, clamped to 1..3),
+    forced back to 1 on DD-class sets of CONSENSUS_DD_MIN_PAGES_DEFAULT
+    pages or more (override: NIGHTSHIFT_CONSENSUS_DD_MIN_PAGES).
+    """
+    try:
+        n = max(1, min(3, int(os.environ.get(
+            "NIGHTSHIFT_PER_SHEET_CONSENSUS", "1"))))
+    except (TypeError, ValueError):
+        n = 1
+    if n > 1:
+        try:
+            dd_min = int(os.environ.get(
+                "NIGHTSHIFT_CONSENSUS_DD_MIN_PAGES",
+                str(CONSENSUS_DD_MIN_PAGES_DEFAULT)))
+        except (TypeError, ValueError):
+            dd_min = CONSENSUS_DD_MIN_PAGES_DEFAULT
+        try:
+            pages = int(total_pages or 0)
+        except (TypeError, ValueError):
+            pages = 0
+        if pages >= dd_min > 0:
+            return 1
+    return n
+
+
+def scale_timeout_for_consensus(base_seconds, total_pages=0):
+    """Stretch an RQ job_timeout to cover N-read per-sheet consensus.
+
+    Straight x N — the base tiers already carry ~2x slack over a
+    single-read run, so no extra margin is layered on. Never returns less
+    than ``base_seconds``.
+    """
+    try:
+        base = int(base_seconds)
+    except (TypeError, ValueError):
+        return base_seconds
+    n = effective_consensus_n(total_pages)
+    if n <= 1:
+        return base
+    return max(base, min(base * n, CONSENSUS_TIMEOUT_CAP_SECONDS))
+
+
+
 def validate_config():
     if not CLAUDE_API_KEY:
         print("⚠️  CLAUDE_API_KEY is not set")

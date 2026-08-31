@@ -3851,25 +3851,14 @@ _CONSENSUS_JOB_PAGE_COUNT = 0  # set by the per-sheet loop; module-global
 
 
 def _effective_consensus_n():
-    """Per-class consensus N (V3): the configured NIGHTSHIFT_PER_SHEET_
-    CONSENSUS, forced to 1 on large DD-class sets (page count ≥
-    NIGHTSHIFT_CONSENSUS_DD_MIN_PAGES, default 30) — ULUM (49 pages) was
-    stable and bid-grade single-read (−5.6%) and consistently −16/−17%
-    under consensus; big sets' variance is cross-sheet, not per-read."""
-    try:
-        n = max(1, min(3, int(os.environ.get(
-            "NIGHTSHIFT_PER_SHEET_CONSENSUS", "1"))))
-    except (TypeError, ValueError):
-        n = 1
-    if n > 1:
-        try:
-            dd_min = int(os.environ.get(
-                "NIGHTSHIFT_CONSENSUS_DD_MIN_PAGES", "30"))
-        except (TypeError, ValueError):
-            dd_min = 30
-        if _CONSENSUS_JOB_PAGE_COUNT >= dd_min > 0:
-            return 1
-    return n
+    """Per-class consensus N (V3) for THIS job's page scale.
+
+    Delegates to config.effective_consensus_n so the extraction path and
+    web_app._pick_timeout / jobs.py's re-route size themselves off the
+    exact same N — they disagreed on 364 Main (2026-08-31) and the job was
+    SIGKILL'd mid-extraction. See config.py for the DD-cutoff rationale.
+    """
+    return _cfg.effective_consensus_n(_CONSENSUS_JOB_PAGE_COUNT)
 
 
 def _sheet_checkpoint_load(ckpt_dir, page_idx0, key_hash):
@@ -4031,6 +4020,47 @@ def _render_sheet_image_blocks(pdf_path, page_idx0):
     return blocks
 
 
+_CONTROL_FLOW_EXC_NAMES = (
+    "JobTimeoutException",        # rq death penalty (job_timeout elapsed)
+    "BaseTimeoutException",
+    "HorseMonitorTimeoutException",
+    "ShutDownImminentException",  # rq worker asked to stop
+)
+
+
+def _is_control_flow_exc(exc):
+    """True when an exception means "this process must stop NOW" rather
+    than "this API call failed".
+
+    _call_sheet_api's catch-all used to swallow RQ's death penalty: on 364
+    Main (2026-08-31) the 3600s JobTimeoutException fired mid-read, was
+    logged as one more failed sheet, and the loop calmly moved on to the
+    next sheet until RQ SIGKILL'd the work-horse a minute later. Because
+    nothing propagated, process_submission's failure handler never ran, the
+    row sat at 'processing', and the customer got a generic "worker died"
+    message from the watchdog 17 minutes later instead of the real reason.
+    Let these through so the job fails cleanly and immediately.
+
+    Matches on rq's classes when rq is importable and falls back to class
+    names so offline/CLI runs of this module behave identically.
+    """
+    if isinstance(exc, (KeyboardInterrupt, SystemExit)):
+        return True
+    try:
+        from rq.timeouts import BaseTimeoutException
+        if isinstance(exc, BaseTimeoutException):
+            return True
+    except Exception:
+        pass
+    try:
+        from rq.exceptions import ShutDownImminentException
+        if isinstance(exc, ShutDownImminentException):
+            return True
+    except Exception:
+        pass
+    return type(exc).__name__ in _CONTROL_FLOW_EXC_NAMES
+
+
 def _call_sheet_api(client, content_blocks, output_kwargs, label,
                     max_tokens=32000, max_retries=4, base_delay=30):
     """One schema-enforced streaming call with the standard retry ladder.
@@ -4088,6 +4118,8 @@ def _call_sheet_api(client, content_blocks, output_kwargs, label,
                                 except TruncatedResponseError as _ce:
                                     joined += _ce.partial_text
                         except Exception as _cexc:
+                            if _is_control_flow_exc(_cexc):
+                                raise
                             print(f"      ⚠️  {label}: continuation failed "
                                   f"({type(_cexc).__name__}) — using "
                                   f"salvaged partial")
@@ -4111,6 +4143,12 @@ def _call_sheet_api(client, content_blocks, output_kwargs, label,
                   f"(attempt {attempt + 1}/{max_retries})")
             time.sleep(delay)
         except Exception as e:
+            if _is_control_flow_exc(e):
+                # Death penalty / shutdown: propagate so the sheet loop
+                # stops and process_submission can fail the row cleanly.
+                print(f"      ⏹  {label}: {type(e).__name__} — aborting "
+                      f"extraction (not a sheet failure)")
+                raise
             print(f"      ❌ {label}: {type(e).__name__}: {str(e)[:120]}")
             return None
     return None
@@ -27582,6 +27620,11 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                     building_inventory=building_inventory,
                     project_overview=project_overview)
             except Exception as _ps_exc:
+                if _is_control_flow_exc(_ps_exc):
+                    # Falling back to the legacy chunked path here would
+                    # start a fresh round of API calls on a job that has
+                    # already blown its deadline. Abort instead.
+                    raise
                 import traceback as _tb
                 print(f"   ⚠️  Per-sheet extraction crashed — falling back "
                       f"to legacy path: {_ps_exc}")
@@ -27623,6 +27666,8 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                                 building_inventory=building_inventory,
                                 project_overview=project_overview)
                         except Exception as _alt_exc:
+                            if _is_control_flow_exc(_alt_exc):
+                                raise
                             print(f"   ⚠️  Per-sheet retry {_ra + 1} crashed: {_alt_exc}")
                             _alt = None
                         if not _alt:
