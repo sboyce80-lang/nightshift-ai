@@ -2129,6 +2129,68 @@ _FINISH_PLACEHOLDER_RX = re.compile(
     re.IGNORECASE)
 
 
+def _crop_page_png_bytes(pdf_path, page_idx0, clip, target_px=1500):
+    """PNG of one page region, or None.
+
+    Rendered rather than PDF-cropped on purpose. set_cropbox() cannot
+    express these rects — Phelps A102 carries an offset MediaBox
+    (-1296,-864 .. 1296,864) while page space is (0,0 .. 2592,1728), so a
+    page-space clip raises "CropBox not in MediaBox". Rendering sidesteps
+    box arithmetic entirely.
+
+    It is also the better input: the vision API fits an image to ~1568px
+    on the long edge, so one tile at that budget resolves the per-room
+    code grid at several times the effective detail of the whole sheet
+    sent at the same cap.
+    """
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        page = doc[page_idx0]
+        rect = fitz.Rect(clip) & page.rect
+        if rect.is_empty or rect.width < 20 or rect.height < 20:
+            doc.close()
+            return None
+        long_pt = max(rect.width, rect.height)
+        dpi = max(72, min(300, int(target_px * 72.0 / long_pt)))
+        pix = page.get_pixmap(clip=rect, dpi=dpi, alpha=False)
+        data = pix.tobytes("png")
+        doc.close()
+        return data
+    except Exception:
+        return None
+
+
+def _finish_plan_regions(pdf_path, page_idx0, cols=2, rows=2, overlap=0.08):
+    """Overlapping tiles covering one finish-plan page.
+
+    Phelps A102 is 2592x1728 pt and carries TWO spatially separate suites —
+    the 400-series occupies x 529-1250 and the 417-series x 1399-1790. Sent
+    whole, extraction returned only the 417 block; at full-sheet scale the
+    per-room code grid is too dense to traverse reliably. Tiles with a
+    generous overlap let each pass read a legible fraction, and merging is
+    safe because rows are keyed by room number.
+    """
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        r = doc[page_idx0].rect
+        doc.close()
+    except Exception:
+        return []
+    ox, oy = r.width * overlap, r.height * overlap
+    out = []
+    for c in range(cols):
+        for rw in range(rows):
+            x0 = r.x0 + (r.width / cols) * c - (ox if c else 0)
+            x1 = r.x0 + (r.width / cols) * (c + 1) + (ox if c < cols - 1 else 0)
+            y0 = r.y0 + (r.height / rows) * rw - (oy if rw else 0)
+            y1 = r.y0 + (r.height / rows) * (rw + 1) + (
+                oy if rw < rows - 1 else 0)
+            out.append((f"r{c}{rw}", (x0, y0, x1, y1)))
+    return out
+
+
 def _finish_row_has_evidence(row):
     """True when a schedule row carries an actual finish DESIGNATION.
 
@@ -2151,6 +2213,85 @@ def _finish_row_has_evidence(row):
 
 def _finish_rows_with_evidence(rows):
     return [r for r in (rows or []) if _finish_row_has_evidence(r)]
+
+
+def _canon_room_number(v):
+    """Room number reduced to comparable form: '417-16', '417.16' and
+    '417 16' all become '41716'. Region tiles overlap, so the same room
+    comes back from two passes and the separator style drifts between
+    them — without this the merge keeps both copies."""
+    return re.sub(r"[^0-9A-Za-z]+", "", str(v or "")).upper()
+
+
+_STRUCTURED_ROOM_NUM_RX = re.compile(r"^\d{3}[-. ]\s?\d{1,2}[A-Za-z]?$|"
+                                     r"^\d{3}[-. ]?[A-D]$")
+_BARE_TAG_RX = re.compile(r"^\d{1,3}$")
+
+
+def _sheet_room_number_tokens(pdf_path, page_indices):
+    """Canonical room numbers actually PRINTED on the given pages.
+
+    The sheet is the ground truth for which rooms exist, and it costs
+    nothing to read. Phelps: the region sweep returned 75 rows, of which
+    56 matched a number on the sheet — and the 19 that did not were all
+    malformed or invented ('400-', '417O', '400-33', 'OPTS/CRBI G'). 56 is
+    exactly the count of room-number tags on that sheet.
+    """
+    toks = set()
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        for idx in (page_indices or []):
+            if idx < 0 or idx >= len(doc):
+                continue
+            txt = doc[idx].get_text() or ""
+            for m in re.finditer(
+                    r"\b\d{3}[-.\s]?\d{1,2}[A-Za-z]?\b|\b\d{3}[A-D]\b", txt):
+                toks.add(_canon_room_number(m.group(0)))
+        doc.close()
+    except Exception:
+        return set()
+    return {t for t in toks if t}
+
+
+def _drop_offsheet_rows(rows, on_sheet):
+    """Split rows into (kept, rejected) by whether their room number is
+    printed on the sheet. Rows without a number are kept — name-only rows
+    are matched by name downstream. No-op when the token scan came back
+    empty, so a text-less sheet cannot delete a whole schedule."""
+    if not on_sheet:
+        return list(rows or []), []
+    keep, drop = [], []
+    for r in (rows or []):
+        num = _canon_room_number(r.get("room_number"))
+        if not num or num in on_sheet:
+            keep.append(r)
+        else:
+            drop.append(r)
+    return keep, drop
+
+
+def _drop_floorplan_tag_rows(rows):
+    """Drop rows keyed by a bare area tag when suite numbering dominates.
+
+    A finish plan and its floor plan share a sheet. Asked to read the
+    grid, extraction also picks up the floor plan's room labels — Phelps
+    yielded 39 bare tags (116, 117, 119 ...) alongside 65 real
+    '400-xx'/'417-xx' rows. Those tags are not schedule rows: they carry
+    no finish designation of their own and they inflate coverage.
+
+    Only fires when structured numbers are already the clear majority, so
+    jobs whose rooms are legitimately numbered 101/102 are untouched.
+    """
+    rows = list(rows or [])
+    structured = [r for r in rows if _STRUCTURED_ROOM_NUM_RX.match(
+        str(r.get("room_number") or "").strip())]
+    bare = [r for r in rows if _BARE_TAG_RX.match(
+        str(r.get("room_number") or "").strip())]
+    if not bare or len(structured) < max(5, len(rows) * 0.5):
+        return rows, []
+    keep = [r for r in rows if r not in bare]
+    return keep, bare
 
 
 # pdf_path -> number of per-room finish blocks the grid actually shows.
@@ -9127,8 +9268,18 @@ including corridors and every numbered suite room."""
             _cap = 32000
         _max_tok = max(8000, min(_cap, _expected * 260))
 
-    def _one_call(prompt_text, max_tok):
+    def _one_call(prompt_text, max_tok, png_b64=None):
         parts, stop = [], None
+        if png_b64:
+            _doc_block = {"type": "image",
+                          "source": {"type": "base64",
+                                     "media_type": "image/png",
+                                     "data": png_b64}}
+        else:
+            _doc_block = {"type": "document",
+                          "source": {"type": "base64",
+                                     "media_type": "application/pdf",
+                                     "data": pdf_data}}
         with client.messages.stream(
             model="claude-sonnet-4-6",
             max_tokens=max_tok,
@@ -9137,14 +9288,7 @@ including corridors and every numbered suite room."""
             messages=[{
                 "role": "user",
                 "content": [
-                    {
-                        "type": "document",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "application/pdf",
-                            "data": pdf_data
-                        }
-                    },
+                    _doc_block,
                     {
                         "type": "text",
                         "text": prompt_text
@@ -9192,12 +9336,12 @@ including corridors and every numbered suite room."""
                     break
                 _key = set()
                 for r in _seen:
-                    _key.add(str(r.get("room_number")
-                                 or r.get("room_name") or "").lower())
+                    _key.add(_canon_room_number(r.get("room_number"))
+                             or str(r.get("room_name") or "").lower())
                 _added = 0
                 for r in _new:
-                    k = str(r.get("room_number")
-                            or r.get("room_name") or "").lower()
+                    k = (_canon_room_number(r.get("room_number"))
+                         or str(r.get("room_name") or "").lower())
                     if k and k not in _key:
                         _key.add(k)
                         _seen.append(r)
@@ -9207,15 +9351,98 @@ including corridors and every numbered suite room."""
                       f"+{_added} room(s) → {len(_seen)}")
                 if not _added:
                     break
+            # Region sweep: if the whole-sheet read still falls short on
+            # rows that carry a real designation, walk the page in
+            # overlapping tiles. Merging is keyed by room number, and the
+            # evidence filter means a tile that pads its answer adds
+            # nothing.
+            def _clean(rows):
+                """Canonical dedup -> drop floor-plan area tags -> drop
+                numbers not printed on the sheet. Runs on EVERY path: the
+                coverage decision below is only meaningful once padding
+                has been removed, and a first pass padded to 41 rows with
+                24 area tags would otherwise skip the region sweep it
+                actually needed."""
+                _d = {}
+                for _r in rows:
+                    _k = (_canon_room_number(_r.get("room_number"))
+                          or str(_r.get("room_name") or "").lower())
+                    if _k and _k not in _d:
+                        _d[_k] = _r
+                _rows = list(_d.values())
+                _rows, _tg = _drop_floorplan_tag_rows(_rows)
+                _rows, _of = _drop_offsheet_rows(
+                    _rows, _sheet_room_number_tokens(pdf_path, page_indices))
+                if _tg:
+                    print(f"   🧹 Dropped {len(_tg)} floor-plan area-tag "
+                          f"row(s) (bare numbers, not finish-grid rooms)")
+                if _of:
+                    print(f"   🧹 Dropped {len(_of)} row(s) whose number is "
+                          f"not printed on the sheet (e.g. "
+                          f"{', '.join(str(r.get('room_number')) for r in _of[:4])})")
+                return _rows
+
+            _seen = _clean(_seen)
+            _ev = _finish_rows_with_evidence(_seen)
+            _regions_on = os.environ.get(
+                "NIGHTSHIFT_FINISH_PLAN_REGIONS", "0").strip() in (
+                "1", "true", "True")
+            if (_regions_on and page_indices and _expected
+                    and len(_ev) < _expected * 0.6):
+                print(f"   🔍 Region sweep: {len(_ev)} evidence row(s) of "
+                      f"~{_expected} — reading the sheet in tiles")
+                _key = set()
+                for r in _seen:
+                    _key.add(_canon_room_number(r.get("room_number"))
+                             or str(r.get("room_name") or "").lower())
+                for _pi in page_indices[:2]:
+                    for _tag, _clip in _finish_plan_regions(
+                            pdf_path, _pi, cols=3, rows=2):
+                        _crop = _crop_page_png_bytes(pdf_path, _pi, _clip)
+                        if not _crop:
+                            continue
+                        _tp = room_finish_prompt + (
+                            f"\n\nThis is a CROPPED REGION of the finish "
+                            f"plan, not the whole sheet. Return every room "
+                            f"block fully visible in this crop. Skip blocks "
+                            f"cut off at the edges — another crop covers "
+                            f"them. Read ONLY the per-room finish grid: do "
+                            f"NOT invent rows from floor-plan room labels or "
+                            f"area tags, and never write a placeholder like "
+                            f"\"see finish plan\" into a finish cell. If this "
+                            f"crop contains no finish grid, return an empty "
+                            f"room_finish_schedule array.")
+                        _txt3, _ = _one_call(
+                            _tp, _max_tok,
+                            png_b64=base64.b64encode(_crop).decode())
+                        _o3 = _parse_json_response(
+                            _txt3, context=f"finish region {_tag}")
+                        _r3 = _finish_rows_with_evidence(
+                            (_o3 or {}).get("room_finish_schedule") or [])
+                        _add = 0
+                        for r in _r3:
+                            k = (_canon_room_number(r.get("room_number"))
+                                 or str(r.get("room_name") or "").lower())
+                            if k and k not in _key:
+                                _key.add(k)
+                                _seen.append(r)
+                                _add += 1
+                        if _add:
+                            print(f"      ▸ {_tag}: +{_add} room(s) → "
+                                  f"{len(_finish_rows_with_evidence(_seen))} "
+                                  f"with evidence")
+                _seen = _clean(_seen)
+                _ev = _finish_rows_with_evidence(_seen)
+
             if _seen:
                 if json_match is None:
                     json_match = {"room_finish_schedule": [],
                                   "building_info": {}}
                 json_match["room_finish_schedule"] = _seen
-                if _expected and len(_seen) < _expected * 0.6:
-                    print(f"   ⚠️  Finish schedule still short: {len(_seen)} "
-                          f"of ~{_expected} blocks — scope gates will stand "
-                          f"down")
+                if _expected and len(_ev) < _expected * 0.6:
+                    print(f"   ⚠️  Finish schedule still short: {len(_ev)} "
+                          f"evidence row(s) of ~{_expected} blocks — scope "
+                          f"gates will stand down")
         if json_match:
             rfs_data = json_match
             rooms = rfs_data.get("room_finish_schedule", [])

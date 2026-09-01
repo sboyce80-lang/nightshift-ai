@@ -354,6 +354,47 @@ check(prec2.get("coverage") == round(18 / 62, 3),
 T._FINISH_PLAN_BLOCK_COUNTS.clear()
 os.environ.pop("NIGHTSHIFT_SCHEDULE_ROOM_SCOPE", None)
 
+# ── 7. region sweep hygiene: dedup, area tags, on-sheet validation ──────
+print("\n[7] region sweep row hygiene")
+
+check(T._canon_room_number("417-16") == "41716", "canon strips dashes")
+check(T._canon_room_number("417.16") == "41716", "canon strips dots")
+check(T._canon_room_number("417 16") == "41716", "canon strips spaces")
+check(T._canon_room_number(None) == "", "canon handles None")
+check(T._canon_room_number("417-16") == T._canon_room_number("417.16"),
+      "separator drift collapses to one key (overlapping tiles)")
+
+TAGROWS = ([{"room_number": f"400-{i:02d}", "room_name": f"Exam {i}",
+             "wall_finish": "PT1", "ceiling_finish": "ACT1"}
+            for i in range(1, 13)]
+           + [{"room_number": str(116 + i), "room_name": f"Room {i}",
+               "wall_finish": "PT1", "ceiling_finish": "ACT1"}
+              for i in range(6)])
+kept, tags = T._drop_floorplan_tag_rows(TAGROWS)
+check(len(tags) == 6 and len(kept) == 12,
+      f"bare area tags dropped when suite numbering dominates "
+      f"(kept {len(kept)}, dropped {len(tags)})")
+
+BARE_ONLY = [{"room_number": str(100 + i), "room_name": f"R{i}",
+              "wall_finish": "PT1"} for i in range(10)]
+kept2, tags2 = T._drop_floorplan_tag_rows(BARE_ONLY)
+check(len(tags2) == 0 and len(kept2) == 10,
+      "jobs legitimately numbered 101/102 are untouched")
+
+ON = {"41716", "40001"}
+rows = [{"room_number": "417-16"}, {"room_number": "400-01"},
+        {"room_number": "400-33"}, {"room_number": "417O"},
+        {"room_name": "Corridor"}]
+k3, d3 = T._drop_offsheet_rows(rows, ON)
+check(len(k3) == 3 and len(d3) == 2,
+      f"numbers absent from the sheet are rejected (kept {len(k3)}, "
+      f"dropped {len(d3)})")
+check(any(not r.get("room_number") for r in k3),
+      "name-only rows survive (matched by name downstream)")
+k4, d4 = T._drop_offsheet_rows(rows, set())
+check(len(k4) == 5 and not d4,
+      "empty token scan is a no-op — never deletes a whole schedule")
+
 print("\n" + "=" * 60)
 if FAILS:
     print(f"❌ {len(FAILS)} FAILED:")
