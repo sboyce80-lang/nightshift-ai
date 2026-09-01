@@ -53,3 +53,20 @@ validate_recovery.log
 validate_recovery_summary.json
 *_validate.json
 *_validate.pdf
+
+# Validation-run artifacts (nsai_* batches, golden plan sets).
+# The harness SCRIPTS and the analysis NOTES are committed; the customer bid
+# sets, run outputs and logs are not — they are third-party confidential
+# documents and would bloat history permanently (~600MB as of 2026-09-01).
+golden/plans/
+nsai_*/**/*.pdf
+nsai_*/**/*.json
+nsai_*/**/*.log
+nsai_*/**/*.txt
+nsai_*/**/*.xlsx
+nsai_*/*.pdf
+nsai_*/*.json
+nsai_*/*.log
+nsai_*/*.txt
+nsai_*/*.xlsx
+nsai_*/*.html
