@@ -148,6 +148,44 @@ _HTML_TEMPLATE = Template("""<!DOCTYPE html>
     }
     .totals-row.subtotal { border-bottom: 1px solid #ccc; }
     .totals-row.grand { font-weight: bold; font-size: 12pt; }
+    .review-banner {
+        border: 2px solid #000;
+        background: #f2f2f2;
+        padding: 10px 14px;
+        margin: 0 0 16px 0;
+    }
+    .review-banner .rb-title {
+        font-weight: bold;
+        font-size: 12pt;
+        letter-spacing: 0.5px;
+    }
+    .review-banner .rb-body {
+        font-size: 10pt;
+        margin-top: 5px;
+    }
+    .review-banner ul {
+        margin: 6px 0 0 0;
+        padding-left: 18px;
+        font-size: 10pt;
+    }
+    .open-items {
+        margin-top: 22px;
+    }
+    .open-items h2 {
+        font-size: 12pt;
+        margin: 0 0 10px 0;
+    }
+    .open-items ul {
+        margin: 0 0 14px 0;
+        padding-left: 18px;
+        font-size: 10.5pt;
+    }
+    .open-items li { margin-bottom: 7px; }
+    .open-items .oi-sub {
+        font-size: 11pt;
+        font-weight: bold;
+        margin: 0 0 6px 0;
+    }
     .notes-page {
         page-break-before: always;
     }
@@ -167,6 +205,23 @@ _HTML_TEMPLATE = Template("""<!DOCTYPE html>
 </head>
 <body>
     <h1 class="title">ESTIMATE</h1>
+
+    {% if review.needs_review %}
+    <div class="review-banner">
+        <div class="rb-title">DRAFT — INTERNAL REVIEW REQUIRED, NOT FOR SUBMISSION</div>
+        <div class="rb-body">This estimate was generated from an incomplete or
+        low-confidence takeoff and has <strong>not</strong> been cleared for
+        release to an owner or general contractor. Resolve the open items on the
+        last page before issuing a bid.</div>
+        {% if review.reasons %}
+        <ul>
+        {% for reason in review.reasons %}
+            <li>{{ reason }}</li>
+        {% endfor %}
+        </ul>
+        {% endif %}
+    </div>
+    {% endif %}
 
     <div class="header">
         <div class="left">
@@ -235,6 +290,28 @@ _HTML_TEMPLATE = Template("""<!DOCTYPE html>
             <span>${{ "{:,.2f}".format(subtotal) }}</span>
         </div>
     </div>
+
+    {% if open_items.excluded or open_items.unresolved %}
+    <div class="open-items">
+        <h2>Scope Not Included &amp; Open Items</h2>
+        {% if open_items.excluded %}
+        <div class="oi-sub">Excluded from this price</div>
+        <ul>
+        {% for item in open_items.excluded %}
+            <li>{{ item }}</li>
+        {% endfor %}
+        </ul>
+        {% endif %}
+        {% if open_items.unresolved %}
+        <div class="oi-sub">Information required before this price is firm</div>
+        <ul>
+        {% for item in open_items.unresolved %}
+            <li>{{ item }}</li>
+        {% endfor %}
+        </ul>
+        {% endif %}
+    </div>
+    {% endif %}
 
     <div class="notes-page">
         <h2>Important Notes &amp; Exclusions</h2>
@@ -358,9 +435,15 @@ def _build_line_items(result: dict) -> List[dict]:
         ("Stairs",
          ["stair", "railing", "handrail"],
          "Risers, railings, and adjacent stair walls prepared and finished as part of the painted-stair scope."),
+        # Scope text is rebuilt below from the lines that actually matched.
+        # 2026-09-01 (Profeta / 168 Holley St): every door on the job was
+        # PRE-FIN so 0 doors were priced, yet this row printed "Includes
+        # baseboards, casings, doors, and frames as scheduled" over a
+        # base-trim-only $1,324.05 — a contractual offer to paint doors for
+        # free.
         ("Trim, doors, and windows",
          ["trim", "door", "window", "hm panel", "frame", "cabinet"],
-         "Caulked, filled, sanded, and finished with two coats. Includes baseboards, casings, doors, and frames as scheduled."),
+         "Caulked, filled, sanded, and finished with two coats."),
         ("Interior painting — walls & ceilings",
          ["wall", "ceiling", "soffit"],
          "Surfaces prepared with standard renovation prep (patching, sanding, caulking) and finished with primer plus two coats."),
@@ -372,6 +455,7 @@ def _build_line_items(result: dict) -> List[dict]:
     misc_labels = []
 
     specialty_labels = []
+    trim_labels = []
     for li in items:
         qty = float(li.get("qty") or 0)
         total = float(li.get("total") or 0)
@@ -384,12 +468,33 @@ def _build_line_items(result: dict) -> List[dict]:
                 grouped[title]["total"] += total
                 if title == "Specialty coatings":
                     specialty_labels.append(label)
+                elif title == "Trim, doors, and windows":
+                    trim_labels.append(label)
                 matched = True
                 break
         if not matched:
             misc["total"] += total
             misc_labels.append(str(li.get("item") or "").strip())
 
+    # Name only the trim components that were actually priced. Listing
+    # "doors, and frames" on a row that priced zero doors reads as an
+    # all-inclusive trim offer.
+    if trim_labels:
+        present = []
+        if any("base" in l or "crown" in l or "trim" in l for l in trim_labels):
+            present.append("baseboards and casings")
+        if any("door" in l or "hm panel" in l or "frame" in l for l in trim_labels):
+            present.append("doors and frames")
+        if any("window" in l for l in trim_labels):
+            present.append("window trim")
+        if any("cabinet" in l for l in trim_labels):
+            present.append("cabinetry")
+        if present:
+            listed = present[0] if len(present) == 1 else (
+                ", ".join(present[:-1]) + " and " + present[-1])
+            grouped["Trim, doors, and windows"]["scope"] = (
+                "Caulked, filled, sanded, and finished with two coats. "
+                f"Includes {listed} as scheduled.")
     # When the Specialty bucket holds ONLY stained-wood lines, say so — a
     # generic "Specialty coatings" row the customer can't tie to any plan
     # scope reads as an invented charge (Rider feedback on Biddle,
@@ -424,6 +529,120 @@ def _build_line_items(result: dict) -> List[dict]:
         misc["scope"] = "\n".join(misc_labels)
         out.append(misc)
     return out
+
+
+def _review_gate_enabled() -> bool:
+    """Kill switch for the review gate. Default ON — an estimate that the
+    pipeline itself refused to clear must never render as a clean bid."""
+    return os.environ.get("NIGHTSHIFT_ESTIMATE_REVIEW_GATE", "1").strip() not in (
+        "0", "false", "False")
+
+
+def _review_state(result: dict) -> dict:
+    """Decide whether this estimate may be presented as a finished bid.
+
+    2026-09-01 (Profeta / 168 Holley St, the first PLG self-serve job): the
+    pipeline set ready_to_send=false, route_to_human_review=true,
+    manual_review_required=true and calibrated confidence 24 (+/-54%) — four
+    plan pages had failed extraction and the whole exterior scope priced at
+    $0. The branded estimate still rendered as a clean, caveat-free
+    $34,139.02 bid. The estimator had no signal in the document itself that
+    it was not ready to send.
+
+    Reads the routing decisions the pipeline already made; it never makes a
+    new judgement of its own.
+    """
+    reasons: List[str] = []
+
+    analysis = result.get("analysis", {}) or {}
+    will = result.get("will_synthesis", {}) or {}
+    flags = will.get("pipeline_flags", {}) or {}
+
+    # Will's gate (and confidence.reconcile_will_confidence, which can only
+    # tighten it). ready_to_send is only meaningful when Will actually ran —
+    # an absent will_synthesis must not be read as "not ready".
+    if flags:
+        if flags.get("ready_to_send") is False:
+            reasons.append("The takeoff was not cleared for release "
+                           "(ready_to_send = false).")
+        if flags.get("route_to_human_review"):
+            reasons.append("Routed to human review before the price is issued.")
+        for override in (flags.get("ready_to_send_overrides") or []):
+            reasons.append(str(override))
+
+    # Coverage / scope-missing gate.
+    if result.get("manual_review_required") or analysis.get("manual_review_required"):
+        why = (result.get("manual_review_reason")
+               or analysis.get("manual_review_reason") or "").strip()
+        reasons.append(f"Manual review flag: {why}" if why else "Manual review flag set.")
+
+    # Calibrated band — printed whenever it is wide enough to change a bid.
+    cal = analysis.get("calibrated_confidence", {}) or {}
+    err = cal.get("predicted_error_pct")
+    level = cal.get("confidence_level")
+    if isinstance(err, (int, float)) and err >= 15:
+        reasons.append(f"Predicted accuracy is only within +/-{err:.0f}% at 90% "
+                       f"confidence (calibrated confidence {level}).")
+
+    # De-duplicate while preserving order.
+    seen = set()
+    deduped = [r for r in reasons if not (r in seen or seen.add(r))]
+    return {"needs_review": bool(deduped), "reasons": deduped}
+
+
+# Exclusions carrying these sources are job-specific findings (Will's review,
+# the hard-numbers gates). "standard" rows are the generic trade boilerplate
+# already covered by DEFAULT_BOILERPLATE and are not reprinted here.
+_BOILERPLATE_EXCLUSION_SOURCES = {"standard", ""}
+
+
+def _open_items(result: dict) -> dict:
+    """Job-specific exclusions and unresolved questions for the estimate.
+
+    The full job PDF carries all of these; the branded estimate carried none
+    of them. A bid that names no exclusions is read as all-inclusive, so the
+    job-specific rows travel with the price.
+
+    Returns {"excluded": [str], "unresolved": [str]}.
+    """
+    excluded: List[str] = []
+    unresolved: List[str] = []
+
+    costs = result.get("cost_estimate", {}) or {}
+    for exc in (costs.get("exclusions") or []):
+        if not isinstance(exc, dict):
+            continue
+        source = str(exc.get("source") or "").strip().lower()
+        if source in _BOILERPLATE_EXCLUSION_SOURCES:
+            continue
+        item = str(exc.get("item") or "").strip()
+        reason = str(exc.get("reason") or "").strip()
+        if not item:
+            continue
+        excluded.append(f"{item} — {reason}" if reason else item)
+
+    # High-severity validation warnings are priced-at-zero scope: the quantity
+    # exists on the drawings but the hard-numbers policy refused to invent it.
+    for warn in ((result.get("validation", {}) or {}).get("warnings") or []):
+        if not isinstance(warn, dict):
+            continue
+        if str(warn.get("severity") or "").lower() != "high" and not warn.get("policy_zero"):
+            continue
+        msg = str(warn.get("message") or "").strip()
+        if msg:
+            unresolved.append(msg)
+
+    will = result.get("will_synthesis", {}) or {}
+    for missing in ((will.get("pipeline_flags", {}) or {}).get("missing_information") or []):
+        text = str(missing or "").strip()
+        if text:
+            unresolved.append(text)
+
+    def _dedupe(rows):
+        seen = set()
+        return [r for r in rows if not (r in seen or seen.add(r))]
+
+    return {"excluded": _dedupe(excluded), "unresolved": _dedupe(unresolved)}
 
 
 def _client_block(submission, result: dict) -> Tuple[str, str, str]:
@@ -483,6 +702,17 @@ def generate_estimate_pdf(submission, organization, result: dict, out_dir: str,
 
     client_name, client_address, client_phone = _client_block(submission, result)
 
+    # Routing state the pipeline already decided, surfaced in the document
+    # itself rather than only in the full job PDF the estimator may not open.
+    review = _review_state(result) if _review_gate_enabled() else {
+        "needs_review": False, "reasons": []}
+    open_items = _open_items(result) if _review_gate_enabled() else {
+        "excluded": [], "unresolved": []}
+    if review["needs_review"]:
+        logger.warning(
+            "Estimate %s rendered as DRAFT (review required): %s",
+            submission.id, "; ".join(review["reasons"]))
+
     html_str = _HTML_TEMPLATE.render(
         org=organization,
         logo_src=_resolve_logo_src(organization),
@@ -494,6 +724,8 @@ def generate_estimate_pdf(submission, organization, result: dict, out_dir: str,
         estimate_date=today,
         line_items=_build_line_items(result),
         subtotal=_result_subtotal(result),
+        review=review,
+        open_items=open_items,
         boilerplate=list(boilerplate) if boilerplate is not None else DEFAULT_BOILERPLATE,
     )
 
