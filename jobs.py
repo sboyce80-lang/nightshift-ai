@@ -1500,8 +1500,22 @@ def send_manual_review_email(contact_info, result, submission_id):
         logger.warning("SMTP not configured — skipping manual-review email")
         return
 
-    reason = (result.get("manual_review_reason")
-              or "Automated confidence check failed.")
+    # POLICY HOLD vs REAL FLAG (2026-09-01). NIGHTSHIFT_MANDATORY_REVIEW
+    # holds EVERY estimate during the accuracy rollout, so this function
+    # now sends to healthy jobs too — and the original copy tells those
+    # customers their submission failed ("unlikely to reflect the full
+    # painting scope", "don't act on any preliminary numbers"). On a
+    # self-serve signup that is the customer's entire first impression,
+    # and it is not true. The extractor's own checks set
+    # manual_review_reason; the blanket policy only appends a note, so
+    # an absent/policy-only reason means "held by policy, nothing wrong".
+    _raw_reason = result.get("manual_review_reason")
+    _analysis = result.get("analysis") or {}
+    _policy_note = any(
+        str(n).startswith("[Mandatory Review]")
+        for n in (_analysis.get("notes") or []))
+    _policy_hold = _policy_note and not _raw_reason
+    reason = _raw_reason or "Automated confidence check failed."
     # Trim the leading [MANUAL REVIEW REQUIRED] marker if present —
     # the email subject conveys that already; the body shouldn't shout.
     if reason.startswith("[MANUAL REVIEW REQUIRED]"):
@@ -1511,7 +1525,31 @@ def send_manual_review_email(contact_info, result, submission_id):
     contact_email = contact_info.get("email") or ""
     business_name = contact_info.get("business_name") or "(your project)"
 
-    body = f"""Hi {contact_name},
+    if _policy_hold:
+        body = f"""Hi {contact_name},
+
+Thanks for sending over {business_name} — we have your plans and your
+takeoff is underway.
+
+Every Knight Shift estimate is reviewed by one of our estimators before
+it goes out. That is a deliberate choice: a painting bid is a number you
+are going to stand behind with a customer, so a person checks the
+measurements and scope before we put it in your hands.
+
+Submission ID: {submission_id}
+
+What happens next: your reviewer confirms the takeoff against the
+drawings and replies to this thread with your estimate, along with any
+questions about scope the drawings did not settle (owner-supplied
+finishes, exterior work, and ceiling types are the usual ones).
+
+If this is time-sensitive, reply directly or call {COMPANY_PHONE} and we
+will prioritize it.
+
+— {COMPANY_NAME}
+"""
+    else:
+        body = f"""Hi {contact_name},
 
 Thank you for submitting {business_name} through Knight Shift.
 
@@ -1547,8 +1585,11 @@ If this is time-sensitive, reply directly or call {COMPANY_PHONE}.
     msg["To"] = f"{contact_name} <{contact_email}>" if contact_email else COMPANY_EMAIL
     if contact_email and contact_email.lower() != "admin@knightshiftai.com":
         msg["Cc"] = "admin@knightshiftai.com"
-    msg["Subject"] = (f"Knight Shift — {business_name} flagged for manual "
-                      f"review (estimate NOT auto-sent)")
+    msg["Subject"] = (
+        f"Knight Shift — {business_name}: your estimate is in review"
+        if _policy_hold else
+        f"Knight Shift — {business_name} flagged for manual "
+        f"review (estimate NOT auto-sent)")
     msg.attach(MIMEText(body, "plain"))
 
     try:
