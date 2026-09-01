@@ -30,6 +30,7 @@ from config import (
     EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT,
     COMPANY_NAME, COMPANY_EMAIL, COMPANY_PHONE,
     ADMIN_EMAILS,
+    scale_timeout_for_consensus,
 )
 import storage
 from db import session_scope
@@ -80,6 +81,16 @@ def _describe_exc(exc):
     PDFs with dangling object references) — that empty string used to flow
     into the customer error email and the DB error column verbatim.
     """
+    # RQ's death penalty stringifies to "Task exceeded maximum timeout
+    # value (N seconds)", which tells a painting contractor nothing. Say
+    # what actually happened and what to do about it.
+    if type(exc).__name__ in ("JobTimeoutException", "BaseTimeoutException"):
+        return (
+            "The takeoff ran past its time limit and was stopped before it "
+            "finished. This usually means the plan set needs a longer "
+            "processing window — resubmit, and if it happens again the set "
+            "needs to be split or the job timeout raised."
+        )
     msg = str(exc).strip()
     return msg if msg else f"Unexpected error ({type(exc).__name__})"
 
@@ -233,13 +244,15 @@ def _reroute_to_heavy_if_misrouted(submission_id, local_pdfs, kwargs_for_requeue
     if total_pages < HEAVY_QUEUE_PAGE_THRESHOLD and total_mb < HEAVY_QUEUE_FILE_MB:
         return False  # genuinely a fast-class job
 
-    # Tiered timeout on MEASURED totals (mirrors web_app._pick_timeout).
+    # Tiered timeout on MEASURED totals (mirrors web_app._pick_timeout),
+    # scaled by the same per-sheet consensus N the extraction path will use.
     if total_mb >= 300 or total_pages >= 50:
         timeout = 4 * 3600
     elif total_mb >= 100 or total_pages >= 25:
         timeout = 2 * 3600
     else:
         timeout = 3600
+    timeout = scale_timeout_for_consensus(timeout, total_pages)
     try:
         from redis import Redis
         from rq import Queue
