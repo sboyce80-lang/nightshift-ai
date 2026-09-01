@@ -192,6 +192,55 @@ check("_vme_authoritative" not in a
       "flag off -> completely inert")
 os.environ.pop("NIGHTSHIFT_VME_AUTHORITATIVE_WALLS", None)
 
+# ── Whole-building coverage precondition (Hudson r2) ───────────────────────
+print("\nFloor-coverage precondition")
+os.environ["NIGHTSHIFT_VME_AUTHORITATIVE_WALLS"] = "1"
+os.environ["NIGHTSHIFT_VME_REQUIRE_FLOOR_COVERAGE"] = "1"
+
+
+def _multi_story(stories=4, pages=1, floor_groups=4):
+    a = _analysis()
+    a["project_info"] = {"total_stories": stories}
+    a["_vme_shadow_v2"]["n_floor_pages"] = pages
+    a["floors"] = [
+        {"floor_name": f"Floor {i+1}",
+         "rooms": [{"room_name": f"R{i}-{j}", "in_scope": True,
+                    "dimensions": {"ceiling_height_feet": 10.83}}
+                   for j in range(3)]}
+        for i in range(floor_groups)]
+    return a
+
+
+a = T._apply_vme_authoritative_walls(_multi_story())
+check(a["_vme_authoritative"]["applied"] is False
+      and "floor page" in a["_vme_authoritative"]["reason"],
+      f"1 page / 4 stories must abstain: {a['_vme_authoritative']}")
+check(a["aggregated_totals"]["total_paintable_wall_sqft"] == 12021,
+      "abstention leaves the extraction value")
+
+a = T._apply_vme_authoritative_walls(_multi_story(stories=4, pages=4,
+                                                  floor_groups=4))
+check(a["_vme_authoritative"]["applied"] is True,
+      f"full coverage still promotes: {a['_vme_authoritative']}")
+
+a = T._apply_vme_authoritative_walls(_multi_story(stories=1, pages=1,
+                                                  floor_groups=1))
+check(a["_vme_authoritative"]["applied"] is True,
+      "single-story job unaffected")
+
+# extraction that itself only spans the measured floor is not a coverage gap
+a = T._apply_vme_authoritative_walls(_multi_story(stories=4, pages=1,
+                                                  floor_groups=1))
+check(a["_vme_authoritative"]["applied"] is True,
+      f"scope limited to the measured floor still promotes: "
+      f"{a['_vme_authoritative']}")
+
+os.environ.pop("NIGHTSHIFT_VME_REQUIRE_FLOOR_COVERAGE", None)
+a = T._apply_vme_authoritative_walls(_multi_story())
+check(a["_vme_authoritative"]["applied"] is True,
+      "flag off -> legacy behavior (no coverage check)")
+os.environ.pop("NIGHTSHIFT_VME_AUTHORITATIVE_WALLS", None)
+
 # ── Faces convention (JW): geometric gross x2 before the WC deduct ─────────
 print("\nFaces basis (Caris/JW convention)")
 os.environ["NIGHTSHIFT_VME_AUTHORITATIVE_WALLS"] = "1"

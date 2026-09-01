@@ -9306,6 +9306,59 @@ def _extract_exterior_scope_consensus(client, pdf_path):
     return base
 
 
+# Deterministic exterior evidence (round 3, 2026-08-28): Caris r2 measured
+# exterior in ALL 5 draws but the evidence gate's verdict split 3 ways —
+# whether a draw read the factory-finish note off the sheet was a per-draw
+# dice roll, and the 2 draws that read it were both in band (+3.0/+9.5)
+# while the 3 that didn't ran −16/−18. The note is IN THE PDF TEXT LAYER;
+# reading it must not involve dice.
+_DET_EXT_PAINT_RX = re.compile(
+    r"(?:field[\s-]*paint\w*|paint\w*[^.\n]{0,40}\b(?:siding|hardie|"
+    r"fascia|trim|soffit|cornice|lintel|corner\s*board)|(?:siding|hardie|"
+    r"fascia|trim|soffit|cornice|lintel|corner\s*board)[^.\n]{0,40}"
+    r"\bpaint\w*|\bPT[- ]?\d\b[^.\n]{0,40}\b(?:siding|trim|fascia)|"
+    r"(?:siding|trim|fascia)[^.\n]{0,40}\bPT[- ]?\d\b)", re.IGNORECASE)
+_DET_EXT_FACTORY_RX = re.compile(
+    r"(?:factory[\s-]*(?:finish\w*|primed|applied)|pre[\s-]*finish\w*|"
+    r"prefinish\w*|finish\w*\s+by\s+(?:manufacturer|others))",
+    re.IGNORECASE)
+
+
+def _deterministic_elev_text_evidence(pdf_path, elevation_indices):
+    """Flag-gated (NIGHTSHIFT_ELEV_TEXT_EVIDENCE, default off): regex the
+    elevation pages' embedded text for paint mandates and factory-finish
+    notes. Pure text-layer read — identical result every draw. Returns a
+    dict of quoted matches (possibly empty) or None on failure."""
+    if os.environ.get("NIGHTSHIFT_ELEV_TEXT_EVIDENCE", "0").strip() not in (
+            "1", "true", "True"):
+        return None
+    try:
+        text_parts = []
+        with open(pdf_path, "rb") as fh:
+            reader = PyPDF2.PdfReader(fh)
+            for idx in elevation_indices:
+                if 0 <= idx < len(reader.pages):
+                    try:
+                        text_parts.append(
+                            reader.pages[idx].extract_text() or "")
+                    except Exception:
+                        continue
+        text = "\n".join(text_parts)
+        if not text.strip():
+            return {"empty_text_layer": True}
+        paint_hits = [m.group(0).strip()[:120]
+                      for m in _DET_EXT_PAINT_RX.finditer(text)][:8]
+        factory_hits = [m.group(0).strip()[:120]
+                        for m in _DET_EXT_FACTORY_RX.finditer(text)][:8]
+        return {"paint_mandates": paint_hits,
+                "factory_finish_notes": factory_hits,
+                "pages": [i + 1 for i in elevation_indices]}
+    except Exception as e:
+        print(f"   ⚠️  Deterministic elevation text scan failed "
+              f"(non-fatal): {type(e).__name__}: {str(e)[:80]}")
+        return None
+
+
 def _extract_exterior_scope(client, pdf_path):
     """Extract exterior painting scope from elevation sheets only.
 
@@ -9468,6 +9521,13 @@ exterior scope visible.")."""
 
         ext_data = json_match
         ext_data["source_pages"] = [i + 1 for i in elevation_indices]
+        # Deterministic text-layer evidence rides with every pass draw —
+        # identical content each time, so the evidence gate's verdict
+        # stops depending on which draw happened to read the note.
+        _det = _deterministic_elev_text_evidence(pdf_path,
+                                                 elevation_indices)
+        if _det is not None:
+            ext_data["deterministic_text_evidence"] = _det
 
         if _structured:
             ext_data = _apply_elevation_breakdown(ext_data)
@@ -16550,6 +16610,15 @@ def _enforce_exterior_evidence(analysis):
         return analysis
     blobs = [str(ext.get("paint_evidence") or ""),
              str(ext.get("notes") or "")]
+    # Deterministic text-layer evidence (identical every draw): quoted
+    # paint mandates and factory-finish notes regex'd straight from the
+    # elevation pages' embedded text. Present whenever the scan flag is
+    # on — the gate's verdict must not depend on which draw's LLM read
+    # happened to transcribe the note.
+    _det_ev = ext.get("deterministic_text_evidence") or {}
+    for _hit in ((_det_ev.get("paint_mandates") or [])
+                 + (_det_ev.get("factory_finish_notes") or [])):
+        blobs.append(str(_hit))
     for f in ((analysis.get("_scope_sweep") or {}).get("findings") or []):
         blobs.append(f"{f.get('item') or ''} {f.get('detail') or ''}")
     # Finish-schedule rows are first-class paint evidence — Honey's
@@ -17612,13 +17681,34 @@ def _enforce_unit_mix_coverage(analysis):
             and total_units >= 2 and covered > total_units):
         excess = int(round(covered - total_units))
         reductions = {}
-        for ut, m in sorted(by_type.items(), key=lambda kv: -kv[1]):
-            if excess <= 0:
-                break
-            take = min(excess, int(m) - 1)
-            if take > 0:
-                reductions[ut] = take
-                excess -= take
+        # PROPORTIONAL reduction (round 3, 2026-08-30): the original
+        # largest-first rule emptied the catch-alls before touching
+        # anything else — Hudson round 2 cut 'Unit A' ×34→×1 and
+        # 'Unit B' ×17→×1, erasing ~19 real guestroom units and taking
+        # the bid to −33.9%. Every typical over-claims in proportion to
+        # its share of the over-count, so every typical gives back in
+        # that same proportion; largest-first only breaks remainder ties.
+        _pool = {ut: int(m) for ut, m in by_type.items() if int(m) > 1}
+        _pool_total = sum(_pool.values())
+        _headroom = sum(m - 1 for m in _pool.values())
+        if _pool and _headroom >= excess:
+            for ut, m in _pool.items():
+                take = int((m / _pool_total) * excess)
+                take = min(take, m - 1)
+                if take > 0:
+                    reductions[ut] = take
+            excess -= sum(reductions.values())
+            # distribute the rounding remainder, largest headroom first
+            for ut, m in sorted(_pool.items(),
+                                key=lambda kv: -(kv[1] - 1
+                                                 - reductions.get(kv[0], 0))):
+                if excess <= 0:
+                    break
+                room = (m - 1) - reductions.get(ut, 0)
+                take = min(excess, room)
+                if take > 0:
+                    reductions[ut] = reductions.get(ut, 0) + take
+                    excess -= take
         if reductions and excess <= 0:
             stash = analysis.get("_schedule_authoritative_counts") or {}
             agg = analysis.setdefault("aggregated_totals", {})
@@ -19635,6 +19725,32 @@ def _apply_vme_authoritative_walls(analysis):
             scoped_why = "scoped measurement found no billable wall geometry"
     if basis is None:
         return _abstain(f"{fallback_why}; {scoped_why}")
+
+    # Whole-building coverage precondition (round 3, 2026-08-30,
+    # NIGHTSHIFT_VME_REQUIRE_FLOOR_COVERAGE): geometry may only price
+    # the whole job when it MEASURED the whole job. Hudson round 2: the
+    # scoped basis measured ONE floor page of a 4-story hotel and
+    # applied 38,212 SF against JW's 72,382 — a single floor's walls
+    # sold as the building. When measured floor pages fall short of the
+    # building's stories (and the extraction itself spans more floors
+    # than were measured), abstain to the extraction and say why.
+    if os.environ.get(
+            "NIGHTSHIFT_VME_REQUIRE_FLOOR_COVERAGE", "0").strip() in (
+            "1", "true", "True"):
+        _stories = int(_num((analysis.get("project_info") or {})
+                            .get("total_stories", 0)) or 0)
+        _measured_pages = int(_num(rec.get("n_floor_pages", 0)) or 0)
+        _extracted_floors = len([
+            fl for fl in (analysis.get("floors") or [])
+            if isinstance(fl, dict) and any(
+                r.get("in_scope", True) for r in (fl.get("rooms") or []))])
+        if (_stories >= 2 and 0 < _measured_pages < _stories
+                and _extracted_floors > _measured_pages):
+            return _abstain(
+                f"geometry measured {_measured_pages} floor page(s) of a "
+                f"{_stories}-story building (extraction spans "
+                f"{_extracted_floors} floor group(s)) — partial-building "
+                f"geometry must not price the whole job")
 
     # Wall-quantity CONVENTION (per-customer, 2026-08-26): run-basis LF
     # counts each partition once — the Rider convention (their verified
@@ -26982,6 +27098,36 @@ def _final_composition_implausible(comp):
         return True
     if rooms >= 10 and doors <= 0:
         return True
+    # NOTE: zero-ceiling draws are judged RELATIVELY, in
+    # _hollow_against_field — a job may legitimately have no painted
+    # ceilings (exposed structure, exterior-only scope), and an
+    # absolute rule would force review on correct work.
+    return False
+
+
+def _hollow_against_field(comp, field):
+    """True when this draw is missing a component its SIBLINGS found —
+    evidence the draw dropped real scope rather than the job lacking it.
+
+    Hudson round 2 priced three of five draws at ZERO ceiling area
+    across 86-90 rooms while the other draws measured ~5,000 SF; no
+    absolute band caught it. Judging against the field keeps a
+    genuinely ceiling-less job (TSC's exposed structure, exterior-only
+    work — every draw at zero) out of the net."""
+    rooms = float(comp.get("rooms") or 0)
+    if rooms < 10 or not field:
+        return False
+    import statistics
+    for key in ("ceilings_sqft",):
+        mine = float(comp.get(key) or 0)
+        if mine > 0:
+            continue
+        peers = [float(c.get(key) or 0) for c in field
+                 if c is not comp]
+        if not peers:
+            continue
+        if statistics.median(peers) > 0 and max(peers) > 0:
+            return True
     return False
 
 
@@ -27019,8 +27165,16 @@ def _run_job_draw_median(k, pdf_paths, run_kwargs):
     comps = [_draw_composition(r) for r in draws]
     clean = [i for i, r in enumerate(draws)
              if not (r.get("analysis") or {}).get("_cold_draw_suspect")
-             and not _final_composition_implausible(comps[i])]
-    vote = clean if len(clean) >= 2 else list(range(len(draws)))
+             and not _final_composition_implausible(comps[i])
+             and not _hollow_against_field(comps[i], comps)]
+    # A single clean draw beats a vote that re-admits known-bad ones
+    # (round 3, 2026-08-30): Dutchess round 2 flagged two hollow draws
+    # (705 / 870 SF of wall across ~28 rooms), then the old ">= 2 clean"
+    # rule fell back to voting ALL draws and the median landed on a
+    # hollow one — a −35% bid decided by draws the detector had already
+    # rejected. Any clean draw now wins; only an all-implausible job
+    # falls back to the full field (and that job is held for review).
+    vote = clean if clean else list(range(len(draws)))
     sel_in_vote, rep = _draw_median_select([comps[i] for i in vote])
     sel = vote[sel_in_vote]
     excluded = [i + 1 for i in range(len(draws)) if i not in vote]
@@ -27036,6 +27190,8 @@ def _run_job_draw_median(k, pdf_paths, run_kwargs):
             excluded_reasons[i + 1] = "cold_draw_suspect"
         elif _final_composition_implausible(comps[i]):
             excluded_reasons[i + 1] = "final_composition_implausible"
+        elif _hollow_against_field(comps[i], comps):
+            excluded_reasons[i + 1] = "hollow_vs_sibling_draws"
     # Scope disagreement: a component that is nonzero in only a MINORITY
     # of voting draws is a mechanism that fired in some draws and not
     # others (elevation pass, WC chain, schedule discovery) — not scale
@@ -27091,6 +27247,18 @@ def _run_job_draw_median(k, pdf_paths, run_kwargs):
             f"sometimes-firing mechanism, not scale noise. The selected "
             f"draw follows the majority; reviewer should confirm whether "
             f"that scope is real.")
+    if not clean:
+        # Every draw failed plausibility — the median is the best of a
+        # bad field and must never ship unreviewed.
+        msg = (f"[MANUAL REVIEW REQUIRED] All {k} extraction draws failed "
+               f"plausibility checks; the priced draw is the least "
+               f"implausible of them. Confirm the takeoff against the "
+               f"drawings before sending.")
+        analysis["manual_review_required"] = True
+        if not analysis.get("manual_review_reason"):
+            analysis["manual_review_reason"] = msg
+        analysis.setdefault("notes", []).append(msg)
+        report["all_draws_implausible"] = True
     if spread_pct is not None and spread_pct > spread_limit:
         spread_msg = (
             f"[MANUAL REVIEW REQUIRED] Draw-median subtotal spread is "

@@ -91,9 +91,17 @@ JOBS = {
     "jw_hudson_hotel": {"cls": "jw", "pdf": os.path.join(
         BATCH, "hudson_hotel", "plans_clean.pdf"), "bid": 146023.71,
         "ref": "hudson_hotel"},
+    # Faces wall basis is a CARIS fact (their ground truth: 39,752 SF
+    # of wall paint vs run-basis 15,667; run×2−WC ≈ 41.7k), not a
+    # JW-wide convention — Harlem's own target sits at run basis.
     "jw_caris_hyde_park": {"cls": "jw", "pdf": os.path.join(
         BATCH, "caris_hyde_park", "plans_clean.pdf"), "bid": 87608.82,
-        "ref": "caris_hyde_park"},
+        "ref": "caris_hyde_park",
+        # ELEV_TEXT_EVIDENCE added post-cell for the re-run: the r2 cell
+        # split 3 ways on reading the PREFINISHED note; the text-layer
+        # scan makes every draw see it (2026-08-28).
+        "extra_env": {"NIGHTSHIFT_WALL_BASIS_FACES": "1",
+                      "NIGHTSHIFT_ELEV_TEXT_EVIDENCE": "1"}},
     "jw_under_canvas_ulum": {"cls": "jw", "pdf": os.path.join(
         BATCH, "under_canvas_ulum", "plans_clean.pdf"), "bid": 41575.45,
         "ref": "under_canvas_ulum"},
@@ -104,11 +112,13 @@ JOBS = {
 
 
 JW_ONLY_FLAGS = {
-    # Round 2 (2026-08-26): JW bids each painted wall FACE (Caris ground
-    # truth 39,752 SF vs run-basis 15,667); Rider counts run once
-    # (364 validated +1.6% on run). Customer convention, never a
-    # class default in prod.
-    "NIGHTSHIFT_WALL_BASIS_FACES": "1",
+    # (2026-08-28 mid-round amendment: WALL_BASIS_FACES moved from
+    # JW-wide to Caris-only extra_env. Harlem r2 regressed +4.9 → +17.1
+    # with faces ON while its walls were already on target without it,
+    # and Homewood banded +0.9 in r1 WITHOUT faces — the ×2 is a
+    # per-JOB fact (Caris ground truth), not a JW-wide convention.
+    # Harlem's r2 cell is tainted by the old posture; re-run it after
+    # ULUM completes.)
 }
 
 
@@ -134,6 +144,15 @@ def build_flags(cls):
     flags["NIGHTSHIFT_DRAW_MEDIAN_K_SMALL"] = "5"
     # Round 2: wainscot height bands are universal hard numbers
     flags["NIGHTSHIFT_SCHEDULE_HEIGHT_SPLIT"] = "1"
+    # Round 3: Dutchess is 21pp — above the old 12-page threshold, so
+    # it only drew K=3 on the flakiest set in the corpus. Raise to 25.
+    flags["NIGHTSHIFT_DRAW_MEDIAN_SMALL_MAX_PAGES"] = "25"
+    # Round 3: geometry may only price the whole job when it measured
+    # the whole job (Hudson: 1 floor page of a 4-story hotel).
+    flags["NIGHTSHIFT_VME_REQUIRE_FLOOR_COVERAGE"] = "1"
+    # Round 3: deterministic elevation evidence everywhere (validated
+    # on Caris: +19.9 -> +2.6 with identical extractions).
+    flags["NIGHTSHIFT_ELEV_TEXT_EVIDENCE"] = "1"
     flags["NIGHTSHIFT_MANDATORY_REVIEW"] = "1"
     return flags
 
