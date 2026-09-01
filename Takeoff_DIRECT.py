@@ -2123,6 +2123,36 @@ def _finish_plan_grid_rooms(page_text):
     return min(min(counts), ceil)
 
 
+_FINISH_PLACEHOLDER_RX = re.compile(
+    r"^\s*(?:see\b|refer\b|per\b|tbd\b|n/?a\b|none\b|not\s+(?:listed|given|"
+    r"shown|specified|indicated)|unknown|\?+|-+|\.+)\s*",
+    re.IGNORECASE)
+
+
+def _finish_row_has_evidence(row):
+    """True when a schedule row carries an actual finish DESIGNATION.
+
+    Phelps 2026-09-01: pushed to return more rooms, extraction padded the
+    schedule with 28 rows lifted from floor-plan area tags — room numbers
+    like "117"/"122" and finishes reading "see finish plan block". Those
+    rows are not evidence, but they inflated coverage from 29% to 73% and
+    would have let a partial schedule bound scope after all. A row counts
+    only if at least one of its wall/ceiling cells names a real finish.
+    """
+    if not isinstance(row, dict):
+        return False
+    for k in ("wall_finish", "ceiling_finish", "base_finish", "floor_finish"):
+        v = str(row.get(k) or "").strip()
+        if not v or _FINISH_PLACEHOLDER_RX.match(v):
+            continue
+        return True
+    return False
+
+
+def _finish_rows_with_evidence(rows):
+    return [r for r in (rows or []) if _finish_row_has_evidence(r)]
+
+
 # pdf_path -> number of per-room finish blocks the grid actually shows.
 # Populated by _find_finish_plan_pages so the scope gates can tell a
 # COMPLETE schedule read from a partial one before trusting it.
@@ -8885,7 +8915,8 @@ Be precise — count every entry in each schedule row by row."""
         return None
 
 
-def _extract_room_finish_schedule(client, pdf_path, page_indices=None):
+def _extract_room_finish_schedule(client, pdf_path, page_indices=None,
+                                  expected_rooms=0):
     """
     Extract Room Finish Schedule data from PDFs that have schedules but no floor plans.
     Unlike analyze_schedule_pdf() which gets door/window/stair counts, this function
@@ -9064,13 +9095,43 @@ Treat EVERY such block as one room in the room finish schedule:
     "LVT2"). RB/TB codes are resilient/rubber base — not painted wood.
 Codes are defined in the sheet's material legend; copy the CODE, not the
 legend prose. Extract every block on the sheet — these grids routinely hold
-50+ rooms and a partial read silently shrinks the priced scope."""
+50+ rooms and a partial read silently shrinks the priced scope.
 
-    try:
-        result_parts = []
+THIS OVERRIDES the "ONE REPRESENTATIVE UNIT of each type" rule above. That
+rule exists for apartment sets with repeated identical units. A finish plan
+lists REAL, DISTINCT rooms — "Exam 01" and "Exam 02" are two rooms with
+their own numbers and their own wall codes, not one type seen twice. Never
+collapse them, never emit a "types" summary: return one entry per block,
+including corridors and every numbered suite room."""
+        if expected_rooms:
+            room_finish_prompt += (
+                f"\n\nThis sheet shows approximately {int(expected_rooms)} "
+                f"room blocks. Returning materially fewer than that means "
+                f"rooms were skipped — the downstream takeoff treats any room "
+                f"missing from this list as OUT OF SCOPE and prices it at "
+                f"zero, so a short list silently deletes real work. Work "
+                f"through the sheet block by block and return them all.")
+
+    # Budget the output to the sheet. Phelps 2026-09-01: a 62-block finish
+    # plan against a flat max_tokens=8000 returned 17 rooms / an unparseable
+    # response / 40 rooms across three draws — the row list was being cut
+    # mid-JSON, and a partial schedule is worse than none because the scope
+    # gates then treat the rooms it never reached as out of scope.
+    _expected = int(expected_rooms or 0)
+    _max_tok = 8000
+    if _expected > 0:
+        try:
+            _cap = int(os.environ.get(
+                "NIGHTSHIFT_FINISH_SCHEDULE_MAX_TOKENS", "32000") or 32000)
+        except (TypeError, ValueError):
+            _cap = 32000
+        _max_tok = max(8000, min(_cap, _expected * 260))
+
+    def _one_call(prompt_text, max_tok):
+        parts, stop = [], None
         with client.messages.stream(
             model="claude-sonnet-4-6",
-            max_tokens=8000,
+            max_tokens=max_tok,
             temperature=0,
             timeout=300.0,
             messages=[{
@@ -9086,16 +9147,75 @@ legend prose. Extract every block on the sheet — these grids routinely hold
                     },
                     {
                         "type": "text",
-                        "text": room_finish_prompt
+                        "text": prompt_text
                     }
                 ]
             }]
         ) as stream:
             for text in stream.text_stream:
-                result_parts.append(text)
+                parts.append(text)
+            try:
+                stop = stream.get_final_message().stop_reason
+            except Exception:
+                stop = None
+        return "".join(parts), stop
 
-        result_text = "".join(result_parts)
+    try:
+        result_text, _stop = _one_call(room_finish_prompt, _max_tok)
+        if _stop == "max_tokens":
+            print(f"   ✂️  Finish schedule truncated at {_max_tok} tokens")
         json_match = _parse_json_response(result_text)
+
+        # Continuation: the grid is bigger than one response. Ask for the
+        # rooms we do not already have, by room number, and merge. Only
+        # runs when we know how many blocks the sheet actually shows.
+        if _expected > 0:
+            _seen = list((json_match or {}).get("room_finish_schedule") or [])
+            _rounds = 0
+            while (_rounds < 3 and len(_seen) < _expected * 0.9
+                   and (_stop == "max_tokens" or json_match is None
+                        or len(_seen) < _expected * 0.9)):
+                _have = [str(r.get("room_number") or r.get("room_name") or "?")
+                         for r in _seen]
+                _cont = room_finish_prompt + (
+                    f"\n\nCONTINUATION {_rounds + 1}: this sheet shows about "
+                    f"{_expected} room blocks. {len(_seen)} have already been "
+                    f"captured: {', '.join(_have[:80])}.\nReturn ONLY the "
+                    f"rooms NOT in that list, in the same JSON shape. Do not "
+                    f"repeat any room already listed. If every room is "
+                    f"already captured, return an empty "
+                    f"room_finish_schedule array.")
+                _txt2, _stop = _one_call(_cont, _max_tok)
+                _obj2 = _parse_json_response(_txt2, context="finish cont")
+                _new = list((_obj2 or {}).get("room_finish_schedule") or [])
+                if not _new:
+                    break
+                _key = set()
+                for r in _seen:
+                    _key.add(str(r.get("room_number")
+                                 or r.get("room_name") or "").lower())
+                _added = 0
+                for r in _new:
+                    k = str(r.get("room_number")
+                            or r.get("room_name") or "").lower()
+                    if k and k not in _key:
+                        _key.add(k)
+                        _seen.append(r)
+                        _added += 1
+                _rounds += 1
+                print(f"   ➕ Finish schedule continuation {_rounds}: "
+                      f"+{_added} room(s) → {len(_seen)}")
+                if not _added:
+                    break
+            if _seen:
+                if json_match is None:
+                    json_match = {"room_finish_schedule": [],
+                                  "building_info": {}}
+                json_match["room_finish_schedule"] = _seen
+                if _expected and len(_seen) < _expected * 0.6:
+                    print(f"   ⚠️  Finish schedule still short: {len(_seen)} "
+                          f"of ~{_expected} blocks — scope gates will stand "
+                          f"down")
         if json_match:
             rfs_data = json_match
             rooms = rfs_data.get("room_finish_schedule", [])
@@ -19544,26 +19664,33 @@ def _apply_schedule_room_scope(analysis):
             "NIGHTSHIFT_SCHEDULE_SCOPE_MIN_COVERAGE", "0.6") or 0.6)
     except (TypeError, ValueError):
         _cov_min = 0.6
-    if _blocks and len(rfs) < _blocks * _cov_min:
+    # Coverage counts only rows carrying a real finish designation —
+    # placeholder rows ("see finish plan block") are padding, not evidence.
+    _evid = _finish_rows_with_evidence(rfs)
+    if _blocks and len(_evid) < _blocks * _cov_min:
         rec = {"noop": "schedule_incomplete", "rows": len(rfs),
+               "rows_with_evidence": len(_evid),
                "grid_blocks": _blocks,
-               "coverage": round(len(rfs) / _blocks, 3),
+               "coverage": round(len(_evid) / _blocks, 3),
                "min_coverage": _cov_min}
         analysis["_schedule_room_scope"] = rec
         analysis.setdefault("notes", []).append(
             f"[Schedule Room Scope] STOOD DOWN: the finish schedule read "
-            f"{len(rfs)} room(s) but the finish plan shows ~{_blocks} room "
-            f"blocks ({len(rfs) / _blocks:.0%} coverage, need "
-            f"{_cov_min:.0%}). A partial schedule cannot define the scope "
-            f"boundary, so no rooms were excluded.")
+            f"{len(rfs)} row(s), {len(_evid)} carrying an actual finish "
+            f"designation, but the finish plan shows ~{_blocks} room blocks "
+            f"({len(_evid) / _blocks:.0%} coverage, need {_cov_min:.0%}). A "
+            f"partial schedule cannot define the scope boundary, so no rooms "
+            f"were excluded.")
         _gate_add_rfi(
             analysis, "Scope Boundary",
-            f"The finish schedule extraction returned {len(rfs)} rooms but the "
-            f"finish plan appears to list ~{_blocks}. The scope boundary was "
+            f"The finish schedule extraction returned {len(_evid)} usable "
+            f"room row(s) but the finish plan appears to list ~{_blocks}. "
+            f"The scope boundary was "
             f"NOT applied. Confirm the full room finish schedule so the "
             f"takeoff can be bounded to the scheduled areas.")
-        print(f"   📐 Schedule room scope: STOOD DOWN — {len(rfs)} rows vs "
-              f"~{_blocks} grid blocks ({len(rfs) / _blocks:.0%} coverage)")
+        print(f"   📐 Schedule room scope: STOOD DOWN — {len(_evid)} usable "
+              f"of {len(rfs)} rows vs ~{_blocks} grid blocks "
+              f"({len(_evid) / _blocks:.0%} coverage)")
         return analysis
     by_num, by_name = _build_schedule_row_maps(rfs)
     row_toks = [(r, _schedule_row_tokens(r)) for r in rfs]
@@ -27838,8 +27965,12 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             if _detect_finish_schedule(pdf_path_scan):
                 fs_pages = (_find_finish_schedule_pages(pdf_path_scan)
                             if _targeted_fs else [])
+                # Block count from the grid detector anchors both the token
+                # budget and the continuation loop.
+                _exp = int(_FINISH_PLAN_BLOCK_COUNTS.get(pdf_path_scan, 0) or 0)
                 rfs_pre = _extract_room_finish_schedule(
-                    client, pdf_path_scan, page_indices=fs_pages)
+                    client, pdf_path_scan, page_indices=fs_pages,
+                    expected_rooms=_exp)
                 if rfs_pre and rfs_pre.get("room_finish_schedule"):
                     room_finish_schedule = rfs_pre["room_finish_schedule"]
                     print(f"   📋 Room finish schedule pre-extracted: "

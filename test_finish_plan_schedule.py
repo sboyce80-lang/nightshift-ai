@@ -310,6 +310,50 @@ check(34340 < 30000 * 3,
       "...but scores 1.14x against the INFERRED 30,000 footprint")
 os.environ.pop("NIGHTSHIFT_GSF_BASIS", None)
 
+# ── 6. placeholder rows are not evidence ────────────────────────────────
+print("\n[6] fabricated/placeholder schedule rows")
+
+REAL = {"room_number": "417-16", "room_name": "Exam 09",
+        "wall_finish": "WN PT4; WE PT1", "ceiling_finish": "ACT2"}
+PAD = {"room_number": "117", "room_name": "Exam 1",
+       "wall_finish": "see finish plan block",
+       "ceiling_finish": "see finish plan block"}
+PAD2 = {"room_number": "124", "room_name": "Blood Draw",
+        "wall_finish": "not listed", "ceiling_finish": "N/A"}
+EMPTY = {"room_number": "9", "room_name": "X",
+         "wall_finish": "", "ceiling_finish": None}
+
+check(T._finish_row_has_evidence(REAL) is True, "real finish codes count")
+check(T._finish_row_has_evidence(PAD) is False,
+      "'see finish plan block' is not evidence")
+check(T._finish_row_has_evidence(PAD2) is False,
+      "'not listed' / 'N/A' is not evidence")
+check(T._finish_row_has_evidence(EMPTY) is False, "empty cells are not evidence")
+check(len(T._finish_rows_with_evidence([REAL, PAD, PAD2, EMPTY])) == 1,
+      "filter keeps only the real row")
+
+# padding must not buy coverage: 18 real + 27 padded vs 62 blocks stays under
+os.environ["NIGHTSHIFT_SCHEDULE_ROOM_SCOPE"] = "1"
+T._FINISH_PLAN_BLOCK_COUNTS.clear()
+T._FINISH_PLAN_BLOCK_COUNTS["/tmp/z.pdf"] = 62
+padded = _scope_analysis()
+padded["_vme_pdf_paths"] = ["/tmp/z.pdf"]
+padded["room_finish_schedule"] = (
+    [dict(REAL, room_number=f"417-{i:02d}", room_name=f"Exam {i}")
+     for i in range(1, 19)]
+    + [dict(PAD, room_number=str(100 + i)) for i in range(27)])
+pd_res = T._apply_schedule_room_scope(padded)
+prec2 = pd_res["_schedule_room_scope"]
+check(prec2.get("noop") == "schedule_incomplete",
+      f"45 rows but only 18 real -> still stands down (got {prec2.get('noop')})")
+check(prec2.get("rows_with_evidence") == 18 and prec2.get("rows") == 45,
+      f"records both counts (rows={prec2.get('rows')}, "
+      f"evidence={prec2.get('rows_with_evidence')})")
+check(prec2.get("coverage") == round(18 / 62, 3),
+      "coverage computed on evidence rows, not padded rows")
+T._FINISH_PLAN_BLOCK_COUNTS.clear()
+os.environ.pop("NIGHTSHIFT_SCHEDULE_ROOM_SCOPE", None)
+
 print("\n" + "=" * 60)
 if FAILS:
     print(f"❌ {len(FAILS)} FAILED:")
