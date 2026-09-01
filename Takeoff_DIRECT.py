@@ -2123,6 +2123,24 @@ def _finish_plan_grid_rooms(page_text):
     return min(min(counts), ceil)
 
 
+# pdf_path -> number of per-room finish blocks the grid actually shows.
+# Populated by _find_finish_plan_pages so the scope gates can tell a
+# COMPLETE schedule read from a partial one before trusting it.
+_FINISH_PLAN_BLOCK_COUNTS = {}
+
+
+def _finish_plan_block_count(analysis):
+    """Detected finish-plan block count for this job's PDFs (0 if unknown)."""
+    if not isinstance(analysis, dict):
+        return 0
+    best = 0
+    for p in (analysis.get("_vme_pdf_paths") or []):
+        best = max(best, int(_FINISH_PLAN_BLOCK_COUNTS.get(p, 0) or 0))
+    if not best and _FINISH_PLAN_BLOCK_COUNTS:
+        best = max(int(v or 0) for v in _FINISH_PLAN_BLOCK_COUNTS.values())
+    return best
+
+
 def _find_finish_plan_pages(pdf_path, max_pages=4):
     """0-based pages carrying a finish-PLAN grid, richest first.
 
@@ -2150,6 +2168,8 @@ def _find_finish_plan_pages(pdf_path, max_pages=4):
         return []
     finally:
         doc.close()
+    if hits:
+        _FINISH_PLAN_BLOCK_COUNTS[pdf_path] = sum(hits.values())
     return [i for i, _ in sorted(hits.items(),
                                  key=lambda kv: (-kv[1], kv[0]))][:max_pages]
 
@@ -19509,6 +19529,41 @@ def _apply_schedule_room_scope(analysis):
     rfs = _get_room_finish_schedule(analysis)
     if len(rfs) < _SCHEDULE_FINISH_AUTHORITY_MIN_ROWS:
         analysis["_schedule_room_scope"] = {"noop": "schedule_too_thin"}
+        return analysis
+    # COMPLETENESS, not just thickness. Phelps rerun 2026-09-01: the finish
+    # plan shows 62 room blocks but extraction returned 17 rows, all from
+    # Suite 417 — the 400-series rooms were simply never read. Using that as
+    # a SCOPE BOUNDARY is how a +175% job became -69%: rooms the estimator
+    # certainly bid were declared out of scope because a partial read did not
+    # mention them. A schedule may only bound scope when it plausibly covers
+    # the grid it came from. Row-count minimums cannot catch this; only the
+    # detected block count can.
+    _blocks = _finish_plan_block_count(analysis)
+    try:
+        _cov_min = float(os.environ.get(
+            "NIGHTSHIFT_SCHEDULE_SCOPE_MIN_COVERAGE", "0.6") or 0.6)
+    except (TypeError, ValueError):
+        _cov_min = 0.6
+    if _blocks and len(rfs) < _blocks * _cov_min:
+        rec = {"noop": "schedule_incomplete", "rows": len(rfs),
+               "grid_blocks": _blocks,
+               "coverage": round(len(rfs) / _blocks, 3),
+               "min_coverage": _cov_min}
+        analysis["_schedule_room_scope"] = rec
+        analysis.setdefault("notes", []).append(
+            f"[Schedule Room Scope] STOOD DOWN: the finish schedule read "
+            f"{len(rfs)} room(s) but the finish plan shows ~{_blocks} room "
+            f"blocks ({len(rfs) / _blocks:.0%} coverage, need "
+            f"{_cov_min:.0%}). A partial schedule cannot define the scope "
+            f"boundary, so no rooms were excluded.")
+        _gate_add_rfi(
+            analysis, "Scope Boundary",
+            f"The finish schedule extraction returned {len(rfs)} rooms but the "
+            f"finish plan appears to list ~{_blocks}. The scope boundary was "
+            f"NOT applied. Confirm the full room finish schedule so the "
+            f"takeoff can be bounded to the scheduled areas.")
+        print(f"   📐 Schedule room scope: STOOD DOWN — {len(rfs)} rows vs "
+              f"~{_blocks} grid blocks ({len(rfs) / _blocks:.0%} coverage)")
         return analysis
     by_num, by_name = _build_schedule_row_maps(rfs)
     row_toks = [(r, _schedule_row_tokens(r)) for r in rfs]

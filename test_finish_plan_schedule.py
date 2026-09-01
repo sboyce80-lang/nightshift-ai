@@ -248,6 +248,30 @@ check(on4.get("manual_review_required") is True,
 check(any("Schedule Room Scope" in str(n) for n in on4.get("notes", [])),
       "explanatory note emitted")
 
+# a PARTIAL schedule must not bound scope (the -69% rerun failure)
+T._FINISH_PLAN_BLOCK_COUNTS.clear()
+T._FINISH_PLAN_BLOCK_COUNTS["/tmp/x.pdf"] = 62
+partial = _scope_analysis()
+partial["_vme_pdf_paths"] = ["/tmp/x.pdf"]
+pr = T._apply_schedule_room_scope(partial)
+prec = pr["_schedule_room_scope"]
+check(prec.get("noop") == "schedule_incomplete",
+      f"17-of-62 style read stands down (got {prec.get('noop')})")
+check(all(r.get("in_scope") for r in pr["floors"][0]["rooms"]),
+      "no room excluded when the schedule is incomplete")
+check(any("STOOD DOWN" in str(n) for n in pr.get("notes", [])),
+      "stand-down is explained in the notes")
+
+# a COMPLETE read still bounds scope
+T._FINISH_PLAN_BLOCK_COUNTS.clear()
+T._FINISH_PLAN_BLOCK_COUNTS["/tmp/y.pdf"] = 9
+complete = _scope_analysis()
+complete["_vme_pdf_paths"] = ["/tmp/y.pdf"]
+cr = T._apply_schedule_room_scope(complete)
+check((cr["_schedule_room_scope"] or {}).get("rooms_dropped") == 2,
+      "8-of-9 coverage still bounds scope")
+T._FINISH_PLAN_BLOCK_COUNTS.clear()
+
 thin4 = _scope_analysis()
 thin4["room_finish_schedule"] = thin4["room_finish_schedule"][:2]
 t4 = T._apply_schedule_room_scope(thin4)
