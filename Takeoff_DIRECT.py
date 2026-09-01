@@ -3482,6 +3482,35 @@ def _work_area_basis_enabled():
         "1", "true", "True")
 
 
+def _gsf_basis_enabled():
+    """Flag-gated (NIGHTSHIFT_GSF_BASIS, default off): let a gross floor
+    area STATED on the drawings outrank an inferred footprint_sqft in the
+    plausibility guards. Phelps read "Total GSF: 8,724" correctly, then
+    inferred footprints of 45,000 and 30,000 on separate runs — the
+    disagreement broke the guard in both directions."""
+    return os.environ.get("NIGHTSHIFT_GSF_BASIS", "0").strip() in (
+        "1", "true", "True")
+
+
+def _stated_gross_sqft(analysis):
+    """Gross floor area stated on the drawings (0 if none).
+
+    Structured fields only — this must stay a hard number. Falls back to
+    the declared renovation work area, which is the same kind of stated
+    figure for a Level 2 / work-area-method job."""
+    if not isinstance(analysis, dict):
+        return 0.0
+    for src in (analysis.get("project_overview") or {},
+                analysis.get("project_info") or {}):
+        if isinstance(src, dict):
+            for k in ("gross_sqft", "total_gsf", "gross_floor_area_sqft",
+                      "building_gross_sqft"):
+                v = _num(src.get(k, 0))
+                if v > 0:
+                    return v
+    return _declared_work_area_sqft(analysis)
+
+
 # "Work area is approximately 3,955 SF within a 580,317 GSF building" — capture
 # the first SF figure that immediately follows a "work area" phrase. The
 # non-greedy [^.\d] run skips filler ("is approximately ") without crossing into
@@ -29532,6 +29561,19 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                 _basis = _work_area
                 _basis_label = "declared work area (Level 2 / work-area-method renovation)"
                 _used_work_area = True
+            # Same basis correction the over-extraction guard makes, applied
+            # to the LOW side (Phelps rerun 2026-09-01): footprint_sqft was
+            # inferred as 30,000 while the drawings state 8,724 GSF, so a
+            # perfectly in-band 34,340 SF read (3.9x the real GSF) scored
+            # 1.14x and tripped "implausibly low" — which then marks a
+            # cold-draw suspect, clears the checkpoints and burns a whole
+            # extra draw. A stated GSF is a hard number; an inferred
+            # footprint is not.
+            if (not _used_work_area) and _gsf_basis_enabled():
+                _read = _stated_gross_sqft(analysis)
+                if _read > 500 and _footprint > _read * 1.5:
+                    _basis = _read
+                    _basis_label = "gross floor area stated on the drawings"
             if _used_work_area and _total_paintable >= _basis * 3:
                 _r = (_total_paintable / _basis) if _basis else 0
                 analysis.setdefault("notes", []).append(
@@ -29607,20 +29649,7 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         except (TypeError, ValueError):
             _hi_max = 8.0
         _pi_hi = analysis.get("project_info") or {}
-        _po_hi = analysis.get("project_overview") or {}
-        _read_gsf = 0.0
-        for _src in (_po_hi, _pi_hi):
-            if isinstance(_src, dict):
-                for _k in ("gross_sqft", "total_gsf", "gross_floor_area_sqft",
-                           "building_gross_sqft"):
-                    _v = _num(_src.get(_k, 0))
-                    if _v > 0:
-                        _read_gsf = _v
-                        break
-            if _read_gsf:
-                break
-        if not _read_gsf:
-            _read_gsf = _declared_work_area_sqft(analysis)
+        _read_gsf = _stated_gross_sqft(analysis)
         _fp_hi = _num(_pi_hi.get("footprint_sqft", 0))
         # The READ GSF wins when it exists and the inferred footprint is
         # materially larger — that disagreement is the Phelps signature.

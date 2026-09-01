@@ -157,6 +157,7 @@ def _guard(paintable, footprint, gsf, flag="1", maxr=None):
                       for l in src[start:end].splitlines())
     g = {"os": os, "_num": T._num, "analysis": ns,
          "_total_paintable": paintable,
+         "_stated_gross_sqft": T._stated_gross_sqft,
          "_declared_work_area_sqft": T._declared_work_area_sqft}
     exec(compile(block, "<guard>", "exec"), g)
     return ns
@@ -256,6 +257,34 @@ check((t4.get("_schedule_room_scope") or {}).get("noop") == "schedule_too_thin"
 
 for _k in ("NIGHTSHIFT_SCHEDULE_ROOM_SCOPE",):
     os.environ.pop(_k, None)
+
+# ── 5. stated GSF outranks an inferred footprint (both guard sides) ──────
+print("\n[5] stated GSF as plausibility basis")
+
+os.environ.pop("NIGHTSHIFT_GSF_BASIS", None)
+check(T._gsf_basis_enabled() is False, "NIGHTSHIFT_GSF_BASIS defaults off")
+os.environ["NIGHTSHIFT_GSF_BASIS"] = "1"
+check(T._gsf_basis_enabled() is True, "flag reads on")
+
+check(T._stated_gross_sqft(
+    {"project_overview": {"gross_sqft": 8724}}) == 8724,
+    "reads gross_sqft from project_overview")
+check(T._stated_gross_sqft(
+    {"project_info": {"total_gsf": 12000}}) == 12000,
+    "reads total_gsf from project_info")
+check(T._stated_gross_sqft({}) == 0, "no stated GSF -> 0")
+check(T._stated_gross_sqft(
+    {"project_overview": {"gross_sqft": 8724},
+     "project_info": {"total_gsf": 999}}) == 8724,
+    "project_overview wins over project_info")
+
+# The Phelps rerun false positive: 34,340 paintable, inferred footprint
+# 30,000 (ratio 1.14 -> "implausibly low"), stated GSF 8,724 (ratio 3.9 -> OK)
+check(34340 / 8724 > 3.0,
+      "34,340 SF is in-band (3.9x) against the STATED 8,724 GSF")
+check(34340 < 30000 * 3,
+      "...but scores 1.14x against the INFERRED 30,000 footprint")
+os.environ.pop("NIGHTSHIFT_GSF_BASIS", None)
 
 print("\n" + "=" * 60)
 if FAILS:
