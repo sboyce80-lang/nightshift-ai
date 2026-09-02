@@ -633,6 +633,14 @@ PLG_BLOCK_FREE_EMAIL_AUTO_APPROVE = os.environ.get(
 PLG_SALES_CONTACT_EMAIL = os.environ.get(
     "PLG_SALES_CONTACT_EMAIL", "hello@knightshiftai.com")
 
+# Customer-facing contact addresses printed in lifecycle emails. Kept here
+# (not inline in notifications.py) so the welcome email, the paywall page and
+# any future in-app help all quote the same two addresses.
+SUPPORT_CONTACT_EMAIL = os.environ.get(
+    "SUPPORT_CONTACT_EMAIL", "admin@knightshiftai.com")
+FOUNDER_CONTACT_EMAIL = os.environ.get(
+    "FOUNDER_CONTACT_EMAIL", "steve@knightshiftai.com")
+
 # Internal recipient lists (comma-separated; both fall back to ADMIN_EMAILS
 # when unset so alerts are never silently dropped).
 def _env_email_list(name):

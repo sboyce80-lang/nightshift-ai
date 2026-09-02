@@ -73,10 +73,10 @@ from orgs import (
 )
 from notifications import (
     notify_admin_of_new_signup,
-    notify_user_of_approval,
     notify_user_of_denial,
     notify_user_of_org_invite,
     notify_freemium_welcome,
+    notify_welcome,
     notify_internal_plg_signup,
     notifications_configured,
     PRICING_REPLY_TEMPLATE,
@@ -594,6 +594,7 @@ def index():
             mailto_body=mailto_body,
         )
 
+    _max_files, _max_size_mb = _upload_caps(snap["is_freemium"])
     return render_template(
         "index.html",
         rate_fields=RATE_FIELDS,
@@ -607,6 +608,8 @@ def index():
         is_freemium=snap["is_freemium"],
         freemium_bids_used=snap["freemium_bids_used"],
         freemium_bid_limit=snap["freemium_bid_limit"],
+        max_files=_max_files,
+        max_size_mb=_max_size_mb,
     )
 
 
@@ -625,12 +628,22 @@ def sign_in():
     return render_template("sign_in.html", next_path=next_path)
 
 
+@app.route("/guide")
+def guide():
+    """Public getting-started page. Deliberately un-gated: the welcome email
+    links here, and a new user may open it before they've signed in."""
+    return render_template("guide.html")
+
+
 @app.route("/mobile")
 def mobile():
     """Streamlined phone-first submission form. Same /submit endpoint, but
     no inline pricing override UI — the backend falls back to the user's
     saved pricing defaults when no rate__ fields are POSTed."""
-    return render_template("mobile.html")
+    _uid, snap = _try_signed_in_user_snapshot()
+    max_files, max_size_mb = _upload_caps(bool(snap and snap["is_freemium"]))
+    return render_template("mobile.html",
+                           max_files=max_files, max_size_mb=max_size_mb)
 
 
 def _freemium_paywall_message():
@@ -688,16 +701,27 @@ def _check_submission_gates(user_id):
     return org_id, None
 
 
+def _upload_caps(is_freemium):
+    """Return (max_files, max_size_mb) for a plan. Freemium orgs get tighter
+    caps than the platform-wide limits.
+
+    The submission forms render these same numbers, so a free user is never
+    told 25 files / 600 MB and then rejected at 5 / 100.
+    """
+    if is_freemium:
+        return (min(FREEMIUM_MAX_PDFS, MAX_PDFS_PER_EMAIL),
+                min(FREEMIUM_MAX_PDF_SIZE_MB, MAX_PDF_SIZE_MB))
+    return MAX_PDFS_PER_EMAIL, MAX_PDF_SIZE_MB
+
+
 def _freemium_upload_caps(org_id):
-    """Return (max_files, max_size_mb) for this org's uploads. Freemium orgs
-    get tighter caps than the platform-wide limits."""
+    """(max_files, max_size_mb) for an org, resolved from its plan row."""
+    is_freemium = False
     if PLG_SELF_SERVE_ENABLED and org_id is not None:
         with session_scope() as session:
             org = session.get(Organization, org_id)
-            if org is not None and org.plan == "freemium":
-                return (min(FREEMIUM_MAX_PDFS, MAX_PDFS_PER_EMAIL),
-                        min(FREEMIUM_MAX_PDF_SIZE_MB, MAX_PDF_SIZE_MB))
-    return MAX_PDFS_PER_EMAIL, MAX_PDF_SIZE_MB
+            is_freemium = org is not None and org.plan == "freemium"
+    return _upload_caps(is_freemium)
 
 
 @app.route("/api/uploads/init", methods=["POST"])
@@ -3249,6 +3273,7 @@ def onboarding():
                         org_name=notify_payload["org_name"],
                         app_url=url_for("index", _external=True),
                         bid_limit=FREEMIUM_BID_LIMIT,
+                        guide_url=url_for("guide", _external=True),
                     )
                 except Exception as exc:
                     logger.error("Freemium welcome email failed: %s", exc)
@@ -3372,9 +3397,13 @@ def admin_orgs_approve(org_id):
                 notify.append((m.user.email, m.user.name or ""))
 
     app_url = url_for("index", _external=True)
+    guide_url = url_for("guide", _external=True)
     for email, name in notify:
         try:
-            notify_user_of_approval(email, name, org_name, app_url)
+            # Hand-approved orgs land on plan='beta' (no quota), so the
+            # welcome goes out with the unlimited wording — bid_limit=None.
+            notify_welcome(email, name, org_name, app_url,
+                           bid_limit=None, guide_url=guide_url)
         except Exception as exc:
             logger.error("Approval notification to %s failed: %s", email, exc)
 

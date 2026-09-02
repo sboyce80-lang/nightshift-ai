@@ -36,6 +36,8 @@ from config import (
     PLG_SALES_EMAILS,
     PLG_SALES_CC_EMAILS,
     PLG_SALES_CONTACT_EMAIL,
+    SUPPORT_CONTACT_EMAIL,
+    FOUNDER_CONTACT_EMAIL,
 )
 
 logger = logging.getLogger("nightshift.notifications")
@@ -192,28 +194,58 @@ Number of estimators on staff:
 Primary work type (commercial TI / multifamily / healthcare / new build / other):
 Best phone number and time to call:"""
 
-def notify_freemium_welcome(email: str, name: str, org_name: str,
-                            app_url: str, bid_limit: int) -> bool:
-    """Welcome a self-serve signup whose access was auto-approved."""
+def notify_welcome(email: str, name: str, org_name: str, app_url: str,
+                   bid_limit=None, guide_url: str = "") -> bool:
+    """Welcome an approved user — the one email every new account gets.
+
+    Two callers, one voice:
+      - self-serve signup auto-approved onto freemium (bid_limit=5)
+      - an admin hand-approving a waitlisted org, which lands on plan='beta'
+        with no quota (bid_limit=None → the unlimited wording)
+    """
+    if bid_limit is None:
+        allowance = ("Your account has no bid limit — upload as many projects "
+                     "as you like.")
+        subject = f"Welcome to KnightShiftAI — {org_name} is approved"
+    else:
+        allowance = (f"You have {bid_limit} free bids to try the system on "
+                     f"your own projects.")
+        subject = f"Welcome to KnightShiftAI — {bid_limit} free bids inside"
+
+    guide_block = f"""
+
+New to KnightShiftAI? This one-pager walks you through your first bid and
+what each tab does — five minutes now saves you a re-run later:
+
+  {guide_url}""" if guide_url else ""
+
     body = f"""Hi {name or 'there'},
 
-Welcome to Knight Shift — your account for {org_name} is ready to go.
+Welcome to KnightShiftAI — your account for {org_name} is ready to go.
 
-You have {bid_limit} free bids to try the system on your own projects.
+{allowance}
 Upload a bid set (plans + finish schedules as PDFs) and we'll email you a
 full takeoff and estimate, usually the same day:
 
-  {app_url}
+  {app_url}{guide_block}
 
 Tips for the best results:
   - Include the finish schedules and floor plans, not just a cover sheet.
   - One project per submission.
 
 Questions at any point? Just reply to this email — a real person reads it.
+You can also reach us directly:
 
-— Knight Shift
+  - General support: {SUPPORT_CONTACT_EMAIL}
+  - Steve, Co-founder and Head of Technology: {FOUNDER_CONTACT_EMAIL}
+
+— KnightShiftAI
 """
-    return _send([email], f"Welcome to Knight Shift — {bid_limit} free bids inside", body)
+    return _send([email], subject, body)
+
+
+# Back-compat alias — the freemium signup path has always called this name.
+notify_freemium_welcome = notify_welcome
 
 
 def notify_internal_plg_signup(user_email: str, user_name: str, user_title: str,
