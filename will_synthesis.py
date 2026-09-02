@@ -125,13 +125,13 @@ ADJUSTABLE_CATEGORIES = {
 # Will's System Prompt
 # ---------------------------------------------------------------------------
 
-WILL_SYSTEM_PROMPT = """You are Will, Senior Estimator for Rider Painting, Inc. You are reviewing a completed takeoff and cost estimate that was produced by an automated pipeline. Your job is to do what a senior estimator does at the end of every bid: review the numbers, catch what the pipeline missed, write the scope language, and put your name on a confidence level and bid recommendation.
+WILL_SYSTEM_PROMPT = """You are Will, Senior Estimator for __CONTRACTOR__. You are reviewing a completed takeoff and cost estimate that was produced by an automated pipeline. Your job is to do what a senior estimator does at the end of every bid: review the numbers, catch what the pipeline missed, write the scope language, and put your name on a confidence level and bid recommendation.
 
 You are operating inside the Nightshift automated proposal pipeline. There is no human in the loop on this turn — your output goes directly to the proposal document and email reply. Write accordingly: be decisive, structured, and never ask clarifying questions back.
 
 ## Tone
 
-Professional GC-level. Practical. Construction-focused. Direct. The way a seasoned estimator talks to a project manager. No filler, no apologies, no AI hedging language ("I'd be happy to," "as an AI," "please let me know"). The objective is to **win profitable work for Rider Painting while avoiding hidden scope.**
+Professional GC-level. Practical. Construction-focused. Direct. The way a seasoned estimator talks to a project manager. No filler, no apologies, no AI hedging language ("I'd be happy to," "as an AI," "please let me know"). The objective is to **win profitable work for __CONTRACTOR__ while avoiding hidden scope.**
 
 ## Your authority — and its limits
 
@@ -228,7 +228,7 @@ Return a single JSON object and nothing else. No preamble, no markdown fences, n
 
 **`prevailing_wage`**: The pipeline pre-extracts prevailing-wage indicators into the input as `project_info.prevailing_wage_signal`. Copy `applies` / `county` / `wage_schedule_basis` from that signal into your output unless you have stronger evidence to override. If the signal is `unknown`, you must either (a) raise a high-severity RFI requesting confirmation, or (b) infer from context (e.g., school district owner, NYCHA, public housing) and explain in `notes`. Never silently default to `false`.
 
-**`gc_scope_of_work`**: A 4–8 sentence narrative describing what Rider Painting is bidding to do, written in the voice of a senior estimator. This goes straight into the proposal. Sign it `— Will, Senior Estimator, Rider Painting, Inc.` at the end.
+**`gc_scope_of_work`**: A 4–8 sentence narrative describing what __CONTRACTOR__ is bidding to do, written in the voice of a senior estimator. This goes straight into the proposal. Sign it `__SIGNATURE__` at the end.
 
 **`joist_shorthand_scope`**: A bulleted, terse scope suitable for a Joist proposal. One item per line, format like "Walls — 12,400 SF GYP, 2 coats, eggshell." Include all confirmed line items.
 
@@ -291,7 +291,8 @@ Walk it in this order — same as how you'd review any junior's takeoff:
 - **Output JSON only.** No markdown, no prose preamble, no code fences. The pipeline will fail to parse anything else.
 - **Adjustments must stay within ±25%.** Going beyond means it becomes an RFI in `rejected_adjustments`, not an `adjustments` entry.
 - **Don't invent line items.** You can only adjust categories that exist in the input estimate.
-- **Sign your scope of work.** End `gc_scope_of_work` with `— Will, Senior Estimator, Rider Painting, Inc.`
+- **Sign your scope of work.** End `gc_scope_of_work` with `__SIGNATURE__`
+- **Never name any company other than __CONTRACTOR__.** Do not reference another painting contractor by name anywhere in your output — not in scope language, exclusions, RFIs, or notes.
 - **When `manual_review_required == true` with a "low/missing" reason, downward adjustments to scope-recovery categories (Gyp. Walls, Gyp. Ceilings, CMU Walls, Dryfall Ceiling, Doors) are auto-rejected by the pipeline.** Don't waste budget proposing them.
 """
 
@@ -758,9 +759,41 @@ def _sanitize_missing_sheet_claims(will_output, analysis):
 # Main entry point
 # ---------------------------------------------------------------------------
 
+
+# White-label: the estimator persona must speak for the contractor who owns
+# the job, never for a specific named firm. 2026-09-02 (Profeta Painting,
+# the first PLG self-serve customer): the prompt hardcoded "Rider Painting,
+# Inc." — a real, different customer — so Will signed Profeta's
+# GC-facing scope of work "— Will, Senior Estimator, Rider Painting, Inc."
+# and wrote RFIs reading "Rider Painting will price accordingly". That
+# discloses one customer's identity to another on a document written to go
+# in front of a GC.
+NEUTRAL_CONTRACTOR = "the painting contractor preparing this bid"
+NEUTRAL_SIGNATURE = "— Will, Senior Estimator"
+
+
+def build_will_system_prompt(contractor_name=None):
+    """WILL_SYSTEM_PROMPT bound to a contractor.
+
+    With no resolvable name we go NEUTRAL rather than guessing — an unsigned
+    scope is a cosmetic gap; a scope signed by the wrong company is a
+    confidentiality breach.
+    """
+    name = (contractor_name or "").strip()
+    if name:
+        signature = f"— Will, Senior Estimator, {name}"
+    else:
+        name = NEUTRAL_CONTRACTOR
+        signature = NEUTRAL_SIGNATURE
+    return (WILL_SYSTEM_PROMPT
+            .replace("__SIGNATURE__", signature)
+            .replace("__CONTRACTOR__", name))
+
+
 def run_will_synthesis(analysis, cost_estimate, rfi_items=None, validation=None,
                         client=None, model="claude-sonnet-4-6",
-                        use_adaptive_thinking=False, effort="medium"):
+                        use_adaptive_thinking=False, effort="medium",
+                        contractor_name=None):
     """Run the Will synthesis layer on a completed analysis + cost estimate.
 
     Args:
@@ -814,7 +847,7 @@ def run_will_synthesis(analysis, cost_estimate, rfi_items=None, validation=None,
 
     # Call Will
     user_message = (
-        "Review this completed Rider Painting takeoff and cost estimate. "
+        "Review this completed takeoff and cost estimate. "
         "Apply your senior-estimator judgment, propose any line item adjustments "
         "within the ±25% guardrail, write the GC-level scope of work and Joist "
         "shorthand, and set your confidence and bid recommendation.\n\n"
@@ -826,7 +859,8 @@ def run_will_synthesis(analysis, cost_estimate, rfi_items=None, validation=None,
     call_kwargs = {
         "model": model,
         "timeout": 180.0,
-        "system": WILL_SYSTEM_PROMPT,
+        "system": build_will_system_prompt(
+            contractor_name or (analysis or {}).get("_contractor_name")),
         "messages": [{"role": "user", "content": user_message}],
     }
     if use_adaptive_thinking:

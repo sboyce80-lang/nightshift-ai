@@ -25496,6 +25496,67 @@ def _build_allowance_lines(analysis=None, aggregated_totals=None, exterior=None,
     return out
 
 
+
+# --- White-label contractor identity -------------------------------------
+# Customer-facing copy (exclusions, Will's scope language, RFIs) must name
+# the contractor who owns the job, or no contractor at all. 2026-09-02: three
+# standard exclusions and the Will persona hardcoded "Rider Painting", so
+# Profeta Painting's estimate told them Rider paints to a clean substrate and
+# signed their GC scope of work in Rider's name.
+_ACTIVE_CONTRACTOR_NAME = ""
+
+_CONTRACTOR_DOMAIN_NAMES = {
+    "riderpaintingny.com": "Rider Painting",
+}
+_FREE_EMAIL_DOMAINS = frozenset({
+    "gmail.com", "yahoo.com", "yahoo.co.uk", "outlook.com", "hotmail.com",
+    "icloud.com", "me.com", "mac.com", "aol.com", "live.com", "msn.com",
+    "protonmail.com", "proton.me", "pm.me",
+})
+
+
+def _resolve_contractor_name(contact_email="", business_name=""):
+    """Display name for the contractor this bid belongs to, or "" if unknown.
+
+    Mirrors orgs.py's domain logic without importing it — orgs pulls
+    SQLAlchemy, which the offline takeoff path (and its tests) must not
+    require. Returns "" rather than guessing: unnamed copy is a cosmetic
+    gap, copy naming the wrong firm is a confidentiality breach.
+    """
+    name = (business_name or "").strip()
+    if name:
+        return name
+    email = (contact_email or "").strip().lower()
+    if "@" not in email:
+        return ""
+    domain = email.rsplit("@", 1)[1].strip()
+    if not domain or domain in _FREE_EMAIL_DOMAINS:
+        return ""
+    if domain in _CONTRACTOR_DOMAIN_NAMES:
+        return _CONTRACTOR_DOMAIN_NAMES[domain]
+    label = domain.split(".")[0].replace("-", " ").replace("_", " ").title()
+    return label or ""
+
+
+def _contractor_subject(analysis=None):
+    """Third-person singular subject for exclusion copy.
+
+    Must agree with "paints" / "does not perform", so the unresolved case is
+    "The Contractor", not "We".
+    """
+    name = ((analysis or {}).get("_contractor_name") or "").strip()
+    return name or _ACTIVE_CONTRACTOR_NAME.strip() or "The Contractor"
+
+
+def _contractor_possessive(analysis=None):
+    """Possessive form: "Profeta Painting's own work" / "our own work"."""
+    name = ((analysis or {}).get("_contractor_name") or "").strip() \
+        or _ACTIVE_CONTRACTOR_NAME.strip()
+    if not name:
+        return "our"
+    return name + ("'" if name.endswith("s") else "'s")
+
+
 def _build_standard_exclusions(analysis=None, aggregated_totals=None,
                                 exterior=None, building_type=""):
     """Standard Rider Painting exclusions surfaced on every estimate.
@@ -25525,12 +25586,15 @@ def _build_standard_exclusions(analysis=None, aggregated_totals=None,
         {
             "category": "Coordination",
             "item": "Cut-in / patching of work installed by other trades",
-            "reason": "By others. Rider Painting paints to a clean, prepared substrate.",
+            "reason": f"By others. {_contractor_subject(analysis)} paints to a "
+                      f"clean, prepared substrate.",
         },
         {
             "category": "Coordination",
             "item": "Repair of trade damage and rework caused by other trades",
-            "reason": "By others. Touch-up of Rider's own work is included.",
+            "reason": f"By others. Touch-up of "
+                      f"{_contractor_possessive(analysis)} own work is "
+                      f"included.",
         },
         {
             "category": "Building Envelope",
@@ -25555,7 +25619,8 @@ def _build_standard_exclusions(analysis=None, aggregated_totals=None,
         {
             "category": "Hazardous Materials",
             "item": "Lead paint, asbestos, mold abatement, and any hazmat removal",
-            "reason": "By others. Rider does not perform abatement.",
+            "reason": f"By others. {_contractor_subject(analysis)} does not "
+                      f"perform abatement.",
         },
         {
             "category": "Conditions",
@@ -27026,6 +27091,8 @@ def run_analysis_merge(prior_json, new_pdf_paths, scope_tags=None,
                     rfi_items=rfi_items,
                     validation=validation,
                     client=will_client,
+                    contractor_name=(merged_analysis.get("_contractor_name")
+                                     or _ACTIVE_CONTRACTOR_NAME),
                 )
             except Exception as exc:
                 print(f"⚠️  Will Synthesis failed: {exc}")
@@ -27569,6 +27636,7 @@ def _run_job_draw_median(k, pdf_paths, run_kwargs):
 
 
 def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
+                  business_name="",
                   corrections_path=None, use_cache=False, multi_pass=False,
                   image_fallback=True, schedule_estimation=True,
                   rate_overrides=None, interactive=False,
@@ -27597,6 +27665,16 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         ValueError: if no PDFs provided or none could be analysed
         anthropic.RateLimitError: if API rate-limited
     """
+    # Bind the customer-facing contractor identity for this run. Everything
+    # downstream (standard exclusions, Will's scope language and RFIs) reads
+    # it; unresolved means those surfaces stay unnamed rather than borrowing
+    # somebody else's company name.
+    global _ACTIVE_CONTRACTOR_NAME
+    _ACTIVE_CONTRACTOR_NAME = _resolve_contractor_name(
+        contact_email, business_name)
+    if _ACTIVE_CONTRACTOR_NAME:
+        print(f"   🏷  Contractor identity: {_ACTIVE_CONTRACTOR_NAME}")
+
     if not pdf_paths:
         raise ValueError("No PDF paths provided")
 

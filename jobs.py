@@ -774,6 +774,10 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
                 local_pdfs,
                 contact_name=contact_info["name"],
                 contact_email=contact_info["email"],
+                # Customer-facing copy (exclusions, Will's scope language)
+                # is written in this contractor's name; the org name beats
+                # a guess derived from the email domain.
+                business_name=contact_info.get("business_name") or "",
                 scope_notes=scope_notes,
                 rate_overrides=rate_overrides,
                 multi_pass=_multi_pass,
