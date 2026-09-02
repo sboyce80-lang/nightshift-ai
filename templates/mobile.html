@@ -289,7 +289,7 @@
                                    accept=".pdf,application/pdf" multiple required>
                             <div class="m-icon">&#128203;</div>
                             <p>Tap to choose PDFs</p>
-                            <p class="m-hint">PDF only &bull; up to 600 MB each</p>
+                            <p class="m-hint">PDF only &bull; up to {{ max_size_mb }} MB each &bull; max {{ max_files }} files</p>
                         </div>
                         <div class="m-files" id="m-file-list"></div>
                         <div id="m-upload-progress" style="display:none;margin-top:8px;font-size:0.82rem;color:rgba(226,232,240,0.85);"></div>
