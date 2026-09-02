@@ -9882,6 +9882,20 @@ def _maybe_run_exterior_pass(client, pdf_path, analysis_result):
             existing = merged.get("notes", "")
             merged["notes"] = (existing + " | " if existing else "") + str(ext_note)
         merged["source_pages"] = ext_data.get("source_pages", [])
+        # EVIDENCE FIELDS MUST SURVIVE THE MERGE (2026-09-01). This loop
+        # copies a whitelist of NUMERIC fields, so every non-numeric key
+        # the elevation pass produced was being dropped here — including
+        # `paint_evidence`, which is the FIRST blob the exterior evidence
+        # gate reads, and `deterministic_text_evidence`, the text-layer
+        # scan added for exactly that gate. Both were silently lost on
+        # every job that runs the dedicated pass, so the gate has been
+        # resolving exterior scope from `notes` alone. Found by a
+        # prod-posture smoke test on Caris: the pass measured 2,922 SF of
+        # hardie, the gate never saw the mandate, and the siding zeroed.
+        for _ev_key in ("paint_evidence", "deterministic_text_evidence",
+                        "_elev_consensus", "elevation_breakdown"):
+            if ext_data.get(_ev_key) and not merged.get(_ev_key):
+                merged[_ev_key] = ext_data[_ev_key]
         analysis_result["exterior"] = merged
         _drop_stale_elevation_claims(analysis_result, merged)
 
