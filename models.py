@@ -75,6 +75,19 @@ class Organization(Base):
     # Shape: {"rates": {<key>: <float>, ...}, "markup": <float>}
     pricing_overrides: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
+    # Confirmed bidding conventions for this customer, consumed by
+    # flag_resolver.resolve_flags(). Shape:
+    #   {"interior_only": true, "wall_basis_faces": false, ...,
+    #    "_conventions_confirmed_at": "2026-09-01T12:00:00+00:00"}
+    # Keys are flag_resolver.CONVENTION_FLAGS profile keys. A key that is
+    # absent is an OPEN QUESTION, not a "no" — the job runs on the
+    # conservative default and raises a convention RFI. The confirmed-at
+    # marker is a reviewer's statement that the profile is complete, and
+    # silences the RFI for conventions it deliberately omits.
+    # NULL → unknown customer: conservative defaults + RFI + held for
+    # review, which is exactly what we want for a first job.
+    convention_profile: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
+
     # Inputs for the Usage / ROI tab. Shape:
     #   {"hourly_wage": <float>, "hours_per_estimate": <float>}
     # NULL → fall back to industry-average defaults in the UI.
@@ -321,6 +334,19 @@ class Submission(Base):
     # 2h legacy default.
     queue_name: Mapped[Optional[str]] = mapped_column(String(64), nullable=True)
     job_timeout: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+
+    # The flag posture this job actually ran under, from
+    # flag_resolver.resolve_flags(). Shape:
+    #   {"flags": {...}, "provenance": {<flag>: "engine|profile|estimate|
+    #    evidence"}, "conventions": {...}, "unresolved": [...],
+    #    "enabled": bool}
+    # Written at enqueue so a result can always be traced back to the
+    # conventions that produced it — the missing piece behind the 9/1
+    # Caris smoke test, where a -44.9% prod run and a +2.6% validation
+    # run were the same code under different, unrecorded flags.
+    # `enabled: false` means the resolver ran in shadow: this is what it
+    # WOULD have used, not what the job used.
+    resolved_flags: Mapped[Optional[dict]] = mapped_column(JSON, nullable=True)
 
     # Versioning for re-runs. v1 has parent_submission_id=NULL; revisions
     # (revised plans, RFI responses, amendments) point at the parent and
