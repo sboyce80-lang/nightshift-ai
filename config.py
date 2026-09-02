@@ -487,7 +487,7 @@ EMAIL_SUBJECT_FILTER = os.environ.get("EMAIL_SUBJECT_FILTER", "")
 # above (which are for inbound RFP ingestion only).
 RESEND_API_KEY    = os.environ.get("RESEND_API_KEY", "")
 RESEND_FROM_EMAIL = os.environ.get("RESEND_FROM_EMAIL", "")
-RESEND_FROM_NAME  = os.environ.get("RESEND_FROM_NAME", "Knight Shift")
+RESEND_FROM_NAME  = os.environ.get("RESEND_FROM_NAME", "KnightShiftAI")
 MAX_PDF_SIZE_MB     = 600
 MAX_PDFS_PER_EMAIL  = 25
 # Browser-direct R2 multipart upload — split each file into parts of this size
