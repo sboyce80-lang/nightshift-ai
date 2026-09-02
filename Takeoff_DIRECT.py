@@ -16705,6 +16705,48 @@ _EXT_FACTORY_FINISH_RX = re.compile(
     r"factory[\s-]?(?:finish(?:ed)?|applied|primed and finished)|"
     r"not\s+field[\s-]?painted|pre[\s-]?finished", re.IGNORECASE)
 
+# Hedged finish language is an ABSENCE of evidence, not a declaration of
+# factory finish. 168 Holley St (2026-09-02): the note "Hardie siding noted
+# as factory finish (ColorPlus or equivalent) status unconfirmed" tripped the
+# factory-finish matcher on the bare token and zeroed the siding, even though
+# the sentence says the status is UNKNOWN — and A-301's finish schedule reads
+# "LAP SIDING - PRIMED FOR PAINT / FIELD PAINT - DARK HUNTER GREEN (SW0041)".
+_EXT_FINISH_HEDGE_RX = re.compile(
+    r"\bunconfirmed\b|\bunverified\b|\bstatus\s+unknown\b|\bunclear\b|"
+    r"\bto\s+be\s+(?:confirmed|determined)\b|\btbd\b|"
+    r"\bnot\s+(?:explicitly\s+)?(?:stated|specified|confirmed|indicated)\b",
+    re.IGNORECASE)
+
+
+def _ext_evidence_precedence_enabled():
+    """Kill switch for hedge-awareness + positive-overrides-negative.
+    Default ON: without it a spec sheet's "status unconfirmed" outranks an
+    elevation schedule's explicit "FIELD PAINT - SW0041"."""
+    return os.environ.get("NIGHTSHIFT_EXT_EVIDENCE_PRECEDENCE", "1").strip() \
+        not in ("0", "false", "False")
+
+
+# The gate writes its own verdict into analysis["notes"] ("[Exterior
+# Evidence] Zeroed factory-finished item(s): hardie_siding_sqft=2,832"),
+# and that sentence both matches the factory-finish pattern AND names the
+# material families. On any re-entrant path — merge, multi-pass, a replay of
+# a stored analysis — the gate would read its own output back as fresh
+# drawing evidence and re-zero on it. Its notes are never evidence.
+_EXT_SELF_NOTE_RX = re.compile(r"\[Exterior Evidence\]", re.IGNORECASE)
+
+
+def _ext_finish_sentence_is_negative(sentence):
+    """True only for an AFFIRMATIVE factory-finish claim from the drawings."""
+    if not _EXT_FACTORY_FINISH_RX.search(sentence):
+        return False
+    if not _ext_evidence_precedence_enabled():
+        return True
+    if _EXT_SELF_NOTE_RX.search(sentence):
+        return False
+    if _EXT_FINISH_HEDGE_RX.search(sentence):
+        return False
+    return True
+
 # Material-family tokens per exterior quantity key: a negative-finish
 # sentence zeroes a key only when it names that key's material.
 _EXT_ITEM_FAMILIES = {
@@ -16728,7 +16770,7 @@ def _ext_negative_evidence_keys(present_keys, blobs):
         if not blob:
             continue
         for sentence in re.split(r"[.;|]", str(blob)):
-            if not _EXT_FACTORY_FINISH_RX.search(sentence):
+            if not _ext_finish_sentence_is_negative(sentence):
                 continue
             low = sentence.lower()
             for k in present_keys:
@@ -16760,7 +16802,7 @@ def _ext_positive_evidence_keys(present_keys, blobs):
         if not blob:
             continue
         for sentence in re.split(r"[.;|]", str(blob)):
-            if _EXT_FACTORY_FINISH_RX.search(sentence):
+            if _ext_finish_sentence_is_negative(sentence):
                 continue
             if not _EXT_PAINT_TOKEN_RX.search(sentence):
                 continue
@@ -16888,6 +16930,31 @@ def _enforce_exterior_evidence(analysis):
     # any key whose material the drawings declare factory-finished / not
     # field-painted, regardless of paint evidence elsewhere on the job.
     negative = _ext_negative_evidence_keys(list(present), blobs)
+    # ...but an EXPLICIT per-item positive callout outranks it. 168 Holley St
+    # (2026-09-02): a spec-sheet note ("Hardie siding ... status unconfirmed")
+    # zeroed the siding and popped the key below, so A-301's own finish
+    # schedule row — "LAP SIDING - PRIMED FOR PAINT / FIELD PAINT - DARK
+    # HUNTER GREEN (SW0041)" — was never evaluated. Soffit survived only
+    # because it carried no negative note, and was kept on evidence from the
+    # very same table four rows down.
+    #
+    # This cannot resurrect a genuine negative: _ext_positive_evidence_keys
+    # skips any sentence that is itself negative, so an override always comes
+    # from a different, affirmatively-painted sentence (Fishkill's
+    # "...siding ... not field-painted" yields no positive for siding).
+    if negative and _ext_evidence_precedence_enabled():
+        _pos_override = _ext_positive_evidence_keys(list(negative), blobs)
+        for _k, _quote in _pos_override.items():
+            negative.pop(_k, None)
+        if _pos_override:
+            _ov = ", ".join(_pos_override)
+            analysis.setdefault("notes", []).append(
+                f"[Exterior Evidence] Explicit paint callout overrode a "
+                f"factory-finish note for: {_ov}.")
+            print(f"   🏛  Exterior evidence: explicit callout overrides "
+                  f"factory-finish note for {_ov}", flush=True)
+            ext.setdefault("_evidence_positive_override", {}).update(
+                {k: v[:160] for k, v in _pos_override.items()})
     # NIGHTSHIFT_FACTORY_FINISH_ALLOWANCE (default off): estimators bid
     # factory-finish-noted siding anyway on 3 of 3 golden jobs (Caris:
     # JW bid 4,762 SF the veto zeroed, -$24.4k; Fishkill: Rider bid
