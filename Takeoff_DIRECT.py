@@ -338,6 +338,16 @@ def _collect_stream_text(stream, label=""):
         parts.append(text)
     final_msg = stream.get_final_message()
     joined = "".join(parts)
+    # Cost accounting. Recorded BEFORE the truncation raise — a call that
+    # died at max_tokens still burned the tokens, and those retries are
+    # exactly the ones worth seeing in the per-job total.
+    try:
+        import usage_meter
+        usage_meter.record(getattr(final_msg, "usage", None),
+                           model=getattr(final_msg, "model", None),
+                           label=label)
+    except Exception:
+        pass
     if getattr(final_msg, "stop_reason", None) == "max_tokens":
         raise TruncatedResponseError(
             f"Response truncated at max_tokens"
@@ -9095,6 +9105,108 @@ Be precise — extract every room listed in the schedule, and capture every stru
 # Exterior Scope Extraction — Dedicated pass on elevation sheets
 # ---------------------------------------------------------------------------
 
+_ELEVATION_CUES = (
+    "exterior elevation", "exterior elevations",
+    "north elevation", "south elevation",
+    "east elevation", "west elevation",
+    "front elevation", "rear elevation", "side elevation",
+    "building elevation", "building elevations",
+)
+
+# Phrases that mark a page as an INDEX/spec sheet rather than a drawing. A
+# cover sheet's drawing index lists "EXTERIOR ELEVATIONS" as a sheet NAME, so
+# it scores an elevation cue while containing no elevation at all.
+_ELEVATION_INDEX_MARKERS = (
+    "drawing index", "sheet index", "drawing list", "sheet list",
+    "index of drawings", "table of contents",
+)
+
+
+def _elevation_ranking_enabled():
+    """Kill switch for evidence-ranked elevation page selection. Default ON:
+    the previous size guard truncated candidates in PAGE ORDER, which on
+    168 Holley St kept the cover sheet and two specification sheets (zero
+    elevation cues between them, 3.2 MB of a 5 MB budget) and dropped A-301
+    Exterior Elevations, the one page carrying two cues. Exterior scope
+    priced $0 as a result."""
+    return os.environ.get("NIGHTSHIFT_ELEV_PAGE_RANKING", "1").strip() \
+        not in ("0", "false", "False")
+
+
+_ELEVATION_DISQUALIFIED = -99
+
+
+def _score_elevation_page(page_text_lower):
+    """Evidence that a page IS an elevation drawing. Higher is better.
+
+    A drawing index is DISQUALIFIED rather than penalised: it names every
+    elevation on the job, so any finite penalty leaves a busy index tied
+    with (or ahead of) the sheet it points at.
+    """
+    if not _elevation_ranking_enabled():
+        return 0
+    if any(m in page_text_lower for m in _ELEVATION_INDEX_MARKERS):
+        return _ELEVATION_DISQUALIFIED
+    return sum(1 for cue in _ELEVATION_CUES if cue in page_text_lower)
+
+
+def _rank_elevation_pages(pdf_path, indices, budget_bytes):
+    """Order elevation candidates by evidence and fill to the size budget.
+
+    Replaces `indices[:4]`, which assumed the first four candidates were the
+    four cardinal elevations. They are simply the four lowest-numbered pages
+    that matched, which on a real set is usually the front matter.
+
+    Returns a page-ordered subset that fits (best-effort) inside
+    budget_bytes.
+    """
+    if not _elevation_ranking_enabled():
+        return indices[:4]
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+    except Exception:
+        return indices[:4]
+    scored = []
+    try:
+        for idx in indices:
+            try:
+                text = (doc[idx].get_text() or "").lower()
+            except Exception:
+                text = ""
+            scored.append((_score_elevation_page(text), idx))
+    finally:
+        doc.close()
+
+    # Measure each candidate once so the budget is spent on real elevations
+    # rather than on whichever page happens to be biggest.
+    sizes = {}
+    for _, idx in scored:
+        try:
+            sizes[idx] = len(_create_filtered_pdf(pdf_path, [idx]))
+        except Exception:
+            sizes[idx] = budget_bytes  # unknown: treat as expensive
+
+    # Best evidence first; among equals prefer the cheaper page so the
+    # budget buys more elevations.
+    scored.sort(key=lambda t: (-t[0], sizes.get(t[1], 0), t[1]))
+
+    # Only pages with positive evidence earn a slot. Spending leftover
+    # headroom on a zero-cue page re-introduces exactly the noise the
+    # filtered PDF exists to remove.
+    positive = [(sc, idx) for sc, idx in scored if sc > 0]
+    chosen, running = [], 0
+    for score, idx in (positive or scored):
+        size = sizes.get(idx, 0)
+        if chosen and running + size > budget_bytes:
+            continue
+        chosen.append(idx)
+        running += size
+    if not chosen:
+        chosen = [scored[0][1]] if scored else indices[:1]
+    return sorted(chosen)
+
+
 def _identify_elevation_pages(pdf_path):
     """Return 0-based page indices that look like exterior-elevation sheets.
 
@@ -9118,13 +9230,7 @@ def _identify_elevation_pages(pdf_path):
     except Exception:
         return []
 
-    elevation_cues = (
-        "exterior elevation", "exterior elevations",
-        "north elevation", "south elevation",
-        "east elevation", "west elevation",
-        "front elevation", "rear elevation", "side elevation",
-        "building elevation", "building elevations",
-    )
+    elevation_cues = _ELEVATION_CUES
 
     for page_idx in range(len(doc)):
         page = doc[page_idx]
@@ -9512,10 +9618,16 @@ def _extract_exterior_scope(client, pdf_path):
     # Size guard: Claude's per-document base64 limit ~5 MB.
     if len(filtered_bytes) > 5 * 1024 * 1024:
         print(f"   ⚠️  Filtered elevation PDF is "
-              f"{len(filtered_bytes)/1024/1024:.1f} MB — truncating to first "
-              f"few elevation pages")
-        # Truncate to first 4 pages (typically the 4 cardinal elevations)
-        elevation_indices = elevation_indices[:4]
+              f"{len(filtered_bytes)/1024/1024:.1f} MB — selecting the "
+              f"strongest elevation evidence within budget")
+        if _elevation_ranking_enabled():
+            elevation_indices = _rank_elevation_pages(
+                pdf_path, elevation_indices, 5 * 1024 * 1024)
+            print(f"   🎯 Ranked elevation pages: "
+                  f"{[i + 1 for i in elevation_indices]}")
+        else:
+            # Legacy: first 4 in PAGE order (assumed to be the cardinals).
+            elevation_indices = elevation_indices[:4]
         try:
             filtered_bytes = _create_filtered_pdf(pdf_path, elevation_indices)
         except Exception as e:
@@ -27441,6 +27553,18 @@ def _run_job_draw_median(k, pdf_paths, run_kwargs):
                 json.dump(data, f, indent=2)
         except Exception as e:
             print(f"   ⚠️  Draw-median JSON rewrite failed (non-fatal): {e}")
+
+    # The chosen draw's own snapshot only covers the draws up to it. What
+    # the JOB cost is all K draws (plus any cold-draw retries), so restamp
+    # the cumulative total onto the result that ships.
+    try:
+        import usage_meter
+        chosen["claude_usage"] = usage_meter.snapshot()
+        _line = usage_meter.format_line()
+        if _line:
+            print("\n" + _line + f"  [K={k} draws]")
+    except Exception:
+        pass
     return chosen
 
 
@@ -27475,6 +27599,16 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     """
     if not pdf_paths:
         raise ValueError("No PDF paths provided")
+
+    # Start this job's cost-accounting window. Only at the OUTERMOST call:
+    # under draw-median each draw re-enters run_analysis in-process, and
+    # the number we want is what the whole job cost, all K draws included.
+    try:
+        import usage_meter
+        if not os.environ.get("NIGHTSHIFT_JOB_DRAW_ACTIVE"):
+            usage_meter.reset()
+    except Exception:
+        pass
 
     # Job-level draw-median consensus (NIGHTSHIFT_JOB_DRAW_MEDIAN=K):
     # orchestrate K independent draws of this same function and return the
@@ -29846,6 +29980,15 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         "will_adjustments_log": will_result.get("adjustments_log"),
         "will_rejected_log": will_result.get("rejected_log"),
     }
+
+    try:
+        import usage_meter
+        result_data["claude_usage"] = usage_meter.snapshot()
+        _line = usage_meter.format_line()
+        if _line:
+            print("\n" + _line)
+    except Exception:
+        pass
 
     with open(output_json, 'w') as f:
         json.dump(result_data, f, indent=2)
