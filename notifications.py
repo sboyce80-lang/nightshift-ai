@@ -257,7 +257,7 @@ with the details below and we'll come back with pricing the same day:
 
 {PRICING_REPLY_TEMPLATE}
 
-Your completed estimates stay available in your account either way.
+Your estimates stay available in your account either way.
 
 — Knight Shift
 """
