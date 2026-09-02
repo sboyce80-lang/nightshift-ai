@@ -56,7 +56,7 @@ from config import (
     RQ_JOB_TIMEOUT, RQ_RESULT_TTL,
     BETA_DAILY_SUBMISSION_CAP_DEFAULT,
     CLERK_PUBLISHABLE_KEY,
-    PLG_SELF_SERVE_ENABLED, FREEMIUM_BID_LIMIT,
+    PLG_SELF_SERVE_ENABLED, FREEMIUM_BID_LIMIT, TEST_WELCOME_MAX_RECIPIENTS,
     FREEMIUM_MAX_PDF_SIZE_MB, FREEMIUM_MAX_PDFS,
     PLG_BLOCK_FREE_EMAIL_AUTO_APPROVE, PLG_SALES_CONTACT_EMAIL,
     scale_timeout_for_consensus,
@@ -334,6 +334,7 @@ def _inject_clerk_context():
         # "Start Free — X Bids") on this flag.
         "plg_enabled": PLG_SELF_SERVE_ENABLED,
         "plg_free_bid_limit": FREEMIUM_BID_LIMIT,
+        "test_welcome_max_recipients": TEST_WELCOME_MAX_RECIPIENTS,
     }
 
 
@@ -3414,46 +3415,85 @@ def admin_orgs_approve(org_id):
 @app.route("/admin/test-welcome", methods=["POST"])
 @require_auth
 def admin_test_welcome():
-    """Send the real welcome email, through Resend, to the admin's own inbox.
+    """Send the real welcome email, through Resend, to the team.
 
     Exists so the production send path can be exercised without creating a
-    throwaway signup — what lands here is byte-identical to what a customer
+    throwaway signup — what lands is byte-identical to what a customer
     gets, CID logo and all.
 
-    The recipient is always the authenticated admin's own address. It is
-    never taken from the request, so this cannot be pointed at a third
-    party even by an admin.
+    Recipients default to the admin's own address. An admin may name others,
+    but only on their OWN email domain: enough to show the team the real
+    thing, while making it useless as a way to mail branded email to
+    strangers. Capped, validated, and every send is logged.
     """
     uid = current_user_id()
     with session_scope() as session:
         user = session.get(User, uid)
         if not is_admin(user):
             return ("Forbidden", 403)
-        to_email = user.email
-        to_name = user.name or ""
-        org_name = "Acme Painting LLC (test)"
+        admin_email = (user.email or "").strip().lower()
+        admin_name = user.name or ""
+
+    admin_domain = admin_email.rpartition("@")[2]
+    raw = (request.form.get("recipients") or "").strip()
+    if raw:
+        wanted = [a.strip().lower()
+                  for a in re.split(r"[,;\s]+", raw) if a.strip()]
+    else:
+        wanted = [admin_email]
+
+    if len(wanted) > TEST_WELCOME_MAX_RECIPIENTS:
+        flash(f"At most {TEST_WELCOME_MAX_RECIPIENTS} recipients per test send.",
+              "error")
+        return redirect(url_for("admin_orgs"))
+
+    recipients, rejected = [], []
+    for addr in wanted:
+        if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", addr):
+            rejected.append(f"{addr} (not an email address)")
+        elif addr.rpartition("@")[2] != admin_domain:
+            rejected.append(f"{addr} (not on @{admin_domain})")
+        elif addr not in recipients:
+            recipients.append(addr)
+    if rejected:
+        flash("Refused: " + "; ".join(rejected), "error")
+        return redirect(url_for("admin_orgs"))
+    if not recipients:
+        flash("No valid recipients.", "error")
+        return redirect(url_for("admin_orgs"))
 
     # "unlimited" mirrors the hand-approval path (plan='beta', no quota).
     unlimited = (request.form.get("variant") == "unlimited")
-    try:
-        ok = notify_welcome(
-            email=to_email,
-            name=to_name,
-            org_name=org_name,
-            app_url=url_for("index", _external=True),
-            bid_limit=None if unlimited else FREEMIUM_BID_LIMIT,
-            guide_url=url_for("guide", _external=True),
-        )
-    except Exception as exc:
-        logger.error("Test welcome send failed: %s", exc)
-        flash(f"Test welcome failed: {type(exc).__name__}: {exc}", "error")
-        return redirect(url_for("admin_orgs"))
+    org_name = (request.form.get("org_name") or "").strip() or "Acme Painting LLC"
+    app_url = url_for("index", _external=True)
+    guide_url = url_for("guide", _external=True)
 
-    if ok:
-        variant = "unlimited (approval)" if unlimited else "freemium"
-        flash(f"Sent the {variant} welcome email to {to_email}.", "success")
-    else:
-        flash("Resend rejected the send — check the service logs.", "error")
+    sent, failed = [], []
+    for addr in recipients:
+        # Address each recipient by name where we can, so what they see
+        # reads the way a real signup's would.
+        name = admin_name if addr == admin_email else \
+            addr.partition("@")[0].split(".")[0].capitalize()
+        try:
+            ok = notify_welcome(
+                email=addr, name=name, org_name=org_name, app_url=app_url,
+                bid_limit=None if unlimited else FREEMIUM_BID_LIMIT,
+                guide_url=guide_url,
+            )
+        except Exception as exc:
+            logger.error("Test welcome to %s failed: %s", addr, exc)
+            failed.append(f"{addr} ({type(exc).__name__}: {exc})")
+            continue
+        (sent if ok else failed).append(addr if ok else f"{addr} (Resend rejected)")
+
+    logger.info("Admin %s sent %s test welcome to %s (failed: %s)",
+                admin_email, "unlimited" if unlimited else "freemium",
+                sent, failed)
+    variant = "unlimited (approval)" if unlimited else "freemium"
+    if sent:
+        flash(f"Sent the {variant} welcome email to {', '.join(sent)}.", "success")
+    if failed:
+        flash("Failed: " + "; ".join(failed), "error")
     return redirect(url_for("admin_orgs"))
 
 
