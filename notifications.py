@@ -51,7 +51,8 @@ def notifications_configured() -> bool:
     return bool(RESEND_API_KEY and RESEND_FROM_EMAIL)
 
 
-def _send(to_addrs, subject: str, body: str, cc_addrs=None) -> bool:
+def _send(to_addrs, subject: str, body: str, cc_addrs=None,
+          html_body: str = "") -> bool:
     if not RESEND_API_KEY:
         logger.error(
             "Resend not configured (RESEND_API_KEY missing) — "
@@ -72,6 +73,11 @@ def _send(to_addrs, subject: str, body: str, cc_addrs=None) -> bool:
         "subject": subject,
         "text": body,
     }
+    # Send multipart when an HTML part is supplied. Mail clients that
+    # auto-linkify bare URLs in text/plain rewrite them into tracking
+    # redirects; real <a> tags render as written.
+    if html_body:
+        payload["html"] = html_body
     # Don't double-deliver to anyone already on the To: line.
     cc = [a for a in (cc_addrs or []) if a not in set(to_addrs)]
     if cc:
@@ -194,6 +200,86 @@ Number of estimators on staff:
 Primary work type (commercial TI / multifamily / healthcare / new build / other):
 Best phone number and time to call:"""
 
+def _welcome_html(name, org_name, app_url, allowance, guide_url):
+    """HTML part for the welcome email.
+
+    Table-based with inline styles — the lowest common denominator across
+    mail clients. Every link is a real anchor with human-readable text, so
+    clients that rewrite bare URLs in text/plain have nothing to rewrite.
+    """
+    ink, muted, accent, rule = "#0F1A20", "#4B5C64", "#0B6E85", "#DDE4E8"
+    # Declared on every text node — mail clients don't inherit reliably, and
+    # an unset family renders the whole message in the client's serif default.
+    ff = ("-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,"
+          "Arial,sans-serif")
+    guide_row = f"""
+          <p style="font-family:{ff};margin:0 0 6px;font-size:15px;line-height:1.55;color:{ink};">
+            <strong>New to KnightShiftAI?</strong> This one-pager walks you through
+            your first bid and what each tab does &mdash; five minutes now saves you
+            a re-run later.
+          </p>
+          <p style="font-family:{ff};margin:0 0 26px;font-size:15px;line-height:1.55;">
+            <a href="{guide_url}" style="color:{accent};font-weight:600;">Read the getting-started guide &rarr;</a>
+          </p>""" if guide_url else ""
+
+    return f"""<!DOCTYPE html>
+<html><body style="margin:0;padding:0;background:#F4F6F7;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#F4F6F7;">
+  <tr><td align="center" style="padding:28px 12px;">
+    <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0"
+           style="width:600px;max-width:100%;background:#FFFFFF;border:1px solid {rule};border-radius:3px;">
+      <tr><td style="padding:30px 34px 6px;">
+        <p style="font-family:{ff};margin:0 0 4px;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:{muted};">KnightShiftAI</p>
+        <h1 style="font-family:{ff};margin:0 0 18px;font-size:21px;line-height:1.25;color:{ink};font-weight:700;">
+          Hi {name or 'there'}, your account is ready
+        </h1>
+        <p style="font-family:{ff};margin:0 0 14px;font-size:15px;line-height:1.55;color:{ink};">
+          Welcome to KnightShiftAI &mdash; your account for
+          <strong>{org_name}</strong> is ready to go.
+        </p>
+        <p style="font-family:{ff};margin:0 0 22px;font-size:15px;line-height:1.55;color:{ink};">
+          {allowance} Upload a bid set (plans and finish schedules as PDFs)
+          and we'll email you a full takeoff and estimate, usually the same day.
+        </p>
+
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 26px;">
+          <tr><td style="background:{accent};border-radius:3px;">
+            <a href="{app_url}" style="font-family:{ff};display:inline-block;padding:12px 26px;font-size:15px;
+               font-weight:600;color:#FFFFFF;text-decoration:none;">Upload your first bid</a>
+          </td></tr>
+        </table>
+{guide_row}
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
+               style="border-top:1px solid {rule};margin:0 0 20px;"><tr><td style="height:20px;"></td></tr></table>
+
+        <p style="font-family:{ff};margin:0 0 8px;font-size:11px;letter-spacing:.13em;text-transform:uppercase;color:{muted};">Tips for the best results</p>
+        <p style="font-family:{ff};margin:0 0 6px;font-size:15px;line-height:1.55;color:{ink};">
+          Include the finish schedules and floor plans, not just a cover sheet.
+        </p>
+        <p style="font-family:{ff};margin:0 0 24px;font-size:15px;line-height:1.55;color:{ink};">
+          One project per submission.
+        </p>
+
+        <p style="font-family:{ff};margin:0 0 8px;font-size:15px;line-height:1.55;color:{ink};">
+          Questions at any point? Just reply to this email &mdash; a real person reads it.
+          You can also reach us directly:
+        </p>
+        <p style="font-family:{ff};margin:0 0 30px;font-size:15px;line-height:1.7;color:{ink};">
+          General support &middot;
+          <a href="mailto:{SUPPORT_CONTACT_EMAIL}" style="color:{accent};">{SUPPORT_CONTACT_EMAIL}</a><br>
+          Steve, Co-founder and Head of Technology &middot;
+          <a href="mailto:{FOUNDER_CONTACT_EMAIL}" style="color:{accent};">{FOUNDER_CONTACT_EMAIL}</a>
+        </p>
+      </td></tr>
+      <tr><td style="padding:16px 34px 22px;border-top:1px solid {rule};">
+        <p style="font-family:{ff};margin:0;font-size:12px;color:{muted};">KnightShiftAI &mdash; Forged by Willpower</p>
+      </td></tr>
+    </table>
+  </td></tr>
+</table>
+</body></html>"""
+
+
 def notify_welcome(email: str, name: str, org_name: str, app_url: str,
                    bid_limit=None, guide_url: str = "") -> bool:
     """Welcome an approved user — the one email every new account gets.
@@ -202,14 +288,21 @@ def notify_welcome(email: str, name: str, org_name: str, app_url: str,
       - self-serve signup auto-approved onto freemium (bid_limit=5)
       - an admin hand-approving a waitlisted org, which lands on plan='beta'
         with no quota (bid_limit=None → the unlimited wording)
+
+    Sent multipart: the HTML part carries labelled links, the text part is
+    the plain-reader fallback.
     """
     if bid_limit is None:
         allowance = ("Your account has no bid limit — upload as many projects "
                      "as you like.")
+        allowance_html = ("Your account has no bid limit &mdash; upload as many "
+                          "projects as you like.")
         subject = f"Welcome to KnightShiftAI — {org_name} is approved"
     else:
         allowance = (f"You have {bid_limit} free bids to try the system on "
                      f"your own projects.")
+        allowance_html = (f"You have <strong>{bid_limit} free bids</strong> to try "
+                          f"the system on your own projects.")
         subject = f"Welcome to KnightShiftAI — {bid_limit} free bids inside"
 
     guide_block = f"""
@@ -241,7 +334,9 @@ You can also reach us directly:
 
 — KnightShiftAI
 """
-    return _send([email], subject, body)
+    return _send([email], subject, body,
+                 html_body=_welcome_html(name, org_name, app_url,
+                                         allowance_html, guide_url))
 
 
 # Back-compat alias — the freemium signup path has always called this name.
