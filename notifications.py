@@ -23,7 +23,9 @@ We still return False rather than raise, so the caller's request flow
 isn't interrupted.
 """
 
+import base64
 import logging
+import os
 
 import requests
 
@@ -51,8 +53,40 @@ def notifications_configured() -> bool:
     return bool(RESEND_API_KEY and RESEND_FROM_EMAIL)
 
 
+# The brand lockup travels WITH the message as an inline CID attachment
+# rather than as a remote <img src="https://...">. Remote images depend on
+# the reader's client fetching them (Gmail proxies, Outlook blocks by
+# default, some clients collapse the element to nothing) — a CID part is
+# already in the message and always renders.
+_LOGO_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                          "static", "email_logo.png")
+LOGO_CID = "ksai-logo"
+_logo_b64_cache = None
+
+
+def _logo_attachment():
+    """Base64 logo as a Resend inline attachment, or None if unreadable."""
+    global _logo_b64_cache
+    if _logo_b64_cache is None:
+        try:
+            with open(_LOGO_PATH, "rb") as fh:
+                _logo_b64_cache = base64.b64encode(fh.read()).decode("ascii")
+        except OSError as exc:
+            # Non-fatal: the alt text carries the brand name.
+            logger.error("Email logo unreadable at %s: %s", _LOGO_PATH, exc)
+            _logo_b64_cache = ""
+    if not _logo_b64_cache:
+        return None
+    return {
+        "filename": "knightshiftai.png",
+        "content": _logo_b64_cache,
+        "content_type": "image/png",
+        "content_id": LOGO_CID,
+    }
+
+
 def _send(to_addrs, subject: str, body: str, cc_addrs=None,
-          html_body: str = "") -> bool:
+          html_body: str = "", attachments=None) -> bool:
     if not RESEND_API_KEY:
         logger.error(
             "Resend not configured (RESEND_API_KEY missing) — "
@@ -78,6 +112,8 @@ def _send(to_addrs, subject: str, body: str, cc_addrs=None,
     # redirects; real <a> tags render as written.
     if html_body:
         payload["html"] = html_body
+    if attachments:
+        payload["attachments"] = list(attachments)
     # Don't double-deliver to anyone already on the To: line.
     cc = [a for a in (cc_addrs or []) if a not in set(to_addrs)]
     if cc:
@@ -216,7 +252,7 @@ def _welcome_html(name, org_name, app_url, allowance, guide_url):
     # an unset family renders the whole message in the client's serif default.
     ff = ("-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,"
           "Arial,sans-serif")
-    logo = f"{app_url.rstrip('/')}/static/email_logo.png"
+    logo = f"cid:{LOGO_CID}"
 
     guide_row = f"""
           <p style="font-family:{ff};margin:0 0 6px;font-size:15px;line-height:1.55;color:{body};">
@@ -365,9 +401,11 @@ You can also reach us directly:
 
 — KnightShiftAI
 """
+    logo = _logo_attachment()
     return _send([email], subject, body,
                  html_body=_welcome_html(name, org_name, app_url,
-                                         allowance_html, guide_url))
+                                         allowance_html, guide_url),
+                 attachments=[logo] if logo else None)
 
 
 # Back-compat alias — the freemium signup path has always called this name.
