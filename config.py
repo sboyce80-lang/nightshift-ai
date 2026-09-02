@@ -636,6 +636,11 @@ PLG_SALES_CONTACT_EMAIL = os.environ.get(
 # Customer-facing contact addresses printed in lifecycle emails. Kept here
 # (not inline in notifications.py) so the welcome email, the paywall page and
 # any future in-app help all quote the same two addresses.
+# Cap on the admin welcome-email self-test. Recipients are additionally
+# restricted to the sending admin's own email domain.
+TEST_WELCOME_MAX_RECIPIENTS = int(
+    os.environ.get("TEST_WELCOME_MAX_RECIPIENTS", "10"))
+
 SUPPORT_CONTACT_EMAIL = os.environ.get(
     "SUPPORT_CONTACT_EMAIL", "admin@knightshiftai.com")
 FOUNDER_CONTACT_EMAIL = os.environ.get(
