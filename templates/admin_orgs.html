@@ -127,23 +127,40 @@
         </div>
         {% endif %}
 
-        <div style="margin:0 0 26px;padding:14px 16px;border:1px solid rgba(255,255,255,0.10);
+        <div style="margin:0 0 26px;padding:16px 18px;border:1px solid rgba(255,255,255,0.10);
                     border-radius:8px;background:rgba(15,23,42,0.45);">
-            <strong style="color:#e2e8f0;font-size:0.92rem;">Send yourself a test welcome email</strong>
-            <p style="margin:5px 0 11px;color:rgba(203,213,225,0.7);font-size:0.83rem;line-height:1.5;">
-                Goes through Resend on the real production path, so what arrives is
-                byte-identical to what a customer gets. Always sent to your own
-                address &mdash; never to anyone else.
+            <strong style="color:#e2e8f0;font-size:0.92rem;">Send a real welcome email</strong>
+            <p style="margin:5px 0 12px;color:rgba(203,213,225,0.7);font-size:0.83rem;line-height:1.5;">
+                Goes out through Resend on the production path, so what arrives is
+                byte-identical to what a customer gets &mdash; embedded logo and all.
+                Leave recipients blank to send to yourself. You can only send to
+                addresses on your own email domain.
             </p>
-            <form method="POST" action="{{ url_for('admin_test_welcome') }}"
-                  style="display:inline-block;margin-right:8px;">
-                <input type="hidden" name="variant" value="freemium">
-                <button type="submit" class="btn-approve">Freemium ({{ plg_free_bid_limit }} bids)</button>
-            </form>
-            <form method="POST" action="{{ url_for('admin_test_welcome') }}"
-                  style="display:inline-block;">
-                <input type="hidden" name="variant" value="unlimited">
-                <button type="submit" class="btn-approve">Unlimited (approval)</button>
+            <form method="POST" action="{{ url_for('admin_test_welcome') }}">
+                <label style="display:block;color:#cbd5e1;font-size:0.8rem;font-weight:600;margin:0 0 4px;">
+                    Recipients <span style="font-weight:400;color:rgba(203,213,225,0.55);">(comma-separated, max {{ test_welcome_max_recipients }})</span>
+                </label>
+                <input type="text" name="recipients"
+                       placeholder="you@yourdomain.com, teammate@yourdomain.com"
+                       style="width:100%;max-width:560px;padding:9px 11px;border-radius:6px;
+                              border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.03);
+                              color:#f1f5f9;font-size:0.9rem;box-sizing:border-box;">
+                <label style="display:block;color:#cbd5e1;font-size:0.8rem;font-weight:600;margin:12px 0 4px;">
+                    Company name shown in the email
+                </label>
+                <input type="text" name="org_name" placeholder="Acme Painting LLC"
+                       style="width:100%;max-width:320px;padding:9px 11px;border-radius:6px;
+                              border:1px solid rgba(255,255,255,0.12);background:rgba(255,255,255,0.03);
+                              color:#f1f5f9;font-size:0.9rem;box-sizing:border-box;">
+                <div style="margin-top:14px;">
+                    <button type="submit" name="variant" value="freemium" class="btn-approve">
+                        Send freemium ({{ plg_free_bid_limit }} bids)
+                    </button>
+                    <button type="submit" name="variant" value="unlimited" class="btn-approve"
+                            style="margin-left:8px;">
+                        Send unlimited (approval)
+                    </button>
+                </div>
             </form>
         </div>
 
