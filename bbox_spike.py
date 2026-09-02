@@ -531,6 +531,14 @@ def _classify_sheet_categories(pdf_path: str) -> dict[int, str]:
     return page_cat
 
 
+def _jw_style_markups_enabled() -> bool:
+    """Flag-gated (NIGHTSHIFT_JW_STYLE_MARKUPS, default off): emit estimator
+    markups in JW's Bluebeam grammar instead of the QA overlay below."""
+    import os
+    return os.environ.get("NIGHTSHIFT_JW_STYLE_MARKUPS", "0").strip() in (
+        "1", "true", "True", "yes", "on")
+
+
 def render_annotated_pdf(pdf_in: str, result_or_analysis: dict, pdf_out: str) -> dict:
     """Render an annotated copy of `pdf_in` with room bboxes drawn on each
     source page. Non-referenced pages get a banner classified by category:
@@ -548,6 +556,21 @@ def render_annotated_pdf(pdf_in: str, result_or_analysis: dict, pdf_out: str) ->
     """
     import os
     from collections import defaultdict
+
+    if _jw_style_markups_enabled():
+        # Customer-facing markups: real annotations carrying the priced
+        # quantity, per JW's convention. The QA overlay below stays available
+        # for internal triage (match quality, extraction-failure banners) —
+        # it is a debugging view and was never meant to reach an estimator.
+        try:
+            import jw_markups
+            summary = jw_markups.render_markup_pdf(pdf_in, result_or_analysis,
+                                                   pdf_out)
+            summary["style"] = "jw_markups"
+            return summary
+        except Exception as exc:  # fall back rather than ship no drawings
+            print(f"[bbox_spike] JW-style markups failed ({exc!r}); "
+                  f"falling back to the QA overlay")
 
     if isinstance(result_or_analysis.get("analysis"), dict) and "floors" in result_or_analysis["analysis"]:
         analysis = result_or_analysis["analysis"]

@@ -560,12 +560,16 @@ def _build_and_upload_annotated_drawings(submission_id, result, local_pdfs, work
             out_path = os.path.join(workdir, out_filename)
 
             summary = render_annotated_pdf(resolved, result, out_path)
-            logger.info("Annotated drawings for %s/%s: %d/%d pages referenced, "
-                        "%d rooms drawn, %d misses, %.1f MB",
+            # Read defensively: a renderer variant that omits a counter must
+            # not KeyError here, since this whole block is best-effort and the
+            # drawings would vanish with only a log line to show for it.
+            logger.info("Annotated drawings for %s/%s (%s): %d/%d pages marked, "
+                        "%d shapes, %d not placed, %.1f MB",
                         submission_id, out_filename,
-                        summary["referenced_pages"], summary["pages"],
-                        summary["rooms_drawn"], summary["misses_marked"],
-                        summary["output_size_bytes"] / 1024 / 1024)
+                        summary.get("style", "qa_overlay"),
+                        summary.get("referenced_pages", 0), summary.get("pages", 0),
+                        summary.get("rooms_drawn", 0), summary.get("misses_marked", 0),
+                        summary.get("output_size_bytes", 0) / 1024 / 1024)
 
             r2_key = storage.result_key(submission_id, out_filename)
             storage.upload_file(out_path, r2_key, content_type="application/pdf")
