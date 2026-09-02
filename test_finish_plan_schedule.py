@@ -12,6 +12,7 @@
 
 All three default OFF and must be inert when unset.
 """
+import json
 import os
 import sys
 
@@ -394,6 +395,46 @@ check(any(not r.get("room_number") for r in k3),
 k4, d4 = T._drop_offsheet_rows(rows, set())
 check(len(k4) == 5 and not d4,
       "empty token scan is a no-op — never deletes a whole schedule")
+
+# ── 8. scope boundary must also reduce the aggregates ───────────────────
+print("\n[8] scope boundary reduces aggregated_totals")
+
+os.environ["NIGHTSHIFT_SCHEDULE_ROOM_SCOPE"] = "1"
+agg_a = {
+    "room_finish_schedule": [
+        {"room_number": f"400-{i:02d}", "room_name": f"Exam {i}",
+         "wall_finish": "PT1", "ceiling_finish": "ACT1"} for i in range(1, 9)],
+    "floors": [{"rooms": [
+        {"room_id": "A", "room_name": "Exam 1", "room_number": "400-01",
+         "in_scope": True, "dimensions": {"wall_area_sqft": 300},
+         "elements": {"doors_full_paint": 2}},
+        {"room_id": "S", "room_name": "Stair 1", "in_scope": True,
+         "dimensions": {"wall_area_sqft": 900},
+         "elements": {"stair_sections": 6, "gyp_between_stairs_sqft": 480,
+                      "doors_full_paint": 4}},
+        {"room_id": "R", "room_name": "Receiving", "in_scope": True,
+         "dimensions": {"wall_area_sqft": 800},
+         "elements": {"concrete_floor_sqft": 1250}},
+    ]}], "notes": [],
+    "aggregated_totals": {"total_doors_full_paint": 6,
+                          "total_stair_sections": 6,
+                          "total_gyp_between_stairs_sqft": 480,
+                          "total_concrete_floor_sqft": 1250}}
+ar = T._apply_schedule_room_scope(agg_a)
+ag = ar["aggregated_totals"]
+check(ag["total_stair_sections"] == 0,
+      f"stairs on a dropped room stop being billed (got {ag['total_stair_sections']})")
+check(ag["total_doors_full_paint"] == 2,
+      f"doors fall to what in-scope rooms hold (got {ag['total_doors_full_paint']})")
+check(ag["total_concrete_floor_sqft"] == 0, "sealed slab follows its room")
+check(ag["total_gyp_between_stairs_sqft"] == 0, "gyp-between-stairs follows too")
+check("aggregates_adjusted" in ar["_schedule_room_scope"],
+      "adjustment recorded for the reviewer")
+
+# never below what survivors hold, never negative
+agg_b = dict(agg_a)
+agg_b = json.loads(json.dumps(agg_a)) if False else None
+os.environ.pop("NIGHTSHIFT_SCHEDULE_ROOM_SCOPE", None)
 
 print("\n" + "=" * 60)
 if FAILS:

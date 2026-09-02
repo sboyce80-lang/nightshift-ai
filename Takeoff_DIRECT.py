@@ -19933,8 +19933,29 @@ def _apply_schedule_room_scope(analysis):
             return False
         return any(toks & rt for _r, rt in row_toks if rt)
 
+    # Element totals carried by the rooms we remove. Marking a room
+    # out_of_scope is not enough: aggregated_totals is computed upstream and
+    # several pricing paths read it directly, so a dropped room's doors and
+    # stairs keep getting billed. Phelps rerun-2: every stair-bearing room
+    # left scope, yet the estimate still priced 6 stair sections ($9,450)
+    # and 159 doors against 108 actually held by in-scope rooms.
+    _ELEM_AGG = (
+        ("doors_full_paint", "total_doors_full_paint"),
+        ("doors_hm_panel", "total_doors_hm_panel"),
+        ("doors_frame_only", "total_doors_frame_only"),
+        ("windows_painted_interior", "total_windows_painted_interior"),
+        ("stair_sections", "total_stair_sections"),
+        ("gyp_between_stairs_sqft", "total_gyp_between_stairs_sqft"),
+        ("concrete_floor_sqft", "total_concrete_floor_sqft"),
+        ("base_trim_lf", "total_base_trim_lf"),
+        ("wallcovering_sqft", "total_wallcovering_sqft"),
+        ("level_5_finish_sqft", "total_level_5_finish_sqft"),
+    )
+    removed_elems = {}
+
     dropped, kept = [], 0
     for fl in (analysis.get("floors") or []):
+        _mf = max(1, int(_num(fl.get("unit_multiplier", 1)) or 1))
         for rm in (fl.get("rooms") or []):
             if not isinstance(rm, dict) or not rm.get("in_scope", True):
                 continue
@@ -19946,10 +19967,48 @@ def _apply_schedule_room_scope(analysis):
                 "not listed in the authoritative room finish schedule — "
                 "outside the scheduled scope boundary")
             dropped.append(rm.get("room_name") or rm.get("room_id") or "room")
+            _mult = _mf * max(1, int(_num(rm.get("unit_multiplier", 1)) or 1))
+            _el = rm.get("elements") or {}
+            for _src, _agg_key in _ELEM_AGG:
+                _v = _num(_el.get(_src, 0)) * _mult
+                if _v:
+                    removed_elems[_agg_key] = removed_elems.get(
+                        _agg_key, 0.0) + _v
 
     total = kept + len(dropped)
     rec = {"applied": bool(dropped), "rooms_dropped": len(dropped),
            "rooms_kept": kept, "schedule_rows": len(rfs)}
+
+    # Decrement the aggregates by what left scope, floored at what the
+    # surviving rooms actually hold so the two can never disagree.
+    if removed_elems:
+        agg = analysis.setdefault("aggregated_totals", {})
+        _survivor = {}
+        for fl in (analysis.get("floors") or []):
+            _mf = max(1, int(_num(fl.get("unit_multiplier", 1)) or 1))
+            for rm in (fl.get("rooms") or []):
+                if not isinstance(rm, dict) or not rm.get("in_scope", True):
+                    continue
+                _mult = _mf * max(
+                    1, int(_num(rm.get("unit_multiplier", 1)) or 1))
+                _el = rm.get("elements") or {}
+                for _src, _agg_key in _ELEM_AGG:
+                    _survivor[_agg_key] = _survivor.get(_agg_key, 0.0) + (
+                        _num(_el.get(_src, 0)) * _mult)
+        adjusted = {}
+        for _agg_key, _gone in removed_elems.items():
+            _cur = _num(agg.get(_agg_key, 0))
+            if _cur <= 0:
+                continue
+            _new = max(_survivor.get(_agg_key, 0.0), _cur - _gone)
+            if round(_new, 2) != round(_cur, 2):
+                agg[_agg_key] = round(_new, 2)
+                adjusted[_agg_key] = [round(_cur, 2), round(_new, 2)]
+        if adjusted:
+            rec["aggregates_adjusted"] = adjusted
+            print("   ➖ Scope boundary reduced aggregates: " + ", ".join(
+                f"{k.replace('total_', '')} {v[0]:g}→{v[1]:g}"
+                for k, v in list(adjusted.items())[:6]))
     analysis["_schedule_room_scope"] = rec
     if dropped:
         names = ", ".join(sorted(set(dropped))[:12])
