@@ -2022,7 +2022,9 @@ def _has_schedule_sheet_title(page, title_phrases, excludes=_SCHEDULE_REFERENCE_
     return False
 
 
-def _detect_schedule_in_pdf(pdf_path, title_phrases, table_tokens=()):
+def _detect_schedule_in_pdf(pdf_path, title_phrases, table_tokens=(),
+                            excludes=_SCHEDULE_REFERENCE_EXCLUDES,
+                            token_only=None):
     """Generic schedule detector. Two passes per page:
       1. Span-level: title phrase appears as a standalone sheet title.
          Works when the schedule table itself is vector art (no extractable
@@ -2046,12 +2048,16 @@ def _detect_schedule_in_pdf(pdf_path, title_phrases, table_tokens=()):
         return None
     try:
         for page in doc:
-            if _has_schedule_sheet_title(page, title_phrases):
+            if _has_schedule_sheet_title(page, title_phrases, excludes):
                 return True
-            if table_tokens:
+            if table_tokens or token_only:
                 t = page.get_text().lower()
-                if any(p.lower() in t for p in title_phrases) \
+                if table_tokens and any(p.lower() in t for p in title_phrases) \
                         and sum(1 for tok in table_tokens if tok in t) >= 2:
+                    return True
+                # Token-only evidence (finish plans, which carry the per-room
+                # columns but no "schedule" title).
+                if token_only is not None and token_only(t):
                     return True
         return False
     finally:
@@ -2061,9 +2067,55 @@ def _detect_schedule_in_pdf(pdf_path, title_phrases, table_tokens=()):
 _FINISH_TITLE_PHRASES = ("room finish schedule", "finish schedule",
                          "interior finish schedule", "finish legend",
                          "room finish legend")
+
+
+# An EXTERIOR finish schedule (siding, trim, fascia materials) is a different
+# document from a room finish schedule and must never be chosen as the source
+# of per-room finishes. On 168 Holley St it was the ONLY title-pass hit — on
+# A-301, one of four sheets that failed extraction — so the targeted room-
+# finish read was aimed at the wrong sheet while A-207 went unread.
+_FINISH_TITLE_EXCLUDES = _SCHEDULE_REFERENCE_EXCLUDES + (
+    "exterior finish schedule", "exterior finish legend")
+
 _FINISH_TABLE_TOKENS = ("wall finish", "ceiling finish", "base finish",
                         "floor finish", "room finish", "room name",
                         "room no", "room number")
+# Tokens that identify a table/plan as keyed BY ROOM. Strong token evidence
+# plus one of these stands on its own — a sheet listing room names against
+# wall/base/floor finishes is a room finish source whatever its title block
+# happens to say.
+_FINISH_ROOM_TOKENS = ("room name", "room no", "room number", "room finish")
+_FINISH_TOKEN_ONLY_MIN = 3
+
+
+def _finish_plan_discovery_enabled():
+    """Kill switch for finish-PLAN discovery (title prefix + token-only pass
+    + exterior-schedule exclusion). Default ON: the pre-fix detector aimed the
+    targeted room-finish read at an exterior schedule and skipped the actual
+    finish plan entirely."""
+    return os.environ.get("NIGHTSHIFT_FINISH_PLAN_DISCOVERY", "1").strip() \
+        not in ("0", "false", "False")
+
+
+def _finish_token_only_match(page_text_lower):
+    """True when a page carries enough finish column tokens, including at
+    least one room-identifying token, to be a room-finish source on token
+    evidence alone (no title phrase required)."""
+    if not _finish_plan_discovery_enabled():
+        return False
+    hits = [tok for tok in _FINISH_TABLE_TOKENS if tok in page_text_lower]
+    if len(hits) < _FINISH_TOKEN_ONLY_MIN:
+        return False
+    return any(tok in page_text_lower for tok in _FINISH_ROOM_TOKENS)
+
+
+def _finish_title_excludes():
+    """Excludes for the room-finish title pass. Reverts to the shared
+    reference excludes when the discovery flag is off."""
+    return (_FINISH_TITLE_EXCLUDES if _finish_plan_discovery_enabled()
+            else _SCHEDULE_REFERENCE_EXCLUDES)
+
+
 _DOOR_TITLE_PHRASES = ("door schedule", "door & window schedule",
                        "door and window schedule", "door schedule:")
 _DOOR_TABLE_TOKENS = ("door no", "door number", "door type", "door size",
@@ -2081,7 +2133,9 @@ def _detect_finish_schedule(pdf_path):
     See _detect_schedule_in_pdf for the dual-pass strategy.
     """
     return _detect_schedule_in_pdf(pdf_path, _FINISH_TITLE_PHRASES,
-                                   _FINISH_TABLE_TOKENS)
+                                   _FINISH_TABLE_TOKENS,
+                                   excludes=_finish_title_excludes(),
+                                   token_only=_finish_token_only_match)
 
 
 def _find_finish_schedule_pages(pdf_path, max_pages=8):
@@ -2106,13 +2160,14 @@ def _find_finish_schedule_pages(pdf_path, max_pages=8):
     (callers fall back to the whole-document path).
     """
     TITLE_FONT_PT = 12.0
-    excl = [e.lower() for e in _SCHEDULE_REFERENCE_EXCLUDES]
+    excl = [e.lower() for e in _finish_title_excludes()]
     try:
         import fitz  # PyMuPDF
         doc = fitz.open(pdf_path)
     except Exception:
         return []
     hits = {}  # page_idx -> max matching span font size
+    token_hits = set()  # pages carrying the per-room finish columns outright
     try:
         for idx in range(len(doc)):
             page = doc[idx]
@@ -2130,22 +2185,56 @@ def _find_finish_schedule_pages(pdf_path, max_pages=8):
                         if any(p in txt for p in _FINISH_TITLE_PHRASES):
                             sz = float(span.get("size", 0))
                             best = sz if best is None else max(best, sz)
+
+            t_lower = None
             if best is None:
                 # Token pass: title phrase anywhere + 2+ column headers.
-                t = (page.get_text() or "").lower()
-                if any(p in t for p in _FINISH_TITLE_PHRASES) \
-                        and sum(1 for tok in _FINISH_TABLE_TOKENS if tok in t) >= 2:
+                t_lower = (page.get_text() or "").lower()
+                if any(p in t_lower for p in _FINISH_TITLE_PHRASES) \
+                        and sum(1 for tok in _FINISH_TABLE_TOKENS
+                                if tok in t_lower) >= 2:
                     best = 0.0
+            # Strong room-keyed token evidence is tracked SEPARATELY, not as a
+            # 0.0-point title hit. A page whose text actually carries the
+            # per-room finish columns is better evidence than any title span,
+            # so it must never be suppressed by the title-size rule below.
+            if _finish_plan_discovery_enabled():
+                if t_lower is None:
+                    t_lower = (page.get_text() or "").lower()
+                if _finish_token_only_match(t_lower):
+                    token_hits.add(idx)
             if best is not None:
                 hits[idx] = best
     except Exception:
         return []
     finally:
         doc.close()
-    if not hits:
+    if not hits and not token_hits:
         return []
+    # Title-size spans outrank small-font cross-references ("REFER TO FINISH
+    # SCHEDULE." emits 6-9pt spans on many sheets). Pages carrying the actual
+    # per-room finish columns are unioned in regardless of what any title
+    # block says — on Hudson Hotel the finish-PLAN title sits on one sheet
+    # while five other sheets hold the finish rows, and suppressing those
+    # five would lose the data this pass exists to find.
     titled = sorted(i for i, sz in hits.items() if sz >= TITLE_FONT_PT)
-    return (titled or sorted(hits))[:max_pages]
+    if titled:
+        base = set(titled)
+    elif token_hits:
+        # Pages carrying the actual per-room finish columns outrank the
+        # small-font fallback, which is a last resort for sets whose schedule
+        # title is genuinely small. 168 Holley St: excluding the exterior
+        # finish schedule removed the only title-size anchor, and the
+        # fallback then returned five sheets whose sole claim was a
+        # "...AS PER FINISH SCHEDULE" note.
+        base = set()
+    else:
+        base = set(hits)
+    # Union, never suppress. `base` reproduces the pre-change selection
+    # exactly; token_hits only ever adds to it. The one
+    # intentional removal is the exterior finish schedule, dropped at the
+    # span level via _finish_title_excludes().
+    return sorted(set(base) | token_hits)[:max_pages]
 
 
 def _detect_door_schedule(pdf_path):
@@ -8776,12 +8865,47 @@ def _extract_room_finish_schedule(client, pdf_path, page_indices=None):
     if pdf_data is None:
         pdf_data = _load_pdf_for_api(pdf_path, _client_for_validation=client)
 
-    room_finish_prompt = """You are analyzing ARCHITECTURAL DRAWING SHEETS that contain SCHEDULES (not floor plans).
+    room_finish_prompt = """You are analyzing ARCHITECTURAL DRAWING SHEETS that carry ROOM FINISH information.
 
 Your task: Extract the ROOM FINISH SCHEDULE and BUILDING INFORMATION from this document.
 
-1. ROOM FINISH SCHEDULE (usually sheet A1.04, A1.04A, or similar "Room Finish" pages):
-   For EACH room listed in the Room Finish Schedule, extract:
+0. TWO FORMS CARRY THE SAME DATA — READ WHICHEVER IS PRESENT:
+   (a) A FINISH SCHEDULE: a table with one row per room and columns for
+       floor / base / wall / ceiling finish.
+   (b) A FINISH PLAN (titles like "FINISH PLAN", "FINISH PLANS &
+       SPECIFICATIONS", "FINISH FLOOR PLAN"): a floor plan where each room
+       carries a small tag block next to its name/number instead of a table
+       row. The tags are usually single letters stacked or arranged in a
+       cluster — F = floor, B = base, W = wall, and sometimes C = ceiling —
+       each paired with a material code. A room tagged
+           F=CPT-2  B=WD-2  W=PT-1
+       is exactly equivalent to a schedule row reading
+           floor "CPT-2", base "WD-2", wall "PT-1".
+   A finish plan is a valid and complete room finish source. Extract from it
+   with the same rigour as from a table. Do NOT return an empty
+   room_finish_schedule merely because the sheet is drawn as a plan rather
+   than tabulated.
+
+   RESOLVE CODES VIA THE LEGEND. These sheets carry a legend / material
+   schedule (often titled "FINISH PLAN LEGEND", "MATERIAL LEGEND" or
+   "FINISH LEGEND") mapping each code to a product and material — for
+   example "WC-1  WALL COVERING  WOLF GORDON  RIDGELINE", "PT-1 PAINT",
+   "WD-2 WOOD BASE". Report BOTH: put the resolved description in the
+   *_finish field and keep the raw code visible in it (e.g. "PT-1 Paint",
+   "WC-1 Wall Covering", "WD-2 Wood Base"). A code you cannot resolve in the
+   legend should still be reported verbatim rather than dropped.
+
+   HONOUR THE SHEET'S GENERAL FINISH NOTES. Notes such as "ALL WALLS TO BE
+   PAINTED PT-1, U.N.O.", "PAINT ALL GYPSUM BOARD CEILINGS AND SOFFITS FLAT
+   CEILING WHITE, U.N.O.", "DO NOT PAINT LAY-IN TILE CEILINGS", or "USE
+   EPOXY PAINT ON WALLS IN ALL TOILET ROOMS" are authoritative defaults for
+   every room on that plan. Apply them to rooms whose tag block omits that
+   surface, and record the note verbatim in "notes". A room covered by a
+   U.N.O. default is CONFIRMED by the drawings — it is not an assumption.
+
+1. ROOM FINISH SCHEDULE (usually sheet A1.04, A1.04A, similar "Room Finish"
+   pages, or the finish plan described in 0(b) above):
+   For EACH room listed in the schedule OR tagged on the finish plan, extract:
    - room_name: The room name/type (e.g., "Living Room", "Bedroom 1", "Kitchen", "Bathroom", "Hallway", "Closet")
    - room_number: The room number if shown
    - wall_finish: What's specified for walls (e.g., "Paint", "PT-1", "Wallcovering", "Tile", "CMU Paint",
