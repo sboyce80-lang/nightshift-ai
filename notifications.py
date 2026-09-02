@@ -206,73 +206,104 @@ def _welcome_html(name, org_name, app_url, allowance, guide_url):
     Table-based with inline styles — the lowest common denominator across
     mail clients. Every link is a real anchor with human-readable text, so
     clients that rewrite bare URLs in text/plain have nothing to rewrite.
+
+    Colours are sampled from the KnightShift mark: navy wordmark, blueprint
+    blue, plume green. White-on-blue clears 5.8:1.
     """
-    ink, muted, accent, rule = "#0F1A20", "#4B5C64", "#0B6E85", "#DDE4E8"
+    navy, body, blue, green, rule = ("#0C1B2D", "#33475B", "#0F67AD",
+                                     "#099967", "#DFE5EA")
     # Declared on every text node — mail clients don't inherit reliably, and
     # an unset family renders the whole message in the client's serif default.
     ff = ("-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,"
           "Arial,sans-serif")
+    logo = f"{app_url.rstrip('/')}/static/email_logo.png"
+
     guide_row = f"""
-          <p style="font-family:{ff};margin:0 0 6px;font-size:15px;line-height:1.55;color:{ink};">
-            <strong>New to KnightShiftAI?</strong> This one-pager walks you through
-            your first bid and what each tab does &mdash; five minutes now saves you
-            a re-run later.
+          <p style="font-family:{ff};margin:0 0 6px;font-size:15px;line-height:1.55;color:{body};">
+            <strong style="color:{navy};">New to KnightShiftAI?</strong> This one-pager walks
+            you through your first bid and what each tab does &mdash; five minutes now
+            saves you a re-run later.
           </p>
-          <p style="font-family:{ff};margin:0 0 26px;font-size:15px;line-height:1.55;">
-            <a href="{guide_url}" style="color:{accent};font-weight:600;">Read the getting-started guide &rarr;</a>
+          <p style="font-family:{ff};margin:0 0 28px;font-size:15px;line-height:1.55;">
+            <a href="{guide_url}" style="color:{blue};font-weight:600;">Read the getting-started guide &rarr;</a>
           </p>""" if guide_url else ""
 
     return f"""<!DOCTYPE html>
-<html><body style="margin:0;padding:0;background:#F4F6F7;">
-<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="background:#F4F6F7;">
-  <tr><td align="center" style="padding:28px 12px;">
+<html><body style="margin:0;padding:0;background:#EEF1F4;">
+<table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
+       bgcolor="#EEF1F4" style="background-color:#EEF1F4;">
+  <tr><td align="center" style="padding:26px 12px 34px;">
     <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0"
-           style="width:600px;max-width:100%;background:#FFFFFF;border:1px solid {rule};border-radius:3px;">
-      <tr><td style="padding:30px 34px 6px;">
-        <p style="font-family:{ff};margin:0 0 4px;font-size:11px;letter-spacing:.14em;text-transform:uppercase;color:{muted};">KnightShiftAI</p>
-        <h1 style="font-family:{ff};margin:0 0 18px;font-size:21px;line-height:1.25;color:{ink};font-weight:700;">
+           bgcolor="#FFFFFF"
+           style="width:600px;max-width:100%;background-color:#FFFFFF;border:1px solid {rule};border-radius:4px;">
+
+      <!-- Brand lockup. alt carries the name when images are blocked. -->
+      <tr><td align="center" style="padding:30px 34px 0;">
+        <img src="{logo}" width="220" alt="KnightShiftAI &mdash; Forged by Willpower"
+             style="width:220px;max-width:70%;height:auto;display:block;border:0;outline:none;">
+      </td></tr>
+      <tr><td style="padding:22px 34px 0;">
+        <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+          <tr>
+            <td height="3" bgcolor="{blue}" style="background-color:{blue};height:3px;line-height:3px;font-size:0;width:64px;">&nbsp;</td>
+            <td height="3" bgcolor="{green}" style="background-color:{green};height:3px;line-height:3px;font-size:0;width:26px;">&nbsp;</td>
+            <td height="3" bgcolor="{rule}" style="background-color:{rule};height:3px;line-height:3px;font-size:0;">&nbsp;</td>
+          </tr>
+        </table>
+      </td></tr>
+
+      <tr><td style="padding:26px 34px 6px;">
+        <h1 style="font-family:{ff};margin:0 0 18px;font-size:22px;line-height:1.25;color:{navy};font-weight:700;">
           Hi {name or 'there'}, your account is ready
         </h1>
-        <p style="font-family:{ff};margin:0 0 14px;font-size:15px;line-height:1.55;color:{ink};">
+        <p style="font-family:{ff};margin:0 0 14px;font-size:15px;line-height:1.55;color:{body};">
           Welcome to KnightShiftAI &mdash; your account for
-          <strong>{org_name}</strong> is ready to go.
+          <strong style="color:{navy};">{org_name}</strong> is ready to go.
         </p>
-        <p style="font-family:{ff};margin:0 0 22px;font-size:15px;line-height:1.55;color:{ink};">
+        <p style="font-family:{ff};margin:0 0 24px;font-size:15px;line-height:1.55;color:{body};">
           {allowance} Upload a bid set (plans and finish schedules as PDFs)
           and we'll email you a full takeoff and estimate, usually the same day.
         </p>
 
-        <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 26px;">
-          <tr><td style="background:{accent};border-radius:3px;">
-            <a href="{app_url}" style="font-family:{ff};display:inline-block;padding:12px 26px;font-size:15px;
-               font-weight:600;color:#FFFFFF;text-decoration:none;">Upload your first bid</a>
+        <!-- Button: colour is set on the td (attribute + property) AND on the
+             anchor itself, so a client that drops any one of the three still
+             renders readable text rather than white-on-white. -->
+        <table role="presentation" cellpadding="0" cellspacing="0" border="0" style="margin:0 0 28px;">
+          <tr><td bgcolor="{blue}" align="center"
+                  style="background-color:{blue};border-radius:4px;">
+            <a href="{app_url}" style="font-family:{ff};display:inline-block;
+               background-color:{blue};border:1px solid {blue};border-radius:4px;
+               padding:13px 28px;font-size:15px;font-weight:600;color:#FFFFFF;
+               text-decoration:none;">Upload your first bid</a>
           </td></tr>
         </table>
 {guide_row}
         <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0"
-               style="border-top:1px solid {rule};margin:0 0 20px;"><tr><td style="height:20px;"></td></tr></table>
+               style="border-top:1px solid {rule};margin:0 0 20px;"><tr><td style="height:20px;line-height:20px;font-size:0;">&nbsp;</td></tr></table>
 
-        <p style="font-family:{ff};margin:0 0 8px;font-size:11px;letter-spacing:.13em;text-transform:uppercase;color:{muted};">Tips for the best results</p>
-        <p style="font-family:{ff};margin:0 0 6px;font-size:15px;line-height:1.55;color:{ink};">
+        <p style="font-family:{ff};margin:0 0 10px;font-size:11px;letter-spacing:.13em;text-transform:uppercase;color:{green};font-weight:700;">Tips for the best results</p>
+        <p style="font-family:{ff};margin:0 0 6px;font-size:15px;line-height:1.55;color:{body};">
           Include the finish schedules and floor plans, not just a cover sheet.
         </p>
-        <p style="font-family:{ff};margin:0 0 24px;font-size:15px;line-height:1.55;color:{ink};">
+        <p style="font-family:{ff};margin:0 0 26px;font-size:15px;line-height:1.55;color:{body};">
           One project per submission.
         </p>
 
-        <p style="font-family:{ff};margin:0 0 8px;font-size:15px;line-height:1.55;color:{ink};">
+        <p style="font-family:{ff};margin:0 0 8px;font-size:15px;line-height:1.55;color:{body};">
           Questions at any point? Just reply to this email &mdash; a real person reads it.
           You can also reach us directly:
         </p>
-        <p style="font-family:{ff};margin:0 0 30px;font-size:15px;line-height:1.7;color:{ink};">
+        <p style="font-family:{ff};margin:0 0 30px;font-size:15px;line-height:1.7;color:{body};">
           General support &middot;
-          <a href="mailto:{SUPPORT_CONTACT_EMAIL}" style="color:{accent};">{SUPPORT_CONTACT_EMAIL}</a><br>
+          <a href="mailto:{SUPPORT_CONTACT_EMAIL}" style="color:{blue};">{SUPPORT_CONTACT_EMAIL}</a><br>
           Steve, Co-founder and Head of Technology &middot;
-          <a href="mailto:{FOUNDER_CONTACT_EMAIL}" style="color:{accent};">{FOUNDER_CONTACT_EMAIL}</a>
+          <a href="mailto:{FOUNDER_CONTACT_EMAIL}" style="color:{blue};">{FOUNDER_CONTACT_EMAIL}</a>
         </p>
       </td></tr>
-      <tr><td style="padding:16px 34px 22px;border-top:1px solid {rule};">
-        <p style="font-family:{ff};margin:0;font-size:12px;color:{muted};">KnightShiftAI &mdash; Forged by Willpower</p>
+
+      <tr><td bgcolor="{navy}" style="background-color:{navy};padding:16px 34px;border-radius:0 0 4px 4px;">
+        <p style="font-family:{ff};margin:0;font-size:12px;letter-spacing:.11em;text-transform:uppercase;color:#FFFFFF;font-weight:600;">KnightShiftAI</p>
+        <p style="font-family:{ff};margin:3px 0 0;font-size:11px;letter-spacing:.11em;text-transform:uppercase;color:{green};">Forged by Willpower</p>
       </td></tr>
     </table>
   </td></tr>
