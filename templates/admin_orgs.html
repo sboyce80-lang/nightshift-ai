@@ -127,6 +127,26 @@
         </div>
         {% endif %}
 
+        <div style="margin:0 0 26px;padding:14px 16px;border:1px solid rgba(255,255,255,0.10);
+                    border-radius:8px;background:rgba(15,23,42,0.45);">
+            <strong style="color:#e2e8f0;font-size:0.92rem;">Send yourself a test welcome email</strong>
+            <p style="margin:5px 0 11px;color:rgba(203,213,225,0.7);font-size:0.83rem;line-height:1.5;">
+                Goes through Resend on the real production path, so what arrives is
+                byte-identical to what a customer gets. Always sent to your own
+                address &mdash; never to anyone else.
+            </p>
+            <form method="POST" action="{{ url_for('admin_test_welcome') }}"
+                  style="display:inline-block;margin-right:8px;">
+                <input type="hidden" name="variant" value="freemium">
+                <button type="submit" class="btn-approve">Freemium ({{ plg_free_bid_limit }} bids)</button>
+            </form>
+            <form method="POST" action="{{ url_for('admin_test_welcome') }}"
+                  style="display:inline-block;">
+                <input type="hidden" name="variant" value="unlimited">
+                <button type="submit" class="btn-approve">Unlimited (approval)</button>
+            </form>
+        </div>
+
         <h2>Pending ({{ pending|length }})</h2>
         {% if pending %}
         <table class="admin-table">

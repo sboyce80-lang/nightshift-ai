@@ -3411,6 +3411,52 @@ def admin_orgs_approve(org_id):
     return redirect(url_for("admin_orgs"))
 
 
+@app.route("/admin/test-welcome", methods=["POST"])
+@require_auth
+def admin_test_welcome():
+    """Send the real welcome email, through Resend, to the admin's own inbox.
+
+    Exists so the production send path can be exercised without creating a
+    throwaway signup — what lands here is byte-identical to what a customer
+    gets, CID logo and all.
+
+    The recipient is always the authenticated admin's own address. It is
+    never taken from the request, so this cannot be pointed at a third
+    party even by an admin.
+    """
+    uid = current_user_id()
+    with session_scope() as session:
+        user = session.get(User, uid)
+        if not is_admin(user):
+            return ("Forbidden", 403)
+        to_email = user.email
+        to_name = user.name or ""
+        org_name = "Acme Painting LLC (test)"
+
+    # "unlimited" mirrors the hand-approval path (plan='beta', no quota).
+    unlimited = (request.form.get("variant") == "unlimited")
+    try:
+        ok = notify_welcome(
+            email=to_email,
+            name=to_name,
+            org_name=org_name,
+            app_url=url_for("index", _external=True),
+            bid_limit=None if unlimited else FREEMIUM_BID_LIMIT,
+            guide_url=url_for("guide", _external=True),
+        )
+    except Exception as exc:
+        logger.error("Test welcome send failed: %s", exc)
+        flash(f"Test welcome failed: {type(exc).__name__}: {exc}", "error")
+        return redirect(url_for("admin_orgs"))
+
+    if ok:
+        variant = "unlimited (approval)" if unlimited else "freemium"
+        flash(f"Sent the {variant} welcome email to {to_email}.", "success")
+    else:
+        flash("Resend rejected the send — check the service logs.", "error")
+    return redirect(url_for("admin_orgs"))
+
+
 @app.route("/admin/orgs/<int:org_id>/deny", methods=["POST"])
 @require_auth
 def admin_orgs_deny(org_id):
