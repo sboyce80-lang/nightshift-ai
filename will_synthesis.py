@@ -772,6 +772,97 @@ NEUTRAL_CONTRACTOR = "the painting contractor preparing this bid"
 NEUTRAL_SIGNATURE = "— Will, Senior Estimator"
 
 
+
+# Known contractor names that must never appear in another contractor's
+# output. Binding the persona (build_will_system_prompt) stops the model
+# WRITING them; this stops one that reaches the model some other way — a
+# drawing that names a competitor, a scope note pasted from a prior bid —
+# from riding out into a customer-facing document. Belt and braces: the
+# 2026-09-01 Profeta delivery shipped 11 "Rider Painting" references.
+_KNOWN_CONTRACTOR_NAMES = ("Rider Painting", "Rider Painting, Inc.")
+
+_SCRUBBED_TEXT_FIELDS = ("gc_scope_of_work", "estimator_recap",
+                         "joist_shorthand_scope")
+
+
+def _competitor_scrub_enabled():
+    """Kill switch for the post-generation competitor-name scrub."""
+    return os.environ.get("NIGHTSHIFT_COMPETITOR_SCRUB", "1").strip() \
+        not in ("0", "false", "False")
+
+
+def scrub_competitor_names(will_output, contractor_name=None):
+    """Replace any known contractor name that is not this job's own.
+
+    Operates on the customer-facing prose fields plus RFI and exclusion
+    text. Substitutes the job's contractor when known, else a neutral noun
+    phrase — never deletes the sentence, so the estimator still sees the
+    substance. Records what it touched in
+    will_output["_competitor_scrub"] so a hit is visible rather than
+    silently laundered.
+    """
+    if not isinstance(will_output, dict) or not _competitor_scrub_enabled():
+        return will_output
+    own = (contractor_name or "").strip()
+    own_l = own.lower()
+    # A name is a target only when it is not this job's own. Compare BOTH
+    # directions: "Rider Painting, Inc." is not a substring of "Rider
+    # Painting", so a one-way test leaves the owner's own name on the
+    # target list and the bare-token pass below rewrites "Rider" ->
+    # "Rider Painting", yielding "Rider Painting Painting".
+    targets = [n for n in _KNOWN_CONTRACTOR_NAMES
+               if not own_l
+               or (n.lower() not in own_l and own_l not in n.lower())]
+    if not targets:
+        return will_output
+    # Never touch a bare token the owner's own name is built from.
+    own_tokens = {t.lower().strip(",.") for t in own.split()}
+    replacement = own or "the Contractor"
+    hits = []
+
+    def _fix(text):
+        if not isinstance(text, str) or not text:
+            return text
+        out = text
+        for name in sorted(targets, key=len, reverse=True):
+            if name.lower() in out.lower():
+                out = re.sub(re.escape(name), replacement, out,
+                             flags=re.IGNORECASE)
+                hits.append(name)
+        # "Rider's own work" -> possessive of the replacement.
+        for bare in {n.split()[0] for n in targets
+                     if n.split()[0].lower() not in own_tokens}:
+            pat = re.compile(rf"\b{re.escape(bare)}(?='s\b|\b)",
+                             re.IGNORECASE)
+            if pat.search(out):
+                out = pat.sub(replacement, out)
+                hits.append(bare)
+        return out
+
+    for field in _SCRUBBED_TEXT_FIELDS:
+        if field in will_output:
+            will_output[field] = _fix(will_output[field])
+    for key in ("additional_rfis", "additional_exclusions"):
+        for row in (will_output.get(key) or []):
+            if isinstance(row, dict):
+                for k, v in list(row.items()):
+                    if isinstance(v, str):
+                        row[k] = _fix(v)
+    conf = will_output.get("confidence")
+    if isinstance(conf, dict):
+        for k, v in list(conf.items()):
+            if isinstance(v, str):
+                conf[k] = _fix(v)
+            elif isinstance(v, list):
+                conf[k] = [_fix(x) if isinstance(x, str) else x for x in v]
+    if hits:
+        will_output["_competitor_scrub"] = {
+            "replaced": sorted(set(hits)), "with": replacement}
+        print(f"   🧽 Competitor-name scrub: replaced "
+              f"{sorted(set(hits))} with {replacement!r}")
+    return will_output
+
+
 def build_will_system_prompt(contractor_name=None):
     """WILL_SYSTEM_PROMPT bound to a contractor.
 
@@ -1126,6 +1217,9 @@ def run_will_synthesis(analysis, cost_estimate, rfi_items=None, validation=None,
         print(f"\n   🚦 Pipeline routing: ready_to_send={ready}, "
               f"route_to_human_review={review}")
 
+    will_output = scrub_competitor_names(
+        will_output,
+        contractor_name or (analysis or {}).get("_contractor_name"))
     return {
         "will_synthesis": will_output,
         "cost_estimate": cost_estimate,

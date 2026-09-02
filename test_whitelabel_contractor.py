@@ -111,10 +111,15 @@ for analysis, expect in ((None, None), ({"_contractor_name": "Profeta Painting"}
 
 # --- 5) No competitor name survives in any customer-facing STRING.
 #     Comments are fine; quoted copy is not.
+# _KNOWN_CONTRACTOR_NAMES is the scrub's TARGET list, not customer-facing
+# copy — it exists precisely so these names never reach a document. Every
+# other quoted occurrence is a defect.
 for path in ("will_synthesis.py",):
     src = open(path).read()
     bad = [ln.strip() for ln in src.splitlines()
-           if "Rider" in ln and not ln.lstrip().startswith("#")]
+           if "Rider" in ln
+           and not ln.lstrip().startswith("#")
+           and "_KNOWN_CONTRACTOR_NAMES" not in ln]
     check(not bad, f"{path} still has a competitor name outside a comment: "
                    f"{bad[:1]}")
 
