@@ -19844,6 +19844,34 @@ _VME_LLM_RATIO_BAND = (0.4, 2.5)
 _VME_MIN_SCOPE_COVERAGE = 0.6
 
 
+
+def _vme_scale_is_text_sourced(analysis):
+    """True when EVERY measured floor page read its scale from explicit
+    drawing text, not inference.
+
+    The ratio band exists to catch a scale misread — the one failure that
+    would make geometry catastrophically wrong. When every page's scale came
+    from a literal callout ("1/8\" = 1'-0\""), that specific risk is not
+    present, and the band's remaining effect is to hand authority back to the
+    LLM read it was only ever meant to sanity-check against.
+
+    Returns (ok, n_pages, detail).
+    """
+    shadow = analysis.get("_vme_shadow_v2") or {}
+    pages = shadow.get("by_page") or []
+    if not pages:
+        return False, 0, "no per-page scale record"
+    sources = [str(pg.get("scale_source") or "").lower() for pg in pages]
+    measured = [pg for pg in pages if _num(pg.get("wall_run_lf", 0)) > 0]
+    if not measured:
+        return False, 0, "no page carried measured wall run"
+    if not all(src == "text" for src in sources):
+        return False, len(pages), (
+            "scale inferred on "
+            f"{sum(1 for x in sources if x != 'text')} of {len(pages)} page(s)")
+    return True, len(pages), f"scale read from drawing text on all {len(pages)} page(s)"
+
+
 def _apply_vme_authoritative_walls(analysis):
     """Flag-gated (NIGHTSHIFT_VME_AUTHORITATIVE_WALLS, default off): the
     vector measurement engine's wall run LF becomes the authoritative wall
@@ -19886,12 +19914,54 @@ def _apply_vme_authoritative_walls(analysis):
     if analysis.get("_vme_authoritative") is not None:
         return analysis
 
+    # Phase 2 of the scope-inversion plan: record what the geometry WOULD
+    # have billed on every job, whether or not it is promoted. Changes no
+    # price — it exists so the Phase 4 decision (make confirmed scope
+    # authoritative and retire the inference guards) rests on a corpus
+    # instead of an argument. Across 16 job records the engine is currently
+    # permitted to own walls on 5; six of the eleven abstentions are scope
+    # judgements rather than measurement failures, and we have no systematic
+    # record of how far the discarded number sat from the billed one.
+    _cf = {}
+
+    def _counterfactual(reason=None):
+        if os.environ.get("NIGHTSHIFT_VME_COUNTERFACTUAL", "1").strip() in (
+                "0", "false", "False"):
+            return None
+        agg_now = analysis.get("aggregated_totals") or {}
+        billed = _num(agg_now.get("total_paintable_wall_sqft", 0)) + \
+            _num(agg_now.get("total_cmu_wall_sqft", 0))
+        lf = _num(_cf.get("run_lf", 0))
+        h = _num(_cf.get("height_ft", 0))
+        geom = round(lf * h, 1) if (lf > 0 and h > 0) else None
+        rec = {
+            "geometric_wall_run_lf": lf or None,
+            "height_ft": h or None,
+            "n_room_heights": _cf.get("n_heights"),
+            "pages_measured": _cf.get("pages_measured"),
+            "scale_sources": _cf.get("scale_sources"),
+            "geometric_wall_sqft": geom,
+            "billed_wall_sqft": round(billed, 1) if billed else 0.0,
+            "promoted": reason is None,
+            "abstain_reason": reason,
+        }
+        if geom and billed > 0:
+            rec["geom_over_billed"] = round(geom / billed, 3)
+            rec["delta_sqft"] = round(geom - billed, 1)
+        analysis["_vme_counterfactual"] = rec
+        return rec
+
     def _abstain(reason):
         analysis["_vme_authoritative"] = {"applied": False, "reason": reason}
+        cf = _counterfactual(reason)
         analysis.setdefault("notes", []).append(
             f"[VME] Geometric wall measurement NOT promoted: {reason}. "
             f"Walls priced from extraction.")
         print(f"   🧪 VME authoritative walls: abstained — {reason}")
+        if cf and cf.get("geom_over_billed"):
+            print(f"      ↳ counterfactual: geometry {cf['geometric_wall_sqft']:,.0f} SF "
+                  f"vs billed {cf['billed_wall_sqft']:,.0f} SF "
+                  f"(x{cf['geom_over_billed']:.2f}) — recorded, not applied")
         return analysis
 
     heights = []
@@ -19902,6 +19972,7 @@ def _apply_vme_authoritative_walls(analysis):
             h = _num((rm.get("dimensions") or {}).get("ceiling_height_feet", 0))
             if 6 < h < 30:
                 heights.append(h)
+    _cf["n_heights"] = len(heights)
     if len(heights) < 3:
         return _abstain(
             f"only {len(heights)} measured room height(s) — refusing the "
@@ -19923,6 +19994,18 @@ def _apply_vme_authoritative_walls(analysis):
             return _abstain(f"engine unavailable ({type(exc).__name__})")
         if shadow:
             analysis["_vme_shadow_v2"] = shadow
+
+    # Feed the counterfactual recorder everything the geometry knows, so an
+    # abstention below still reports what geometry WOULD have billed.
+    if shadow:
+        _cf["run_lf"] = _num(shadow.get("total_wall_run_lf", 0))
+        _cf["pages_measured"] = shadow.get("n_floor_pages")
+        _cf["scale_sources"] = sorted({
+            str(pg.get("scale_source") or "?")
+            for pg in (shadow.get("by_page") or [])}) or None
+    if heights:
+        _h = sorted(heights)
+        _cf["height_ft"] = _h[int(0.9 * (len(_h) - 1))]
 
     # ── Basis 1 (certified on the PNC class): whole-floor geometry × p90
     # measured room height. Valid only when every page measured AND the
@@ -20132,7 +20215,48 @@ def _apply_vme_authoritative_walls(analysis):
                         zero_wall += 1
             starved = (n_rooms >= 5 and zero_wall / n_rooms >= 0.5
                        and ratio > hi)
-            if starved and os.environ.get(
+
+            # Over-extraction promotion (flag NIGHTSHIFT_VME_OVERREAD_
+            # PROMOTE, default OFF): the mirror image of starved-promote.
+            # starved handles ratio > hi (extraction read too LITTLE). Below
+            # the band the extraction read too MUCH, and abstaining hands the
+            # wall number to the noisier of the two signals — precisely when
+            # it is least trustworthy. 168 Holley St (2026-09-02): across
+            # three identical draws the LLM produced 7,256 / 10,277 / 21,933
+            # SF while the geometry measured 1,747.3 LF every time, matching
+            # the production run to the foot; VME abstained at x0.32 and x0.20
+            # and the LLM drove a 66% subtotal spread.
+            #
+            # Only when the scale is TEXT-SOURCED on every page. A scale
+            # misread is the one thing that would make geometry
+            # catastrophically wrong, and it is exactly what the band is for;
+            # with an explicit callout on every page that risk is absent and
+            # the band is comparing against noise.
+            trusted_scale, _n_pg, _scale_why = _vme_scale_is_text_sourced(
+                analysis)
+            overread = (ratio < lo and trusted_scale)
+            if overread and os.environ.get(
+                    "NIGHTSHIFT_VME_OVERREAD_PROMOTE", "0").strip() in (
+                    "1", "true", "True"):
+                _gate_add_rfi(
+                    analysis, "Walls (geometric)",
+                    f"The room extraction read {llm_total:,.0f} SF of walls "
+                    f"but the drawings measure {vme_walls:,.0f} SF "
+                    f"({basis}; {_scale_why}) — a {1 / ratio:.1f}x "
+                    f"disagreement. The geometric measurement was used, as "
+                    f"it is reproducible across runs while the extraction is "
+                    f"not. Confirm wall extents and ceiling heights before "
+                    f"bid.")
+                analysis["manual_review_required"] = True
+                analysis.setdefault("notes", []).append(
+                    f"[VME] Over-read promote: extraction {llm_total:,.0f} SF "
+                    f"vs measured {vme_walls:,.0f} SF (x{ratio:.2f}); "
+                    f"geometry used, manual review forced.")
+                print(f"   🧪 VME over-read promote: extracted "
+                      f"{llm_total:,.0f} SF vs measured {vme_walls:,.0f} SF "
+                      f"(x{ratio:.2f}, {_scale_why}) — geometry promoted, "
+                      f"review forced", flush=True)
+            elif starved and os.environ.get(
                     "NIGHTSHIFT_VME_STARVED_PROMOTE", "0").strip() in (
                     "1", "true", "True"):
                 _gate_add_rfi(
@@ -20187,6 +20311,9 @@ def _apply_vme_authoritative_walls(analysis):
         "substrate_split": split,
     })
     analysis["_vme_authoritative"] = rec
+    # Both arms of the corpus: record the promoted case too, so the Phase 4
+    # comparison has a denominator and not just the abstentions.
+    _counterfactual(None)
     if basis == "whole-floor":
         detail = (f"{rec['wall_run_lf']:,.0f} LF of wall runs × "
                   f"{rec['height_ft']:.2f} ft measured ceiling height")
