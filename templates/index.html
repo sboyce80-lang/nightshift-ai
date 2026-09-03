@@ -87,9 +87,13 @@
                         </div>
 
                         <div class="form-group">
-                            <label for="scope_notes">Additional Notes</label>
-                            <textarea id="scope_notes" name="scope_notes" rows="2"
-                                      placeholder="e.g., Skip basement, residential floors only..."></textarea>
+                            <label for="scope_notes">Project Scope Notes *</label>
+                            <textarea id="scope_notes" name="scope_notes" rows="3" required
+                                      minlength="10"
+                                      placeholder="What are you bidding? e.g. &quot;2nd and 3rd floor tenant fit-out only, no basement, no exterior&quot; or &quot;Full building interior + exterior siding and trim&quot;"></textarea>
+                            <small class="field-hint">Tell us which areas are in your scope.
+                            Without this we infer it from the drawings, and a wrong guess is
+                            the single largest source of estimate error.</small>
                         </div>
 
                         <!-- Per-job pricing overrides (hidden inputs auto-populated from the right panel) -->

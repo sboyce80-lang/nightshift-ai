@@ -279,6 +279,9 @@ def _pick_queue(total_pages, max_size_bytes):
     return _queue_fast, RQ_QUEUE_FAST
 
 
+_MIN_SCOPE_NOTES_CHARS = 10
+
+
 def _pick_timeout(total_pages, max_size_bytes):
     """Per-submission RQ job_timeout, scaled to payload AND to how many
     times each plan sheet will be read.
@@ -1091,6 +1094,20 @@ def submit():
     business_name = request.form.get("business_name", "").strip()
     scope_notes = request.form.get("scope_notes", "").strip()
     deadline = request.form.get("deadline", "").strip()
+
+    # Project scope is REQUIRED. Without it the pipeline infers scope from
+    # the drawings, and that inference is the single largest source of
+    # estimate error: on 168 Holley St (2026-09-01) two internal scope
+    # signals disagreed 2x (1,142 LF vs 587 LF), which disqualified the
+    # deterministic geometric wall measurement and handed walls to the LLM
+    # read, producing a 66% subtotal spread across identical runs. The
+    # contractor knows their scope; we should not be guessing it.
+    # `required` on the textarea is advisory — enforce it here too.
+    if len(scope_notes) < _MIN_SCOPE_NOTES_CHARS:
+        flash("Please describe the project scope — which floors, areas or "
+              "systems you are bidding. This is what stops us guessing.",
+              "error")
+        return redirect(url_for("index"))
 
     try:
         with session_scope() as session:
