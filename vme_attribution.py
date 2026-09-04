@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import collections
 import math
+import os
 import re
 
 import vector_measure as vm
@@ -303,6 +304,98 @@ def classify_title_lines(lines, filename="", filename_only=False):
 
 _SHEET_ID_RE = _re.compile(r"\b(A[D]?[-.]?\d{1,3}(?:\.\d{1,2})?[A-Za-z]?)\b")
 
+# Any-discipline sheet id as it appears in a drawing index row (G000, A100,
+# M-101, FP101, E-201.1). Standalone word only — matching inside prose would
+# shred titles at the column-stop check below.
+_INDEX_ID_RE = _re.compile(
+    r"^[A-Z]{1,3}-?\d{1,3}(?:\.\d{1,2})?[A-Za-z]?$")
+_INDEX_HDR_RE = _re.compile(
+    r"sheet\s+(?:list|index)|drawing\s+(?:list|index)|index\s+of\s+drawings|"
+    r"list\s+of\s+drawings", _re.I)
+_FINISH_PLAN_RE = _re.compile(r"finish\s+plan", _re.I)
+
+
+def _index_key(sheet_id):
+    return sheet_id.upper().replace("-", "").replace(".", "")
+
+
+def sheet_index_titles(pdf_paths):
+    """Public wrapper: {normalized sheet id -> title} from the drawing index."""
+    return _sheet_index(pdf_paths)[0]
+
+
+def _sheet_index(pdf_paths):
+    """({normalized sheet id -> title}, (pdf, page) of the index) or ({}, None).
+
+    The index (G000 "SHEET LIST" / "DRAWING INDEX") is a structured table:
+    a sheet-number column beside a title column. Title BLOCKS on the sheets
+    themselves are frequently unextractable (plotted as curves, or the
+    top-font lines carry only the sheet number — Northwell/Phelps A102/A104),
+    so the index is the authoritative source for what each sheet IS.
+
+    Rows are reassembled from word coordinates: words whose vertical centers
+    align form a row; the title is every word right of the sheet-id word up
+    to the next sheet-id word (two-column indexes put a second number/title
+    pair on the same visual row). First index-bearing page wins.
+    """
+    if fitz is None:
+        return {}, None
+    for pdf in pdf_paths:
+        try:
+            doc = fitz.open(pdf)
+        except Exception:
+            continue
+        try:
+            for i in range(len(doc)):
+                try:
+                    if not _INDEX_HDR_RE.search(doc[i].get_text() or ""):
+                        continue
+                    words = doc[i].get_text("words")
+                except Exception:
+                    continue
+                marks = sorted(((w[1] + w[3]) / 2.0, w[0], w[2], w[4])
+                               for w in words)
+                heights = sorted(w[3] - w[1] for w in words)
+                med_h = heights[len(heights) // 2] if heights else 8.0
+                rows, cur, prev_y = [], [], None
+                for yc, x0, x1, txt in marks:
+                    # dense index tables pitch rows ~1 line height apart;
+                    # chain-clustering merges neighbors, so split on the
+                    # y GAP between consecutive word centers instead
+                    if prev_y is not None and yc - prev_y > med_h * 0.5:
+                        rows.append(cur)
+                        cur = []
+                    cur.append((x0, x1, txt))
+                    prev_y = yc
+                if cur:
+                    rows.append(cur)
+                titles = {}
+                for row in rows:
+                    row.sort()
+                    for j, (_, kx1, txt) in enumerate(row):
+                        if not _INDEX_ID_RE.match(txt):
+                            continue
+                        title_words = []
+                        prev_x1 = kx1
+                        for x0_2, x1_2, t2 in row[j + 1:]:
+                            if _INDEX_ID_RE.match(t2):
+                                break
+                            # column stop: a wide x gap means we crossed
+                            # into an unrelated column (notes, dates)
+                            if title_words and x0_2 - prev_x1 > max(
+                                    24.0, med_h * 2.5):
+                                break
+                            title_words.append(t2)
+                            prev_x1 = x1_2
+                        if title_words:
+                            titles.setdefault(_index_key(txt),
+                                              " ".join(title_words))
+                if titles:
+                    return titles, (pdf, i)
+        finally:
+            doc.close()
+    return {}, None
+
 
 def select_floor_plan_pages(pdf_paths):
     """Canonical floor-plan pages for a job (single- or multi-file).
@@ -314,6 +407,11 @@ def select_floor_plan_pages(pdf_paths):
     if fitz is None:
         raise RuntimeError("PyMuPDF (fitz) is required")
     filename_only = len(pdf_paths) > 3   # sheet-per-file set
+    use_index = os.environ.get(
+        "NIGHTSHIFT_SHEET_INDEX_TITLES", "0") == "1"
+    index_titles, index_page = (_sheet_index(pdf_paths) if use_index
+                                else ({}, None))
+    finish_candidates = []
     plan_pages = []
     for pdf in pdf_paths:
         fname = pdf.rsplit("/", 1)[-1]
@@ -344,6 +442,33 @@ def select_floor_plan_pages(pdf_paths):
                                 break
                     except Exception:
                         pass
+                if index_page == (pdf, i):
+                    # the drawing-index page's rows read like plan titles
+                    # ("FIRST FLOOR CONSTRUCTION PLAN...") and can classify
+                    # the COVER SHEET as a floor plan on sparse sets —
+                    # never claim the index itself (sheet=None also stops
+                    # the index-title route below: the id scraped from its
+                    # own rows is another sheet's number, not this page's)
+                    info = {"kind": "other", "floors": [], "sheet": None}
+                if (info["kind"] != "floor_plan" and index_titles
+                        and info.get("sheet")):
+                    # index-title route: the drawing index names this sheet;
+                    # classify that title instead of the mute title block
+                    ix_title = index_titles.get(_index_key(info["sheet"]))
+                    if ix_title:
+                        ix = classify_title_lines([ix_title], "",
+                                                  filename_only=False)
+                        if ix["kind"] == "floor_plan":
+                            info = {"kind": "floor_plan",
+                                    "floors": ix["floors"],
+                                    "sheet": info["sheet"], "src": "index"}
+                        elif (_FINISH_PLAN_RE.search(_norm(ix_title))
+                                and _floors_in(ix_title)):
+                            finish_candidates.append(
+                                {"pdf": pdf, "page": i,
+                                 "floors": _floors_in(ix_title),
+                                 "sheet": info["sheet"], "arch": False,
+                                 "src": "index-finish"})
                 if info["kind"] == "floor_plan":
                     arch = bool(info["sheet"]
                                 and _re.match(r"A-?D?-?\d", info["sheet"]))
@@ -360,6 +485,16 @@ def select_floor_plan_pages(pdf_paths):
     specific = [p for p in plan_pages if p["floors"] != ["all"]]
     claimed, out = set(), []
     for p in specific:
+        new = [f for f in p["floors"] if f not in claimed]
+        if new:
+            claimed.update(new)
+            out.append({**p, "floors": new})
+    # finish-plan fallback: a floor whose construction/floor plan is NOT in
+    # the submitted set (Northwell/Phelps: A100 in the index, never
+    # submitted) has its wall geometry drawn on that floor's FINISH PLAN.
+    # Claim it ONLY for floors no real plan page covers — a set with proper
+    # plan sheets is untouched (demo/RCP/furniture stay excluded).
+    for p in finish_candidates:
         new = [f for f in p["floors"] if f not in claimed]
         if new:
             claimed.update(new)
@@ -1584,7 +1719,20 @@ def compute_vme_scoped(pdf_paths, analysis, default_height_ft=9.0):
             else:
                 blf, bsf = wb["run_bill_lf"], wb["run_bill_sf"]
             mode = f"rooms({n_anch},{a_src},cov{wb['region_coverage']:.2f})"
-            region_lf += blf
+            if (os.environ.get("NIGHTSHIFT_SHEET_INDEX_TITLES", "0") == "1"
+                    and blf < lf * 0.05 and lf >= 300
+                    and wb["region_coverage"] < 0.3):
+                # zero-capture degrade: substantial drawn geometry with a
+                # near-zero region bill means the anchor coordinates are
+                # mis-registered for this sheet (wrong page frame /
+                # clustered tiles) — billing zero silently deletes a floor
+                # (Northwell A102: 2,508 LF drawn, 0 billed). Fall back to
+                # the painted-fraction clip like the degen path.
+                blf, bsf = lf * pg_frac, lf * h * pg_frac
+                mode = (f"frac(zero-capture,{pg_frac:.2f},"
+                        f"cov{wb['region_coverage']:.2f})")
+            else:
+                region_lf += blf
         raw_lf += lf
         raw_sf += lf * h
         bill_lf += blf
