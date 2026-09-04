@@ -120,6 +120,13 @@ def _so_obj(props, nullable=False):
 _SO_ROOM_ITEM = _so_obj({
     "room_id": _SO_STR,
     "room_name": _SO_STR,
+    # The JOIN KEY to the finish schedule. Its absence was structural:
+    # Phelps extracted 161 rooms carrying ZERO room numbers while the
+    # schedule listed clean 400-xx / 417-xx identities, so the two sides
+    # could only be matched on fuzzy names — which is many-to-one and
+    # therefore either over-keeps rooms (91 kept, 103 doors vs JW's 78) or
+    # over-folds them (34 kept, 42 doors). Null when the plan shows none.
+    "room_number": _SO_STR,
     "source_page": _SO_NUM,
     "source_sheet": _SO_STR,
     "unit_multiplier": _SO_NUM,
@@ -2138,14 +2145,290 @@ _WINDOW_TABLE_TOKENS = ("window no", "window number", "window type",
                         "glazing type", "sill height")
 
 
+# ── Finish PLAN grid (Phelps/Northwell class, 2026-09-01) ─────────────────
+# Some architects publish per-room finishes on a FINISH PLAN sheet rather
+# than a tabular "Finish Schedule": every room block lists the four wall
+# directions plus floor / base / ceiling as abbreviated headers —
+#     WN  WE  WS  WW  FL  B  CLG
+# Phelps A102 ("Fourth Floor Finish Plan") carries 62 such room blocks and
+# is the authoritative finish evidence for that job. Neither
+# _FINISH_TITLE_PHRASES ("finish schedule") nor _FINISH_TABLE_TOKENS
+# ("wall finish", "room name") matches it, so the schedule was never
+# detected. room_finish_schedule came back EMPTY, which no-op'd the scope
+# clip, the paint gate and the WC gate ("schedule_too_thin") and left the
+# ceiling assume-painted default free to flip 118 ACT rooms to painted
+# (+$18,840). One missed sheet, four downstream failures.
+_FINISH_PLAN_DIR_TOKENS = ("wn", "we", "ws", "ww")
+_FINISH_PLAN_CEIL_TOKENS = ("clg", "ceil")
+_FINISH_PLAN_MIN_ROOMS = 5
+
+
+def _finish_plan_grid_enabled():
+    """Flag-gated (NIGHTSHIFT_FINISH_PLAN_SCHEDULE, default off)."""
+    return os.environ.get(
+        "NIGHTSHIFT_FINISH_PLAN_SCHEDULE", "0").strip() in (
+        "1", "true", "True")
+
+
+def _finish_plan_grid_rooms(page_text):
+    """Number of per-room finish blocks a page's text implies (0 = none).
+
+    The signature is a repeated WN/WE/WS/WW + CLG header group, one group
+    per room. Requiring ALL FOUR wall directions AND a ceiling header, each
+    at >= _FINISH_PLAN_MIN_ROOMS occurrences, is what keeps this off
+    ordinary sheets: a stray "WS" callout or a lone "CLG" note cannot
+    fabricate the grid, and the count is taken as the MINIMUM across the
+    headers so a page only claims as many rooms as its weakest column.
+    """
+    t = (page_text or "").lower()
+    counts = [len(re.findall(r"\b" + tok + r"\b", t))
+              for tok in _FINISH_PLAN_DIR_TOKENS]
+    if not counts or min(counts) < _FINISH_PLAN_MIN_ROOMS:
+        return 0
+    ceil = max(len(re.findall(r"\b" + tok + r"\b", t))
+               for tok in _FINISH_PLAN_CEIL_TOKENS)
+    if ceil < _FINISH_PLAN_MIN_ROOMS:
+        return 0
+    return min(min(counts), ceil)
+
+
+_FINISH_PLACEHOLDER_RX = re.compile(
+    r"^\s*(?:see\b|refer\b|per\b|tbd\b|n/?a\b|none\b|not\s+(?:listed|given|"
+    r"shown|specified|indicated)|unknown|\?+|-+|\.+)\s*",
+    re.IGNORECASE)
+
+
+def _crop_page_png_bytes(pdf_path, page_idx0, clip, target_px=1500):
+    """PNG of one page region, or None.
+
+    Rendered rather than PDF-cropped on purpose. set_cropbox() cannot
+    express these rects — Phelps A102 carries an offset MediaBox
+    (-1296,-864 .. 1296,864) while page space is (0,0 .. 2592,1728), so a
+    page-space clip raises "CropBox not in MediaBox". Rendering sidesteps
+    box arithmetic entirely.
+
+    It is also the better input: the vision API fits an image to ~1568px
+    on the long edge, so one tile at that budget resolves the per-room
+    code grid at several times the effective detail of the whole sheet
+    sent at the same cap.
+    """
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        page = doc[page_idx0]
+        rect = fitz.Rect(clip) & page.rect
+        if rect.is_empty or rect.width < 20 or rect.height < 20:
+            doc.close()
+            return None
+        long_pt = max(rect.width, rect.height)
+        dpi = max(72, min(300, int(target_px * 72.0 / long_pt)))
+        pix = page.get_pixmap(clip=rect, dpi=dpi, alpha=False)
+        data = pix.tobytes("png")
+        doc.close()
+        return data
+    except Exception:
+        return None
+
+
+def _finish_plan_regions(pdf_path, page_idx0, cols=2, rows=2, overlap=0.08):
+    """Overlapping tiles covering one finish-plan page.
+
+    Phelps A102 is 2592x1728 pt and carries TWO spatially separate suites —
+    the 400-series occupies x 529-1250 and the 417-series x 1399-1790. Sent
+    whole, extraction returned only the 417 block; at full-sheet scale the
+    per-room code grid is too dense to traverse reliably. Tiles with a
+    generous overlap let each pass read a legible fraction, and merging is
+    safe because rows are keyed by room number.
+    """
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        r = doc[page_idx0].rect
+        doc.close()
+    except Exception:
+        return []
+    ox, oy = r.width * overlap, r.height * overlap
+    out = []
+    for c in range(cols):
+        for rw in range(rows):
+            x0 = r.x0 + (r.width / cols) * c - (ox if c else 0)
+            x1 = r.x0 + (r.width / cols) * (c + 1) + (ox if c < cols - 1 else 0)
+            y0 = r.y0 + (r.height / rows) * rw - (oy if rw else 0)
+            y1 = r.y0 + (r.height / rows) * (rw + 1) + (
+                oy if rw < rows - 1 else 0)
+            out.append((f"r{c}{rw}", (x0, y0, x1, y1)))
+    return out
+
+
+def _finish_row_has_evidence(row):
+    """True when a schedule row carries an actual finish DESIGNATION.
+
+    Phelps 2026-09-01: pushed to return more rooms, extraction padded the
+    schedule with 28 rows lifted from floor-plan area tags — room numbers
+    like "117"/"122" and finishes reading "see finish plan block". Those
+    rows are not evidence, but they inflated coverage from 29% to 73% and
+    would have let a partial schedule bound scope after all. A row counts
+    only if at least one of its wall/ceiling cells names a real finish.
+    """
+    if not isinstance(row, dict):
+        return False
+    for k in ("wall_finish", "ceiling_finish", "base_finish", "floor_finish"):
+        v = str(row.get(k) or "").strip()
+        if not v or _FINISH_PLACEHOLDER_RX.match(v):
+            continue
+        return True
+    return False
+
+
+def _finish_rows_with_evidence(rows):
+    return [r for r in (rows or []) if _finish_row_has_evidence(r)]
+
+
+def _canon_room_number(v):
+    """Room number reduced to comparable form: '417-16', '417.16' and
+    '417 16' all become '41716'. Region tiles overlap, so the same room
+    comes back from two passes and the separator style drifts between
+    them — without this the merge keeps both copies."""
+    return re.sub(r"[^0-9A-Za-z]+", "", str(v or "")).upper()
+
+
+_STRUCTURED_ROOM_NUM_RX = re.compile(r"^\d{3}[-. ]\s?\d{1,2}[A-Za-z]?$|"
+                                     r"^\d{3}[-. ]?[A-D]$")
+_BARE_TAG_RX = re.compile(r"^\d{1,3}$")
+
+
+def _sheet_room_number_tokens(pdf_path, page_indices):
+    """Canonical room numbers actually PRINTED on the given pages.
+
+    The sheet is the ground truth for which rooms exist, and it costs
+    nothing to read. Phelps: the region sweep returned 75 rows, of which
+    56 matched a number on the sheet — and the 19 that did not were all
+    malformed or invented ('400-', '417O', '400-33', 'OPTS/CRBI G'). 56 is
+    exactly the count of room-number tags on that sheet.
+    """
+    toks = set()
+    try:
+        import fitz
+        doc = fitz.open(pdf_path)
+        for idx in (page_indices or []):
+            if idx < 0 or idx >= len(doc):
+                continue
+            txt = doc[idx].get_text() or ""
+            for m in re.finditer(
+                    r"\b\d{3}[-.\s]?\d{1,2}[A-Za-z]?\b|\b\d{3}[A-D]\b", txt):
+                toks.add(_canon_room_number(m.group(0)))
+        doc.close()
+    except Exception:
+        return set()
+    return {t for t in toks if t}
+
+
+def _drop_offsheet_rows(rows, on_sheet):
+    """Split rows into (kept, rejected) by whether their room number is
+    printed on the sheet. Rows without a number are kept — name-only rows
+    are matched by name downstream. No-op when the token scan came back
+    empty, so a text-less sheet cannot delete a whole schedule."""
+    if not on_sheet:
+        return list(rows or []), []
+    keep, drop = [], []
+    for r in (rows or []):
+        num = _canon_room_number(r.get("room_number"))
+        if not num or num in on_sheet:
+            keep.append(r)
+        else:
+            drop.append(r)
+    return keep, drop
+
+
+def _drop_floorplan_tag_rows(rows):
+    """Drop rows keyed by a bare area tag when suite numbering dominates.
+
+    A finish plan and its floor plan share a sheet. Asked to read the
+    grid, extraction also picks up the floor plan's room labels — Phelps
+    yielded 39 bare tags (116, 117, 119 ...) alongside 65 real
+    '400-xx'/'417-xx' rows. Those tags are not schedule rows: they carry
+    no finish designation of their own and they inflate coverage.
+
+    Only fires when structured numbers are already the clear majority, so
+    jobs whose rooms are legitimately numbered 101/102 are untouched.
+    """
+    rows = list(rows or [])
+    structured = [r for r in rows if _STRUCTURED_ROOM_NUM_RX.match(
+        str(r.get("room_number") or "").strip())]
+    bare = [r for r in rows if _BARE_TAG_RX.match(
+        str(r.get("room_number") or "").strip())]
+    if not bare or len(structured) < max(5, len(rows) * 0.5):
+        return rows, []
+    keep = [r for r in rows if r not in bare]
+    return keep, bare
+
+
+# pdf_path -> number of per-room finish blocks the grid actually shows.
+# Populated by _find_finish_plan_pages so the scope gates can tell a
+# COMPLETE schedule read from a partial one before trusting it.
+_FINISH_PLAN_BLOCK_COUNTS = {}
+
+
+def _finish_plan_block_count(analysis):
+    """Detected finish-plan block count for this job's PDFs (0 if unknown)."""
+    if not isinstance(analysis, dict):
+        return 0
+    best = 0
+    for p in (analysis.get("_vme_pdf_paths") or []):
+        best = max(best, int(_FINISH_PLAN_BLOCK_COUNTS.get(p, 0) or 0))
+    if not best and _FINISH_PLAN_BLOCK_COUNTS:
+        best = max(int(v or 0) for v in _FINISH_PLAN_BLOCK_COUNTS.values())
+    return best
+
+
+def _find_finish_plan_pages(pdf_path, max_pages=4):
+    """0-based pages carrying a finish-PLAN grid, richest first.
+
+    Returns [] when the flag is off, on any failure, or when no page shows
+    the grid — every caller unions this with the existing tabular result,
+    so an empty list preserves today's behavior exactly.
+    """
+    if not _finish_plan_grid_enabled():
+        return []
+    try:
+        import fitz  # PyMuPDF
+        doc = fitz.open(pdf_path)
+    except Exception:
+        return []
+    hits = {}
+    try:
+        for idx in range(len(doc)):
+            try:
+                n = _finish_plan_grid_rooms(doc[idx].get_text())
+            except Exception:
+                n = 0
+            if n:
+                hits[idx] = n
+    except Exception:
+        return []
+    finally:
+        doc.close()
+    if hits:
+        _FINISH_PLAN_BLOCK_COUNTS[pdf_path] = sum(hits.values())
+    return [i for i, _ in sorted(hits.items(),
+                                 key=lambda kv: (-kv[1], kv[0]))][:max_pages]
+
+
 def _detect_finish_schedule(pdf_path):
     """Detect a Room Finish Schedule in the PDF (text-only, no API calls).
-    See _detect_schedule_in_pdf for the dual-pass strategy.
+    See _detect_schedule_in_pdf for the dual-pass strategy. A finish-PLAN
+    grid (flag-gated) counts as a finish schedule for detection purposes —
+    it carries the same per-room finish designations.
     """
-    return _detect_schedule_in_pdf(pdf_path, _FINISH_TITLE_PHRASES,
-                                   _FINISH_TABLE_TOKENS,
-                                   excludes=_finish_title_excludes(),
-                                   token_only=_finish_token_only_match)
+    tabular = _detect_schedule_in_pdf(pdf_path, _FINISH_TITLE_PHRASES,
+                                      _FINISH_TABLE_TOKENS,
+                                      excludes=_finish_title_excludes(),
+                                      token_only=_finish_token_only_match)
+    if tabular:
+        return tabular
+    if _find_finish_plan_pages(pdf_path):
+        return True
+    return tabular
 
 
 def _find_finish_schedule_pages(pdf_path, max_pages=8):
@@ -2219,8 +2502,9 @@ def _find_finish_schedule_pages(pdf_path, max_pages=8):
         return []
     finally:
         doc.close()
+    plan_pages = _find_finish_plan_pages(pdf_path)
     if not hits and not token_hits:
-        return []
+        return plan_pages[:max_pages]
     # Title-size spans outrank small-font cross-references ("REFER TO FINISH
     # SCHEDULE." emits 6-9pt spans on many sheets). Pages carrying the actual
     # per-room finish columns are unioned in regardless of what any title
@@ -2240,11 +2524,10 @@ def _find_finish_schedule_pages(pdf_path, max_pages=8):
         base = set()
     else:
         base = set(hits)
-    # Union, never suppress. `base` reproduces the pre-change selection
-    # exactly; token_hits only ever adds to it. The one
-    # intentional removal is the exterior finish schedule, dropped at the
-    # span level via _finish_title_excludes().
-    return sorted(set(base) | token_hits)[:max_pages]
+    # Union, never suppress: token_hits and the finish-PLAN grid pages only
+    # ever ADD to the tabular selection (the grid rides on different sheets
+    # than the material legend on sets that carry both).
+    return sorted(set(base) | token_hits | set(plan_pages))[:max_pages]
 
 
 def _detect_door_schedule(pdf_path):
@@ -3486,6 +3769,35 @@ def _per_sheet_collapse_suspected(analysis):
 def _work_area_basis_enabled():
     return os.environ.get("NIGHTSHIFT_WORK_AREA_BASIS", "0").strip() in (
         "1", "true", "True")
+
+
+def _gsf_basis_enabled():
+    """Flag-gated (NIGHTSHIFT_GSF_BASIS, default off): let a gross floor
+    area STATED on the drawings outrank an inferred footprint_sqft in the
+    plausibility guards. Phelps read "Total GSF: 8,724" correctly, then
+    inferred footprints of 45,000 and 30,000 on separate runs — the
+    disagreement broke the guard in both directions."""
+    return os.environ.get("NIGHTSHIFT_GSF_BASIS", "0").strip() in (
+        "1", "true", "True")
+
+
+def _stated_gross_sqft(analysis):
+    """Gross floor area stated on the drawings (0 if none).
+
+    Structured fields only — this must stay a hard number. Falls back to
+    the declared renovation work area, which is the same kind of stated
+    figure for a Level 2 / work-area-method job."""
+    if not isinstance(analysis, dict):
+        return 0.0
+    for src in (analysis.get("project_overview") or {},
+                analysis.get("project_info") or {}):
+        if isinstance(src, dict):
+            for k in ("gross_sqft", "total_gsf", "gross_floor_area_sqft",
+                      "building_gross_sqft"):
+                v = _num(src.get(k, 0))
+                if v > 0:
+                    return v
+    return _declared_work_area_sqft(analysis)
 
 
 # "Work area is approximately 3,955 SF within a 580,317 GSF building" — capture
@@ -7936,6 +8248,7 @@ IMPORTANT RULES:
         {
           "room_id": "F1-APT101-LIV",
           "room_name": "Living Room",
+          "room_number": "101",
           "source_page": 3,
           "source_sheet": "A-102",
           "unit_multiplier": 1,
@@ -8842,7 +9155,8 @@ Be precise — count every entry in each schedule row by row."""
         return None
 
 
-def _extract_room_finish_schedule(client, pdf_path, page_indices=None):
+def _extract_room_finish_schedule(client, pdf_path, page_indices=None,
+                                  expected_rooms=0):
     """
     Extract Room Finish Schedule data from PDFs that have schedules but no floor plans.
     Unlike analyze_schedule_pdf() which gets door/window/stair counts, this function
@@ -8917,6 +9231,10 @@ Your task: Extract the ROOM FINISH SCHEDULE and BUILDING INFORMATION from this d
    pages, or the finish plan described in 0(b) above):
    For EACH room listed in the schedule OR tagged on the finish plan, extract:
    - room_name: The room name/type (e.g., "Living Room", "Bedroom 1", "Kitchen", "Bathroom", "Hallway", "Closet")
+   - room_number: The room's NUMBER exactly as tagged on the plan ("101", "400-05", "417B").
+     This is the identity used to join a room to its finish-schedule row, so copy it
+     verbatim into this field — do NOT bury it inside room_name and do NOT invent one.
+     Null only when the plan genuinely shows no number for that room.
    - room_number: The room number if shown
    - wall_finish: What's specified for walls (e.g., "Paint", "PT-1", "Wallcovering", "Tile", "CMU Paint",
      "Plaster", "Venetian Plaster", "Lyme Wash", "Lime Wash", "Epoxy", "Epoxy Paint", "Precast").
@@ -9035,36 +9353,234 @@ Return ONLY this JSON:
 If no Room Finish Schedule is found, return {"room_finish_schedule": [], "structural_finish_scope": [], "building_info": {}, "notes": ["No Room Finish Schedule found"]}.
 Be precise — extract every room listed in the schedule, and capture every structural-surface finish callout."""
 
-    try:
-        result_parts = []
+    if _finish_plan_grid_enabled():
+        room_finish_prompt += """
+
+FINISH PLAN SHEETS (abbreviated per-room grid)
+Some sets publish finishes on a FINISH PLAN instead of a table. Each room
+carries a small block of abbreviated headers, one row of codes per header:
+    WN = wall NORTH      WE = wall EAST       WS = wall SOUTH
+    WW = wall WEST       FL = floor           B  = base       CLG = ceiling
+Treat EVERY such block as one room in the room finish schedule:
+  - room_name / room_number come from the room label beside the block
+    (e.g. "PRIVATE OFFICE  400-15" -> name "Private Office", number "400-15").
+  - wall_finish: combine the four wall cells, preserving each code and its
+    direction when they differ, e.g. "WN PT1; WE PT4; WS PT1; WW PT1".
+    If all four match, "PT1" alone is fine.
+  - ceiling_finish: the CLG cell VERBATIM (e.g. "ACT1", "ACT2", "GWB1").
+    ACT-x means acoustic tile — NOT painted. Never translate a tile code
+    into "paint" and never leave this blank when a code is present.
+  - base_finish / floor_finish: the B and FL cells verbatim (e.g. "RB1C",
+    "LVT2"). RB/TB codes are resilient/rubber base — not painted wood.
+Codes are defined in the sheet's material legend; copy the CODE, not the
+legend prose. Extract every block on the sheet — these grids routinely hold
+50+ rooms and a partial read silently shrinks the priced scope.
+
+THIS OVERRIDES the "ONE REPRESENTATIVE UNIT of each type" rule above. That
+rule exists for apartment sets with repeated identical units. A finish plan
+lists REAL, DISTINCT rooms — "Exam 01" and "Exam 02" are two rooms with
+their own numbers and their own wall codes, not one type seen twice. Never
+collapse them, never emit a "types" summary: return one entry per block,
+including corridors and every numbered suite room."""
+        if expected_rooms:
+            room_finish_prompt += (
+                f"\n\nThis sheet shows approximately {int(expected_rooms)} "
+                f"room blocks. Returning materially fewer than that means "
+                f"rooms were skipped — the downstream takeoff treats any room "
+                f"missing from this list as OUT OF SCOPE and prices it at "
+                f"zero, so a short list silently deletes real work. Work "
+                f"through the sheet block by block and return them all.")
+
+    # Budget the output to the sheet. Phelps 2026-09-01: a 62-block finish
+    # plan against a flat max_tokens=8000 returned 17 rooms / an unparseable
+    # response / 40 rooms across three draws — the row list was being cut
+    # mid-JSON, and a partial schedule is worse than none because the scope
+    # gates then treat the rooms it never reached as out of scope.
+    _expected = int(expected_rooms or 0)
+    _max_tok = 8000
+    if _expected > 0:
+        try:
+            _cap = int(os.environ.get(
+                "NIGHTSHIFT_FINISH_SCHEDULE_MAX_TOKENS", "32000") or 32000)
+        except (TypeError, ValueError):
+            _cap = 32000
+        _max_tok = max(8000, min(_cap, _expected * 260))
+
+    def _one_call(prompt_text, max_tok, png_b64=None):
+        parts, stop = [], None
+        if png_b64:
+            _doc_block = {"type": "image",
+                          "source": {"type": "base64",
+                                     "media_type": "image/png",
+                                     "data": png_b64}}
+        else:
+            _doc_block = {"type": "document",
+                          "source": {"type": "base64",
+                                     "media_type": "application/pdf",
+                                     "data": pdf_data}}
         with client.messages.stream(
             model="claude-sonnet-4-6",
-            max_tokens=8000,
+            max_tokens=max_tok,
             temperature=0,
             timeout=300.0,
             messages=[{
                 "role": "user",
                 "content": [
-                    {
-                        "type": "document",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "application/pdf",
-                            "data": pdf_data
-                        }
-                    },
+                    _doc_block,
                     {
                         "type": "text",
-                        "text": room_finish_prompt
+                        "text": prompt_text
                     }
                 ]
             }]
         ) as stream:
             for text in stream.text_stream:
-                result_parts.append(text)
+                parts.append(text)
+            try:
+                stop = stream.get_final_message().stop_reason
+            except Exception:
+                stop = None
+        return "".join(parts), stop
 
-        result_text = "".join(result_parts)
+    try:
+        result_text, _stop = _one_call(room_finish_prompt, _max_tok)
+        if _stop == "max_tokens":
+            print(f"   ✂️  Finish schedule truncated at {_max_tok} tokens")
         json_match = _parse_json_response(result_text)
+
+        # Continuation: the grid is bigger than one response. Ask for the
+        # rooms we do not already have, by room number, and merge. Only
+        # runs when we know how many blocks the sheet actually shows.
+        if _expected > 0:
+            _seen = list((json_match or {}).get("room_finish_schedule") or [])
+            _rounds = 0
+            while (_rounds < 3 and len(_seen) < _expected * 0.9
+                   and (_stop == "max_tokens" or json_match is None
+                        or len(_seen) < _expected * 0.9)):
+                _have = [str(r.get("room_number") or r.get("room_name") or "?")
+                         for r in _seen]
+                _cont = room_finish_prompt + (
+                    f"\n\nCONTINUATION {_rounds + 1}: this sheet shows about "
+                    f"{_expected} room blocks. {len(_seen)} have already been "
+                    f"captured: {', '.join(_have[:80])}.\nReturn ONLY the "
+                    f"rooms NOT in that list, in the same JSON shape. Do not "
+                    f"repeat any room already listed. If every room is "
+                    f"already captured, return an empty "
+                    f"room_finish_schedule array.")
+                _txt2, _stop = _one_call(_cont, _max_tok)
+                _obj2 = _parse_json_response(_txt2, context="finish cont")
+                _new = list((_obj2 or {}).get("room_finish_schedule") or [])
+                if not _new:
+                    break
+                _key = set()
+                for r in _seen:
+                    _key.add(_canon_room_number(r.get("room_number"))
+                             or str(r.get("room_name") or "").lower())
+                _added = 0
+                for r in _new:
+                    k = (_canon_room_number(r.get("room_number"))
+                         or str(r.get("room_name") or "").lower())
+                    if k and k not in _key:
+                        _key.add(k)
+                        _seen.append(r)
+                        _added += 1
+                _rounds += 1
+                print(f"   ➕ Finish schedule continuation {_rounds}: "
+                      f"+{_added} room(s) → {len(_seen)}")
+                if not _added:
+                    break
+            # Region sweep: if the whole-sheet read still falls short on
+            # rows that carry a real designation, walk the page in
+            # overlapping tiles. Merging is keyed by room number, and the
+            # evidence filter means a tile that pads its answer adds
+            # nothing.
+            def _clean(rows):
+                """Canonical dedup -> drop floor-plan area tags -> drop
+                numbers not printed on the sheet. Runs on EVERY path: the
+                coverage decision below is only meaningful once padding
+                has been removed, and a first pass padded to 41 rows with
+                24 area tags would otherwise skip the region sweep it
+                actually needed."""
+                _d = {}
+                for _r in rows:
+                    _k = (_canon_room_number(_r.get("room_number"))
+                          or str(_r.get("room_name") or "").lower())
+                    if _k and _k not in _d:
+                        _d[_k] = _r
+                _rows = list(_d.values())
+                _rows, _tg = _drop_floorplan_tag_rows(_rows)
+                _rows, _of = _drop_offsheet_rows(
+                    _rows, _sheet_room_number_tokens(pdf_path, page_indices))
+                if _tg:
+                    print(f"   🧹 Dropped {len(_tg)} floor-plan area-tag "
+                          f"row(s) (bare numbers, not finish-grid rooms)")
+                if _of:
+                    print(f"   🧹 Dropped {len(_of)} row(s) whose number is "
+                          f"not printed on the sheet (e.g. "
+                          f"{', '.join(str(r.get('room_number')) for r in _of[:4])})")
+                return _rows
+
+            _seen = _clean(_seen)
+            _ev = _finish_rows_with_evidence(_seen)
+            _regions_on = os.environ.get(
+                "NIGHTSHIFT_FINISH_PLAN_REGIONS", "0").strip() in (
+                "1", "true", "True")
+            if (_regions_on and page_indices and _expected
+                    and len(_ev) < _expected * 0.6):
+                print(f"   🔍 Region sweep: {len(_ev)} evidence row(s) of "
+                      f"~{_expected} — reading the sheet in tiles")
+                _key = set()
+                for r in _seen:
+                    _key.add(_canon_room_number(r.get("room_number"))
+                             or str(r.get("room_name") or "").lower())
+                for _pi in page_indices[:2]:
+                    for _tag, _clip in _finish_plan_regions(
+                            pdf_path, _pi, cols=3, rows=2):
+                        _crop = _crop_page_png_bytes(pdf_path, _pi, _clip)
+                        if not _crop:
+                            continue
+                        _tp = room_finish_prompt + (
+                            f"\n\nThis is a CROPPED REGION of the finish "
+                            f"plan, not the whole sheet. Return every room "
+                            f"block fully visible in this crop. Skip blocks "
+                            f"cut off at the edges — another crop covers "
+                            f"them. Read ONLY the per-room finish grid: do "
+                            f"NOT invent rows from floor-plan room labels or "
+                            f"area tags, and never write a placeholder like "
+                            f"\"see finish plan\" into a finish cell. If this "
+                            f"crop contains no finish grid, return an empty "
+                            f"room_finish_schedule array.")
+                        _txt3, _ = _one_call(
+                            _tp, _max_tok,
+                            png_b64=base64.b64encode(_crop).decode())
+                        _o3 = _parse_json_response(
+                            _txt3, context=f"finish region {_tag}")
+                        _r3 = _finish_rows_with_evidence(
+                            (_o3 or {}).get("room_finish_schedule") or [])
+                        _add = 0
+                        for r in _r3:
+                            k = (_canon_room_number(r.get("room_number"))
+                                 or str(r.get("room_name") or "").lower())
+                            if k and k not in _key:
+                                _key.add(k)
+                                _seen.append(r)
+                                _add += 1
+                        if _add:
+                            print(f"      ▸ {_tag}: +{_add} room(s) → "
+                                  f"{len(_finish_rows_with_evidence(_seen))} "
+                                  f"with evidence")
+                _seen = _clean(_seen)
+                _ev = _finish_rows_with_evidence(_seen)
+
+            if _seen:
+                if json_match is None:
+                    json_match = {"room_finish_schedule": [],
+                                  "building_info": {}}
+                json_match["room_finish_schedule"] = _seen
+                if _expected and len(_ev) < _expected * 0.6:
+                    print(f"   ⚠️  Finish schedule still short: {len(_ev)} "
+                          f"evidence row(s) of ~{_expected} blocks — scope "
+                          f"gates will stand down")
         if json_match:
             rfs_data = json_match
             rooms = rfs_data.get("room_finish_schedule", [])
@@ -19689,6 +20205,382 @@ def _room_geometry_shadow_enabled():
         "1", "true", "True")
 
 
+_SCHEDULE_NONPAINT_CEILING_RX = re.compile(
+    r"\bact[-\s]?\d*\b|acoustic|\bcg\d\b|ceiling\s*grid|lay[-\s]?in|"
+    r"tegular|\bapc\b|open\s*to\s*(?:deck|structure)|exposed",
+    re.IGNORECASE)
+# Checked FIRST, so a row like "GWB - Paint" or "ACT / GWB PT-1 at soffit"
+# is never read as non-paint evidence.
+_PAINTED_CEILING_FINISH_RX = re.compile(
+    r"\bpt[-\s]?\d|\bpaint(?:ed|ing)?\b|\bgwb\d*\b|gyp(?:sum)?\s*(?:bd|board)?|"
+    r"\bgyp\b|drywall|epoxy|semi-?gloss", re.IGNORECASE)
+
+
+def _ceiling_schedule_evidence_enabled():
+    """Flag-gated (NIGHTSHIFT_CEILING_SCHEDULE_EVIDENCE, default off).
+
+    Phelps 2026-08-31: per-sheet extraction read the ceilings CORRECTLY —
+    A608/A610/A611/A613/A615/A616 each set ceiling_painted=False, recorded
+    "ACT assumed per healthcare default" and raised an RFI. The rooms
+    therefore carried the '(assumed)' provenance marker, and the
+    enclosed-room painted default flipped 118 of them to painted GYP
+    (+24,005 SF, +$18,840) — while sheet A102's finish plan designated
+    ACT1/ACT2/ACT3 for those very rooms.
+
+    The marker means "this SHEET had no ceiling evidence", not "this JOB
+    has none". When the job-level finish schedule designates a non-painted
+    ceiling for the matched room, that is a hard number and it outranks the
+    default. Only-suppress: this never paints a ceiling, it only declines
+    to flip one."""
+    return os.environ.get(
+        "NIGHTSHIFT_CEILING_SCHEDULE_EVIDENCE", "0").strip() in (
+        "1", "true", "True")
+
+
+def _schedule_nonpaint_ceiling_rooms(analysis):
+    """Match map for rooms whose finish schedule designates a NON-painted
+    ceiling. Returns (matcher, n_rows) where matcher(room) -> bool."""
+    rfs = _get_room_finish_schedule(analysis)
+    if len(rfs) < _SCHEDULE_FINISH_AUTHORITY_MIN_ROWS:
+        return (lambda _room: False), 0
+    by_num, by_name = _build_schedule_row_maps(rfs)
+
+    def _is_nonpaint(room):
+        row = _match_schedule_row(room, by_num, by_name)
+        if not row:
+            return False
+        cf = str(row.get("ceiling_finish") or "").strip()
+        if not cf:
+            return False
+        if _PAINTED_CEILING_FINISH_RX.search(cf):
+            return False  # schedule says painted — leave the flip alone
+        return bool(_SCHEDULE_NONPAINT_CEILING_RX.search(cf))
+
+    return _is_nonpaint, len(rfs)
+
+
+_EMBEDDED_ROOM_NUM_RX = re.compile(
+    r"[(\[#]?\s*\b(\d{3}[-.\s]?\d{1,2}[A-Za-z]?|\d{3}[A-D])\b\s*[)\]]?")
+
+
+def _backfill_room_numbers(analysis):
+    """Lift a room number out of room_name into room_number.
+
+    Extraction writes names like "Shared Office (400-05)" or
+    "Pre/Post Bay 400-27" but leaves room_number null, so the schedule
+    join has nothing to key on. Parsing it is deterministic and free, and
+    it works on results produced before room_number existed in the schema.
+    Only fills an EMPTY field — never overwrites what extraction reported.
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if os.environ.get("NIGHTSHIFT_ROOM_NUMBER_BACKFILL", "0").strip() not in (
+            "1", "true", "True"):
+        return analysis
+    filled = 0
+    for fl in (analysis.get("floors") or []):
+        for rm in (fl.get("rooms") or []):
+            if not isinstance(rm, dict):
+                continue
+            if str(rm.get("room_number") or "").strip():
+                continue
+            m = _EMBEDDED_ROOM_NUM_RX.search(str(rm.get("room_name") or ""))
+            if m:
+                rm["room_number"] = m.group(1)
+                filled += 1
+    if filled:
+        analysis["_room_number_backfill"] = {"filled": filled}
+        print(f"   🔑 Room-number backfill: recovered {filled} room "
+              f"number(s) from room names")
+    return analysis
+
+
+def _apply_schedule_room_scope(analysis):
+    """Flag-gated (NIGHTSHIFT_SCHEDULE_ROOM_SCOPE, default off): rooms
+    absent from an authoritative finish schedule leave SCOPE entirely.
+
+    NIGHTSHIFT_SCHEDULE_SCOPE_AUTHORITATIVE already clips WALLS to the
+    scheduled rooms, but a room extracted off an out-of-scope plan carries
+    doors, stairs, sealed concrete and ceilings too. Phelps 2026-08-31:
+    sheet A104 is the FULL fourth-floor plan while the job renovates
+    Suites 400/417 only. A104 alone contributed 114 of 181 rooms — 141 of
+    185 doors, 20,758 SF of painted ceiling, 6 stair sections, 1,250 SF of
+    sealed concrete and 120 LF of railing — none of it in the bid. Walls-only
+    clipping cannot remove any of that.
+
+    Marks unmatched rooms in_scope=False with a reason so every downstream
+    aggregate skips them. Loud by construction: a note, an RFI naming the
+    dropped rooms, and manual review whenever the drop is material — a
+    partial schedule read must never silently delete real scope.
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if os.environ.get("NIGHTSHIFT_SCHEDULE_ROOM_SCOPE", "0").strip() not in (
+            "1", "true", "True"):
+        return analysis
+    if analysis.get("_schedule_room_scope"):
+        return analysis
+    rfs = _get_room_finish_schedule(analysis)
+    if len(rfs) < _SCHEDULE_FINISH_AUTHORITY_MIN_ROWS:
+        analysis["_schedule_room_scope"] = {"noop": "schedule_too_thin"}
+        return analysis
+    # COMPLETENESS, not just thickness. Phelps rerun 2026-09-01: the finish
+    # plan shows 62 room blocks but extraction returned 17 rows, all from
+    # Suite 417 — the 400-series rooms were simply never read. Using that as
+    # a SCOPE BOUNDARY is how a +175% job became -69%: rooms the estimator
+    # certainly bid were declared out of scope because a partial read did not
+    # mention them. A schedule may only bound scope when it plausibly covers
+    # the grid it came from. Row-count minimums cannot catch this; only the
+    # detected block count can.
+    _blocks = _finish_plan_block_count(analysis)
+    try:
+        _cov_min = float(os.environ.get(
+            "NIGHTSHIFT_SCHEDULE_SCOPE_MIN_COVERAGE", "0.6") or 0.6)
+    except (TypeError, ValueError):
+        _cov_min = 0.6
+    # Coverage counts only rows carrying a real finish designation —
+    # placeholder rows ("see finish plan block") are padding, not evidence.
+    _evid = _finish_rows_with_evidence(rfs)
+    if _blocks and len(_evid) < _blocks * _cov_min:
+        rec = {"noop": "schedule_incomplete", "rows": len(rfs),
+               "rows_with_evidence": len(_evid),
+               "grid_blocks": _blocks,
+               "coverage": round(len(_evid) / _blocks, 3),
+               "min_coverage": _cov_min}
+        analysis["_schedule_room_scope"] = rec
+        analysis.setdefault("notes", []).append(
+            f"[Schedule Room Scope] STOOD DOWN: the finish schedule read "
+            f"{len(rfs)} row(s), {len(_evid)} carrying an actual finish "
+            f"designation, but the finish plan shows ~{_blocks} room blocks "
+            f"({len(_evid) / _blocks:.0%} coverage, need {_cov_min:.0%}). A "
+            f"partial schedule cannot define the scope boundary, so no rooms "
+            f"were excluded.")
+        _gate_add_rfi(
+            analysis, "Scope Boundary",
+            f"The finish schedule extraction returned {len(_evid)} usable "
+            f"room row(s) but the finish plan appears to list ~{_blocks}. "
+            f"The scope boundary was "
+            f"NOT applied. Confirm the full room finish schedule so the "
+            f"takeoff can be bounded to the scheduled areas.")
+        print(f"   📐 Schedule room scope: STOOD DOWN — {len(_evid)} usable "
+              f"of {len(rfs)} rows vs ~{_blocks} grid blocks "
+              f"({len(_evid) / _blocks:.0%} coverage)")
+        return analysis
+    by_num, by_name = _build_schedule_row_maps(rfs)
+    row_toks = [(r, _schedule_row_tokens(r)) for r in rfs]
+
+    def _match_key(room, numeric_only=False):
+        """Schedule row this room maps to, or None.
+
+        numeric_only=True restricts the answer to matches made through a
+        room NUMBER. That distinction is what makes anchoring safe: a
+        number is a 1:1 identity, whereas name-token matching is
+        many-to-one — five distinct exam rooms can all "best match" one
+        generic row. Rerun-4 anchored on both and folded 57 rooms, leaving
+        34 for a 55-row schedule; doors collapsed +105% -> -41%.
+        """
+        row = _match_schedule_row(room, by_num, by_name)
+        if row is not None:
+            # Membership must use the SAME normalization by_num was built
+            # with (_room_num_token), not _canon_room_number — mixing the
+            # two silently made every numeric match fail.
+            rtok = _room_num_token(room.get("room_number"))
+            if numeric_only and not (rtok and rtok in by_num):
+                return None
+            return (_canon_room_number(row.get("room_number"))
+                    or str(row.get("room_name") or "").lower())
+        if numeric_only:
+            return None
+        toks = set(t for t in re.sub(
+            r"[^a-z0-9]+", " ",
+            str(room.get("room_name") or "").lower()).split()
+            if len(t) >= 3 and t not in _DEDUP_GENERIC_TOKENS)
+        if not toks:
+            return None
+        best, best_n = None, 0
+        for _r, rt in row_toks:
+            if not rt:
+                continue
+            n = len(toks & rt)
+            if n > best_n:
+                best, best_n = _r, n
+        if best is None:
+            return None
+        return (_canon_room_number(best.get("room_number"))
+                or str(best.get("room_name") or "").lower())
+
+    def _matched(room):
+        return _match_key(room) is not None
+
+    # Element totals carried by the rooms we remove. Marking a room
+    # out_of_scope is not enough: aggregated_totals is computed upstream and
+    # several pricing paths read it directly, so a dropped room's doors and
+    # stairs keep getting billed. Phelps rerun-2: every stair-bearing room
+    # left scope, yet the estimate still priced 6 stair sections ($9,450)
+    # and 159 doors against 108 actually held by in-scope rooms.
+    _ELEM_AGG = (
+        ("doors_full_paint", "total_doors_full_paint"),
+        ("doors_hm_panel", "total_doors_hm_panel"),
+        ("doors_frame_only", "total_doors_frame_only"),
+        ("windows_painted_interior", "total_windows_painted_interior"),
+        ("stair_sections", "total_stair_sections"),
+        ("gyp_between_stairs_sqft", "total_gyp_between_stairs_sqft"),
+        ("concrete_floor_sqft", "total_concrete_floor_sqft"),
+        ("base_trim_lf", "total_base_trim_lf"),
+        ("wallcovering_sqft", "total_wallcovering_sqft"),
+        ("level_5_finish_sqft", "total_level_5_finish_sqft"),
+    )
+    removed_elems = {}
+
+    # ── Roster anchoring (NIGHTSHIFT_SCHEDULE_ROOM_ANCHOR) ────────────────
+    # A finish schedule row IS one room. Without this, every extracted room
+    # that maps to a row is kept, so extraction noise passes straight
+    # through: Phelps rerun-3 read a stable 53-55 row schedule on all six
+    # passes yet kept 62-131 rooms, and doors swung 80-161 (65% spread)
+    # because duplicates each carried their own. Keeping the best room per
+    # row makes the roster as stable as the schedule it came from.
+    _anchor = os.environ.get(
+        "NIGHTSHIFT_SCHEDULE_ROOM_ANCHOR", "0").strip() in (
+        "1", "true", "True")
+    _best_for_row, _dupes = {}, set()
+    if _anchor:
+        def _score(rm):
+            d = rm.get("dimensions") or {}
+            el = rm.get("elements") or {}
+            return (1 if _num(d.get("wall_area_sqft", 0)) > 0 else 0,
+                    _num(d.get("wall_area_sqft", 0)),
+                    _num(d.get("ceiling_area_sqft", 0)),
+                    sum(_num(el.get(k, 0)) for k in
+                        ("doors_full_paint", "doors_hm_panel")))
+        for fl in (analysis.get("floors") or []):
+            for rm in (fl.get("rooms") or []):
+                if not isinstance(rm, dict) or not rm.get("in_scope", True):
+                    continue
+                # Numeric identity only — see _match_key.
+                k = _match_key(rm, numeric_only=True)
+                if k is None:
+                    continue
+                cur = _best_for_row.get(k)
+                if cur is None or _score(rm) > _score(cur):
+                    if cur is not None:
+                        _dupes.add(id(cur))
+                    _best_for_row[k] = rm
+                else:
+                    _dupes.add(id(rm))
+
+    dropped, kept = [], 0
+    anchored_out = []
+    for fl in (analysis.get("floors") or []):
+        _mf = max(1, int(_num(fl.get("unit_multiplier", 1)) or 1))
+        for rm in (fl.get("rooms") or []):
+            if not isinstance(rm, dict) or not rm.get("in_scope", True):
+                continue
+            if _anchor and id(rm) in _dupes:
+                rm["in_scope"] = False
+                rm["scope_exclusion_reason"] = (
+                    "duplicate of another extracted room mapping to the same "
+                    "finish-schedule row — one row is one room")
+                anchored_out.append(rm.get("room_name")
+                                    or rm.get("room_id") or "room")
+                _mult = _mf * max(
+                    1, int(_num(rm.get("unit_multiplier", 1)) or 1))
+                _el = rm.get("elements") or {}
+                for _src, _agg_key in _ELEM_AGG:
+                    _v = _num(_el.get(_src, 0)) * _mult
+                    if _v:
+                        removed_elems[_agg_key] = removed_elems.get(
+                            _agg_key, 0.0) + _v
+                continue
+            if _matched(rm):
+                kept += 1
+                continue
+            rm["in_scope"] = False
+            rm["scope_exclusion_reason"] = (
+                "not listed in the authoritative room finish schedule — "
+                "outside the scheduled scope boundary")
+            dropped.append(rm.get("room_name") or rm.get("room_id") or "room")
+            _mult = _mf * max(1, int(_num(rm.get("unit_multiplier", 1)) or 1))
+            _el = rm.get("elements") or {}
+            for _src, _agg_key in _ELEM_AGG:
+                _v = _num(_el.get(_src, 0)) * _mult
+                if _v:
+                    removed_elems[_agg_key] = removed_elems.get(
+                        _agg_key, 0.0) + _v
+
+    total = kept + len(dropped) + len(anchored_out)
+    rec = {"applied": bool(dropped or anchored_out),
+           "rooms_dropped": len(dropped),
+           "rooms_kept": kept, "schedule_rows": len(rfs)}
+    if anchored_out:
+        rec["rooms_anchored_out"] = len(anchored_out)
+        analysis.setdefault("notes", []).append(
+            f"[Schedule Room Anchor] {len(anchored_out)} extracted room(s) "
+            f"mapped to a finish-schedule row already represented by a "
+            f"better-dimensioned room and were folded out — one schedule row "
+            f"is one room. {kept} room(s) remain against {len(rfs)} rows.")
+        print(f"   ⚓ Schedule room anchor: folded {len(anchored_out)} "
+              f"duplicate(s); {kept} room(s) for {len(rfs)} rows")
+
+    # Decrement the aggregates by what left scope, floored at what the
+    # surviving rooms actually hold so the two can never disagree.
+    if removed_elems:
+        agg = analysis.setdefault("aggregated_totals", {})
+        _survivor = {}
+        for fl in (analysis.get("floors") or []):
+            _mf = max(1, int(_num(fl.get("unit_multiplier", 1)) or 1))
+            for rm in (fl.get("rooms") or []):
+                if not isinstance(rm, dict) or not rm.get("in_scope", True):
+                    continue
+                _mult = _mf * max(
+                    1, int(_num(rm.get("unit_multiplier", 1)) or 1))
+                _el = rm.get("elements") or {}
+                for _src, _agg_key in _ELEM_AGG:
+                    _survivor[_agg_key] = _survivor.get(_agg_key, 0.0) + (
+                        _num(_el.get(_src, 0)) * _mult)
+        adjusted = {}
+        for _agg_key, _gone in removed_elems.items():
+            _cur = _num(agg.get(_agg_key, 0))
+            if _cur <= 0:
+                continue
+            _new = max(_survivor.get(_agg_key, 0.0), _cur - _gone)
+            if round(_new, 2) != round(_cur, 2):
+                agg[_agg_key] = round(_new, 2)
+                adjusted[_agg_key] = [round(_cur, 2), round(_new, 2)]
+        if adjusted:
+            rec["aggregates_adjusted"] = adjusted
+            print("   ➖ Scope boundary reduced aggregates: " + ", ".join(
+                f"{k.replace('total_', '')} {v[0]:g}→{v[1]:g}"
+                for k, v in list(adjusted.items())[:6]))
+    analysis["_schedule_room_scope"] = rec
+    if dropped:
+        names = ", ".join(sorted(set(dropped))[:12])
+        if len(set(dropped)) > 12:
+            names += f", and {len(set(dropped)) - 12} more"
+        analysis.setdefault("notes", []).append(
+            f"[Schedule Room Scope] {len(dropped)} of {total} extracted "
+            f"room(s) are absent from the {len(rfs)}-row finish schedule and "
+            f"were taken OUT of scope (walls, ceilings, doors and elements "
+            f"all excluded): {names}.")
+        _gate_add_rfi(
+            analysis, "Scope Boundary",
+            f"{len(dropped)} extracted room(s) do not appear in the finish "
+            f"schedule and were treated as outside the scope boundary: "
+            f"{names}. Confirm the bid covers only the scheduled areas — if "
+            f"any of these rooms ARE in scope, the takeoff must be re-run.")
+        print(f"   📐 Schedule room scope: {len(dropped)} room(s) dropped, "
+              f"{kept} kept (schedule has {len(rfs)} rows)")
+        if total and len(dropped) / total > 0.25:
+            analysis["manual_review_required"] = True
+            analysis.setdefault("manual_review_reason", "") or None
+            analysis["manual_review_reason"] = (
+                f"[MANUAL REVIEW REQUIRED] The schedule scope boundary removed "
+                f"{len(dropped)} of {total} extracted rooms "
+                f"({len(dropped) / total:.0%}). That is a large reduction — "
+                f"confirm the finish schedule is complete and that the dropped "
+                f"rooms are genuinely outside the bid before sending.")
+    return analysis
+
+
 def _apply_ceiling_assume_painted(analysis):
     """Flag-gated (NIGHTSHIFT_CEILING_ASSUME_PAINTED, default off): an
     enclosed room's ceiling is PAINTED unless the documents show otherwise.
@@ -19715,7 +20607,13 @@ def _apply_ceiling_assume_painted(analysis):
     if analysis.get("_ceiling_assume_painted") is not None:
         return analysis
 
+    sched_nonpaint, _n_sched_rows = (
+        _schedule_nonpaint_ceiling_rooms(analysis)
+        if _ceiling_schedule_evidence_enabled()
+        else ((lambda _room: False), 0))
+
     flipped, added_sf = [], 0.0
+    held_by_schedule = []
     for fl in (analysis.get("floors") or []):
         mult_f = max(1, int(_num(fl.get("unit_multiplier", 1)) or 1))
         for rm in (fl.get("rooms") or []):
@@ -19727,6 +20625,13 @@ def _apply_ceiling_assume_painted(analysis):
             mat = str(mats.get("ceiling") or "").lower()
             if "assumed" not in mat:
                 continue  # evidence-based classification — respect it
+            if sched_nonpaint(rm):
+                # The SHEET had no ceiling evidence, but the JOB's finish
+                # schedule designates a non-painted ceiling for this room.
+                # Hard number beats the enclosed-room default.
+                held_by_schedule.append(rm.get("room_name")
+                                        or rm.get("room_id") or "room")
+                continue
             is_exposed = any(k in mat for k in ("open", "exposed",
                                                 "unpainted", "none",
                                                 "unfinished"))
@@ -19759,6 +20664,18 @@ def _apply_ceiling_assume_painted(analysis):
 
     rec = {"applied": bool(flipped), "rooms_flipped": len(flipped),
            "ceiling_sqft_added": round(added_sf, 2)}
+    if held_by_schedule:
+        rec["held_by_schedule"] = len(held_by_schedule)
+        held_list = ", ".join(sorted(set(held_by_schedule))[:8])
+        if len(set(held_by_schedule)) > 8:
+            held_list += f", and {len(set(held_by_schedule)) - 8} more"
+        analysis.setdefault("notes", []).append(
+            f"[Ceiling Schedule Evidence] {len(held_by_schedule)} room(s) were "
+            f"NOT flipped to painted: the finish schedule designates a "
+            f"non-painted ceiling (ACT/grid/exposed) for them, which outranks "
+            f"the enclosed-room default: {held_list}.")
+        print(f"   📋 Ceiling schedule evidence: held "
+              f"{len(held_by_schedule)} room(s) at unpainted")
     analysis["_ceiling_assume_painted"] = rec
     if flipped:
         agg = analysis.setdefault("aggregated_totals", {})
@@ -21423,6 +22340,15 @@ def build_priced_takeoff(analysis, strict=None):
     # no-op when off. After the evidence gate so its record reflects
     # what evidence-surviving scope the convention struck.
     analysis = _enforce_interior_only_convention(analysis)
+
+    # Schedule ROOM scope boundary: rooms absent from an authoritative
+    # finish schedule leave scope entirely (walls, ceilings, doors and
+    # elements), not just their wall paint. Must run BEFORE the ceiling
+    # gates and every aggregate rebuild below, so out-of-scope rooms never
+    # reach them. Flag-gated; no-op when off.
+    # Recover the schedule join key before any schedule gate runs.
+    analysis = _backfill_room_numbers(analysis)
+    analysis = _apply_schedule_room_scope(analysis)
 
     # Final ceiling-scope reconciliation (ACT demote + commercial aggregate
     # rebuild) before any quantity is priced. Flag-gated; no-op when off.
@@ -27752,11 +28678,18 @@ def _run_job_draw_median(k, pdf_paths, run_kwargs):
         spread_pct = (max(vote_subs) - min(vote_subs)) / (
             sum(vote_subs) / len(vote_subs)) * 100
         report["subtotal_spread_pct"] = round(spread_pct, 1)
+    # Default lowered 40 -> 25 (Phelps rerun-3, 2026-09-03). That job's
+    # draws were $39,388 / $42,236 / $56,480 — a 37.1% spread, meaning the
+    # answer depended on which draw won the vote (+1.0% vs +44.8%). At the
+    # old limit it shipped unflagged; it was caught only because a
+    # different rule happened to fire. A spread this wide is exactly the
+    # case a human must see, and the check only ADDS review — it never
+    # changes a quantity.
     try:
         spread_limit = float(os.environ.get(
-            "NIGHTSHIFT_DRAW_SPREAD_REVIEW_PCT", "40") or 40)
+            "NIGHTSHIFT_DRAW_SPREAD_REVIEW_PCT", "25") or 25)
     except (TypeError, ValueError):
-        spread_limit = 40.0
+        spread_limit = 25.0
     analysis["_job_draw_median"] = report
     note = (f"[Draw Median] {k} independent extraction draws; draw "
             f"{sel + 1} selected as composition median. Subtotals: "
@@ -28188,8 +29121,12 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             if _detect_finish_schedule(pdf_path_scan):
                 fs_pages = (_find_finish_schedule_pages(pdf_path_scan)
                             if _targeted_fs else [])
+                # Block count from the grid detector anchors both the token
+                # budget and the continuation loop.
+                _exp = int(_FINISH_PLAN_BLOCK_COUNTS.get(pdf_path_scan, 0) or 0)
                 rfs_pre = _extract_room_finish_schedule(
-                    client, pdf_path_scan, page_indices=fs_pages)
+                    client, pdf_path_scan, page_indices=fs_pages,
+                    expected_rooms=_exp)
                 if rfs_pre and rfs_pre.get("room_finish_schedule"):
                     room_finish_schedule = rfs_pre["room_finish_schedule"]
                     print(f"   📋 Room finish schedule pre-extracted: "
@@ -29966,6 +30903,19 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                 _basis = _work_area
                 _basis_label = "declared work area (Level 2 / work-area-method renovation)"
                 _used_work_area = True
+            # Same basis correction the over-extraction guard makes, applied
+            # to the LOW side (Phelps rerun 2026-09-01): footprint_sqft was
+            # inferred as 30,000 while the drawings state 8,724 GSF, so a
+            # perfectly in-band 34,340 SF read (3.9x the real GSF) scored
+            # 1.14x and tripped "implausibly low" — which then marks a
+            # cold-draw suspect, clears the checkpoints and burns a whole
+            # extra draw. A stated GSF is a hard number; an inferred
+            # footprint is not.
+            if (not _used_work_area) and _gsf_basis_enabled():
+                _read = _stated_gross_sqft(analysis)
+                if _read > 500 and _footprint > _read * 1.5:
+                    _basis = _read
+                    _basis_label = "gross floor area stated on the drawings"
             if _used_work_area and _total_paintable >= _basis * 3:
                 _r = (_total_paintable / _basis) if _basis else 0
                 analysis.setdefault("notes", []).append(
@@ -30020,6 +30970,67 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                       f"(ratio {ratio:.1f}×, expected 3-6×)")
                 print(f"   ⚠️  Flagged for manual review — proposal will print "
                       f"but should NOT be sent without reviewer sign-off.")
+
+    # ── Over-extraction guard (Phelps/Northwell, 2026-09-01) ──────────────
+    # Until now the plausibility check only tested the LOW side
+    # (paintable < footprint x 3). Phelps priced the whole 4th floor of a
+    # hospital instead of the 8,724 SF suite in scope and came in +175%,
+    # yet the only warning it produced said the surface was "implausibly
+    # LOW" — because footprint_sqft had been inferred as 45,000 while the
+    # overview had correctly READ 8,724 GSF. The guard told the reviewer to
+    # go find MORE scope on a job that was already nearly triple the bid.
+    # Two corrections, both flag-gated:
+    #   1. Prefer the GSF actually read off the sheets over an inferred
+    #      footprint when the two disagree materially.
+    #   2. Flag the HIGH side too.
+    if os.environ.get("NIGHTSHIFT_OVER_EXTRACTION_GUARD", "0").strip() in (
+            "1", "true", "True") and not analysis.get("manual_review_required"):
+        try:
+            _hi_max = float(os.environ.get(
+                "NIGHTSHIFT_OVER_EXTRACTION_MAX_RATIO", "8") or 8)
+        except (TypeError, ValueError):
+            _hi_max = 8.0
+        _pi_hi = analysis.get("project_info") or {}
+        _read_gsf = _stated_gross_sqft(analysis)
+        _fp_hi = _num(_pi_hi.get("footprint_sqft", 0))
+        # The READ GSF wins when it exists and the inferred footprint is
+        # materially larger — that disagreement is the Phelps signature.
+        _basis_hi = _read_gsf if (_read_gsf > 500 and
+                                  (not _fp_hi or _fp_hi > _read_gsf * 1.5)) \
+            else _fp_hi
+        _basis_hi_label = ("gross floor area stated on the drawings"
+                           if _basis_hi == _read_gsf and _read_gsf
+                           else "building footprint")
+        if _basis_hi > 500 and _total_paintable > _basis_hi * _hi_max:
+            _r_hi = _total_paintable / _basis_hi
+            _msg_hi = (
+                f"[MANUAL REVIEW REQUIRED] Total extracted paintable surface "
+                f"({_total_paintable:,.0f} sqft) is implausibly HIGH relative "
+                f"to the {_basis_hi_label} ({_basis_hi:,.0f} sqft) — ratio is "
+                f"{_r_hi:.1f}x, expected 3-6x. This usually means rooms "
+                f"OUTSIDE the scope boundary were extracted (a full-floor or "
+                f"full-building plan priced as if all of it were in scope), or "
+                f"the same rooms were counted on more than one sheet. Confirm "
+                f"the scope boundary against the finish schedule before "
+                f"sending.")
+            analysis["manual_review_required"] = True
+            analysis["manual_review_reason"] = _msg_hi
+            analysis.setdefault("notes", []).append(_msg_hi)
+            analysis["_over_extraction_guard"] = {
+                "paintable": round(_total_paintable, 1),
+                "basis": round(_basis_hi, 1),
+                "basis_label": _basis_hi_label,
+                "ratio": round(_r_hi, 2),
+                "max_ratio": _hi_max,
+                "inferred_footprint": round(_fp_hi, 1),
+                "read_gsf": round(_read_gsf, 1)}
+            print(f"\n🚨 OVER-EXTRACTION GUARD TRIPPED")
+            print(f"   Paintable: {_total_paintable:,.0f} sqft vs "
+                  f"{_basis_hi_label} {_basis_hi:,.0f} sqft "
+                  f"({_r_hi:.1f}x, max {_hi_max:.0f}x)")
+            if _fp_hi and _read_gsf and _fp_hi > _read_gsf * 1.5:
+                print(f"   ⚠️  inferred footprint {_fp_hi:,.0f} disagrees with "
+                      f"read GSF {_read_gsf:,.0f} — used the read GSF")
 
     # Doors-zero cold-draw detector: a job with 10+ in-scope rooms and
     # ZERO doors of any class is a cold draw, not a doorless building
