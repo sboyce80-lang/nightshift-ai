@@ -20106,6 +20106,20 @@ def _apply_vme_authoritative_walls(analysis):
                 # disagree, so neither earns measured provenance
                 # (Livestock replay: region billed 99% of a page whose rooms
                 # are 46% painted -> +73% would have shipped as measured).
+                # A collapsed roster (aggregate walls == 0) does NOT earn an
+                # exception here: Northwell rerun5 promoted 50,424 SF
+                # (+148% vs the key) because the dead roster's scope masks
+                # defaulted everything to painted — geometry x dead scope
+                # overbills exactly like the Livestock case. When the
+                # roster is dead, nothing on the job has scope authority;
+                # abstain, flag, and let review price it.
+                if llm_total <= 0:
+                    analysis.setdefault("notes", []).append(
+                        "[VME] Extraction wall roster collapsed to zero AND "
+                        "geometry sat measured but unpromotable (scope "
+                        "masks unusable without a roster). RFI: confirm "
+                        "wall scope and ceiling heights; walls are NOT "
+                        "priced on this run.")
                 scoped_why = (
                     f"region attribution bills {bill_lf_scoped:,.0f} LF but "
                     f"room-level scope supports only ~{frac_expect:,.0f} LF "
