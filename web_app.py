@@ -59,12 +59,14 @@ from config import (
     PLG_SELF_SERVE_ENABLED, FREEMIUM_BID_LIMIT, TEST_WELCOME_MAX_RECIPIENTS,
     FREEMIUM_MAX_PDF_SIZE_MB, FREEMIUM_MAX_PDFS,
     PLG_BLOCK_FREE_EMAIL_AUTO_APPROVE, PLG_SALES_CONTACT_EMAIL,
+    PLG_CRM_AUTOCREATE,
     scale_timeout_for_consensus,
 )
 import storage
 from datetime import datetime, timezone, timedelta
 
 from db import session_scope
+from crm_sync import ensure_crm_account_for_org
 from models import User, Submission, File, Organization, OrganizationMembership
 from auth import require_auth, current_user_id, clerk_frontend_api_host, is_admin
 from orgs import (
@@ -3267,6 +3269,18 @@ def onboarding():
                 "phone": org.phone or "",
                 "company_size": org.company_size or "",
             }
+
+    # CRM bookkeeping runs in its OWN transaction after the approval has
+    # committed: a CRM hiccup must never roll back or block a signup.
+    if auto_approved and PLG_CRM_AUTOCREATE:
+        try:
+            with session_scope() as session:
+                user = session.get(User, uid)
+                org = user.current_organization if user else None
+                if org is not None:
+                    ensure_crm_account_for_org(session, org, user)
+        except Exception as exc:
+            logger.error("PLG CRM auto-create failed: %s", exc)
 
     if notify_payload:
         if PLG_SELF_SERVE_ENABLED:

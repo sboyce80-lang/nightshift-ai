@@ -646,6 +646,20 @@ SUPPORT_CONTACT_EMAIL = os.environ.get(
 FOUNDER_CONTACT_EMAIL = os.environ.get(
     "FOUNDER_CONTACT_EMAIL", "steve@knightshiftai.com")
 
+# Auto-create a CRM account (+ primary contact + timeline note) when a PLG
+# signup is auto-approved onto freemium. Without this, the internal signup
+# email is the only trace a self-serve customer leaves — if nobody acts on
+# it, the account never appears in the sales pipeline. OFF by default;
+# only nightshift-web needs the flag (workers never run /onboarding).
+PLG_CRM_AUTOCREATE = os.environ.get(
+    "PLG_CRM_AUTOCREATE", "0").strip().lower() in ("1", "true", "yes", "on")
+
+# Every auto-created account needs an owner or it sits unassigned in the
+# CRM; steve owns the PLG motion. Must be one of the crm_accounts
+# account_owner CHECK values: brian / matt / steve / elliott.
+PLG_CRM_DEFAULT_OWNER = os.environ.get(
+    "PLG_CRM_DEFAULT_OWNER", "steve").strip().lower()
+
 # Internal recipient lists (comma-separated; both fall back to ADMIN_EMAILS
 # when unset so alerts are never silently dropped).
 def _env_email_list(name):
