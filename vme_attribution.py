@@ -620,8 +620,22 @@ def compute_vme_shadow_v2(pdf_paths, default_height_ft=9.0):
         if not pages:
             return None
         total_lf, by_page, unmeasured = 0.0, [], []
+        first = {id(p): vm.measure_wall_runs_geometric(p["pdf"], p["page"])
+                 for p in pages}
+        _scales = [r["pts_per_ft"] for r in first.values()
+                   if r.get("wall_run_lf") is not None]
+        _sib = (max(set(_scales), key=_scales.count) if _scales else None)
+        _sib_ok = _sib is not None and os.environ.get(
+            "NIGHTSHIFT_SHEET_INDEX_TITLES", "0") == "1"
         for p in pages:
-            r = vm.measure_wall_runs_geometric(p["pdf"], p["page"])
+            r = first[id(p)]
+            if r.get("wall_run_lf") is None and _sib_ok:
+                # sibling-scale retry, same contract the certified scoped
+                # path uses: unscaled part-plan sheets (Northwell A104)
+                # otherwise force basis-1 to abstain on the whole job
+                r = vm.measure_wall_runs_geometric(p["pdf"], p["page"],
+                                                   pts_per_ft=_sib)
+                r["scale_source"] = "sibling"
             lf = r.get("wall_run_lf")
             if lf is None:
                 unmeasured.append({"pdf": p["pdf"].rsplit("/", 1)[-1],
@@ -1710,7 +1724,7 @@ def _dispersed(anchors):
     return (xs[-1] - xs[0]) > 0.15 or (ys[-1] - ys[0]) > 0.15
 
 
-def _painted_wall_fracs(analysis):
+def _painted_wall_fracs(analysis, preclip=False):
     """Painted-wall fraction (painted SF / ALL wall SF) per floor + job
     default — the scope signal for pages whose room labels can't be mapped
     spatially. Ported from the M4 golden harness (rider_batch_durable/
@@ -1746,7 +1760,16 @@ def _painted_wall_fracs(analysis):
             unpaintable = any(k in mats for k in (
                 "tile", "frp", "storefront", "glass", "curtain",
                 "prefinish", "trusscore", "fiberglass"))
-            if room.get("in_scope", True) and not unpaintable:
+            in_scope = bool(room.get("in_scope", True))
+            if preclip and not in_scope and "outside the scheduled scope boundary" in str(
+                    room.get("scope_exclusion_reason") or ""):
+                # pre-clip view: the schedule-authority boundary is a scope
+                # JUDGMENT layered on the extraction; the disagreement
+                # yardstick must not inherit it (the clip is deliberately
+                # conservative, so post-clip expectation is biased low and
+                # permanently vetoes geometry when both flags are on)
+                in_scope = True
+            if in_scope and not unpaintable:
                 painted += w
                 f_painted += w
         if f_allw > 0:
@@ -1980,6 +2003,9 @@ def compute_vme_scoped(pdf_paths, analysis, default_height_ft=9.0):
             # 99% of a page the rooms say is 46% painted).
             "frac_expectation_lf": round(
                 raw_lf * def_frac * (2.0 if face_basis else 1.0), 1),
+            "frac_expectation_preclip_lf": round(
+                raw_lf * _painted_wall_fracs(analysis, preclip=True)[1]
+                * (2.0 if face_basis else 1.0), 1),
             "unmeasured": unmeasured, "by_page": by_page,
             "n_pages": len(pages), "n_labeled_pages": labeled_pages}
 

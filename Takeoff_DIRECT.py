@@ -21012,6 +21012,20 @@ def _apply_vme_authoritative_walls(analysis):
             share = _num(scoped.get("region_lf_share", 0))
             bill_lf_scoped = _num(scoped.get("measured_wall_run_lf", 0))
             frac_expect = _num(scoped.get("frac_expectation_lf", 0))
+            _sched_clip = analysis.get("_schedule_room_scope")
+            if (os.environ.get("NIGHTSHIFT_SHEET_INDEX_TITLES", "0") == "1"
+                    and isinstance(_sched_clip, dict)
+                    and not _sched_clip.get("noop")):
+                # The schedule-scope clip just SHRANK the roster on
+                # purpose; measuring geometry against the post-clip
+                # expectation is a biased-low yardstick that vetoes
+                # promotion whenever both features are on (Northwell
+                # combined: geometry billed 2,528 LF ~= the key, clipped
+                # expectation 1,355 LF -> vetoed -> walls -57%). Compare
+                # against the PRE-clip expectation instead; the clip keeps
+                # its authority over line items either way.
+                frac_expect = max(frac_expect, _num(
+                    scoped.get("frac_expectation_preclip_lf", 0)))
             if share < 0.6:
                 scoped_why = (
                     f"scope-clipped measurement is only {share:.0%} room-"
