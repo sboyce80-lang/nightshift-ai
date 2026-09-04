@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import collections
 import math
+import os
 import re
 
 import vector_measure as vm
@@ -303,6 +304,98 @@ def classify_title_lines(lines, filename="", filename_only=False):
 
 _SHEET_ID_RE = _re.compile(r"\b(A[D]?[-.]?\d{1,3}(?:\.\d{1,2})?[A-Za-z]?)\b")
 
+# Any-discipline sheet id as it appears in a drawing index row (G000, A100,
+# M-101, FP101, E-201.1). Standalone word only — matching inside prose would
+# shred titles at the column-stop check below.
+_INDEX_ID_RE = _re.compile(
+    r"^[A-Z]{1,3}-?\d{1,3}(?:\.\d{1,2})?[A-Za-z]?$")
+_INDEX_HDR_RE = _re.compile(
+    r"sheet\s+(?:list|index)|drawing\s+(?:list|index)|index\s+of\s+drawings|"
+    r"list\s+of\s+drawings", _re.I)
+_FINISH_PLAN_RE = _re.compile(r"finish\s+plan", _re.I)
+
+
+def _index_key(sheet_id):
+    return sheet_id.upper().replace("-", "").replace(".", "")
+
+
+def sheet_index_titles(pdf_paths):
+    """Public wrapper: {normalized sheet id -> title} from the drawing index."""
+    return _sheet_index(pdf_paths)[0]
+
+
+def _sheet_index(pdf_paths):
+    """({normalized sheet id -> title}, (pdf, page) of the index) or ({}, None).
+
+    The index (G000 "SHEET LIST" / "DRAWING INDEX") is a structured table:
+    a sheet-number column beside a title column. Title BLOCKS on the sheets
+    themselves are frequently unextractable (plotted as curves, or the
+    top-font lines carry only the sheet number — Northwell/Phelps A102/A104),
+    so the index is the authoritative source for what each sheet IS.
+
+    Rows are reassembled from word coordinates: words whose vertical centers
+    align form a row; the title is every word right of the sheet-id word up
+    to the next sheet-id word (two-column indexes put a second number/title
+    pair on the same visual row). First index-bearing page wins.
+    """
+    if fitz is None:
+        return {}, None
+    for pdf in pdf_paths:
+        try:
+            doc = fitz.open(pdf)
+        except Exception:
+            continue
+        try:
+            for i in range(len(doc)):
+                try:
+                    if not _INDEX_HDR_RE.search(doc[i].get_text() or ""):
+                        continue
+                    words = doc[i].get_text("words")
+                except Exception:
+                    continue
+                marks = sorted(((w[1] + w[3]) / 2.0, w[0], w[2], w[4])
+                               for w in words)
+                heights = sorted(w[3] - w[1] for w in words)
+                med_h = heights[len(heights) // 2] if heights else 8.0
+                rows, cur, prev_y = [], [], None
+                for yc, x0, x1, txt in marks:
+                    # dense index tables pitch rows ~1 line height apart;
+                    # chain-clustering merges neighbors, so split on the
+                    # y GAP between consecutive word centers instead
+                    if prev_y is not None and yc - prev_y > med_h * 0.5:
+                        rows.append(cur)
+                        cur = []
+                    cur.append((x0, x1, txt))
+                    prev_y = yc
+                if cur:
+                    rows.append(cur)
+                titles = {}
+                for row in rows:
+                    row.sort()
+                    for j, (_, kx1, txt) in enumerate(row):
+                        if not _INDEX_ID_RE.match(txt):
+                            continue
+                        title_words = []
+                        prev_x1 = kx1
+                        for x0_2, x1_2, t2 in row[j + 1:]:
+                            if _INDEX_ID_RE.match(t2):
+                                break
+                            # column stop: a wide x gap means we crossed
+                            # into an unrelated column (notes, dates)
+                            if title_words and x0_2 - prev_x1 > max(
+                                    24.0, med_h * 2.5):
+                                break
+                            title_words.append(t2)
+                            prev_x1 = x1_2
+                        if title_words:
+                            titles.setdefault(_index_key(txt),
+                                              " ".join(title_words))
+                if titles:
+                    return titles, (pdf, i)
+        finally:
+            doc.close()
+    return {}, None
+
 
 def select_floor_plan_pages(pdf_paths):
     """Canonical floor-plan pages for a job (single- or multi-file).
@@ -314,6 +407,11 @@ def select_floor_plan_pages(pdf_paths):
     if fitz is None:
         raise RuntimeError("PyMuPDF (fitz) is required")
     filename_only = len(pdf_paths) > 3   # sheet-per-file set
+    use_index = os.environ.get(
+        "NIGHTSHIFT_SHEET_INDEX_TITLES", "0") == "1"
+    index_titles, index_page = (_sheet_index(pdf_paths) if use_index
+                                else ({}, None))
+    finish_candidates = []
     plan_pages = []
     for pdf in pdf_paths:
         fname = pdf.rsplit("/", 1)[-1]
@@ -344,6 +442,33 @@ def select_floor_plan_pages(pdf_paths):
                                 break
                     except Exception:
                         pass
+                if index_page == (pdf, i):
+                    # the drawing-index page's rows read like plan titles
+                    # ("FIRST FLOOR CONSTRUCTION PLAN...") and can classify
+                    # the COVER SHEET as a floor plan on sparse sets —
+                    # never claim the index itself (sheet=None also stops
+                    # the index-title route below: the id scraped from its
+                    # own rows is another sheet's number, not this page's)
+                    info = {"kind": "other", "floors": [], "sheet": None}
+                if (info["kind"] != "floor_plan" and index_titles
+                        and info.get("sheet")):
+                    # index-title route: the drawing index names this sheet;
+                    # classify that title instead of the mute title block
+                    ix_title = index_titles.get(_index_key(info["sheet"]))
+                    if ix_title:
+                        ix = classify_title_lines([ix_title], "",
+                                                  filename_only=False)
+                        if ix["kind"] == "floor_plan":
+                            info = {"kind": "floor_plan",
+                                    "floors": ix["floors"],
+                                    "sheet": info["sheet"], "src": "index"}
+                        elif (_FINISH_PLAN_RE.search(_norm(ix_title))
+                                and _floors_in(ix_title)):
+                            finish_candidates.append(
+                                {"pdf": pdf, "page": i,
+                                 "floors": _floors_in(ix_title),
+                                 "sheet": info["sheet"], "arch": False,
+                                 "src": "index-finish"})
                 if info["kind"] == "floor_plan":
                     arch = bool(info["sheet"]
                                 and _re.match(r"A-?D?-?\d", info["sheet"]))
@@ -360,6 +485,16 @@ def select_floor_plan_pages(pdf_paths):
     specific = [p for p in plan_pages if p["floors"] != ["all"]]
     claimed, out = set(), []
     for p in specific:
+        new = [f for f in p["floors"] if f not in claimed]
+        if new:
+            claimed.update(new)
+            out.append({**p, "floors": new})
+    # finish-plan fallback: a floor whose construction/floor plan is NOT in
+    # the submitted set (Northwell/Phelps: A100 in the index, never
+    # submitted) has its wall geometry drawn on that floor's FINISH PLAN.
+    # Claim it ONLY for floors no real plan page covers — a set with proper
+    # plan sheets is untouched (demo/RCP/furniture stay excluded).
+    for p in finish_candidates:
         new = [f for f in p["floors"] if f not in claimed]
         if new:
             claimed.update(new)
@@ -1217,6 +1352,164 @@ def page_text_unit_anchors(pdf_path, page_index, vocab):
         doc.close()
 
 
+_ROOM_WORD_STOP = frozenset(
+    "room rooms floor plan area new existing typical note notes see detail "
+    "wall walls ceiling paint finish schedule legend scale north the and "
+    "with type work suite level sheet".split())
+
+
+def room_name_vocab(analysis, floor_labels=None):
+    """{lowercase first-word of room_name -> [(painted, height_ft)]} for the
+    given floors (all floors when None). Words too generic to be room labels
+    (_ROOM_WORD_STOP, or shorter than 3 chars) are dropped."""
+    vocab = {}
+    for fl in (analysis.get("floors") or []):
+        if floor_labels is not None:
+            if not (_floor_tokens(fl.get("floor_name")) & set(floor_labels)):
+                continue
+        for room in (fl.get("rooms") or []):
+            name = str(room.get("room_name") or "")
+            word = next((w for w in _re.split(r"[^A-Za-z]+", name) if w), "")
+            word = word.lower()
+            if len(word) < 3 or word in _ROOM_WORD_STOP:
+                continue
+            mats = str((room.get("materials") or {}).get("walls", "")).lower()
+            painted = bool(room.get("in_scope", True)) and not any(
+                k in mats for k in _UNPAINTABLE_WALL_KW)
+            h = (room.get("dimensions") or {}).get("ceiling_height_feet")
+            try:
+                h = float(h) if h else None
+            except (TypeError, ValueError):
+                h = None
+            if h is not None and not (6 <= h <= 45):
+                h = None
+            vocab.setdefault(word, []).append((painted, h))
+    return vocab
+
+
+def _drop_table_columns(hits, min_run=5):
+    """Remove matches stacked in one x-column at uniform y pitch — that's a
+    schedule/legend table (A102 carries a FINISH PLAN MATERIAL SCHEDULE whose
+    rows repeat the room-name vocabulary), not room labels on the plan."""
+    by_col = {}
+    for hit in hits:
+        by_col.setdefault(round(hit[0] / 4.0), []).append(hit)
+    out = []
+    for col in by_col.values():
+        if len(col) >= min_run:
+            ys = sorted(h[1] for h in col)
+            gaps = [b - a for a, b in zip(ys, ys[1:])]
+            med = sorted(gaps)[len(gaps) // 2] if gaps else 0
+            if med and all(abs(g - med) <= med * 0.35 for g in gaps):
+                continue
+        out.extend(col)
+    return out
+
+
+_CAPTION_SKIP_RE = _re.compile(r"plot|key|notes|:", _re.I)
+
+
+def viewport_captions(pdf_path, page_index):
+    """Viewport title captions on a plan page: [(cx, cy, text, excluded,
+    floors)]. A caption is a short text line ending in PLAN(S); excluded
+    means the viewport is a non-wall source (_NOT_PLAN_RE: reflected
+    ceiling, demolition, furniture, power...). Overlapping captions dedupe
+    to the longest text (multi-line titles emit both the full line and its
+    fragments)."""
+    if fitz is None:
+        return []
+    doc = fitz.open(pdf_path)
+    try:
+        page = doc[page_index]
+        d = page.get_text("dict")
+    finally:
+        doc.close()
+    cands = []
+    for block in d.get("blocks", []):
+        for line in block.get("lines", []):
+            txt = " ".join(sp.get("text", "") for sp in line.get("spans", []))
+            t = _norm(txt).strip()
+            if (not t or len(t) > 60 or _CAPTION_SKIP_RE.search(t)
+                    or not _re.search(r"plans?$", t, _re.I)):
+                continue
+            bb = line.get("bbox") or (0, 0, 0, 0)
+            cands.append(((bb[0] + bb[2]) / 2.0, (bb[1] + bb[3]) / 2.0,
+                          t, bool(_NOT_PLAN_RE.search(t)), _floors_in(t)))
+    cands.sort(key=lambda c: -len(c[2]))
+    out = []
+    for c in cands:
+        if any(abs(c[0] - o[0]) < 40 and abs(c[1] - o[1]) < 40 for o in out):
+            continue
+        out.append(c)
+    return out
+
+
+def viewport_wall_split(pdf_path, page_index, pts_per_ft):
+    """(kept_lf_ratio, kept_floors) for a multi-viewport plan page.
+
+    JW/Northwell A104 plots "FIFTH FLOOR PART PLAN" beside "THIRD FLOOR
+    REFLECTED CEILING PART PLAN": the RCP viewport's walls are drawn for
+    reference, not painted, and billing them fabricated ~11.5k SF. Wall
+    runs are assigned to their nearest caption; runs in excluded viewports
+    drop out. Returns (None, None) when the page has no excluded viewport
+    (nothing to split) or no usable captions."""
+    caps = viewport_captions(pdf_path, page_index)
+    if not caps or not any(c[3] for c in caps) or all(c[3] for c in caps):
+        return None, None
+    try:
+        runs = vm.wall_runs_with_positions(pdf_path, page_index, pts_per_ft)
+    except Exception:
+        return None, None
+    total = kept = 0.0
+    for orient, perp, lo, hi in runs:
+        mx, my = ((lo + hi) / 2.0, perp) if orient == "H" else (perp, (lo + hi) / 2.0)
+        best = min(caps, key=lambda c: (c[0] - mx) ** 2 + (c[1] - my) ** 2)
+        L = hi - lo
+        total += L
+        if not best[3]:
+            kept += L
+    if total <= 0:
+        return None, None
+    floors = sorted({f for c in caps if not c[3] for f in c[4]})
+    return kept / total, floors or None
+
+
+def page_text_room_anchors(pdf_path, page_index, analysis, floor_labels=None):
+    """Anchors from the measured page's OWN text layer, joined to extraction
+    rooms by name word: [(x_norm, y_norm, painted, h, unit=False)].
+
+    The extraction's label_bbox_norm coordinates register to whatever sheet
+    each room was READ from — on Northwell most 4th-floor rooms carry A400
+    (RCP) coordinates while the geometry is measured on A102, so region
+    billing captured nothing and the floor billed zero. The sheet's plotted
+    room labels are in the measured page's frame by construction; scope and
+    height still come from the extraction (majority painted / median height
+    per name word)."""
+    vocab = room_name_vocab(analysis, floor_labels)
+    if not vocab:
+        return []
+    doc = fitz.open(pdf_path)
+    try:
+        page = doc[page_index]
+        W, Hh = page.rect.width, page.rect.height
+        hits = []
+        for (x0, y0, x1, y1, word, *_rest) in page.get_text("words"):
+            w = _re.sub(r"[^A-Za-z]+", "", word).lower()
+            if w in vocab:
+                hits.append((x0, y0, (x0 + x1) / 2.0, (y0 + y1) / 2.0, w))
+    finally:
+        doc.close()
+    hits = _drop_table_columns(hits)
+    out = []
+    for (_, _, cx, cy, w) in hits:
+        votes = vocab[w]
+        painted = sum(1 for p, _ in votes if p) * 2 >= len(votes)
+        hs = sorted(h for _, h in votes if h is not None)
+        h = hs[len(hs) // 2] if hs else None
+        out.append((cx / W, cy / Hh, painted, h, False))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # M2b — raster room resolver (curves/diagonals-proof)
 # ---------------------------------------------------------------------------
@@ -1378,6 +1671,15 @@ def _read_heights(analysis, default=9.0):
     return per_floor, (num / den) if den else default
 
 
+def _floor45_arms():
+    """Fourth/fifth-floor height+frac matching, gated with the sheet-index
+    flag: it is a genuine bug fix (a 4th/5th floor could never match its own
+    read height and silently used the job default) but it shifts flag-off
+    results on tall sets (Homewood: −1.1% walls), and flag-off must stay
+    byte-identical to main."""
+    return os.environ.get("NIGHTSHIFT_SHEET_INDEX_TITLES", "0") == "1"
+
+
 def _height_for(per_floor, default, floor_label):
     for name, h in per_floor.items():
         if floor_label in ("1", "ground") and any(
@@ -1386,6 +1688,12 @@ def _height_for(per_floor, default, floor_label):
         if floor_label == "2" and any(k in name for k in ("second", "2nd")):
             return h
         if floor_label == "3" and any(k in name for k in ("third", "3rd")):
+            return h
+        if (floor_label == "4" and _floor45_arms()
+                and any(k in name for k in ("fourth", "4th"))):
+            return h
+        if (floor_label == "5" and _floor45_arms()
+                and any(k in name for k in ("fifth", "5th"))):
             return h
         if floor_label == "basement" and "basement" in name:
             return h
@@ -1471,6 +1779,12 @@ def _frac_for(per_floor_frac, default_frac, floor_labels):
                 fr.append(f)
             elif lab == "3" and any(k in name for k in ("third", "3rd")):
                 fr.append(f)
+            elif (lab == "4" and _floor45_arms()
+                    and any(k in name for k in ("fourth", "4th"))):
+                fr.append(f)
+            elif (lab == "5" and _floor45_arms()
+                    and any(k in name for k in ("fifth", "5th"))):
+                fr.append(f)
             elif lab == "basement" and "basement" in name:
                 fr.append(f)
             elif lab == "mezz" and "mezz" in name:
@@ -1520,17 +1834,47 @@ def compute_vme_scoped(pdf_paths, analysis, default_height_ft=9.0):
     sib = max(set(scales), key=scales.count) if scales else None
 
     def page_anchor_info(p):
+        use_text = os.environ.get(
+            "NIGHTSHIFT_SHEET_INDEX_TITLES", "0") == "1"
+        fl = [f for f in p["floors"] if f != "all"]
+
+        def text_route(beat=0):
+            # anchors from the measured page's own plotted labels — always
+            # registered to the right frame (extraction bboxes register to
+            # whatever sheet each room was READ from, e.g. the RCP)
+            if not use_text:
+                return None
+            a = page_text_room_anchors(p["pdf"], p["page"], analysis,
+                                       set(fl) if fl else None)
+            if len(a) >= max(3, beat + 1) and _dispersed(a):
+                return a, "text"
+            return None
+
         if multi:
             tok = (p["pdf"].rsplit("/", 1)[-1].upper()
                    .replace("-", "").replace(".", ""))
             a = room_anchors(analysis, sheet_token=tok)
             if a and _dispersed(a):
+                if len(a) < 8:
+                    t = text_route(beat=len(a))
+                    if t:
+                        return t
                 return a, "sheet"
         else:
             a = room_anchors(analysis, page_number=p["page"] + 1)
             if a and _dispersed(a):
+                # a sparse page route means most of this page's rooms were
+                # read off a sibling sheet (Northwell: 5 of 66 fourth-floor
+                # rooms carry A102 coordinates, the rest the RCP's) — prefer
+                # the page's own labels when they outnumber it
+                if len(a) < 8:
+                    t = text_route(beat=len(a))
+                    if t:
+                        return t
                 return a, "page"
-        fl = [f for f in p["floors"] if f != "all"]
+        t = text_route()
+        if t:
+            return t
         if fl:
             a = room_anchors(analysis, floor_labels=set(fl))
             # floor-fallback coordinates only transfer within the SAME
@@ -1559,8 +1903,18 @@ def compute_vme_scoped(pdf_paths, analysis, default_height_ft=9.0):
         if lf is None:
             unmeasured.append(f"{p['pdf'].rsplit('/', 1)[-1]}#{p['page'] + 1}")
             continue
-        if len(p["floors"]) == 1 and p["floors"][0] != "all":
-            h = _height_for(per_floor_h, def_h, p["floors"][0])
+        bill_floors = p["floors"]
+        vp_note = ""
+        if os.environ.get("NIGHTSHIFT_SHEET_INDEX_TITLES", "0") == "1":
+            ratio, kept_floors = viewport_wall_split(
+                p["pdf"], p["page"], r["pts_per_ft"])
+            if ratio is not None:
+                lf *= ratio
+                vp_note = f",vp{ratio:.2f}"
+                if kept_floors:
+                    bill_floors = kept_floors
+        if len(bill_floors) == 1 and bill_floors[0] != "all":
+            h = _height_for(per_floor_h, def_h, bill_floors[0])
         else:
             h = def_h
         anchors, a_src = anchor_info[id(p)]
@@ -1568,7 +1922,7 @@ def compute_vme_scoped(pdf_paths, analysis, default_height_ft=9.0):
         wb = walls_by_basis_regions(p["pdf"], p["page"], r["pts_per_ft"],
                                     anchors, default_height_ft=h)
         n_anch = wb["n_anchors"]
-        pg_frac = _frac_for(per_floor_fr, def_frac, p["floors"])
+        pg_frac = _frac_for(per_floor_fr, def_frac, bill_floors)
         if a_src == "degen":
             blf, bsf = lf * pg_frac, lf * h * pg_frac
             mode = f"frac(degen,{pg_frac:.2f})"
@@ -1584,13 +1938,27 @@ def compute_vme_scoped(pdf_paths, analysis, default_height_ft=9.0):
             else:
                 blf, bsf = wb["run_bill_lf"], wb["run_bill_sf"]
             mode = f"rooms({n_anch},{a_src},cov{wb['region_coverage']:.2f})"
-            region_lf += blf
+            if (os.environ.get("NIGHTSHIFT_SHEET_INDEX_TITLES", "0") == "1"
+                    and blf < lf * 0.05 and lf >= 300
+                    and wb["region_coverage"] < 0.3):
+                # zero-capture degrade: substantial drawn geometry with a
+                # near-zero region bill means the anchor coordinates are
+                # mis-registered for this sheet (wrong page frame /
+                # clustered tiles) — billing zero silently deletes a floor
+                # (Northwell A102: 2,508 LF drawn, 0 billed). Fall back to
+                # the painted-fraction clip like the degen path.
+                blf, bsf = lf * pg_frac, lf * h * pg_frac
+                mode = (f"frac(zero-capture,{pg_frac:.2f},"
+                        f"cov{wb['region_coverage']:.2f})")
+            else:
+                region_lf += blf
+        mode += vp_note
         raw_lf += lf
         raw_sf += lf * h
         bill_lf += blf
         bill_sf += bsf
         by_page.append({"pdf": p["pdf"].rsplit("/", 1)[-1],
-                        "page": p["page"] + 1, "floors": p["floors"],
+                        "page": p["page"] + 1, "floors": bill_floors,
                         "lf": round(lf, 1), "bill_lf": round(blf, 1),
                         "bill_sf": round(bsf), "scope_mode": mode,
                         "h": round(h, 2),
