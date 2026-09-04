@@ -18291,8 +18291,30 @@ def _dedup_template_instances(analysis):
         if total_units >= 2:
             keep_template = (abs(t["mult"] - total_units)
                              <= abs(inst_units - total_units))
+        # Schedule identity outranks template inference: a finish-schedule
+        # row is a 1:1 proof the instance is a real, distinct room. On a
+        # non-residential job total_units is 0, keep_template defaults
+        # True, and this gate folded 43 of 57 schedule-listed hospital
+        # exam/office rooms as "instances" of an extraction-artifact
+        # template (Northwell combined-2: walls -61%, doors 34->11).
+        _sched_nums = set()
+        if os.environ.get("NIGHTSHIFT_SHEET_INDEX_TITLES", "0") == "1":
+            for _row in (analysis.get("room_finish_schedule") or []):
+                _n = str(_row.get("room_number") or "").strip()
+                if _n:
+                    _sched_nums.add(_n)
+        if _sched_nums:
+            proven = [r for r in instances
+                      if str(r.get("room_number") or "").strip()
+                      in _sched_nums]
+            if keep_template and len(proven) >= 2:
+                keep_template = False
         losers = instances if keep_template else t["rooms"]
         side = "instances" if keep_template else "template"
+        if _sched_nums and keep_template:
+            losers = [r for r in losers
+                      if str(r.get("room_number") or "").strip()
+                      not in _sched_nums]
         for r in losers:
             r["in_scope"] = False
             r["scope_exclusion_reason"] = (
@@ -20468,9 +20490,27 @@ def _apply_schedule_room_scope(analysis):
                 else:
                     _dupes.add(id(rm))
 
+    # Floor boundary for NAME-token matches: a name match is many-to-one
+    # ('Exam (1)' on the FIFTH floor matches a fourth-floor 'Exam 09' row),
+    # so it can leak scope onto floors the schedule never mentions. When
+    # numeric identities exist, the floors holding them ARE the schedule's
+    # coverage; a floor with zero numeric matches gets no name-match
+    # inclusion (Northwell: the A102 finish plan covers suites 400/417 on
+    # the fourth floor only — JW bids no walls on 3/5, but name leakage
+    # kept 33 third/fifth-floor rooms in scope).
+    _num_floors = set()
+    if os.environ.get("NIGHTSHIFT_SHEET_INDEX_TITLES", "0") == "1":
+        for fl in (analysis.get("floors") or []):
+            for rm in (fl.get("rooms") or []):
+                if (isinstance(rm, dict) and rm.get("in_scope", True)
+                        and _match_key(rm, numeric_only=True) is not None):
+                    _num_floors.add(id(fl))
+                    break
+
     dropped, kept = [], 0
     anchored_out = []
     for fl in (analysis.get("floors") or []):
+        _floor_name_ok = (not _num_floors) or (id(fl) in _num_floors)
         _mf = max(1, int(_num(fl.get("unit_multiplier", 1)) or 1))
         for rm in (fl.get("rooms") or []):
             if not isinstance(rm, dict) or not rm.get("in_scope", True):
@@ -20491,7 +20531,10 @@ def _apply_schedule_room_scope(analysis):
                         removed_elems[_agg_key] = removed_elems.get(
                             _agg_key, 0.0) + _v
                 continue
-            if _matched(rm):
+            _mk = _match_key(rm)
+            if _mk is not None and (
+                    _floor_name_ok
+                    or _match_key(rm, numeric_only=True) is not None):
                 kept += 1
                 continue
             rm["in_scope"] = False
