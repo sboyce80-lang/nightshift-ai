@@ -1352,6 +1352,164 @@ def page_text_unit_anchors(pdf_path, page_index, vocab):
         doc.close()
 
 
+_ROOM_WORD_STOP = frozenset(
+    "room rooms floor plan area new existing typical note notes see detail "
+    "wall walls ceiling paint finish schedule legend scale north the and "
+    "with type work suite level sheet".split())
+
+
+def room_name_vocab(analysis, floor_labels=None):
+    """{lowercase first-word of room_name -> [(painted, height_ft)]} for the
+    given floors (all floors when None). Words too generic to be room labels
+    (_ROOM_WORD_STOP, or shorter than 3 chars) are dropped."""
+    vocab = {}
+    for fl in (analysis.get("floors") or []):
+        if floor_labels is not None:
+            if not (_floor_tokens(fl.get("floor_name")) & set(floor_labels)):
+                continue
+        for room in (fl.get("rooms") or []):
+            name = str(room.get("room_name") or "")
+            word = next((w for w in _re.split(r"[^A-Za-z]+", name) if w), "")
+            word = word.lower()
+            if len(word) < 3 or word in _ROOM_WORD_STOP:
+                continue
+            mats = str((room.get("materials") or {}).get("walls", "")).lower()
+            painted = bool(room.get("in_scope", True)) and not any(
+                k in mats for k in _UNPAINTABLE_WALL_KW)
+            h = (room.get("dimensions") or {}).get("ceiling_height_feet")
+            try:
+                h = float(h) if h else None
+            except (TypeError, ValueError):
+                h = None
+            if h is not None and not (6 <= h <= 45):
+                h = None
+            vocab.setdefault(word, []).append((painted, h))
+    return vocab
+
+
+def _drop_table_columns(hits, min_run=5):
+    """Remove matches stacked in one x-column at uniform y pitch — that's a
+    schedule/legend table (A102 carries a FINISH PLAN MATERIAL SCHEDULE whose
+    rows repeat the room-name vocabulary), not room labels on the plan."""
+    by_col = {}
+    for hit in hits:
+        by_col.setdefault(round(hit[0] / 4.0), []).append(hit)
+    out = []
+    for col in by_col.values():
+        if len(col) >= min_run:
+            ys = sorted(h[1] for h in col)
+            gaps = [b - a for a, b in zip(ys, ys[1:])]
+            med = sorted(gaps)[len(gaps) // 2] if gaps else 0
+            if med and all(abs(g - med) <= med * 0.35 for g in gaps):
+                continue
+        out.extend(col)
+    return out
+
+
+_CAPTION_SKIP_RE = _re.compile(r"plot|key|notes|:", _re.I)
+
+
+def viewport_captions(pdf_path, page_index):
+    """Viewport title captions on a plan page: [(cx, cy, text, excluded,
+    floors)]. A caption is a short text line ending in PLAN(S); excluded
+    means the viewport is a non-wall source (_NOT_PLAN_RE: reflected
+    ceiling, demolition, furniture, power...). Overlapping captions dedupe
+    to the longest text (multi-line titles emit both the full line and its
+    fragments)."""
+    if fitz is None:
+        return []
+    doc = fitz.open(pdf_path)
+    try:
+        page = doc[page_index]
+        d = page.get_text("dict")
+    finally:
+        doc.close()
+    cands = []
+    for block in d.get("blocks", []):
+        for line in block.get("lines", []):
+            txt = " ".join(sp.get("text", "") for sp in line.get("spans", []))
+            t = _norm(txt).strip()
+            if (not t or len(t) > 60 or _CAPTION_SKIP_RE.search(t)
+                    or not _re.search(r"plans?$", t, _re.I)):
+                continue
+            bb = line.get("bbox") or (0, 0, 0, 0)
+            cands.append(((bb[0] + bb[2]) / 2.0, (bb[1] + bb[3]) / 2.0,
+                          t, bool(_NOT_PLAN_RE.search(t)), _floors_in(t)))
+    cands.sort(key=lambda c: -len(c[2]))
+    out = []
+    for c in cands:
+        if any(abs(c[0] - o[0]) < 40 and abs(c[1] - o[1]) < 40 for o in out):
+            continue
+        out.append(c)
+    return out
+
+
+def viewport_wall_split(pdf_path, page_index, pts_per_ft):
+    """(kept_lf_ratio, kept_floors) for a multi-viewport plan page.
+
+    JW/Northwell A104 plots "FIFTH FLOOR PART PLAN" beside "THIRD FLOOR
+    REFLECTED CEILING PART PLAN": the RCP viewport's walls are drawn for
+    reference, not painted, and billing them fabricated ~11.5k SF. Wall
+    runs are assigned to their nearest caption; runs in excluded viewports
+    drop out. Returns (None, None) when the page has no excluded viewport
+    (nothing to split) or no usable captions."""
+    caps = viewport_captions(pdf_path, page_index)
+    if not caps or not any(c[3] for c in caps) or all(c[3] for c in caps):
+        return None, None
+    try:
+        runs = vm.wall_runs_with_positions(pdf_path, page_index, pts_per_ft)
+    except Exception:
+        return None, None
+    total = kept = 0.0
+    for orient, perp, lo, hi in runs:
+        mx, my = ((lo + hi) / 2.0, perp) if orient == "H" else (perp, (lo + hi) / 2.0)
+        best = min(caps, key=lambda c: (c[0] - mx) ** 2 + (c[1] - my) ** 2)
+        L = hi - lo
+        total += L
+        if not best[3]:
+            kept += L
+    if total <= 0:
+        return None, None
+    floors = sorted({f for c in caps if not c[3] for f in c[4]})
+    return kept / total, floors or None
+
+
+def page_text_room_anchors(pdf_path, page_index, analysis, floor_labels=None):
+    """Anchors from the measured page's OWN text layer, joined to extraction
+    rooms by name word: [(x_norm, y_norm, painted, h, unit=False)].
+
+    The extraction's label_bbox_norm coordinates register to whatever sheet
+    each room was READ from — on Northwell most 4th-floor rooms carry A400
+    (RCP) coordinates while the geometry is measured on A102, so region
+    billing captured nothing and the floor billed zero. The sheet's plotted
+    room labels are in the measured page's frame by construction; scope and
+    height still come from the extraction (majority painted / median height
+    per name word)."""
+    vocab = room_name_vocab(analysis, floor_labels)
+    if not vocab:
+        return []
+    doc = fitz.open(pdf_path)
+    try:
+        page = doc[page_index]
+        W, Hh = page.rect.width, page.rect.height
+        hits = []
+        for (x0, y0, x1, y1, word, *_rest) in page.get_text("words"):
+            w = _re.sub(r"[^A-Za-z]+", "", word).lower()
+            if w in vocab:
+                hits.append((x0, y0, (x0 + x1) / 2.0, (y0 + y1) / 2.0, w))
+    finally:
+        doc.close()
+    hits = _drop_table_columns(hits)
+    out = []
+    for (_, _, cx, cy, w) in hits:
+        votes = vocab[w]
+        painted = sum(1 for p, _ in votes if p) * 2 >= len(votes)
+        hs = sorted(h for _, h in votes if h is not None)
+        h = hs[len(hs) // 2] if hs else None
+        out.append((cx / W, cy / Hh, painted, h, False))
+    return out
+
+
 # ---------------------------------------------------------------------------
 # M2b — raster room resolver (curves/diagonals-proof)
 # ---------------------------------------------------------------------------
@@ -1522,6 +1680,10 @@ def _height_for(per_floor, default, floor_label):
             return h
         if floor_label == "3" and any(k in name for k in ("third", "3rd")):
             return h
+        if floor_label == "4" and any(k in name for k in ("fourth", "4th")):
+            return h
+        if floor_label == "5" and any(k in name for k in ("fifth", "5th")):
+            return h
         if floor_label == "basement" and "basement" in name:
             return h
         if floor_label == "mezz" and "mezz" in name:
@@ -1606,6 +1768,10 @@ def _frac_for(per_floor_frac, default_frac, floor_labels):
                 fr.append(f)
             elif lab == "3" and any(k in name for k in ("third", "3rd")):
                 fr.append(f)
+            elif lab == "4" and any(k in name for k in ("fourth", "4th")):
+                fr.append(f)
+            elif lab == "5" and any(k in name for k in ("fifth", "5th")):
+                fr.append(f)
             elif lab == "basement" and "basement" in name:
                 fr.append(f)
             elif lab == "mezz" and "mezz" in name:
@@ -1655,17 +1821,47 @@ def compute_vme_scoped(pdf_paths, analysis, default_height_ft=9.0):
     sib = max(set(scales), key=scales.count) if scales else None
 
     def page_anchor_info(p):
+        use_text = os.environ.get(
+            "NIGHTSHIFT_SHEET_INDEX_TITLES", "0") == "1"
+        fl = [f for f in p["floors"] if f != "all"]
+
+        def text_route(beat=0):
+            # anchors from the measured page's own plotted labels — always
+            # registered to the right frame (extraction bboxes register to
+            # whatever sheet each room was READ from, e.g. the RCP)
+            if not use_text:
+                return None
+            a = page_text_room_anchors(p["pdf"], p["page"], analysis,
+                                       set(fl) if fl else None)
+            if len(a) >= max(3, beat + 1) and _dispersed(a):
+                return a, "text"
+            return None
+
         if multi:
             tok = (p["pdf"].rsplit("/", 1)[-1].upper()
                    .replace("-", "").replace(".", ""))
             a = room_anchors(analysis, sheet_token=tok)
             if a and _dispersed(a):
+                if len(a) < 8:
+                    t = text_route(beat=len(a))
+                    if t:
+                        return t
                 return a, "sheet"
         else:
             a = room_anchors(analysis, page_number=p["page"] + 1)
             if a and _dispersed(a):
+                # a sparse page route means most of this page's rooms were
+                # read off a sibling sheet (Northwell: 5 of 66 fourth-floor
+                # rooms carry A102 coordinates, the rest the RCP's) — prefer
+                # the page's own labels when they outnumber it
+                if len(a) < 8:
+                    t = text_route(beat=len(a))
+                    if t:
+                        return t
                 return a, "page"
-        fl = [f for f in p["floors"] if f != "all"]
+        t = text_route()
+        if t:
+            return t
         if fl:
             a = room_anchors(analysis, floor_labels=set(fl))
             # floor-fallback coordinates only transfer within the SAME
@@ -1694,8 +1890,18 @@ def compute_vme_scoped(pdf_paths, analysis, default_height_ft=9.0):
         if lf is None:
             unmeasured.append(f"{p['pdf'].rsplit('/', 1)[-1]}#{p['page'] + 1}")
             continue
-        if len(p["floors"]) == 1 and p["floors"][0] != "all":
-            h = _height_for(per_floor_h, def_h, p["floors"][0])
+        bill_floors = p["floors"]
+        vp_note = ""
+        if os.environ.get("NIGHTSHIFT_SHEET_INDEX_TITLES", "0") == "1":
+            ratio, kept_floors = viewport_wall_split(
+                p["pdf"], p["page"], r["pts_per_ft"])
+            if ratio is not None:
+                lf *= ratio
+                vp_note = f",vp{ratio:.2f}"
+                if kept_floors:
+                    bill_floors = kept_floors
+        if len(bill_floors) == 1 and bill_floors[0] != "all":
+            h = _height_for(per_floor_h, def_h, bill_floors[0])
         else:
             h = def_h
         anchors, a_src = anchor_info[id(p)]
@@ -1703,7 +1909,7 @@ def compute_vme_scoped(pdf_paths, analysis, default_height_ft=9.0):
         wb = walls_by_basis_regions(p["pdf"], p["page"], r["pts_per_ft"],
                                     anchors, default_height_ft=h)
         n_anch = wb["n_anchors"]
-        pg_frac = _frac_for(per_floor_fr, def_frac, p["floors"])
+        pg_frac = _frac_for(per_floor_fr, def_frac, bill_floors)
         if a_src == "degen":
             blf, bsf = lf * pg_frac, lf * h * pg_frac
             mode = f"frac(degen,{pg_frac:.2f})"
@@ -1733,12 +1939,13 @@ def compute_vme_scoped(pdf_paths, analysis, default_height_ft=9.0):
                         f"cov{wb['region_coverage']:.2f})")
             else:
                 region_lf += blf
+        mode += vp_note
         raw_lf += lf
         raw_sf += lf * h
         bill_lf += blf
         bill_sf += bsf
         by_page.append({"pdf": p["pdf"].rsplit("/", 1)[-1],
-                        "page": p["page"] + 1, "floors": p["floors"],
+                        "page": p["page"] + 1, "floors": bill_floors,
                         "lf": round(lf, 1), "bill_lf": round(blf, 1),
                         "bill_sf": round(bsf), "scope_mode": mode,
                         "h": round(h, 2),
