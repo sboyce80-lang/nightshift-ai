@@ -20100,12 +20100,23 @@ def _apply_vme_authoritative_walls(analysis):
                     f"scope-clipped measurement is only {share:.0%} room-"
                     f"anchored (rest is fraction-inferred) — not measured "
                     f"provenance")
-            elif bill_lf_scoped > 1.75 * max(frac_expect, 1.0):
+            elif (bill_lf_scoped > 1.75 * max(frac_expect, 1.0)
+                    and not (llm_total <= 0
+                             and os.environ.get(
+                                 "NIGHTSHIFT_SHEET_INDEX_TITLES",
+                                 "0") == "1")):
                 # Region attribution claims far more in-scope wall than the
                 # LLM's room-level scope supports — the two scope signals
                 # disagree, so neither earns measured provenance
                 # (Livestock replay: region billed 99% of a page whose rooms
                 # are 46% painted -> +73% would have shipped as measured).
+                # Exception (flag-gated): a roster whose aggregate walls
+                # collapsed to ZERO has no scope signal to disagree WITH —
+                # its frac expectation is noise, and abstaining here prices
+                # walls at $0 from that same dead roster (Northwell rerun4:
+                # every room height read 0, dedup removed all wall SF, the
+                # zero-walls gate fired, yet 2,868 room-anchored LF sat
+                # measured). Promote room-anchored geometry and say so.
                 scoped_why = (
                     f"region attribution bills {bill_lf_scoped:,.0f} LF but "
                     f"room-level scope supports only ~{frac_expect:,.0f} LF "
@@ -20121,6 +20132,14 @@ def _apply_vme_authoritative_walls(analysis):
                                        for pg in scoped.get("by_page", [])],
                        "n_floor_pages": scoped.get("n_pages"),
                        "engine": "m4-scoped-regions"}
+                if (llm_total <= 0
+                        and bill_lf_scoped > 1.75 * max(frac_expect, 1.0)):
+                    rec["roster_collapsed"] = True
+                    analysis.setdefault("notes", []).append(
+                        "[VME] Extraction wall roster collapsed to zero; "
+                        "walls priced from room-anchored geometry alone. "
+                        "RFI: confirm wall scope and ceiling heights — the "
+                        "room schedule read failed on this run.")
         elif scoped is not None:
             scoped_why = "scoped measurement found no billable wall geometry"
     if basis is None:
