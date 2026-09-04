@@ -1671,6 +1671,15 @@ def _read_heights(analysis, default=9.0):
     return per_floor, (num / den) if den else default
 
 
+def _floor45_arms():
+    """Fourth/fifth-floor height+frac matching, gated with the sheet-index
+    flag: it is a genuine bug fix (a 4th/5th floor could never match its own
+    read height and silently used the job default) but it shifts flag-off
+    results on tall sets (Homewood: −1.1% walls), and flag-off must stay
+    byte-identical to main."""
+    return os.environ.get("NIGHTSHIFT_SHEET_INDEX_TITLES", "0") == "1"
+
+
 def _height_for(per_floor, default, floor_label):
     for name, h in per_floor.items():
         if floor_label in ("1", "ground") and any(
@@ -1680,9 +1689,11 @@ def _height_for(per_floor, default, floor_label):
             return h
         if floor_label == "3" and any(k in name for k in ("third", "3rd")):
             return h
-        if floor_label == "4" and any(k in name for k in ("fourth", "4th")):
+        if (floor_label == "4" and _floor45_arms()
+                and any(k in name for k in ("fourth", "4th"))):
             return h
-        if floor_label == "5" and any(k in name for k in ("fifth", "5th")):
+        if (floor_label == "5" and _floor45_arms()
+                and any(k in name for k in ("fifth", "5th"))):
             return h
         if floor_label == "basement" and "basement" in name:
             return h
@@ -1768,9 +1779,11 @@ def _frac_for(per_floor_frac, default_frac, floor_labels):
                 fr.append(f)
             elif lab == "3" and any(k in name for k in ("third", "3rd")):
                 fr.append(f)
-            elif lab == "4" and any(k in name for k in ("fourth", "4th")):
+            elif (lab == "4" and _floor45_arms()
+                    and any(k in name for k in ("fourth", "4th"))):
                 fr.append(f)
-            elif lab == "5" and any(k in name for k in ("fifth", "5th")):
+            elif (lab == "5" and _floor45_arms()
+                    and any(k in name for k in ("fifth", "5th"))):
                 fr.append(f)
             elif lab == "basement" and "basement" in name:
                 fr.append(f)
