@@ -436,6 +436,61 @@ agg_b = dict(agg_a)
 agg_b = json.loads(json.dumps(agg_a)) if False else None
 os.environ.pop("NIGHTSHIFT_SCHEDULE_ROOM_SCOPE", None)
 
+# ── 9. roster anchoring: one schedule row is one room ───────────────────
+print("\n[9] schedule roster anchoring")
+
+def _anchor_case():
+    return {
+        "room_finish_schedule": [
+            {"room_number": f"400-{i:02d}", "room_name": f"Exam {i}",
+             "wall_finish": "PT1", "ceiling_finish": "ACT1"}
+            for i in range(1, 9)],
+        "floors": [{"rooms": [
+            {"room_id": "A1", "room_name": "Exam 1", "room_number": "400-01",
+             "in_scope": True, "dimensions": {"wall_area_sqft": 300},
+             "elements": {"doors_full_paint": 1}},
+            {"room_id": "A2", "room_name": "Exam 1 (dup)",
+             "room_number": "400-01", "in_scope": True,
+             "dimensions": {"wall_area_sqft": 0},
+             "elements": {"doors_full_paint": 1}},
+            {"room_id": "A3", "room_name": "Exam 1", "room_number": "400-01",
+             "in_scope": True, "dimensions": {"wall_area_sqft": 120},
+             "elements": {"doors_full_paint": 1}},
+            {"room_id": "B", "room_name": "Exam 2", "room_number": "400-02",
+             "in_scope": True, "dimensions": {"wall_area_sqft": 250},
+             "elements": {"doors_full_paint": 1}},
+            {"room_id": "X", "room_name": "Elevator Lobby", "in_scope": True,
+             "dimensions": {"wall_area_sqft": 900},
+             "elements": {"doors_full_paint": 4}},
+        ]}], "notes": [],
+        "aggregated_totals": {"total_doors_full_paint": 8}}
+
+os.environ["NIGHTSHIFT_SCHEDULE_ROOM_SCOPE"] = "1"
+os.environ["NIGHTSHIFT_SCHEDULE_ROOM_ANCHOR"] = "0"
+off9 = T._apply_schedule_room_scope(_anchor_case())
+check(off9["_schedule_room_scope"]["rooms_kept"] == 4
+      and off9["_schedule_room_scope"].get("rooms_anchored_out", 0) == 0,
+      "anchor OFF -> all three duplicates kept (unchanged behavior)")
+
+os.environ["NIGHTSHIFT_SCHEDULE_ROOM_ANCHOR"] = "1"
+on9 = T._apply_schedule_room_scope(_anchor_case())
+r9 = on9["_schedule_room_scope"]
+ins9 = [x["room_id"] for f in on9["floors"] for x in f["rooms"]
+        if x.get("in_scope", True)]
+check(r9["rooms_anchored_out"] == 2,
+      f"two duplicates folded out (got {r9.get('rooms_anchored_out')})")
+check(ins9 == ["A1", "B"],
+      f"best-dimensioned room per row survives (got {ins9})")
+check(on9["aggregated_totals"]["total_doors_full_paint"] == 2,
+      f"folded rooms stop billing doors (got "
+      f"{on9['aggregated_totals']['total_doors_full_paint']})")
+check(any("Schedule Room Anchor" in str(n) for n in on9.get("notes", [])),
+      "anchoring explained in the notes")
+check(r9["rooms_kept"] <= len(_anchor_case()["room_finish_schedule"]),
+      "kept rooms never exceed the schedule row count")
+os.environ.pop("NIGHTSHIFT_SCHEDULE_ROOM_ANCHOR", None)
+os.environ.pop("NIGHTSHIFT_SCHEDULE_ROOM_SCOPE", None)
+
 print("\n" + "=" * 60)
 if FAILS:
     print(f"❌ {len(FAILS)} FAILED:")

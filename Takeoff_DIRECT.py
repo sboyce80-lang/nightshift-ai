@@ -19922,16 +19922,33 @@ def _apply_schedule_room_scope(analysis):
     by_num, by_name = _build_schedule_row_maps(rfs)
     row_toks = [(r, _schedule_row_tokens(r)) for r in rfs]
 
-    def _matched(room):
-        if _match_schedule_row(room, by_num, by_name) is not None:
-            return True
+    def _match_key(room):
+        """Schedule row this room maps to, or None. Returns a stable key so
+        rooms can be grouped per row."""
+        row = _match_schedule_row(room, by_num, by_name)
+        if row is not None:
+            return (_canon_room_number(row.get("room_number"))
+                    or str(row.get("room_name") or "").lower())
         toks = set(t for t in re.sub(
             r"[^a-z0-9]+", " ",
             str(room.get("room_name") or "").lower()).split()
             if len(t) >= 3 and t not in _DEDUP_GENERIC_TOKENS)
         if not toks:
-            return False
-        return any(toks & rt for _r, rt in row_toks if rt)
+            return None
+        best, best_n = None, 0
+        for _r, rt in row_toks:
+            if not rt:
+                continue
+            n = len(toks & rt)
+            if n > best_n:
+                best, best_n = _r, n
+        if best is None:
+            return None
+        return (_canon_room_number(best.get("room_number"))
+                or str(best.get("room_name") or "").lower())
+
+    def _matched(room):
+        return _match_key(room) is not None
 
     # Element totals carried by the rooms we remove. Marking a room
     # out_of_scope is not enough: aggregated_totals is computed upstream and
@@ -19953,11 +19970,63 @@ def _apply_schedule_room_scope(analysis):
     )
     removed_elems = {}
 
+    # ── Roster anchoring (NIGHTSHIFT_SCHEDULE_ROOM_ANCHOR) ────────────────
+    # A finish schedule row IS one room. Without this, every extracted room
+    # that maps to a row is kept, so extraction noise passes straight
+    # through: Phelps rerun-3 read a stable 53-55 row schedule on all six
+    # passes yet kept 62-131 rooms, and doors swung 80-161 (65% spread)
+    # because duplicates each carried their own. Keeping the best room per
+    # row makes the roster as stable as the schedule it came from.
+    _anchor = os.environ.get(
+        "NIGHTSHIFT_SCHEDULE_ROOM_ANCHOR", "0").strip() in (
+        "1", "true", "True")
+    _best_for_row, _dupes = {}, set()
+    if _anchor:
+        def _score(rm):
+            d = rm.get("dimensions") or {}
+            el = rm.get("elements") or {}
+            return (1 if _num(d.get("wall_area_sqft", 0)) > 0 else 0,
+                    _num(d.get("wall_area_sqft", 0)),
+                    _num(d.get("ceiling_area_sqft", 0)),
+                    sum(_num(el.get(k, 0)) for k in
+                        ("doors_full_paint", "doors_hm_panel")))
+        for fl in (analysis.get("floors") or []):
+            for rm in (fl.get("rooms") or []):
+                if not isinstance(rm, dict) or not rm.get("in_scope", True):
+                    continue
+                k = _match_key(rm)
+                if k is None:
+                    continue
+                cur = _best_for_row.get(k)
+                if cur is None or _score(rm) > _score(cur):
+                    if cur is not None:
+                        _dupes.add(id(cur))
+                    _best_for_row[k] = rm
+                else:
+                    _dupes.add(id(rm))
+
     dropped, kept = [], 0
+    anchored_out = []
     for fl in (analysis.get("floors") or []):
         _mf = max(1, int(_num(fl.get("unit_multiplier", 1)) or 1))
         for rm in (fl.get("rooms") or []):
             if not isinstance(rm, dict) or not rm.get("in_scope", True):
+                continue
+            if _anchor and id(rm) in _dupes:
+                rm["in_scope"] = False
+                rm["scope_exclusion_reason"] = (
+                    "duplicate of another extracted room mapping to the same "
+                    "finish-schedule row — one row is one room")
+                anchored_out.append(rm.get("room_name")
+                                    or rm.get("room_id") or "room")
+                _mult = _mf * max(
+                    1, int(_num(rm.get("unit_multiplier", 1)) or 1))
+                _el = rm.get("elements") or {}
+                for _src, _agg_key in _ELEM_AGG:
+                    _v = _num(_el.get(_src, 0)) * _mult
+                    if _v:
+                        removed_elems[_agg_key] = removed_elems.get(
+                            _agg_key, 0.0) + _v
                 continue
             if _matched(rm):
                 kept += 1
@@ -19975,9 +20044,19 @@ def _apply_schedule_room_scope(analysis):
                     removed_elems[_agg_key] = removed_elems.get(
                         _agg_key, 0.0) + _v
 
-    total = kept + len(dropped)
-    rec = {"applied": bool(dropped), "rooms_dropped": len(dropped),
+    total = kept + len(dropped) + len(anchored_out)
+    rec = {"applied": bool(dropped or anchored_out),
+           "rooms_dropped": len(dropped),
            "rooms_kept": kept, "schedule_rows": len(rfs)}
+    if anchored_out:
+        rec["rooms_anchored_out"] = len(anchored_out)
+        analysis.setdefault("notes", []).append(
+            f"[Schedule Room Anchor] {len(anchored_out)} extracted room(s) "
+            f"mapped to a finish-schedule row already represented by a "
+            f"better-dimensioned room and were folded out — one schedule row "
+            f"is one room. {kept} room(s) remain against {len(rfs)} rows.")
+        print(f"   ⚓ Schedule room anchor: folded {len(anchored_out)} "
+              f"duplicate(s); {kept} room(s) for {len(rfs)} rows")
 
     # Decrement the aggregates by what left scope, floored at what the
     # surviving rooms actually hold so the two can never disagree.
@@ -27860,11 +27939,18 @@ def _run_job_draw_median(k, pdf_paths, run_kwargs):
         spread_pct = (max(vote_subs) - min(vote_subs)) / (
             sum(vote_subs) / len(vote_subs)) * 100
         report["subtotal_spread_pct"] = round(spread_pct, 1)
+    # Default lowered 40 -> 25 (Phelps rerun-3, 2026-09-03). That job's
+    # draws were $39,388 / $42,236 / $56,480 — a 37.1% spread, meaning the
+    # answer depended on which draw won the vote (+1.0% vs +44.8%). At the
+    # old limit it shipped unflagged; it was caught only because a
+    # different rule happened to fire. A spread this wide is exactly the
+    # case a human must see, and the check only ADDS review — it never
+    # changes a quantity.
     try:
         spread_limit = float(os.environ.get(
-            "NIGHTSHIFT_DRAW_SPREAD_REVIEW_PCT", "40") or 40)
+            "NIGHTSHIFT_DRAW_SPREAD_REVIEW_PCT", "25") or 25)
     except (TypeError, ValueError):
-        spread_limit = 40.0
+        spread_limit = 25.0
     analysis["_job_draw_median"] = report
     note = (f"[Draw Median] {k} independent extraction draws; draw "
             f"{sel + 1} selected as composition median. Subtotals: "
