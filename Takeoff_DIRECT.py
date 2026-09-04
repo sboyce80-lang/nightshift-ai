@@ -120,6 +120,13 @@ def _so_obj(props, nullable=False):
 _SO_ROOM_ITEM = _so_obj({
     "room_id": _SO_STR,
     "room_name": _SO_STR,
+    # The JOIN KEY to the finish schedule. Its absence was structural:
+    # Phelps extracted 161 rooms carrying ZERO room numbers while the
+    # schedule listed clean 400-xx / 417-xx identities, so the two sides
+    # could only be matched on fuzzy names — which is many-to-one and
+    # therefore either over-keeps rooms (91 kept, 103 doors vs JW's 78) or
+    # over-folds them (34 kept, 42 doors). Null when the plan shows none.
+    "room_number": _SO_STR,
     "source_page": _SO_NUM,
     "source_sheet": _SO_STR,
     "unit_multiplier": _SO_NUM,
@@ -8150,6 +8157,7 @@ IMPORTANT RULES:
         {
           "room_id": "F1-APT101-LIV",
           "room_name": "Living Room",
+          "room_number": "101",
           "source_page": 3,
           "source_sheet": "A-102",
           "unit_multiplier": 1,
@@ -9097,6 +9105,10 @@ Your task: Extract the ROOM FINISH SCHEDULE and BUILDING INFORMATION from this d
 1. ROOM FINISH SCHEDULE (usually sheet A1.04, A1.04A, or similar "Room Finish" pages):
    For EACH room listed in the Room Finish Schedule, extract:
    - room_name: The room name/type (e.g., "Living Room", "Bedroom 1", "Kitchen", "Bathroom", "Hallway", "Closet")
+   - room_number: The room's NUMBER exactly as tagged on the plan ("101", "400-05", "417B").
+     This is the identity used to join a room to its finish-schedule row, so copy it
+     verbatim into this field — do NOT bury it inside room_name and do NOT invent one.
+     Null only when the plan genuinely shows no number for that room.
    - room_number: The room number if shown
    - wall_finish: What's specified for walls (e.g., "Paint", "PT-1", "Wallcovering", "Tile", "CMU Paint",
      "Plaster", "Venetian Plaster", "Lyme Wash", "Lime Wash", "Epoxy", "Epoxy Paint", "Precast").
@@ -19848,6 +19860,42 @@ def _schedule_nonpaint_ceiling_rooms(analysis):
     return _is_nonpaint, len(rfs)
 
 
+_EMBEDDED_ROOM_NUM_RX = re.compile(
+    r"[(\[#]?\s*\b(\d{3}[-.\s]?\d{1,2}[A-Za-z]?|\d{3}[A-D])\b\s*[)\]]?")
+
+
+def _backfill_room_numbers(analysis):
+    """Lift a room number out of room_name into room_number.
+
+    Extraction writes names like "Shared Office (400-05)" or
+    "Pre/Post Bay 400-27" but leaves room_number null, so the schedule
+    join has nothing to key on. Parsing it is deterministic and free, and
+    it works on results produced before room_number existed in the schema.
+    Only fills an EMPTY field — never overwrites what extraction reported.
+    """
+    if not isinstance(analysis, dict):
+        return analysis
+    if os.environ.get("NIGHTSHIFT_ROOM_NUMBER_BACKFILL", "0").strip() not in (
+            "1", "true", "True"):
+        return analysis
+    filled = 0
+    for fl in (analysis.get("floors") or []):
+        for rm in (fl.get("rooms") or []):
+            if not isinstance(rm, dict):
+                continue
+            if str(rm.get("room_number") or "").strip():
+                continue
+            m = _EMBEDDED_ROOM_NUM_RX.search(str(rm.get("room_name") or ""))
+            if m:
+                rm["room_number"] = m.group(1)
+                filled += 1
+    if filled:
+        analysis["_room_number_backfill"] = {"filled": filled}
+        print(f"   🔑 Room-number backfill: recovered {filled} room "
+              f"number(s) from room names")
+    return analysis
+
+
 def _apply_schedule_room_scope(analysis):
     """Flag-gated (NIGHTSHIFT_SCHEDULE_ROOM_SCOPE, default off): rooms
     absent from an authoritative finish schedule leave SCOPE entirely.
@@ -19922,13 +19970,28 @@ def _apply_schedule_room_scope(analysis):
     by_num, by_name = _build_schedule_row_maps(rfs)
     row_toks = [(r, _schedule_row_tokens(r)) for r in rfs]
 
-    def _match_key(room):
-        """Schedule row this room maps to, or None. Returns a stable key so
-        rooms can be grouped per row."""
+    def _match_key(room, numeric_only=False):
+        """Schedule row this room maps to, or None.
+
+        numeric_only=True restricts the answer to matches made through a
+        room NUMBER. That distinction is what makes anchoring safe: a
+        number is a 1:1 identity, whereas name-token matching is
+        many-to-one — five distinct exam rooms can all "best match" one
+        generic row. Rerun-4 anchored on both and folded 57 rooms, leaving
+        34 for a 55-row schedule; doors collapsed +105% -> -41%.
+        """
         row = _match_schedule_row(room, by_num, by_name)
         if row is not None:
+            # Membership must use the SAME normalization by_num was built
+            # with (_room_num_token), not _canon_room_number — mixing the
+            # two silently made every numeric match fail.
+            rtok = _room_num_token(room.get("room_number"))
+            if numeric_only and not (rtok and rtok in by_num):
+                return None
             return (_canon_room_number(row.get("room_number"))
                     or str(row.get("room_name") or "").lower())
+        if numeric_only:
+            return None
         toks = set(t for t in re.sub(
             r"[^a-z0-9]+", " ",
             str(room.get("room_name") or "").lower()).split()
@@ -19994,7 +20057,8 @@ def _apply_schedule_room_scope(analysis):
             for rm in (fl.get("rooms") or []):
                 if not isinstance(rm, dict) or not rm.get("in_scope", True):
                     continue
-                k = _match_key(rm)
+                # Numeric identity only — see _match_key.
+                k = _match_key(rm, numeric_only=True)
                 if k is None:
                     continue
                 cur = _best_for_row.get(k)
@@ -21716,6 +21780,8 @@ def build_priced_takeoff(analysis, strict=None):
     # elements), not just their wall paint. Must run BEFORE the ceiling
     # gates and every aggregate rebuild below, so out-of-scope rooms never
     # reach them. Flag-gated; no-op when off.
+    # Recover the schedule join key before any schedule gate runs.
+    analysis = _backfill_room_numbers(analysis)
     analysis = _apply_schedule_room_scope(analysis)
 
     # Final ceiling-scope reconciliation (ACT demote + commercial aggregate

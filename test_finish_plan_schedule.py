@@ -491,6 +491,43 @@ check(r9["rooms_kept"] <= len(_anchor_case()["room_finish_schedule"]),
 os.environ.pop("NIGHTSHIFT_SCHEDULE_ROOM_ANCHOR", None)
 os.environ.pop("NIGHTSHIFT_SCHEDULE_ROOM_SCOPE", None)
 
+# ── 10. room_number: the schedule join key ──────────────────────────────
+print("\n[10] room_number join key")
+
+check("room_number" in T._SO_ROOM_ITEM["properties"],
+      "room_number is in the extraction schema")
+check("room_number" in T._SO_ROOM_ITEM["required"],
+      "room_number is required+nullable like every other field")
+
+def _bf():
+    return {"floors": [{"rooms": [
+        {"room_id": "a", "room_name": "Shared Office (400-05)"},
+        {"room_id": "b", "room_name": "Pre/Post Bay 400-27"},
+        {"room_id": "c", "room_name": "MA Station (417-13)"},
+        {"room_id": "d", "room_name": "Corridor 417B"},
+        {"room_id": "e", "room_name": "Isolation #1"},
+        {"room_id": "f", "room_name": "Exam 9", "room_number": "400-99"},
+    ]}]}
+
+os.environ.pop("NIGHTSHIFT_ROOM_NUMBER_BACKFILL", None)
+off10 = T._backfill_room_numbers(_bf())
+check(all(not r.get("room_number") for r in off10["floors"][0]["rooms"][:5]),
+      "flag OFF -> inert")
+
+os.environ["NIGHTSHIFT_ROOM_NUMBER_BACKFILL"] = "1"
+on10 = T._backfill_room_numbers(_bf())
+got = {r["room_id"]: r.get("room_number") for r in on10["floors"][0]["rooms"]}
+check(got["a"] == "400-05", f"parses '(400-05)' (got {got['a']})")
+check(got["b"] == "400-27", f"parses bare '400-27' (got {got['b']})")
+check(got["c"] == "417-13", f"parses '(417-13)' (got {got['c']})")
+check(got["d"] == "417B", f"parses suite letter '417B' (got {got['d']})")
+check(not got["e"], "'Isolation #1' yields no false number")
+check(got["f"] == "400-99", "never overwrites a number extraction reported")
+check(on10["_room_number_backfill"]["filled"] == 4,
+      f"records how many were recovered (got "
+      f"{on10['_room_number_backfill']['filled']})")
+os.environ.pop("NIGHTSHIFT_ROOM_NUMBER_BACKFILL", None)
+
 print("\n" + "=" * 60)
 if FAILS:
     print(f"❌ {len(FAILS)} FAILED:")
