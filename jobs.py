@@ -723,6 +723,86 @@ def _build_and_upload_annotated_drawings(submission_id, result, local_pdfs,
         return [], []
 
 
+def _delivery_full_package_enabled():
+    """Full review package in delivery emails (2026-09-05 product decision):
+    customer-facing takeoff PDF attached alongside the estimate + annotated
+    drawings, and a "Please confirm scope" section in the email body and
+    takeoff. Read at call time so per-job flag posture applies. Default OFF.
+    """
+    return os.environ.get(
+        "NIGHTSHIFT_DELIVERY_FULL_PACKAGE", "0").strip() in (
+            "1", "true", "True")
+
+
+def _build_and_upload_customer_takeoff(submission_id, result, workdir):
+    """Render the customer-facing Takeoff PDF and upload it as a result file.
+
+    Best-effort like the estimate: any failure — including the renderer's
+    internal-voice/competitor scrub refusing the content — logs and returns
+    None, and the delivery goes out without the takeoff. A scrub refusal
+    must never be "fixed" by attaching the document anyway (white-label
+    lesson, 2026-09-02).
+
+    Returns the local PDF path on success, or None.
+    """
+    try:
+        with session_scope() as session:
+            sub = session.get(Submission, submission_id)
+            if sub is None:
+                logger.warning("Takeoff skipped: submission %s not found",
+                               submission_id)
+                return None
+            org = session.get(Organization, sub.org_id)
+            if org is None:
+                logger.warning("Takeoff skipped: org %s not found for %s",
+                               sub.org_id, submission_id)
+                return None
+            session.expunge(sub)
+            session.expunge(org)
+
+        from takeoff_customer_pdf import generate_customer_takeoff_pdf
+        pdf_path = generate_customer_takeoff_pdf(sub, org, result, workdir)
+        filename = os.path.basename(pdf_path)
+        r2_key = storage.result_key(submission_id, filename)
+        size_bytes = os.path.getsize(pdf_path)
+        storage.upload_file(pdf_path, r2_key, content_type="application/pdf")
+        _record_result_file(submission_id, filename, r2_key, size_bytes,
+                            "application/pdf")
+        return pdf_path
+    except Exception as exc:
+        logger.error("Customer takeoff PDF generation failed for %s: %s",
+                     submission_id, exc, exc_info=True)
+        return None
+
+
+def _scope_confirm_email_block(result, max_items=8):
+    """Plaintext "PLEASE CONFIRM SCOPE" section for the delivery email.
+
+    Lists allowance lines, customer-facing RFIs, and policy-uncertain
+    (priced-at-zero) scope — item, quantity, dollar amount, one-line
+    question. Empty string when there is nothing to confirm. Long lists
+    are capped; the takeoff PDF carries the full set.
+    """
+    from takeoff_customer_pdf import (SCOPE_CONFIRM_FRAMING,
+                                      build_scope_confirm_items)
+    items = build_scope_confirm_items(result)
+    if not items:
+        return ""
+    lines = ["", "PLEASE CONFIRM SCOPE", SCOPE_CONFIRM_FRAMING, ""]
+    for it in items[:max_items]:
+        amount = it.get("amount") or 0
+        amount_txt = (f"${amount:,.2f}" if amount > 0
+                      else "$0.00 (not priced)")
+        lines.append(f"  - {it['item']}")
+        lines.append(f"    Qty: {it['qty']} | Amount: {amount_txt}")
+        lines.append(f"    {it['question']}")
+    if len(items) > max_items:
+        lines.append(f"  (+{len(items) - max_items} more — see the attached "
+                     f"takeoff PDF for the full list)")
+    lines.append("")
+    return "\n".join(lines)
+
+
 def _build_and_upload_estimate(submission_id, result, workdir):
     """Render the formal Estimate PDF and upload it as a third result file.
 
@@ -1080,14 +1160,26 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
                 submission_id, result, workdir,
             )
 
+            # Full-package deliverable (flag NIGHTSHIFT_DELIVERY_FULL_PACKAGE):
+            # customer-facing Takeoff PDF — per-category quantities and
+            # per-room measurements in the customer's voice, plus the
+            # "Please confirm scope" section. Best-effort.
+            takeoff_pdf_path = None
+            if _delivery_full_package_enabled():
+                takeoff_pdf_path = _build_and_upload_customer_takeoff(
+                    submission_id, result, workdir)
+
             # Fourth deliverable: Annotated Drawings PDF — each source page
             # rendered with the takeoff markups drawn on top, so the
             # contractor (and we) can visually confirm what was measured and
             # spot missed sheets at a glance. Best-effort. Reserve email
-            # budget for the two PDFs that must always attach.
+            # budget for the PDFs that must always attach (takeoff included
+            # when the full package is on — it is small next to the
+            # annotated set, which is the one that gets cut down).
             reserved = sum(
                 os.path.getsize(p)
-                for p in (result.get("output_pdf_path"), estimate_pdf_path)
+                for p in (result.get("output_pdf_path"), estimate_pdf_path,
+                          takeoff_pdf_path)
                 if p and os.path.exists(p))
             annotated_pdf_paths, annotated_notes = \
                 _build_and_upload_annotated_drawings(
@@ -1167,6 +1259,7 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
                         contact_info, result,
                         extra_attachment_paths=annotated_pdf_paths,
                         estimate_pdf_path=estimate_pdf_path,
+                        takeoff_pdf_path=takeoff_pdf_path,
                         submission_id=submission_id,
                         extra_body_notes=annotated_notes,
                     )
@@ -1360,6 +1453,13 @@ def merge_submission(submission_id, parent_id, new_pdf_keys, contact_info,
 
             _build_and_upload_estimate(submission_id, result, workdir)
 
+            # Full-package takeoff for revisions too — a rerun is a fresh
+            # delivery and carries the same review package.
+            takeoff_pdf_path = None
+            if _delivery_full_package_enabled():
+                takeoff_pdf_path = _build_and_upload_customer_takeoff(
+                    submission_id, result, workdir)
+
             # Same manual-review gate as process_submission. A revision
             # can fail confidence checks too — e.g. a customer uploading
             # an addendum that re-introduces a Hardie scope the parent
@@ -1408,6 +1508,7 @@ def merge_submission(submission_id, parent_id, new_pdf_keys, contact_info,
             if claim_email_send(submission_id):
                 try:
                     send_result_email(contact_info, result,
+                                      takeoff_pdf_path=takeoff_pdf_path,
                                       submission_id=submission_id)
                 except Exception as email_exc:
                     release_email_claim(submission_id)
@@ -1544,14 +1645,20 @@ def _budget_attachments(paths):
 
 
 def send_result_email(contact_info, result, extra_attachment_paths=None,
-                      estimate_pdf_path=None, submission_id=None,
-                      extra_body_notes=None):
+                      estimate_pdf_path=None, takeoff_pdf_path=None,
+                      submission_id=None, extra_body_notes=None):
     """Email the contractor that their estimate is ready.
 
     Attaches the analysis PDF, the formal branded Estimate PDF (with the
-    org's logo), and any extra attachments (annotated drawings, etc.)
+    org's logo), the customer takeoff PDF (full-package flag), and any
+    extra attachments (annotated drawings, etc.)
     that fit the size budget — oversized files are omitted with a note
     in the body rather than bouncing the whole message.
+
+    When NIGHTSHIFT_DELIVERY_FULL_PACKAGE is on, the body also carries the
+    "Please confirm scope" section — allowances, open RFIs, and unpriced
+    scope, framed so the customer decides what enters the final bid. With
+    the flag off, body and attachments are exactly the pre-flag behavior.
     The raw result JSON is intentionally *not* attached — end users don't
     know what to do with it. `send_result_json_to_admin` ships that
     separately to admin@knightshiftai.com so we still keep a copy.
@@ -1578,9 +1685,13 @@ def send_result_email(contact_info, result, extra_attachment_paths=None,
         if item.get("qty", 0) > 0:
             items_text += f"  - {item['item']}: ${item['total']:,.2f}\n"
 
-    # Analysis PDF and estimate PDF first — they're small and essential.
-    # Annotated drawings are the ones that blow the budget.
+    full_package = _delivery_full_package_enabled()
+
+    # Analysis PDF, estimate PDF and takeoff PDF first — they're small and
+    # essential. Annotated drawings are the ones that blow the budget.
     candidates = [result.get("output_pdf_path"), estimate_pdf_path]
+    if full_package and takeoff_pdf_path:
+        candidates.append(takeoff_pdf_path)
     candidates += list(extra_attachment_paths or [])
     attach_paths, skipped_paths = _budget_attachments(candidates)
     job_url = _job_page_url(submission_id) if submission_id else None
@@ -1606,6 +1717,18 @@ def send_result_email(contact_info, result, extra_attachment_paths=None,
         f"\nView this job online (all files, open RFIs, rerun with "
         f"revisions):\n{job_url}\n" if job_url else "")
 
+    # Full-package additions. Both stay "" with the flag off so the body
+    # is byte-identical to the pre-flag email.
+    scope_confirm_block = ""
+    takeoff_note = ""
+    if full_package:
+        scope_confirm_block = _scope_confirm_email_block(result)
+        if takeoff_pdf_path and takeoff_pdf_path in attach_paths:
+            takeoff_note = (
+                "\nAlso attached: your complete takeoff (PDF) — the "
+                "measured quantities behind this estimate, category by "
+                "category and room by room.")
+
     body = f"""Hi {contact_info['name']},
 
 Thank you for submitting your construction documents through Knight Shift. Your painting estimate is ready.
@@ -1626,12 +1749,12 @@ MEASUREMENTS EXTRACTED
 COST ESTIMATE
 {items_text}
   TOTAL: ${costs.get('subtotal', 0):,.2f}
-
+{scope_confirm_block}
 IMPORTANT: This is a preliminary estimate generated automatically from your
 drawings. A formal proposal will follow after review.
 
 Attached: the detailed analysis PDF and a formal Estimate (PDF) you can
-forward directly to your client.
+forward directly to your client.{takeoff_note}
 {omitted_note}{job_link_line}
 Best regards,
 {COMPANY_NAME}
