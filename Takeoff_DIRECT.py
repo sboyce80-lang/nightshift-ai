@@ -935,6 +935,58 @@ def _cache_dir_for(pdf_path):
     return d, ph
 
 
+# Runtime state the draw-median machinery threads through the environment.
+# These describe WHERE we are inside a job, not WHICH posture the job runs
+# under, so they stay out of the flag fingerprint (the checkpoint key already
+# hashes the draw tag separately).
+_FLAG_FINGERPRINT_EXCLUDE = {
+    "NIGHTSHIFT_JOB_DRAW_TAG",
+    "NIGHTSHIFT_JOB_DRAW_ACTIVE",
+    "NIGHTSHIFT_PROGRESS_FILE",
+}
+
+
+def _nightshift_flag_vector():
+    """The effective NIGHTSHIFT_* posture of this process, sorted k=v.
+
+    This is the record whose absence confounded every cross-run comparison
+    through 2026-09: the six Northwell runs executed at 56-66 flags and no
+    artifact said which. Read at call time so a per-job resolver posture is
+    captured as applied, not as booted.
+    """
+    return {
+        k: os.environ[k]
+        for k in sorted(os.environ)
+        if k.startswith("NIGHTSHIFT_") and k not in _FLAG_FINGERPRINT_EXCLUDE
+    }
+
+
+def _flag_fingerprint(vector=None):
+    """Short stable hash of the effective flag posture."""
+    vec = _nightshift_flag_vector() if vector is None else vector
+    blob = "\n".join(f"{k}={v}" for k, v in vec.items())
+    return hashlib.sha256(blob.encode("utf-8", "replace")).hexdigest()[:12]
+
+
+def _git_sha():
+    """Best-effort code revision: Render stamps RENDER_GIT_COMMIT; local
+    runs ask git. Returns "" rather than guessing."""
+    sha = os.environ.get("RENDER_GIT_COMMIT", "").strip()
+    if sha:
+        return sha[:12]
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True, text=True, timeout=5)
+        if out.returncode == 0:
+            return out.stdout.strip()[:12]
+    except Exception:
+        pass
+    return ""
+
+
 def _cache_valid(cache_dir):
     """Check if cache exists and was generated with the current code version."""
     meta_path = cache_dir / "metadata.json"
@@ -4255,6 +4307,13 @@ def _sheet_checkpoint_key(static_prompt, sheet_context, verify_enabled):
     _draw_tag = os.environ.get("NIGHTSHIFT_JOB_DRAW_TAG", "").strip()
     if _draw_tag:
         h.update(b"|draw=%s" % _draw_tag.encode("utf-8", "replace"))
+    # Effective flag posture: a checkpoint written under one flag set must
+    # not replay under another. The R4 batch silently replayed max-merge-era
+    # checkpoints after the fill-only fix, and cross-posture replays made
+    # the 2026-09 Northwell series unattributable. Within a job (and its
+    # retries) the posture is constant, so resume still works; a posture
+    # change forces fresh extraction, which is the point.
+    h.update(b"|posture=%s" % _flag_fingerprint().encode())
     return h.hexdigest()[:16]
 
 
@@ -29972,6 +30031,19 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     # Normalize scope fields after merge (ensures every room has in_scope)
     _update_progress(5, TOTAL_STEPS, "Validating & Recalculating", "Applying guardrails and schedule overrides...")
     analysis = _normalize_scope_fields(analysis)
+
+    # --- Run fingerprint: which code, under which flags, produced this ---
+    # Stamped on every path (web, CLI, harness), unlike the jobs.py posture
+    # stamp which only web jobs get. Without this no two results are
+    # comparable: the 2026-09 Northwell series ran at 56/61/63/63/64/66
+    # flags and only shell history knew.
+    _fp_vector = _nightshift_flag_vector()
+    analysis["run_fingerprint"] = {
+        "flag_fingerprint": _flag_fingerprint(_fp_vector),
+        "flags": _fp_vector,
+        "git_sha": _git_sha(),
+        "code_hash": _code_hash()[:12],
+    }
 
     # --- Skipped files: block silent partial estimates ---
     # files_skipped used to be written into the result JSON and read by
