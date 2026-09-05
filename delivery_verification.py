@@ -435,6 +435,15 @@ def attach_delivery_verification(analysis, costs=None):
             prior = analysis.get("manual_review_reason")
             analysis["manual_review_reason"] = (
                 f"{prior} | {reason}" if prior else reason)
+        if flagged:
+            # Tier 2: the bounded model reviewer, flagged jobs only,
+            # behind its own flag (see delivery_reviewer.py — hold-only
+            # authority, never quantities, never raises).
+            try:
+                import delivery_reviewer as _dr
+                analysis = _dr.attach_delivery_review(analysis)
+            except Exception:
+                pass
     except Exception as e:
         try:
             print(f"   ⚠️  delivery verification failed (non-fatal): "
