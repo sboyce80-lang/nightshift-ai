@@ -23388,6 +23388,20 @@ def build_priced_takeoff(analysis, strict=None):
                 f"under the provenance gate ({m:,.0f} measured priced). "
                 f"RFI REQUIRED: confirm this scope on the drawings before it "
                 f"is added to the bid.")
+    # Scope-mask shadow (NIGHTSHIFT_SCOPE_MASK_SHADOW, default off): derive
+    # the Phase-1 scope-mask contract from this run's extraction and record
+    # whether it validates. Shadow only — changes nothing (see scope_mask.py).
+    if os.environ.get("NIGHTSHIFT_SCOPE_MASK_SHADOW", "0").strip() in (
+            "1", "true", "True"):
+        try:
+            import scope_mask as _scope_mask
+            _sm = _scope_mask.mask_from_extraction(analysis)
+            _sm_ok, _sm_errs = _scope_mask.validate_scope_mask(_sm)
+            analysis["_scope_mask_shadow"] = {
+                "mask": _sm, "valid": _sm_ok, "errors": _sm_errs,
+                "rooms": len(_sm.get("rooms") or {})}
+        except Exception as _sm_exc:  # shadow tooling must never fail a job
+            analysis["_scope_mask_shadow"] = {"error": str(_sm_exc)}
     # Last step of the chain, after every gate has had its say: measure how
     # far the hand-maintained aggregates sit from the room data they claim
     # to summarize. Records only (see _audit_aggregate_drift).
