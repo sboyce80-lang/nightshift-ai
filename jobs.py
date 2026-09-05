@@ -325,6 +325,39 @@ def release_email_claim(submission_id):
                        submission_id, exc)
 
 
+def manual_review_flagged(result):
+    """True when the extractor flagged this result for manual review.
+
+    run_analysis() returns {"analysis": ..., "cost_estimate": ...}; the
+    manual_review_required flag lives on the analysis dict and is only
+    promoted to the top level of the JSON written to disk/R2 — never on
+    the in-memory return. Reading only the top level made the gate below
+    dead code from the day it landed (43f549b): every flagged estimate
+    auto-emailed anyway (Otto/BofA 7/21; BASC, MCC, Toyota 9/1–9/4).
+    Check both levels so neither representation can slip through.
+    """
+    if not isinstance(result, dict):
+        return False
+    if result.get("manual_review_required"):
+        return True
+    analysis = result.get("analysis")
+    return bool(isinstance(analysis, dict)
+                and analysis.get("manual_review_required"))
+
+
+def manual_review_reason(result):
+    """The flag's reason string, wherever it lives (see manual_review_flagged)."""
+    if not isinstance(result, dict):
+        return None
+    reason = result.get("manual_review_reason")
+    if reason:
+        return reason
+    analysis = result.get("analysis")
+    if isinstance(analysis, dict):
+        return analysis.get("manual_review_reason")
+    return None
+
+
 def maybe_send_freemium_lifecycle_emails(submission_id):
     """After a bid finishes (completed OR needs_review — both consume a
     freemium credit), fire the freemium lifecycle emails when thresholds
@@ -836,7 +869,7 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
             # mark the submission needs_review (not completed) so the
             # web UI / harness can distinguish auto-shippable runs from
             # human-needed ones.
-            manual_review = bool(result.get("manual_review_required"))
+            manual_review = manual_review_flagged(result)
             subtotal = result.get("cost_estimate", {}).get("subtotal", 0) or 0
 
             if manual_review:
@@ -844,7 +877,7 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
                     "Submission %s flagged for MANUAL REVIEW — skipping "
                     "customer estimate email. Reason: %s",
                     submission_id,
-                    result.get("manual_review_reason") or "(none provided)",
+                    manual_review_reason(result) or "(none provided)",
                 )
                 # Persist state BEFORE sending email: a crash/requeue in
                 # the old order (email -> status) re-ran the job and sent
@@ -1082,7 +1115,7 @@ def merge_submission(submission_id, parent_id, new_pdf_keys, contact_info,
             # an addendum that re-introduces a Hardie scope the parent
             # had auto-suppressed. Skip the customer-facing email when
             # the merged result is flagged.
-            manual_review = bool(result.get("manual_review_required"))
+            manual_review = manual_review_flagged(result)
             subtotal = result.get("cost_estimate", {}).get("subtotal", 0) or 0
 
             if manual_review:
@@ -1090,7 +1123,7 @@ def merge_submission(submission_id, parent_id, new_pdf_keys, contact_info,
                     "Merge submission %s flagged for MANUAL REVIEW — "
                     "skipping customer estimate email. Reason: %s",
                     submission_id,
-                    result.get("manual_review_reason") or "(none provided)",
+                    manual_review_reason(result) or "(none provided)",
                 )
                 # Status first, then claimed email — see process_submission.
                 update_status(submission_id, "needs_review", subtotal=subtotal)
@@ -1517,7 +1550,7 @@ def send_manual_review_email(contact_info, result, submission_id):
     # and it is not true. The extractor's own checks set
     # manual_review_reason; the blanket policy only appends a note, so
     # an absent/policy-only reason means "held by policy, nothing wrong".
-    _raw_reason = result.get("manual_review_reason")
+    _raw_reason = manual_review_reason(result)
     _analysis = result.get("analysis") or {}
     _policy_note = any(
         str(n).startswith("[Mandatory Review]")
