@@ -421,3 +421,127 @@ class File(Base):
 
     def __repr__(self) -> str:
         return f"<File id={self.id} kind={self.kind} key={self.r2_key}>"
+
+
+# ---------------------------------------------------------------------------
+# Internal CRM (accounts / contacts / notes)
+# ---------------------------------------------------------------------------
+# Schema is OWNED by the alembic migrations (0011, 0013, 0015-0019) and the
+# nightshift-crm Next.js app; these mappings exist so the product can WRITE
+# the tables (PLG signup auto-creates an account) and tests can create them
+# on sqlite. If a migration changes a crm_* table, mirror it here.
+#
+# Value constraints (varchar + CHECK in Postgres, enforced here only by
+# convention — sqlite tests don't get the CHECKs):
+#   status:          partner / prospect / beta / client / churned
+#   plan:            growth / scale / enterprise (freemium is NOT allowed;
+#                    the CRM UI's PLAN_OPTIONS has no freemium entry, so
+#                    PLG accounts carry plan=NULL + a timeline note)
+#   contact_status:  new / contacted / do_not_contact
+#   account_owner:   brian / matt / steve / elliott
+
+class CrmAccount(Base):
+    __tablename__ = "crm_accounts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    knightshift_org_id: Mapped[Optional[int]] = mapped_column(
+        ForeignKey("organizations.id", ondelete="SET NULL"),
+        nullable=True, index=True,
+    )
+
+    address_line1: Mapped[Optional[str]] = mapped_column(String(255))
+    address_line2: Mapped[Optional[str]] = mapped_column(String(255))
+    city: Mapped[Optional[str]] = mapped_column(String(128))
+    state: Mapped[Optional[str]] = mapped_column(String(64))
+    postal_code: Mapped[Optional[str]] = mapped_column(String(32))
+    country: Mapped[Optional[str]] = mapped_column(String(64))
+
+    industry: Mapped[Optional[str]] = mapped_column(String(32))
+    status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="prospect",
+    )
+    plan: Mapped[Optional[str]] = mapped_column(String(32))
+    contact_status: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="new",
+    )
+    account_owner: Mapped[Optional[str]] = mapped_column(String(32))
+
+    website: Mapped[Optional[str]] = mapped_column(String(255))
+    phone: Mapped[Optional[str]] = mapped_column(String(64))
+    org_size: Mapped[Optional[int]] = mapped_column(Integer)
+    annual_revenue: Mapped[Optional[float]] = mapped_column(Numeric(14, 2))
+    estimated_roi: Mapped[Optional[float]] = mapped_column(Numeric(8, 2))
+    notes: Mapped[Optional[str]] = mapped_column(Text)
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False,
+    )
+
+    contacts: Mapped[List["CrmContact"]] = relationship(
+        back_populates="account", cascade="all, delete-orphan",
+    )
+
+    def __repr__(self) -> str:
+        return f"<CrmAccount id={self.id} name={self.name!r} org={self.knightshift_org_id}>"
+
+
+class CrmContact(Base):
+    __tablename__ = "crm_contacts"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("crm_accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    email: Mapped[Optional[str]] = mapped_column(String(255), index=True)
+    phone: Mapped[Optional[str]] = mapped_column(String(64))
+    title: Mapped[Optional[str]] = mapped_column(String(255))
+
+    address_line1: Mapped[Optional[str]] = mapped_column(String(255))
+    address_line2: Mapped[Optional[str]] = mapped_column(String(255))
+    city: Mapped[Optional[str]] = mapped_column(String(128))
+    state: Mapped[Optional[str]] = mapped_column(String(64))
+    postal_code: Mapped[Optional[str]] = mapped_column(String(32))
+    country: Mapped[Optional[str]] = mapped_column(String(64))
+
+    lead_source: Mapped[Optional[str]] = mapped_column(String(64))
+    is_primary: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default="false",
+    )
+
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False,
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False,
+    )
+
+    account: Mapped["CrmAccount"] = relationship(back_populates="contacts")
+
+    def __repr__(self) -> str:
+        return f"<CrmContact id={self.id} name={self.name!r} account={self.account_id}>"
+
+
+class CrmAccountNote(Base):
+    __tablename__ = "crm_account_notes"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    account_id: Mapped[int] = mapped_column(
+        ForeignKey("crm_accounts.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    body: Mapped[str] = mapped_column(Text, nullable=False)
+    author_user_id: Mapped[Optional[str]] = mapped_column(String(255))
+    author_email: Mapped[Optional[str]] = mapped_column(String(320))
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, nullable=False,
+    )
+
+    def __repr__(self) -> str:
+        return f"<CrmAccountNote id={self.id} account={self.account_id}>"
