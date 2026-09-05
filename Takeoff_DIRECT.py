@@ -1874,6 +1874,7 @@ def _extract_known_sheet_ids_from_index(pdf_path):
     try:
         scan_limit = min(len(doc), 3)
         for pg_0 in range(scan_limit):
+            txt = ""
             try:
                 txt = doc[pg_0].get_text() or ""
             except Exception:
@@ -10761,6 +10762,7 @@ def _extract_building_inventory(client, pdf_path, index_page_indices, index_text
     # Create filtered PDF with only index pages
     # Try PDF first; if Claude can't process it, fall back to rendered images
     use_images = False
+    pdf_b64 = None
     try:
         filtered_pdf_bytes = _create_filtered_pdf(pdf_path, index_page_indices)
         # Check if the filtered PDF is too large (>5MB can cause issues)
@@ -12076,10 +12078,13 @@ def _apply_schedule_overrides(combined):
     sched_doors_frame = _num(ds.get("total_doors_frame_only", 0)) * schedule_scale
     sched_doors_total = sched_doors_fp + sched_doors_hm + sched_doors_frame
 
-    if sched_doors_total > 0:
-        room_doors_fp = _num(agg.get("total_doors_full_paint", 0))
-        room_doors_hm = _num(agg.get("total_doors_hm_panel", 0))
+    # Room-level counts captured BEFORE any schedule override writes into agg
+    # — the residential supplement below re-reads them and must see the
+    # pre-override values even when the override branch didn't run.
+    room_doors_fp = _num(agg.get("total_doors_full_paint", 0))
+    room_doors_hm = _num(agg.get("total_doors_hm_panel", 0))
 
+    if sched_doors_total > 0:
         # Schedule is authoritative — always use its values
         agg["total_doors_full_paint"] = sched_doors_fp
         agg["total_doors_hm_panel"] = sched_doors_hm
@@ -21084,9 +21089,9 @@ def _apply_vme_authoritative_walls(analysis):
     # clip where they don't, sibling-scale retry for no-scale pages. This is
     # what lets partial-scope jobs (renos, phased work) price from geometry
     # instead of abstaining.
+    scoped_why = "scoped measurement unavailable"
     if basis is None:
         scoped = analysis.get("_vme_scoped")
-        scoped_why = "scoped measurement unavailable"
         if scoped is None:
             paths = analysis.get("_vme_pdf_paths") or []
             if paths:
@@ -26372,6 +26377,7 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
 
     _use_footprint_pricing = False
     _footprint_interior_total = 0
+    _fp_rate = 0.0  # set alongside _use_footprint_pricing below
 
     # HARD_NUMBERS_ONLY: never substitute a footprint × rate estimate for the
     # measured per-room line items. Footprint pricing discards extracted scope
@@ -29575,6 +29581,9 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             and _extraction_likely_incomplete(best_result[1])
         )
 
+        # Referenced by the extra-pass branches much further down even when
+        # the enhanced-rescue block never runs — must exist on every path.
+        painting_page_indices = None
         if not used_per_sheet and (
                 best_rooms == 0 or rooms_have_zero_dims or likely_incomplete):
             try:
@@ -29587,7 +29596,6 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                 # Check if any page in this PDF is large-format, and identify
                 # painting-relevant pages to avoid tiling structural/MEP sheets
                 has_large_pages = False
-                painting_page_indices = None
                 try:
                     import fitz as _fitz_check
                     _doc_check = _fitz_check.open(pdf_path)
@@ -31136,11 +31144,24 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         _basis_hi_label = ("gross floor area stated on the drawings"
                            if _basis_hi == _read_gsf and _read_gsf
                            else "building footprint")
-        if _basis_hi > 500 and _total_paintable > _basis_hi * _hi_max:
-            _r_hi = _total_paintable / _basis_hi
+        # Compute the guard's own total: the commercial-only sanity block
+        # above also builds a _total_paintable, but only for commercial
+        # building types — reusing it here crashed every non-commercial job
+        # that ran with this guard on (UnboundLocalError; killed board cells
+        # in rounds 4 AND 5 before being root-caused).
+        _agg_hi = analysis.get("aggregated_totals", {}) or {}
+        _ext_hi = analysis.get("exterior", {}) or {}
+        _total_paintable_hi = (
+            _num(_agg_hi.get("total_paintable_wall_sqft", 0))
+            + _num(_agg_hi.get("total_paintable_ceiling_sqft", 0))
+            + _num(_agg_hi.get("total_dryfall_ceiling_sqft", 0))
+            + _num(_ext_hi.get("exterior_paint_sqft", 0))
+            + _num(_ext_hi.get("hardie_siding_sqft", 0)))
+        if _basis_hi > 500 and _total_paintable_hi > _basis_hi * _hi_max:
+            _r_hi = _total_paintable_hi / _basis_hi
             _msg_hi = (
                 f"[MANUAL REVIEW REQUIRED] Total extracted paintable surface "
-                f"({_total_paintable:,.0f} sqft) is implausibly HIGH relative "
+                f"({_total_paintable_hi:,.0f} sqft) is implausibly HIGH relative "
                 f"to the {_basis_hi_label} ({_basis_hi:,.0f} sqft) — ratio is "
                 f"{_r_hi:.1f}x, expected 3-6x. This usually means rooms "
                 f"OUTSIDE the scope boundary were extracted (a full-floor or "
@@ -31152,7 +31173,7 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             analysis["manual_review_reason"] = _msg_hi
             analysis.setdefault("notes", []).append(_msg_hi)
             analysis["_over_extraction_guard"] = {
-                "paintable": round(_total_paintable, 1),
+                "paintable": round(_total_paintable_hi, 1),
                 "basis": round(_basis_hi, 1),
                 "basis_label": _basis_hi_label,
                 "ratio": round(_r_hi, 2),
@@ -31160,7 +31181,7 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                 "inferred_footprint": round(_fp_hi, 1),
                 "read_gsf": round(_read_gsf, 1)}
             print(f"\n🚨 OVER-EXTRACTION GUARD TRIPPED")
-            print(f"   Paintable: {_total_paintable:,.0f} sqft vs "
+            print(f"   Paintable: {_total_paintable_hi:,.0f} sqft vs "
                   f"{_basis_hi_label} {_basis_hi:,.0f} sqft "
                   f"({_r_hi:.1f}x, max {_hi_max:.0f}x)")
             if _fp_hi and _read_gsf and _fp_hi > _read_gsf * 1.5:

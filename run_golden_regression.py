@@ -64,4 +64,24 @@ for cid in results:
         f"{('%+.1f'%dleg) if dleg is not None else 'n/a':>9s} "
         f"{('%.1f%%'%ps) if ps is not None else 'n/a':>10s}{flag}")
 log("REGRESSION = any legacy moved >3% from baseline. IMPROVEMENT = per_sheet << legacy.")
+log("NOTE: the ±3 alarm predates the measured 3-34pt run-to-run noise floor —")
+log("treat single-run deltas as noise; the accuracy ledger holds the series.")
 log("========== END ==========")
+
+# Every scored run lands in the ONE ledger (golden/accuracy_history.jsonl),
+# tagged per mode, so this harness stops being a write-only log file.
+import accuracy_ledger as _ledger  # noqa: E402
+for _mode in ("legacy", "per_sheet"):
+    _jobs = []
+    for _cid in results:
+        _mean, _rows = results[_cid].get(_mode, (None, []))
+        _rowdicts = [{"key": k, "actual": a, "target": t,
+                      "delta_pct": round((float(a)-float(t))/float(t)*100, 1)}
+                     for k, a, t, _e in _rows]
+        _rec = _ledger.job_record(_cid, {}, _rowdicts)
+        _rec["mean_abs_err_pct"] = round(_mean, 1) if _mean is not None else None
+        _jobs.append(_rec)
+    if _jobs:
+        _ledger.append_entry(source=f"run_golden_regression[{_mode}]",
+                             jobs=_jobs)
+log("ledger: appended to golden/accuracy_history.jsonl")

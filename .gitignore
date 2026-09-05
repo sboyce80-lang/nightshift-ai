@@ -10,8 +10,7 @@ uploads/
 jobs/
 
 # Local test-run harness — holds large customer PDFs/outputs, never deploy
-wingstop_local_run/
-rider_local_run/
+*_local_run/
 
 # Python
 *.pyc
@@ -53,6 +52,13 @@ validate_recovery.log
 validate_recovery_summary.json
 *_validate.json
 *_validate.pdf
+*_validate_run*.json
+*_validate_run*.pdf
+*_persheet.json
+*_persheet.pdf
+*_persheet_fixed.json
+*_residuals.json
+*.log
 
 # Validation-run artifacts (nsai_* batches, golden plan sets).
 # The harness SCRIPTS and the analysis NOTES are committed; the customer bid

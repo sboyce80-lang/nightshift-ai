@@ -26,6 +26,30 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Lint (correctness rules only)
+        # Undefined names, shadowed defs, syntax errors, pylint error class —
+        # the _total_paintable UnboundLocalError crashed two validation
+        # boards before anything caught it; this catches that class in
+        # milliseconds. Rule set lives in pyproject.toml; the repo passes
+        # clean as of 2026-09-04, so any hit is a new defect.
+        run: |
+          pip install "ruff>=0.6"
+          ruff check .
+
+      - name: UnboundLocalError gate (mypy possibly-undefined only)
+        # The static form of the crash that killed board cells in rounds 4
+        # and 5 (_total_paintable). mypy's other complaints on this untyped
+        # codebase are ignored; only possibly-undefined fails the build.
+        # Config in pyproject.toml [tool.mypy].
+        run: |
+          pip install "mypy>=1.8"
+          mypy *.py > mypy.out 2>&1 || true
+          if grep "possibly-undefined" mypy.out; then
+            echo "::error::possibly-undefined names found (UnboundLocalError risk)"
+            exit 1
+          fi
+          echo "possibly-undefined: clean"
+
       - name: Run offline test suites
         # Auto-discover every test_*.py at the repo root — a hardcoded list let
         # 13 committed suites (door-schedule scope, Beloit fixes, ceiling gate,

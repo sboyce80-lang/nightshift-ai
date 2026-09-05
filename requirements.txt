@@ -1,22 +1,27 @@
+# Pinned exact versions (2026-09-04). The unpinned floats here caused a real
+# outage: anthropic drifted to 1.x on a worker rebuild (2026-08-31) and took
+# extraction down until it was pinned back. Every entry is now the version
+# the production workers and the local venv actually run. Upgrades are
+# deliberate: bump the pin in a PR, let CI run the offline suites against it.
 anthropic==0.83.0
-PyPDF2>=3.0.0
-pycryptodome>=3.20.0
-PyMuPDF>=1.24.0
-reportlab>=4.0.0
-openpyxl>=3.1.0
-python-dotenv>=1.0.0
-flask>=3.0.0
-gunicorn>=21.2.0
-streamlit>=1.30.0
-Pillow>=10.0.0
-pdfplumber>=0.10.0
-redis>=5.0.0
-rq>=1.16.0
-boto3>=1.34.0
-SQLAlchemy>=2.0.0
-alembic>=1.13.0
-psycopg2-binary>=2.9.9
-clerk-backend-api>=1.0.0
-PyJWT[crypto]>=2.8.0
-weasyprint>=62.0
-Jinja2>=3.1.0
+PyPDF2==3.0.1
+pycryptodome==3.23.0
+PyMuPDF==1.26.5
+reportlab==4.5.1
+openpyxl==3.1.5
+python-dotenv==1.2.1
+flask==3.1.3
+gunicorn==23.0.0
+streamlit==1.50.0
+Pillow==11.3.0
+pdfplumber==0.11.8
+redis==7.0.1
+rq==2.8.0
+boto3==1.42.97
+SQLAlchemy==2.0.49
+alembic==1.16.5
+psycopg2-binary==2.9.12
+clerk-backend-api==4.2.0
+PyJWT[crypto]==2.13.0
+weasyprint==66.0
+Jinja2==3.1.6
