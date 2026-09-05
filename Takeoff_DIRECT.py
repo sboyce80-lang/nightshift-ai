@@ -3982,6 +3982,19 @@ def _elev_reconcile_enabled():
         "1", "true", "True")
 
 
+def _price_unpriced_classes_enabled():
+    """Price the scope classes that are extracted but historically never
+    reached the bid (the −15% to −17% JW-band signature): interior window
+    paint from confirmed counts only, wallcovering install at the
+    unit-corrected $/SF rate, and a commercial general-requirements
+    percentage line. Default OFF — when off, calculate_costs output is
+    byte-identical to before. No heuristic quantities: unconfirmed windows
+    stay $0 and raise an RFI instead. Rates/evidence in config.py under
+    "Unpriced-classes pricing"."""
+    return os.environ.get("NIGHTSHIFT_PRICE_UNPRICED_CLASSES", "0").strip() in (
+        "1", "true", "True")
+
+
 def _ext_pricing_fix_enabled():
     """Exterior pricing fixes from the BofA Vails Gate run (2026-07-21):
     extracted exterior quantities that never reached the cost lines.
@@ -26248,6 +26261,31 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
     windows = _num(aggregated_totals.get('total_windows_painted_interior',
                    aggregated_totals.get('total_windows', 0)))
 
+    # NIGHTSHIFT_PRICE_UNPRICED_CLASSES: strict provenance for the window
+    # line. Only total_windows_painted_interior — a count confirmed as
+    # interior-painted by the window schedule / room pass — is priced; the
+    # legacy total_windows fallback above can smuggle an unconfirmed count
+    # into the bid. When the plans show windows (total_windows_all > 0) but
+    # none are confirmed painted, hard-numbers policy holds the line at $0
+    # and raises an RFI (same machinery as the door-ledger mismatch RFI).
+    if _price_unpriced_classes_enabled():
+        windows = _num(aggregated_totals.get('total_windows_painted_interior', 0))
+        _win_all_ea = _num(aggregated_totals.get('total_windows_all', 0))
+        if windows <= 0 and _win_all_ea > 0 and isinstance(analysis, dict):
+            _win_rfi = {
+                "category": "Windows",
+                "question": (
+                    f"The plans show {_win_all_ea:.0f} windows but none are "
+                    f"confirmed as interior field-painted (no window schedule "
+                    f"paint scope). The bid carries interior window paint at "
+                    f"$0 per hard-numbers policy. Please confirm which "
+                    f"windows receive interior paint (sash/stool/apron/"
+                    f"casing) so this line can be priced.")}
+            _win_bucket = analysis.setdefault("rfi_items", [])
+            if not any(isinstance(r, dict) and r.get("category") == "Windows"
+                       for r in _win_bucket):
+                _win_bucket.append(_win_rfi)
+
     # Window TRIM ops (stool/apron/casing) — flag-gated
     # (NIGHTSHIFT_WINDOW_TRIM_SCOPE, default OFF). 2026-08-20 JW batch:
     # the schedule scan already counts paintable components per window
@@ -26617,9 +26655,23 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
         wc_rate = _get_tiered_rate(pm['wallcovering_install'], wallcovering_sqft) if 'wallcovering_install' in pm else 9.00
         wc_markup_key = 'wallcovering_install'
         wc_label = "Wallcovering Install (Labor)"
+        # NIGHTSHIFT_PRICE_UNPRICED_CLASSES — WC unit bug resolution:
+        # the quantity here is SQUARE FEET (wallcovering_sqft = confirmed
+        # WC wall LF × height, aggregated as total_wallcovering_sqft), so
+        # SF won and the rate must be $/SF. The pm default 9.00 is the
+        # trade's per-LINEAL-YARD install quote (54" goods, 13.5 SF/LY)
+        # misapplied per SF — a ~13.5× overprice. Use the converted
+        # config rate ($9.00/LY ÷ 13.5 ≈ $0.67/SF; full derivation and
+        # evidence in config.py WC_INSTALL_RATE_PER_SF). Org rate
+        # overrides (_rate_overridden) keep priority: an operator who set
+        # their own install rate meant it in $/SF already.
+        if (_price_unpriced_classes_enabled()
+                and not _rate_locked('wallcovering_install')):
+            wc_rate = float(getattr(_cfg, "WC_INSTALL_RATE_PER_SF", 0.67))
         # Rider's verified Mazda takeoff bills WC install at $0.50/SF vs the
         # $9.00 config default (18x). Override pending Rider's confirmation:
         # set NIGHTSHIFT_WC_INSTALL_RATE=0.50 once Brian confirms the basis.
+        # (Explicit env override wins over the flag path above.)
         _wc_env = os.environ.get("NIGHTSHIFT_WC_INSTALL_RATE", "").strip()
         if _wc_env:
             try:
@@ -27262,6 +27314,26 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
             f"strike if factory-finished) - {sash_ops:.0f} EA @ "
             f"${_sash_rate:.2f}", sash_ops, _sash_rate,
             _get_markup('window_sash')))
+
+    # NIGHTSHIFT_PRICE_UNPRICED_CLASSES — General Requirements line.
+    # JW carries PM/super/mobilization/clean-up/etc. as LS general-
+    # requirements lines on every commercial bid (Northwell: 11 lines,
+    # $2,500 = 6.8% of the trade subtotal) while we priced $0 — part of
+    # the systematic −15% JW-band gap. Applied AFTER the painting trade
+    # subtotal as a percentage (config GENERAL_REQUIREMENTS_PCT, default
+    # 7%), commercial building types only, no markup on the line (JW's
+    # GR lines are lump sums, not marked-up labor). Not a heuristic
+    # quantity: the base is the measured, priced trade subtotal.
+    if (_price_unpriced_classes_enabled() and is_commercial
+            and subtotal > 0):
+        _gr_pct = float(getattr(_cfg, "GENERAL_REQUIREMENTS_PCT", 0.07))
+        if _gr_pct > 0:
+            _gr_line = _line(
+                f"General Requirements ({_gr_pct:.0%} of painting subtotal "
+                f"— PM/super, mobilization, protection, clean-up)",
+                1, round(subtotal * _gr_pct, 2), 0.0)
+            line_items.append(_gr_line)
+            subtotal = round(subtotal + _gr_line["total"], 2)
 
     return {
         "line_items": line_items,
