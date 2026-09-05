@@ -77,6 +77,43 @@ _MULTIMODAL_DENSE_PAGES_ENABLED = (
 )
 
 
+def _wall_faces_basis(analysis=None):
+    """Single resolution point for the faces-basis wall multiplier.
+
+    PRECEDENCE (decided 2026-09-05, tested in test_billing_convention.py):
+    an EXPLICITLY SET env flag wins over the billing-convention profile.
+    When NIGHTSHIFT_WALL_BASIS_FACES is present in the environment
+    (non-empty — the flag resolver sets it explicitly per job), it alone
+    decides engagement and NIGHTSHIFT_WALL_FACES_FACTOR decides the
+    factor. Only when the env var is ABSENT does the job's stamped
+    billing convention (analysis["_billing_convention"], written by
+    billing_convention.apply_billing_convention under flag
+    NIGHTSHIFT_BILLING_CONVENTION) engage the same path with the
+    profile's factor. One source, one multiply — the VME walls gate is
+    the only caller and multiplies exactly once.
+
+    Returns (engaged: bool, factor: float, source: "env"|"profile"|"off").
+    """
+    raw = os.environ.get("NIGHTSHIFT_WALL_BASIS_FACES")
+    if raw is not None and raw.strip() != "":
+        if raw.strip() not in ("1", "true", "True"):
+            return (False, 1.0, "env")
+        try:
+            factor = float(os.environ.get(
+                "NIGHTSHIFT_WALL_FACES_FACTOR", "2.0") or 2.0)
+        except (TypeError, ValueError):
+            factor = 2.0
+        return (True, min(2.5, max(1.0, factor)), "env")
+    try:
+        import billing_convention as _bc
+        factor = _bc.faces_engagement(analysis)
+    except Exception:
+        factor = None
+    if factor is not None:
+        return (True, factor, "profile")
+    return (False, 1.0, "off")
+
+
 # ---------------------------------------------------------------------------
 # Structured outputs — schema-enforced extraction responses (Phase 2.0)
 # ---------------------------------------------------------------------------
@@ -21637,16 +21674,13 @@ def _apply_vme_authoritative_walls(analysis):
     # 41.7k). NIGHTSHIFT_WALL_BASIS_FACES multiplies the geometric gross
     # by NIGHTSHIFT_WALL_FACES_FACTOR (default 2.0) before the WC
     # deduct. Never a class default in prod — customer-profile data.
-    if os.environ.get("NIGHTSHIFT_WALL_BASIS_FACES", "0").strip() in (
-            "1", "true", "True"):
-        try:
-            _faces = float(os.environ.get(
-                "NIGHTSHIFT_WALL_FACES_FACTOR", "2.0") or 2.0)
-        except (TypeError, ValueError):
-            _faces = 2.0
-        _faces = min(2.5, max(1.0, _faces))
+    # Resolution + precedence (explicit env wins over the billing-
+    # convention profile) live in _wall_faces_basis, top of file.
+    _faces_on, _faces, _faces_src = _wall_faces_basis(analysis)
+    if _faces_on:
         vme_gross *= _faces
         rec["faces_factor"] = _faces
+        rec["faces_source"] = _faces_src
         analysis.setdefault("notes", []).append(
             f"[VME] Wall quantity billed on the FACES convention "
             f"(geometric run × {_faces:g}): each painted wall face is "
@@ -23091,6 +23125,23 @@ def build_priced_takeoff(analysis, strict=None):
     # authoritative quantities. Kill switch NIGHTSHIFT_LEDGER_ENFORCE,
     # default ON.
     analysis = _enforce_ledger_precedence(analysis)
+
+    # Billing-convention layer (Phase 1, 2026-09-05): DECLARE which
+    # customer convention prices this job (run-vs-faces wall basis,
+    # per-floor height fallbacks) and stamp it BEFORE any quantity pass
+    # runs — 364 Main's geometry was measured to +2.8% and then billed
+    # +61% wrong purely by an undeclared convention. The stamp is the
+    # single source the VME faces-basis wiring consults (see
+    # _wall_faces_basis); explicit env flags win over the profile.
+    # Flag-gated NIGHTSHIFT_BILLING_CONVENTION; no-op when off, and the
+    # "default" profile never changes a quantity.
+    try:
+        import billing_convention as _bc
+        analysis = _bc.apply_billing_convention(
+            analysis, recalc=_recalculate_totals)
+    except Exception as _bc_err:
+        print(f"   ⚠️  Billing-convention layer failed (non-fatal): "
+              f"{type(_bc_err).__name__}: {str(_bc_err)[:160]}")
 
     # Template-instance dedup: a multiplied unit template and drawn
     # instances of the same unit type must never both price. Runs FIRST
