@@ -62,6 +62,7 @@ from config import (
     scale_timeout_for_consensus,
 )
 import storage
+import flag_resolver
 from datetime import datetime, timezone, timedelta
 
 from db import session_scope
@@ -1143,6 +1144,8 @@ def submit():
     # 5. Build pricing overrides for this submission.
     #    Start from the org's saved pricing profile, then merge any per-job
     #    overrides posted from the inline pricing table (rate__<key>).
+    convention_profile = None
+    org_label = None
     with session_scope() as session:
         user = session.get(User, user_id)
         org_overrides = (
@@ -1150,6 +1153,9 @@ def submit():
             if user and user.current_organization else None
         )
         rate_overrides = _flatten_overrides(org_overrides)
+        if user and user.current_organization:
+            convention_profile = user.current_organization.convention_profile
+            org_label = user.current_organization.name
 
     per_job = {}
     for key, _label, _unit, _default in RATE_FIELDS:
@@ -1186,6 +1192,48 @@ def submit():
         rate_overrides = dict(rate_overrides or {})
         rate_overrides.update(per_job)
 
+    # 5b. Resolve this job's flag posture: measurement ladder + the
+    #     customer's confirmed bidding conventions, layered
+    #     engine -> profile -> this estimate. (The evidence layer runs
+    #     later, in the worker, once the plans have actually been read.)
+    #     Resolved here rather than in the worker so the posture is
+    #     recorded even if the job never starts, and so a requeue reuses
+    #     it instead of re-deriving it under whatever the profile says
+    #     later. Inert unless NIGHTSHIFT_FLAG_RESOLVER is on: with the
+    #     flag off we still record what WOULD have been used.
+    per_estimate_conventions = {}
+    for _conv in flag_resolver.CONVENTION_FLAGS:
+        raw = (request.form.get(f"convention__{_conv.key}") or "").strip()
+        if raw:
+            per_estimate_conventions[_conv.key] = raw
+    try:
+        resolution = flag_resolver.resolve_flags(
+            profile=convention_profile,
+            overrides=per_estimate_conventions,
+            org_label=org_label,
+        )
+    except Exception as exc:
+        # A resolver bug must never cost a customer their submission —
+        # fall through to the worker's inherited environment.
+        logger.error("Flag resolution failed for %s: %s", submission_id, exc,
+                     exc_info=True)
+        resolution = None
+
+    if resolution:
+        try:
+            with session_scope() as session:
+                sub = session.get(Submission, submission_id)
+                if sub:
+                    sub.resolved_flags = resolution
+        except Exception:
+            logger.warning("Could not persist resolved flags for %s",
+                           submission_id, exc_info=True)
+        logger.info(
+            "Submission %s flag posture: enabled=%s, %d convention(s) "
+            "unresolved%s", submission_id, resolution["enabled"],
+            len(resolution["unresolved"]),
+            " — held for review" if resolution["manual_review"] else "")
+
     # 6. Enqueue the job — route to fast or heavy queue and pick a per-job
     #    timeout sized to the payload (big DD-scale sets need 4h, small
     #    single-PDF jobs only need 30 min).
@@ -1206,6 +1254,7 @@ def submit():
                 },
                 "scope_notes": scope_notes,
                 "rate_overrides": rate_overrides,
+                "resolved_flags": resolution,
             },
             job_id=submission_id,
             job_timeout=job_timeout,
@@ -1462,6 +1511,10 @@ def resubmit(parent_id):
     # alone killed DD-scale re-runs with one small addendum. Floor it at
     # the parent's recorded timeout, and inherit the parent's heavy-queue
     # routing.
+    # The parent's flag posture is inherited wholesale, not re-resolved:
+    # a revision that silently changed wall basis or scope convention
+    # would move the number for a reason the customer never asked for.
+    parent_flags = None
     try:
         with session_scope() as session:
             parent_sub = session.get(Submission, parent_id)
@@ -1470,9 +1523,20 @@ def resubmit(parent_id):
                     job_timeout = max(job_timeout, int(parent_sub.job_timeout))
                 if getattr(parent_sub, "queue_name", None) == RQ_QUEUE_HEAVY:
                     queue, queue_name = _queue_heavy, RQ_QUEUE_HEAVY
+                parent_flags = getattr(parent_sub, "resolved_flags", None)
     except Exception as exc:
         logger.warning("Could not read parent routing for %s: %s",
                        parent_id, exc)
+
+    if parent_flags:
+        try:
+            with session_scope() as session:
+                child = session.get(Submission, submission_id)
+                if child:
+                    child.resolved_flags = parent_flags
+        except Exception:
+            logger.warning("Could not persist inherited flags for %s",
+                           submission_id, exc_info=True)
     try:
         job = queue.enqueue(
             "jobs.merge_submission",
@@ -1490,6 +1554,7 @@ def resubmit(parent_id):
                 "scope_tags": merge_scope_tags,
                 "sheet_hint": merge_sheet_hint,
                 "rate_overrides": None,
+                "resolved_flags": parent_flags,
             },
             job_id=submission_id,
             job_timeout=job_timeout,
@@ -3427,6 +3492,71 @@ def admin_orgs_approve(org_id):
 
     flash(f"Approved {org_name}.", "success")
     return redirect(url_for("admin_orgs"))
+
+
+@app.route("/admin/submissions/<submission_id>/confirm-conventions",
+           methods=["POST"])
+@require_auth
+def admin_confirm_conventions(submission_id):
+    """Write a held job's bidding conventions back to the customer profile.
+
+    The end of the RFI loop. A job for an unknown customer prices on
+    conservative defaults, raises a convention RFI, and is held. The
+    reviewer answers those questions here — once — and every later job for
+    that org resolves from the profile with no RFI and no hold.
+
+    Form fields:
+        convention__<key>  "1"/"0"/"" per flag_resolver.CONVENTION_FLAGS.
+                           Blank leaves that convention open.
+        partial            present = the reviewer answered only some
+                           questions; the rest stay open and keep RFI'ing.
+                           Absent = they are vouching for the whole
+                           profile, which silences the RFI for defaults
+                           they deliberately left alone.
+
+    Answers apply to FUTURE jobs. This does not re-price the held job —
+    a reviewer who wants the new conventions applied to it resubmits.
+    """
+    uid = current_user_id()
+    with session_scope() as session:
+        user = session.get(User, uid)
+        if not is_admin(user):
+            return ("Forbidden", 403)
+
+        sub = session.get(Submission, submission_id)
+        if sub is None:
+            flash("Submission not found.", "error")
+            return redirect(url_for("index"))
+        org = session.get(Organization, sub.org_id)
+        if org is None:
+            flash("Submission has no organization.", "error")
+            return redirect(url_for("index"))
+
+        answers = {}
+        for conv in flag_resolver.CONVENTION_FLAGS:
+            raw = (request.form.get(f"convention__{conv.key}") or "").strip()
+            if raw:
+                answers[conv.key] = raw
+
+        complete = not request.form.get("partial")
+        org.convention_profile = flag_resolver.confirm_profile(
+            org.convention_profile, answers,
+            datetime.now(timezone.utc).isoformat(),
+            complete=complete,
+        )
+        org_name = org.name
+        logger.info(
+            "Conventions confirmed for org %s (%s) from submission %s: %s "
+            "(complete=%s)", org.id, org_name, submission_id,
+            sorted(answers.items()), complete)
+
+    flash(
+        f"Saved bidding conventions for {org_name}. "
+        + ("Future estimates resolve without an RFI."
+           if complete else
+           "Unanswered conventions will keep raising an RFI."),
+        "success")
+    return redirect(url_for("index"))
 
 
 @app.route("/admin/test-welcome", methods=["POST"])
