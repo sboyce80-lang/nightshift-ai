@@ -545,6 +545,34 @@ ALLOWANCE_EXT_SIDES = float(os.environ.get("ALLOWANCE_EXT_SIDES", "3"))         
 ALLOWANCE_EXT_ASPECT = float(os.environ.get("ALLOWANCE_EXT_ASPECT", "1.5"))              # L:W to derive perimeter from footprint
 ALLOWANCE_MISC_METALS_LS = float(os.environ.get("ALLOWANCE_MISC_METALS_LS", "2500"))     # flat LS when railing/misc-metal LF unconfirmed
 
+# ── Unpriced-classes pricing (NIGHTSHIFT_PRICE_UNPRICED_CLASSES, default OFF) ──
+# The JW-class validation band (−15% to −17% subtotal) is signed by scope classes
+# that are extracted but never reach the bid: interior window paint, wallcovering
+# install, and general requirements. These tunables feed the flag-gated pricing
+# paths in calculate_costs().
+#
+# WC INSTALL UNIT RESOLUTION (2026-09-05): the quantity side of the wallcovering
+# line is SQUARE FEET everywhere in the pipeline — wallcovering_sqft is computed
+# as confirmed WC wall LF × wall height per room and aggregated into
+# total_wallcovering_sqft. SF won: the quantity cannot be re-derived in lineal
+# yards after aggregation (the LF and height are gone), so the RATE must be
+# $/SF. The PRICING_MODEL's wallcovering_install 9.00 is the trade's
+# per-LINEAL-YARD install quote (54"-wide goods: 1 LY = 3 ft × 4.5 ft = 13.5 SF)
+# pasted onto a "sqft" unit — applied per SF it overprices install labor ~13.5×
+# (Homewood rerun-3 carried 151k SF of WC; at $9/SF that is a $1.36M phantom).
+# Converted: $9.00/LY ÷ 13.5 SF/LY ≈ $0.67/SF, corroborated by Rider's verified
+# Mazda takeoff billing WC install labor at $0.50/SF (same order of magnitude;
+# JW's Northwell WC-1 line — $630 on 80 SF — includes a material allowance,
+# "Detail not Given", so it is not a clean labor comp).
+WC_INSTALL_RATE_PER_SF = float(os.environ.get(
+    "NIGHTSHIFT_WC_INSTALL_RATE_PER_SF", "0.67"))
+# General requirements carried as a percentage of the painting trade subtotal,
+# commercial jobs only. Evidence: JW Northwell (RP 26-010-AUG) carries 11
+# general-requirements LS lines totaling $2,500 against a $36,505 trade
+# subtotal = 6.8% → default 7%.
+GENERAL_REQUIREMENTS_PCT = float(os.environ.get(
+    "NIGHTSHIFT_GENERAL_REQUIREMENTS_PCT", "0.07"))
+
 # Cross-sheet wall-height back-fill.
 # Per-sheet extraction reads each sheet in isolation. When a floor-plan sheet
 # (e.g. A401) carries room footprints + wall types but NO section/RCP on its own
