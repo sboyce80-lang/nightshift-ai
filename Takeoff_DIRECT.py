@@ -18010,6 +18010,104 @@ def _dedup_cross_sheet_stairs(analysis):
     return analysis
 
 
+def _door_schedule_ledger_enabled():
+    """NIGHTSHIFT_DOOR_SCHEDULE_LEDGER (default off): doors come from a
+    parsed deterministic source when one exists. Doors were wrong on 6/6
+    validation jobs with all four door flags on; the one time a parsed
+    source drove the count (round-5 roster) they hit −3%. Spec:
+    docs/DOOR_LEDGER_SPEC_2026-09-03.md."""
+    return os.environ.get(
+        "NIGHTSHIFT_DOOR_SCHEDULE_LEDGER", "0").strip() in (
+        "1", "true", "True")
+
+
+def _apply_door_schedule_ledger(analysis):
+    """Ledger authority for door counts (flag-gated, never fails the job).
+
+    MODE A (text door schedule parsed, >=5 entries): the ledger count is
+    authoritative. Material split comes from the ledger when it read a
+    material column; otherwise the extraction's existing full-paint:HM
+    ratio classifies the ledger's count (spec: extraction supplies ONLY
+    classification when the ledger lacks materials). Delta > 25% vs the
+    priced doors raises an RFI line — never silent.
+
+    MODE B (plan-symbol count): DIAGNOSTIC ONLY. Harness 2026-09-04:
+    tag-marks read 12/29 Harlem, 14/78 Northwell, 53/26 ULUM — recorded in
+    provenance + an RFI on gross divergence, but it must not set counts
+    until harness_door_ledger.py hits its targets. Validated mode-A case:
+    Caris 79 parsed vs JW 75 (+5.3%).
+    """
+    if not _door_schedule_ledger_enabled():
+        return analysis
+    try:
+        paths = analysis.get("_vme_pdf_paths") or []
+        if not paths:
+            return analysis
+        from door_ledger import build_door_ledger
+        led = build_door_ledger(paths)
+        agg = analysis.get("aggregated_totals")
+        if not isinstance(agg, dict):
+            return analysis
+        cur_fp = _num(agg.get("total_doors_full_paint", 0))
+        cur_hm = _num(agg.get("total_doors_hm_panel", 0))
+        cur_total = cur_fp + cur_hm
+        analysis["_door_ledger"] = {
+            "mode": led.get("mode"), "count": led.get("count"),
+            "full_paint": led.get("full_paint"),
+            "hm_panel": led.get("hm_panel"),
+            "detector": led.get("detector"),
+            "sources": led.get("sources"),
+            "extraction_doors_at_gate": round(cur_total, 1),
+        }
+        if led.get("mode") == "schedule" and _num(led.get("count")) >= 5:
+            n = float(led["count"])
+            fp_led = _num(led.get("full_paint"))
+            hm_led = _num(led.get("hm_panel"))
+            classified = fp_led + hm_led
+            if classified >= n * 0.5:
+                # Ledger read materials: scale its split to the full count
+                # (unknown-material rows follow the classified ratio).
+                new_fp = n * (fp_led / classified)
+                new_hm = n * (hm_led / classified)
+            elif cur_total > 0:
+                new_fp = n * (cur_fp / cur_total)
+                new_hm = n * (cur_hm / cur_total)
+            else:
+                new_fp, new_hm = n, 0.0
+            agg["total_doors_full_paint"] = round(new_fp, 1)
+            agg["total_doors_hm_panel"] = round(new_hm, 1)
+            src = ", ".join(led.get("sources") or [])[:120]
+            analysis.setdefault("notes", []).append(
+                f"[Door Ledger] {n:.0f} doors from parsed door schedule "
+                f"({src}); extraction had {cur_total:.0f}. "
+                f"source: ledger")
+            if cur_total > 0 and abs(n - cur_total) / max(n, cur_total) \
+                    > 0.25:
+                analysis.setdefault("rfi_items", []).append({
+                    "category": "Door Count",
+                    "question": (
+                        f"The door schedule lists {n:.0f} doors but the "
+                        f"floor plans yielded {cur_total:.0f}. The bid "
+                        f"prices the schedule's {n:.0f}; please confirm "
+                        f"door count and any doors excluded from painting "
+                        f"scope.")})
+        elif led.get("mode") == "symbols" and cur_total > 0:
+            n_sym = _num(led.get("count"))
+            if n_sym >= 5 and abs(n_sym - cur_total) / max(
+                    n_sym, cur_total) > 0.5:
+                analysis.setdefault("notes", []).append(
+                    f"[Door Ledger] plan-symbol diagnostic read "
+                    f"{n_sym:.0f} drawn door marks vs {cur_total:.0f} "
+                    f"priced (diagnostic only — counts unchanged). "
+                    f"source: symbols")
+    except Exception as e:
+        try:
+            analysis["_door_ledger"] = {"error": str(e)[:200]}
+        except Exception:
+            pass
+    return analysis
+
+
 def _reconcile_door_density(analysis):
     """Flag-gated (NIGHTSHIFT_DOOR_DENSITY_RECONCILE, default off): a
     unit template cannot carry more doors per unit than its room count
@@ -22547,6 +22645,13 @@ def build_priced_takeoff(analysis, strict=None):
     # G1 door-density reconcile: unit templates cannot carry more doors
     # than rooms+2 per unit. Flag-gated; no-op when off.
     analysis = _reconcile_door_density(analysis)
+
+    # Deterministic door ledger: doors from a PARSED source (text door
+    # schedule; plan symbols are diagnostic-only until the harness proves
+    # them). Runs AFTER the four door heuristics so a real ledger outranks
+    # every one of them — the spec's contract is that they collapse into
+    # it over time. Flag-gated; no-op when off.
+    analysis = _apply_door_schedule_ledger(analysis)
 
     # Stair cross-sheet dedup: a dedicated stairwell plans/sections sheet
     # and the floor plans describe the same flights — count them once.

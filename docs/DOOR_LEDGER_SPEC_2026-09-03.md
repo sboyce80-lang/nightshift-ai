@@ -49,3 +49,22 @@ overfit exactly like the flag pile it replaces.
 - `NIGHTSHIFT_DOOR_SWING_AUTHORITY`, `NIGHTSHIFT_DOOR_DENSITY_RECONCILE`,
   `NIGHTSHIFT_DOOR_TYPICAL_TRANSFER` — all four stay subordinate to the
   ledger when it exists; long-term they collapse into it.
+
+## Harness round 1 (2026-09-04, harness_door_ledger.py — built per this spec)
+
+| set | mode A | mode B tags | mode B arcs | verdict |
+|---|---|---|---|---|
+| caris | **79 parsed vs JW 75 (+5.3%)** | 9 | 0 | Mode A VALIDATED — set has a text schedule nobody knew about |
+| harlem (29) | 0 | 12 (−59%) | 41 (+41%) | arcs closest; tags miss unshaped marks |
+| ulum (26) | 0 (curves, correctly refused) | 53 (+104%) | 161 | tags collide with room/keynote shapes |
+| northwell (78) | 0 | 14 (−82%) | 0 (!!) | arc detector blind to this drawing style |
+| homewood | 0 (7 header-ish rows, 0 marks) | 65 set-deduped | ~100/pg | per-floor instance dedupe works |
+
+SHIPPED ACCORDINGLY: Mode A = authoritative behind
+NIGHTSHIFT_DOOR_SCHEDULE_LEDGER (>=5 entries, >25% delta → RFI). Mode B =
+diagnostic-only (provenance note + divergence RFI), NO count authority
+until this harness hits Harlem 29 / ULUM 26 / Northwell 78 within ±15%.
+Next detector work: (a) arc reconstruction for polyline-drawn swings
+(Northwell reads 0), (b) tag-shape discrimination — door hexagons vs room
+rectangles/ovals by vertex count from get_drawings() item paths, (c)
+leaf-line + arc pairing to kill furniture arcs (ULUM 161).
