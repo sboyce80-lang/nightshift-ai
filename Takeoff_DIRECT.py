@@ -22743,6 +22743,132 @@ def _audit_aggregate_drift(analysis):
     return analysis
 
 
+def _ledger_reconcile_enabled():
+    """Ledger-reconciliation invariant. Default ON: records only, changes
+    no prices and no scope. NIGHTSHIFT_LEDGER_RECONCILE=0 is the kill
+    switch."""
+    return os.environ.get("NIGHTSHIFT_LEDGER_RECONCILE", "1").strip() not in (
+        "0", "false", "False")
+
+
+def _ledger_reconcile_review_enabled():
+    """Escalation: an unledgered write beyond the threshold holds the job
+    for review. Default OFF until a week of prod records confirms the
+    9/5 shadow survey (3 genuine gaps / 12 golden jobs, zero false
+    fires)."""
+    return os.environ.get(
+        "NIGHTSHIFT_LEDGER_RECONCILE_REVIEW", "0").strip() in (
+        "1", "true", "True")
+
+
+def _reconcile_quantity_ledger(analysis):
+    """Enforceable half of the aggregate invariant: every change to a
+    priced quantity must go through the adjustment ledger.
+
+    _audit_aggregate_drift asks "how far are the totals from the rooms?"
+    — the 9/5 shadow survey showed that question is structurally noisy:
+    12/12 healthy golden jobs drift, because schedule overrides, WC
+    deducts, and aggregate-only scopes (railings, stairs) legitimately
+    diverge from a room recompute. This asks the question that IS
+    enforceable: for each key, the _quantity_adjustments entries must
+    chain contiguously (each stage's `from` == the previous stage's `to`)
+    and the last `to` must equal the final aggregate. Any gap is a gate
+    that mutated aggregated_totals without recording the adjustment — the
+    exact family behind "dropped rooms kept getting billed" and
+    schedule-authority values silently overwritten. On the same 12-job
+    survey this fired on exactly 3 keys, each a real unledgered write
+    (364 Main windows zeroed post-schedule; Honey Farms HM doors 7→17;
+    Homewood stairs 18→22 from the inline stair boost).
+
+    Records into analysis["_ledger_reconcile"]. With
+    NIGHTSHIFT_LEDGER_RECONCILE_REVIEW on, a gap beyond
+    NIGHTSHIFT_LEDGER_RECONCILE_REVIEW_PCT (default 10, relative to the
+    key's final value) also holds the job for review. Failure of the
+    check itself can never fail the job.
+    """
+    if not _ledger_reconcile_enabled():
+        return analysis
+    try:
+        agg = analysis.get("aggregated_totals")
+        led = analysis.get("_quantity_adjustments")
+        if not isinstance(agg, dict) or not isinstance(led, list):
+            return analysis
+
+        by_key = {}
+        for e in led:
+            if isinstance(e, dict) and e.get("item"):
+                by_key.setdefault(e["item"], []).append(e)
+
+        unledgered = {}
+        max_gap_pct = 0.0
+        for key, entries in by_key.items():
+            prev_to = None
+            gaps = []
+            for e in entries:
+                frm, to = e.get("from"), e.get("to")
+                if prev_to is not None and frm is not None and \
+                        abs(frm - prev_to) > 0.51:
+                    gaps.append({
+                        "where": f"before stage '{e.get('stage')}'",
+                        "expected": round(prev_to, 2),
+                        "saw": round(frm, 2),
+                        "gap": round(frm - prev_to, 2)})
+                if to is not None:
+                    prev_to = to
+            try:
+                final = float(agg.get(key) or 0)
+            except (TypeError, ValueError):
+                final = None
+            if prev_to is not None and final is not None and \
+                    abs(final - prev_to) > 0.51:
+                gaps.append({
+                    "where": "after final ledgered stage",
+                    "expected": round(prev_to, 2),
+                    "saw": round(final, 2),
+                    "gap": round(final - prev_to, 2)})
+            if not gaps:
+                continue
+            base = max(abs(final or 0.0), abs(prev_to or 0.0), 1.0)
+            pct = round(max(abs(g["gap"]) for g in gaps) / base * 100.0, 1)
+            unledgered[key] = {"gaps": gaps, "worst_gap_pct": pct}
+            max_gap_pct = max(max_gap_pct, pct)
+
+        analysis["_ledger_reconcile"] = {
+            "unledgered": unledgered,
+            "n_keys": len(unledgered),
+            "max_gap_pct": round(max_gap_pct, 1),
+        }
+
+        threshold = float(os.environ.get(
+            "NIGHTSHIFT_LEDGER_RECONCILE_REVIEW_PCT", "10"))
+        if _ledger_reconcile_review_enabled() and unledgered and \
+                max_gap_pct >= threshold:
+            worst = sorted(unledgered.items(),
+                           key=lambda kv: -kv[1]["worst_gap_pct"])[:3]
+            detail = "; ".join(
+                f"{k} moved {v['gaps'][-1]['expected']:,.0f}→"
+                f"{v['gaps'][-1]['saw']:,.0f} outside the ledger"
+                for k, v in worst)
+            analysis["manual_review_required"] = True
+            reason = (f"Unledgered quantity writes beyond "
+                      f"{threshold:.0f}%: {detail}")
+            prior = analysis.get("manual_review_reason")
+            analysis["manual_review_reason"] = (
+                f"{prior} | {reason}" if prior else reason)
+            analysis.setdefault("notes", []).append(
+                f"[Ledger Reconcile] {detail}. A gate changed priced "
+                f"quantities without recording the adjustment; review "
+                f"before send.")
+    except Exception as e:
+        # Same contract as the drift audit: a thermometer, never a
+        # tourniquet.
+        try:
+            analysis["_ledger_reconcile"] = {"error": str(e)[:200]}
+        except Exception:
+            pass
+    return analysis
+
+
 def build_priced_takeoff(analysis, strict=None):
     """Single provenance choke point between aggregation and calculate_costs.
 
@@ -23021,6 +23147,9 @@ def build_priced_takeoff(analysis, strict=None):
     # far the hand-maintained aggregates sit from the room data they claim
     # to summarize. Records only (see _audit_aggregate_drift).
     analysis = _audit_aggregate_drift(analysis)
+    # And the enforceable invariant: every one of those aggregate changes
+    # must be in the adjustment ledger (see _reconcile_quantity_ledger).
+    analysis = _reconcile_quantity_ledger(analysis)
 
     analysis["_priced_takeoff_built"] = True
     return analysis
