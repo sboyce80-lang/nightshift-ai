@@ -849,7 +849,8 @@ def render_markup_pdf(pdf_in, result_or_analysis, pdf_out,
     derotate_cache = {}
     stats = {"pages": len(doc), "annotated_pages": 0, "markups": 0,
              "traced": 0, "nominal": 0, "unplaced": 0, "excluded_shown": 0,
-             "skipped_size_mismatch": 0, "trace_rejected": 0}
+             "skipped_size_mismatch": 0, "trace_rejected": 0,
+             "marked_page_numbers": []}
 
     for pg_0 in range(len(doc)):
         rooms = rooms_by_page.get(pg_0 + 1)
@@ -914,6 +915,7 @@ def render_markup_pdf(pdf_in, result_or_analysis, pdf_out,
             draw_legend(page, totals, secondary)
         if page_markups or secondary:
             stats["annotated_pages"] += 1
+            stats["marked_page_numbers"].append(pg_0 + 1)
         stats["markups"] += page_markups
 
     # Keys the existing annotated-drawings caller (jobs.py) logs by name. The
