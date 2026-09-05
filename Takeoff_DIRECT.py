@@ -23410,6 +23410,17 @@ def build_priced_takeoff(analysis, strict=None):
     # must be in the adjustment ledger (see _reconcile_quantity_ledger).
     analysis = _reconcile_quantity_ledger(analysis)
 
+    # Phase 3: pre-delivery reconciliation suite — every check codifies a
+    # named historical miss (see delivery_verification.py). Read-only over
+    # quantities; NIGHTSHIFT_DELIVERY_VERIFICATION (default OFF for
+    # burn-in), HOLD escalation behind its own flag. Never fatal.
+    try:
+        import delivery_verification as _dv
+        analysis = _dv.attach_delivery_verification(analysis)
+    except Exception as _dv_err:
+        print(f"   ⚠️  delivery verification unavailable (non-fatal): "
+              f"{str(_dv_err)[:160]}")
+
     analysis["_priced_takeoff_built"] = True
     return analysis
 
