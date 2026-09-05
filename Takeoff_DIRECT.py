@@ -22392,6 +22392,110 @@ def _reconcile_scope_sweep(analysis):
     return analysis
 
 
+def _agg_drift_audit_enabled():
+    """Shadow audit of aggregate/room-data drift. Default ON: it changes no
+    prices and no scope — it only records. NIGHTSHIFT_AGG_DRIFT_AUDIT=0 is
+    the kill switch."""
+    return os.environ.get("NIGHTSHIFT_AGG_DRIFT_AUDIT", "1").strip() not in (
+        "0", "false", "False")
+
+
+def _agg_drift_review_enabled():
+    """Escalation: drift beyond the threshold holds the job for review.
+    Default OFF until the shadow data says what legitimate drift (aggregate-
+    level schedule overrides, WC deducts) looks like per class."""
+    return os.environ.get("NIGHTSHIFT_AGG_DRIFT_REVIEW", "0").strip() in (
+        "1", "true", "True")
+
+
+def _audit_aggregate_drift(analysis):
+    """Record how far the gate chain's hand-maintained aggregates have
+    drifted from a clean recompute off room data.
+
+    aggregated_totals and the room inventory are two sources of truth
+    reconciled by ~30 hand-written decrement blocks inside the gates, each
+    clamped with max(0, ...) so a mis-decrement fails silently to zero.
+    _recalculate_totals is never run after the chain because some passes
+    (schedule overrides, WC deducts) legitimately write aggregate-level
+    values that a room recompute would wipe — so drift is not always a bug,
+    but a NEW drift on a job class that had none is exactly how the
+    "dropped rooms kept getting billed" family announces itself.
+
+    This audit runs the recompute on a deep copy (the live analysis is
+    never touched), diffs every numeric key, and stores the result in
+    analysis["_agg_drift"]. With NIGHTSHIFT_AGG_DRIFT_REVIEW on, drift
+    beyond NIGHTSHIFT_AGG_DRIFT_REVIEW_PCT (default 10) also holds the job
+    for review. Failure of the audit itself can never fail the job.
+    """
+    if not _agg_drift_audit_enabled():
+        return analysis
+    try:
+        import contextlib
+        import copy
+        import io
+
+        agg = analysis.get("aggregated_totals")
+        if not isinstance(agg, dict):
+            return analysis
+        with contextlib.redirect_stdout(io.StringIO()):
+            shadow = copy.deepcopy(analysis)
+            recomputed = (_recalculate_totals(shadow) or {}).get(
+                "aggregated_totals") or {}
+
+        drifts = {}
+        max_abs = 0.0
+        for key in sorted(set(agg) | set(recomputed)):
+            try:
+                a = float(agg.get(key) or 0)
+                b = float(recomputed.get(key) or 0)
+            except (TypeError, ValueError):
+                continue
+            if a == b:
+                continue
+            base = max(abs(a), abs(b))
+            if base < 1.0:
+                continue
+            pct = round((a - b) / base * 100.0, 1)
+            if abs(pct) < 1.0:
+                continue
+            drifts[key] = {"chain": round(a, 2),
+                           "room_recompute": round(b, 2),
+                           "drift_pct": pct}
+            max_abs = max(max_abs, abs(pct))
+
+        analysis["_agg_drift"] = {
+            "keys": drifts,
+            "max_abs_drift_pct": round(max_abs, 1),
+            "n_keys_drifted": len(drifts),
+        }
+
+        threshold = float(os.environ.get(
+            "NIGHTSHIFT_AGG_DRIFT_REVIEW_PCT", "10"))
+        if _agg_drift_review_enabled() and max_abs >= threshold:
+            worst = sorted(drifts.items(),
+                           key=lambda kv: -abs(kv[1]["drift_pct"]))[:3]
+            detail = "; ".join(
+                f"{k} chain {v['chain']:,.0f} vs rooms "
+                f"{v['room_recompute']:,.0f} ({v['drift_pct']:+.1f}%)"
+                for k, v in worst)
+            analysis["manual_review_required"] = True
+            reason = ("Aggregate drift: priced totals diverge from room "
+                      f"data beyond {threshold:.0f}% — {detail}")
+            prior = analysis.get("manual_review_reason")
+            analysis["manual_review_reason"] = (
+                f"{prior} | {reason}" if prior else reason)
+            analysis.setdefault("notes", []).append(
+                f"[Aggregate Drift] {detail}. The gate chain's totals no "
+                f"longer match the room inventory; review before send.")
+    except Exception as e:
+        # The audit is a thermometer, never a tourniquet.
+        try:
+            analysis["_agg_drift"] = {"error": str(e)[:200]}
+        except Exception:
+            pass
+    return analysis
+
+
 def build_priced_takeoff(analysis, strict=None):
     """Single provenance choke point between aggregation and calculate_costs.
 
@@ -22652,6 +22756,11 @@ def build_priced_takeoff(analysis, strict=None):
                 f"under the provenance gate ({m:,.0f} measured priced). "
                 f"RFI REQUIRED: confirm this scope on the drawings before it "
                 f"is added to the bid.")
+    # Last step of the chain, after every gate has had its say: measure how
+    # far the hand-maintained aggregates sit from the room data they claim
+    # to summarize. Records only (see _audit_aggregate_drift).
+    analysis = _audit_aggregate_drift(analysis)
+
     analysis["_priced_takeoff_built"] = True
     return analysis
 
