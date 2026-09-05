@@ -33,6 +33,7 @@ from config import (
     RESEND_API_KEY,
     RESEND_FROM_EMAIL,
     RESEND_FROM_NAME,
+    RESEND_REPLY_TO_EMAILS,
     ADMIN_EMAILS,
     PLG_SIGNUP_NOTIFY_EMAILS,
     PLG_SALES_EMAILS,
@@ -107,6 +108,10 @@ def _send(to_addrs, subject: str, body: str, cc_addrs=None,
         "subject": subject,
         "text": body,
     }
+    # The From is noreply@ — route the inevitable "Reply" clicks to
+    # mailboxes people actually read.
+    if RESEND_REPLY_TO_EMAILS:
+        payload["reply_to"] = list(RESEND_REPLY_TO_EMAILS)
     # Send multipart when an HTML part is supplied. Mail clients that
     # auto-linkify bare URLs in text/plain rewrite them into tracking
     # redirects; real <a> tags render as written.
