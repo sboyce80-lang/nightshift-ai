@@ -32,3 +32,25 @@ everywhere else on the coverage floor — and the abstain is CORRECT:
    fraction) as a fallback — only with the walls gate's coverage
    preconditions; do NOT ship it as an escape hatch for the per-room
    coverage floor.
+
+## v2 measurement round (same night): NIGHTSHIFT_ROOM_GEOMETRY_V2
+
+Two loss modes attacked (adaptive closure ladder + render-mask fallback;
+nearest-anchor splitting of merged components, distinct coordinates only):
+
+| job | measured v1→v2 | coverage v1→v2 | note |
+|---|---|---|---|
+| homewood | 12→28 | 4%→41% | splits work; remainder = template siblings (19 anchors on ONE point — not separable, needs template-unit basis) |
+| hudson | 0→4 | 0→30% | partial enclosure rescue |
+| harlem | 19→26 | 0.80→0.927 | applies with larger correction (9,644→12,588; no ceiling target to verify) |
+| fishkill | 6→7 | 4%→11% | enclosure still fails (walls invisible to both segments AND render) |
+| 364/dutchess/ulum | unchanged | — | |
+
+REMAINING BLOCKERS, precisely: (1) template-instance rosters put all
+sibling anchors on one point — the fix is a TEMPLATE-UNIT BASIS (measure
+the typical unit's rooms once on the enlarged unit plan × unit_multiplier,
+which the roster already tracks), not more partitioning; (2) fishkill/ulum
+-class enclosure failure — wall linework invisible to axis segments and
+too faint for the render threshold; try stroke-width-aware rasterization
+of get_drawings() paths (all orientations) before giving up. Nothing new
+clears the 60% coverage bar yet; the gate stays honest.
