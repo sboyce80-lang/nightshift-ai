@@ -77,6 +77,12 @@ ROSTER_HINTS = {
     "_batch": "nsai_batch_2026-08-20/{short}/result.json",
 }
 
+# One-off stored results living outside the standard run dirs.
+ROSTER_EXTRA = {
+    "fishkill_cenhud": ("/Users/stevenboyce/Desktop/_Code/NSAI/"
+                        "rider_batch_durable/cenhud/result.json"),
+}
+
 
 def _registry():
     cases = {}
@@ -110,6 +116,8 @@ CANON = "/Users/stevenboyce/Desktop/_Code/NSAI/nightshift-repo"
 def find_roster(cid, case):
     """Newest stored result.json for a job, searched across run dirs."""
     cands = []
+    if cid in ROSTER_EXTRA:
+        cands.append(ROSTER_EXTRA[cid])
     for pat in case.get("rosters") or []:
         cands.append(os.path.join(HERE, pat))
         cands.append(os.path.join(CANON, pat))
