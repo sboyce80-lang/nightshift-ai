@@ -1409,6 +1409,7 @@ def json_to_pdf(json_path, pdf_path):
                 seen_labels.add(label)
                 tiers = entry.get('tiers', [])
                 markup_val = entry.get('markup', 0)
+                rate_str = ""
                 if len(tiers) == 1:
                     # Single rate (flat)
                     rate_str = f"${tiers[0]['rate']:.2f}{unit}"

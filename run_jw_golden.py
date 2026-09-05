@@ -23,8 +23,12 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
 import regression_test as rt  # noqa: E402
 from jw_golden import JW_CASES  # noqa: E402
+import accuracy_ledger as ledger  # noqa: E402
 
-HISTORY = os.path.join(HERE, "nsai_batch_2026-08-20", "golden_history.jsonl")
+# One ledger for every harness (was nsai_batch_2026-08-20/golden_history.jsonl,
+# which collected exactly one entry in 13 days because only this script wrote
+# to it and only when someone remembered to run it).
+HISTORY = ledger.HISTORY_PATH
 EXIT_CRITERION_JOBS = ("jw_hudson_hotel", "jw_homewood_suites")
 CONSECUTIVE_NEEDED = 2
 
@@ -49,15 +53,14 @@ def score_case(cid, case):
     sub = next((r for r in rows if r["key"] == "cost_estimate_subtotal"),
                None)
     subtotal_delta = sub["delta_pct"] if sub else None
-    in_band_10 = (subtotal_delta is not None
-                  and abs(subtotal_delta) <= 10.0)
-    return {"case": cid, "display": case["display_name"],
-            "jw_bid": case["jw_bid"],
-            "subtotal": metrics.get("cost_estimate_subtotal"),
-            "subtotal_delta_pct": subtotal_delta,
-            "in_band_10": in_band_10,
-            "manual_review": bool(data.get("manual_review_required")),
-            "rows": rows}
+    record = ledger.job_record(
+        cid, data, rows,
+        subtotal=metrics.get("cost_estimate_subtotal"),
+        subtotal_delta_pct=subtotal_delta)
+    record["display"] = case["display_name"]
+    record["jw_bid"] = case["jw_bid"]
+    record["rows"] = rows
+    return record
 
 
 def consecutive_streak(history, cid):
@@ -86,9 +89,12 @@ def main():
             all_pass = False
             continue
         band = "✅" if r["in_band_10"] else "  "
+        mae = r.get("component_mae_pct")
+        mae_txt = (f"  mae {mae:.1f}%/{r['components_scored']}c"
+                   if mae is not None else "  mae n/a")
         print(f"  {band} {r['display'][:44]:44s} "
               f"${r['subtotal'] or 0:>12,.0f} vs ${r['jw_bid']:>12,.0f} "
-              f"({r['subtotal_delta_pct']:+.1f}%)"
+              f"({r['subtotal_delta_pct']:+.1f}%){mae_txt}"
               f"{'' if r['manual_review'] else '  [no review flag!]'}")
         for row in r["rows"]:
             if row["ok"] is False:
@@ -96,18 +102,14 @@ def main():
                       f"{row['target']} ({row['delta_pct']:+.1f}%)")
                 all_pass = False
 
-    history = []
-    if os.path.exists(HISTORY):
-        with open(HISTORY) as f:
-            history = [json.loads(l) for l in f if l.strip()]
-    entry = {"ts": datetime.now(timezone.utc).isoformat(),
-             "jobs": [{k: r.get(k) for k in
-                       ("case", "subtotal", "subtotal_delta_pct",
-                        "in_band_10", "manual_review")}
-                      for r in results if not r.get("error")]}
+    history = ledger.load_history()
+    jobs = [{k: r.get(k) for k in
+             ("case", "subtotal", "subtotal_delta_pct", "in_band_10",
+              "component_mae_pct", "components_scored", "components",
+              "manual_review", "flag_fingerprint", "git_sha")}
+            for r in results if not r.get("error")]
     if log:
-        with open(HISTORY, "a") as f:
-            f.write(json.dumps(entry) + "\n")
+        entry = ledger.append_entry(source="run_jw_golden", jobs=jobs)
         history.append(entry)
 
     print("\n  Mandatory-review exit criterion "

@@ -14,6 +14,7 @@ Public entry point:
 
 import os
 import sys
+import json
 import logging
 import smtplib
 import tempfile
@@ -323,6 +324,39 @@ def release_email_claim(submission_id):
     except Exception as exc:
         logger.warning("release_email_claim failed for %s: %s",
                        submission_id, exc)
+
+
+def manual_review_flagged(result):
+    """True when the extractor flagged this result for manual review.
+
+    run_analysis() returns {"analysis": ..., "cost_estimate": ...}; the
+    manual_review_required flag lives on the analysis dict and is only
+    promoted to the top level of the JSON written to disk/R2 — never on
+    the in-memory return. Reading only the top level made the gate below
+    dead code from the day it landed (43f549b): every flagged estimate
+    auto-emailed anyway (Otto/BofA 7/21; BASC, MCC, Toyota 9/1–9/4).
+    Check both levels so neither representation can slip through.
+    """
+    if not isinstance(result, dict):
+        return False
+    if result.get("manual_review_required"):
+        return True
+    analysis = result.get("analysis")
+    return bool(isinstance(analysis, dict)
+                and analysis.get("manual_review_required"))
+
+
+def manual_review_reason(result):
+    """The flag's reason string, wherever it lives (see manual_review_flagged)."""
+    if not isinstance(result, dict):
+        return None
+    reason = result.get("manual_review_reason")
+    if reason:
+        return reason
+    analysis = result.get("analysis")
+    if isinstance(analysis, dict):
+        return analysis.get("manual_review_reason")
+    return None
 
 
 def maybe_send_freemium_lifecycle_emails(submission_id):
@@ -653,8 +687,118 @@ def _record_result_file(submission_id, filename, r2_key, size_bytes, content_typ
 # Main worker entry point — RQ calls this
 # ---------------------------------------------------------------------------
 
+def _apply_job_flags(submission_id, resolution):
+    """Push a job's resolved flag posture into the worker environment.
+
+    Must run before anything reads a flag: every NIGHTSHIFT_* lookup in
+    the engine hits os.environ at call time, so setting them here is what
+    makes a per-job convention possible at all. No-op when the resolver is
+    disabled (shadow mode) or when the job was enqueued by a path that
+    predates it — those inherit the worker's environment exactly as before.
+    """
+    if not resolution:
+        return
+    try:
+        import flag_resolver
+        changed = flag_resolver.apply_flags(resolution)
+        if changed:
+            logger.info(
+                "Submission %s flag posture applied: %s", submission_id,
+                ", ".join(f"{n}={v[1]}" for n, v in sorted(changed.items())))
+        elif not resolution.get("enabled"):
+            logger.info(
+                "Submission %s resolved in SHADOW (resolver off) — %d "
+                "convention(s) unresolved", submission_id,
+                len(resolution.get("unresolved") or []))
+    except Exception as exc:
+        # Never fail a job over flag plumbing — the worker's inherited
+        # environment is a valid posture, just an unrecorded one.
+        logger.error("Could not apply resolved flags for %s: %s",
+                     submission_id, exc, exc_info=True)
+
+def _stamp_flag_posture(submission_id, result, resolution):
+    """Record the resolved flag posture on the result, and hold the job if
+    it priced on conventions nobody confirmed.
+
+    Three things happen here, all of them about traceability:
+
+    1. result["flag_posture"] gets the full posture + per-flag provenance,
+       so any estimate can be traced to the conventions behind it. This is
+       the record whose absence made the 9/1 Caris smoke test (-44.9%)
+       look like an engine regression when it was a flag difference.
+    2. Unconfirmed conventions become customer-facing RFIs naming the
+       exact question and the conservative default used instead.
+    3. The job is held for review, because an assumed convention is a
+       number the customer has no way to check.
+
+    In SHADOW mode (resolver flag off) only step 1 runs: we record what
+    the resolver would have done and change nothing about the estimate.
+    """
+    if not resolution:
+        return
+    try:
+        posture = {
+            "enabled": resolution.get("enabled", False),
+            "flags": resolution.get("flags") or {},
+            "provenance": resolution.get("provenance") or {},
+            "conventions": resolution.get("conventions") or {},
+            "unresolved": resolution.get("unresolved") or [],
+        }
+        result["flag_posture"] = posture
+        analysis = result.get("analysis")
+        if isinstance(analysis, dict):
+            analysis["flag_posture"] = posture
+
+        if resolution.get("enabled") and resolution.get("rfi_items"):
+            for target in (result, analysis):
+                if not isinstance(target, dict):
+                    continue
+                items = target.get("rfi_items")
+                if not isinstance(items, list):
+                    items = []
+                items = list(items) + list(resolution["rfi_items"])
+                target["rfi_items"] = items
+
+        if resolution.get("enabled") and resolution.get("manual_review"):
+            reason = resolution.get("review_reason") or (
+                "Bidding conventions unconfirmed for this customer.")
+            result["manual_review_required"] = True
+            existing = result.get("manual_review_reason")
+            result["manual_review_reason"] = (
+                f"{existing} | {reason}" if existing else reason)
+            if isinstance(analysis, dict):
+                analysis["manual_review_required"] = True
+                analysis.setdefault("notes", []).append(
+                    f"[Bidding Conventions] {reason}")
+            logger.info(
+                "Submission %s held: %d unconfirmed convention(s) %s",
+                submission_id, len(resolution.get("unresolved") or []),
+                resolution.get("unresolved"))
+
+        # Rewrite the on-disk JSON so the uploaded deliverable carries the
+        # posture too — run_analysis already wrote it before we got here.
+        path = result.get("output_json_path")
+        if path and os.path.exists(path):
+            with open(path) as fh:
+                on_disk = json.load(fh)
+            on_disk["flag_posture"] = posture
+            for key in ("rfi_items", "manual_review_required",
+                        "manual_review_reason"):
+                if key in result:
+                    on_disk[key] = result[key]
+            if isinstance(on_disk.get("analysis"), dict) and isinstance(analysis, dict):
+                on_disk["analysis"] = analysis
+            with open(path, "w") as fh:
+                json.dump(on_disk, fh, indent=2)
+    except Exception as exc:
+        # Provenance is valuable, not load-bearing. A failure here must
+        # not cost the customer a finished estimate.
+        logger.error("Could not stamp flag posture on %s: %s",
+                     submission_id, exc, exc_info=True)
+
+
 def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
-                        rate_overrides=None):
+                        rate_overrides=None, resolved_flags=None):
     """Run the full takeoff pipeline for a submission.
 
     Args:
@@ -664,6 +808,12 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
         scope_notes: free-form scope text.
         rate_overrides: optional dict of pricing overrides applied to
                         PRICING_MODEL via Takeoff_DIRECT._apply_rate_overrides.
+        resolved_flags: optional flag posture from flag_resolver.resolve_flags(),
+                        computed at enqueue. Applied to the environment before
+                        analysis so this job runs under ITS customer's bidding
+                        conventions rather than the worker's process-wide
+                        flags. None (legacy enqueue, requeue scripts) means
+                        inherit the environment, exactly as before.
 
     Workflow:
         1. Mark submission `processing` in the DB.
@@ -677,6 +827,9 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
     Failures: mark `failed` + email; re-raise so RQ records job as failed.
     """
     logger.info("Processing submission %s (%d PDFs)", submission_id, len(pdf_keys))
+
+    _apply_job_flags(submission_id, resolved_flags)
+
     update_status(submission_id, "processing")
     _persist_routing(submission_id)
     _hb_stop = _start_heartbeat(submission_id)
@@ -727,6 +880,10 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
                 "contact_info": contact_info,
                 "scope_notes": scope_notes,
                 "rate_overrides": rate_overrides,
+                # The heavy worker must run the same conventions the
+                # fast one resolved — otherwise a re-route silently
+                # changes the customer's bid basis.
+                "resolved_flags": resolved_flags,
             }):
                 return {"submission_id": submission_id, "rerouted": "heavy"}
 
@@ -792,6 +949,10 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
                 pre_skipped_files=locked_filenames,
             )
 
+            # Stamp provenance + convention RFIs before the JSON is
+            # uploaded and before the manual-review gate reads the result.
+            _stamp_flag_posture(submission_id, result, resolved_flags)
+
             for key_name, content_type in (
                 ("output_json_path", "application/json"),
                 ("output_pdf_path", "application/pdf"),
@@ -836,7 +997,7 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
             # mark the submission needs_review (not completed) so the
             # web UI / harness can distinguish auto-shippable runs from
             # human-needed ones.
-            manual_review = bool(result.get("manual_review_required"))
+            manual_review = manual_review_flagged(result)
             subtotal = result.get("cost_estimate", {}).get("subtotal", 0) or 0
 
             if manual_review:
@@ -844,7 +1005,7 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
                     "Submission %s flagged for MANUAL REVIEW — skipping "
                     "customer estimate email. Reason: %s",
                     submission_id,
-                    result.get("manual_review_reason") or "(none provided)",
+                    manual_review_reason(result) or "(none provided)",
                 )
                 # Persist state BEFORE sending email: a crash/requeue in
                 # the old order (email -> status) re-ran the job and sent
@@ -974,7 +1135,7 @@ def _find_parent_result_json_key(parent_id):
 
 def merge_submission(submission_id, parent_id, new_pdf_keys, contact_info,
                       scope_notes=None, scope_tags=None, rate_overrides=None,
-                      sheet_hint=None):
+                      sheet_hint=None, resolved_flags=None):
     """Incremental re-run for a v2+ child submission.
 
     Loads the parent's stored result JSON from R2, runs extraction on ONLY
@@ -990,6 +1151,9 @@ def merge_submission(submission_id, parent_id, new_pdf_keys, contact_info,
         scope_notes: optional string the user typed describing the change.
         scope_tags: optional list like ["Basement","DoorSchedule"] driving
                     replace-vs-union semantics in merge_analyses().
+        resolved_flags: the parent bid's flag posture, so a revision is
+                        priced on the same bidding conventions as the
+                        estimate it revises.
         rate_overrides: passed through to run_analysis_merge for symmetry,
                         but pricing primarily uses the parent's snapshot.
 
@@ -997,6 +1161,7 @@ def merge_submission(submission_id, parent_id, new_pdf_keys, contact_info,
     """
     logger.info("Merging submission %s onto parent %s (%d new PDFs, tags=%s)",
                 submission_id, parent_id, len(new_pdf_keys), scope_tags)
+    _apply_job_flags(submission_id, resolved_flags)
     update_status(submission_id, "processing")
     _persist_routing(submission_id)
     _hb_stop = _start_heartbeat(submission_id)
@@ -1062,6 +1227,10 @@ def merge_submission(submission_id, parent_id, new_pdf_keys, contact_info,
                 pre_skipped_files=locked_filenames,
             )
 
+            # A revision must be priced on the same conventions as the
+            # parent bid — see _stamp_flag_posture.
+            _stamp_flag_posture(submission_id, result, resolved_flags)
+
             for key_name, content_type in (
                 ("output_json_path", "application/json"),
                 ("output_pdf_path", "application/pdf"),
@@ -1082,7 +1251,7 @@ def merge_submission(submission_id, parent_id, new_pdf_keys, contact_info,
             # an addendum that re-introduces a Hardie scope the parent
             # had auto-suppressed. Skip the customer-facing email when
             # the merged result is flagged.
-            manual_review = bool(result.get("manual_review_required"))
+            manual_review = manual_review_flagged(result)
             subtotal = result.get("cost_estimate", {}).get("subtotal", 0) or 0
 
             if manual_review:
@@ -1090,7 +1259,7 @@ def merge_submission(submission_id, parent_id, new_pdf_keys, contact_info,
                     "Merge submission %s flagged for MANUAL REVIEW — "
                     "skipping customer estimate email. Reason: %s",
                     submission_id,
-                    result.get("manual_review_reason") or "(none provided)",
+                    manual_review_reason(result) or "(none provided)",
                 )
                 # Status first, then claimed email — see process_submission.
                 update_status(submission_id, "needs_review", subtotal=subtotal)
@@ -1517,7 +1686,7 @@ def send_manual_review_email(contact_info, result, submission_id):
     # and it is not true. The extractor's own checks set
     # manual_review_reason; the blanket policy only appends a note, so
     # an absent/policy-only reason means "held by policy, nothing wrong".
-    _raw_reason = result.get("manual_review_reason")
+    _raw_reason = manual_review_reason(result)
     _analysis = result.get("analysis") or {}
     _policy_note = any(
         str(n).startswith("[Mandatory Review]")

@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
-"""Held jobs don't burn freemium credits while blanket review is on.
+"""Held (needs_review) jobs count against the freemium quota.
 
-NIGHTSHIFT_MANDATORY_REVIEW holds EVERY estimate during the accuracy
-rollout, and needs_review counted toward the freemium quota — so a
-trial user could burn all 5 lifetime credits and hit the paywall having
-never received an automated estimate. Same principle the code already
-applies to failed runs: the user did nothing wrong, we chose to hold
-the bid. Steven's call, 2026-09-01.
+Steven, 2026-09-04, reversing the 2026-09-01 held-jobs-free exemption:
+a held job ran and is in the customer's hands, so it burns a credit.
+The old exemption let a bid parked in review temporarily release its
+credit — Profeta reached 6/5 by submitting while an earlier bid sat in
+needs_review. The lifetime cap is hard: any root submission that didn't
+fail or get cancelled counts, regardless of NIGHTSHIFT_MANDATORY_REVIEW.
 
-Locks in: held jobs free while the flag is on, counted when it's off
-(there needs_review means THIS job's own checks fired), delivered bids
-always count, failed/cancelled always free, revisions never count.
+Locks in: held jobs count with the blanket flag on AND off, delivered
+bids count, failed/cancelled always free, revisions never count, and
+the paywall follows the same rule.
 """
 import os
 import sys
@@ -67,27 +67,22 @@ def _set_flag(on):
         os.environ.pop("NIGHTSHIFT_MANDATORY_REVIEW", None)
 
 
-print("1) Blanket review ON: held bids are free")
-_set_flag(True)
-s, org = seed(["needs_review"] * 5)
+print("1) Held bids count, blanket review ON or OFF")
+for flag in (True, False):
+    _set_flag(flag)
+    s, org = seed(["needs_review"] * 5)
+    used = orgs.count_freemium_bids(s, org.id)
+    check(used == 5, f"flag={flag}: 5 held bids must count, got {used}")
+    s.close()
+
+print("\n2) Mixed statuses: everything but failed/cancelled counts")
+s, org = seed(["completed", "completed", "needs_review", "queued",
+               "processing", "failed", "cancelled"])
 used = orgs.count_freemium_bids(s, org.id)
-check(used == 0, f"5 held bids must cost nothing, got {used}")
+check(used == 5, f"5 non-failed root bids must count, got {used}")
 s.close()
 
-print("\n2) Blanket review ON: delivered bids still count")
-s, org = seed(["completed", "completed", "needs_review", "needs_review"])
-used = orgs.count_freemium_bids(s, org.id)
-check(used == 2, f"only the 2 delivered bids count, got {used}")
-s.close()
-
-print("\n3) Blanket review OFF: held bids count (this job's own checks fired)")
-_set_flag(False)
-s, org = seed(["needs_review", "needs_review", "completed"])
-used = orgs.count_freemium_bids(s, org.id)
-check(used == 3, f"legacy behavior when the blanket flag is off, got {used}")
-s.close()
-
-print("\n4) failed/cancelled always free, revisions never count")
+print("\n3) failed/cancelled always free, revisions never count")
 for flag in (True, False):
     _set_flag(flag)
     s, org = seed(["failed", "cancelled", "completed"])
@@ -96,20 +91,19 @@ for flag in (True, False):
           f"flag={flag}: only the completed root bid counts, got {used}")
     s.close()
 
-print("\n5) The paywall follows the same rule")
+print("\n4) The paywall follows the same rule")
 _set_flag(True)
 config.PLG_SELF_SERVE_ENABLED = True
 config.FREEMIUM_BID_LIMIT = 5
 s, org = seed(["needs_review"] * 5)
 used, limit, blocked = orgs.freemium_quota_state(s, org)
-check(used == 0 and blocked is False,
-      f"a user with 5 held bids must NOT be paywalled: "
-      f"used={used} blocked={blocked}")
-s.close()
-s, org = seed(["completed"] * 5)
-used, limit, blocked = orgs.freemium_quota_state(s, org)
 check(used == 5 and blocked is True,
-      f"5 delivered bids still hits the wall: used={used} blocked={blocked}")
+      f"5 held bids must hit the wall: used={used} blocked={blocked}")
+s.close()
+s, org = seed(["needs_review"] * 4)
+used, limit, blocked = orgs.freemium_quota_state(s, org)
+check(used == 4 and blocked is False,
+      f"4 held bids must NOT be paywalled: used={used} blocked={blocked}")
 s.close()
 
 _set_flag(False)

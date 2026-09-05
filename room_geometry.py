@@ -168,8 +168,105 @@ def build_enclosure_grid(pdf_path, page_index, pts_per_ft,
         "n_segments": len(H) + len(V), "shape": (h, w)}
 
 
+# v2 measurement (NIGHTSHIFT_ROOM_GEOMETRY_V2, read by the shadow builder
+# in Takeoff_DIRECT): the round-5 shadow audit (2026-09-04) showed the two
+# dominant loss modes are page-wide enclosure failure (interior fraction
+# ~0 — door openings are 3 ft, the 0.5 ft closing radius seals 1 ft, so
+# the floor leaks to the page border and EVERY anchor reads on_wall:
+# fishkill p6 29/29, hudson p8 21/21) and merged components (door openings
+# connect rooms; only the first owner got an area: homewood 102 rooms).
+_ADAPTIVE_CLOSE_LADDER = (1.0, 2.0, 3.5)   # ft, tried in order
+_ADAPTIVE_MIN_INTERIOR = 0.05              # of page area
+
+
+def _render_enclosure_grid(pdf_path, page_index, pts_per_ft,
+                           px_per_ft=_PX_PER_FT):
+    """Enclosure grid from a rasterized RENDER of the page instead of
+    axis-segment linework. Fallback for drawing styles the segment
+    extractor cannot see (walls as polylines/fills/curves — fishkill p6
+    reads 29/29 on_wall with only 2k axis segments). Any dark-enough
+    pixel is wall; the same border-flood then separates outside from
+    enclosed interior."""
+    if fitz is None:
+        raise RuntimeError("PyMuPDF (fitz) required")
+    doc = fitz.open(pdf_path)
+    try:
+        page = doc[page_index]
+        px_per_pt = px_per_ft / pts_per_ft
+        mat = fitz.Matrix(px_per_pt, px_per_pt)
+        pix = page.get_pixmap(matrix=mat, colorspace=fitz.csGRAY,
+                              alpha=False)
+        arr = np.frombuffer(pix.samples, dtype=np.uint8).reshape(
+            pix.height, pix.width)
+    finally:
+        doc.close()
+    mask = arr < 128          # dark ink = wall-ish
+    r = max(1, int(round(_CLOSE_FT * px_per_ft)))
+    closed = _binary_erode(_binary_dilate(mask, r), max(1, r - _PLUG_PX))
+    free = ~closed
+    h, w = free.shape
+    label = np.zeros((h, w), dtype=np.int32)
+    outside = np.zeros_like(free)
+    for seed in ((0, 0), (0, w - 1), (h - 1, 0), (h - 1, w - 1)):
+        if free[seed] and not outside[seed]:
+            outside |= _flood(free, label, seed, -1)
+    return free, free & ~outside, outside, {
+        "px_per_pt": px_per_pt, "px_per_ft": px_per_ft,
+        "n_segments": -1, "shape": (h, w), "source": "render"}
+
+
+def _adaptive_enclosure(pdf_path, page_index, pts_per_ft, px_per_ft,
+                        close_ft):
+    """build_enclosure_grid, escalating the closing radius while the
+    interior fraction is degenerate; falls back to a page-render mask
+    when segment linework never encloses. Returns (free, interior,
+    outside, meta) of the best attempt; meta gains close_ft_used /
+    interior_frac / source."""
+    best = None
+    for cf in (close_ft,) + _ADAPTIVE_CLOSE_LADDER:
+        free, interior, outside, meta = build_enclosure_grid(
+            pdf_path, page_index, pts_per_ft, px_per_ft, cf)
+        frac = float(interior.sum()) / max(1, interior.size)
+        meta["close_ft_used"] = cf
+        meta["interior_frac"] = round(frac, 4)
+        meta.setdefault("source", "segments")
+        if best is None or frac > best[4]:
+            best = (free, interior, outside, meta, frac)
+        if frac >= _ADAPTIVE_MIN_INTERIOR:
+            break
+    if best[4] < _ADAPTIVE_MIN_INTERIOR:
+        try:
+            free, interior, outside, meta = _render_enclosure_grid(
+                pdf_path, page_index, pts_per_ft, px_per_ft)
+            frac = float(interior.sum()) / max(1, interior.size)
+            meta["close_ft_used"] = _CLOSE_FT
+            meta["interior_frac"] = round(frac, 4)
+            if frac > best[4]:
+                best = (free, interior, outside, meta, frac)
+        except Exception:
+            pass
+    return best[0], best[1], best[2], best[3]
+
+
+def _split_merged_component(label, rid, group_px, px_per_ft):
+    """Partition one merged flood component among its anchors by nearest
+    anchor (in pixels). group_px: [(name, (cy, cx))]. Returns
+    {name: area_sqft}."""
+    ys, xs = np.nonzero(label == rid)
+    if ys.size == 0 or not group_px:
+        return {}
+    names = [n for n, _ in group_px]
+    d = np.stack([(ys - cy) ** 2 + (xs - cx) ** 2
+                  for _, (cy, cx) in group_px])
+    nearest = np.argmin(d, axis=0)
+    counts = np.bincount(nearest, minlength=len(names))
+    return {names[i]: float(counts[i]) / (px_per_ft ** 2)
+            for i in range(len(names))}
+
+
 def measure_room_areas(pdf_path, page_index, anchors, pts_per_ft=None,
-                       px_per_ft=_PX_PER_FT, close_ft=_CLOSE_FT):
+                       px_per_ft=_PX_PER_FT, close_ft=_CLOSE_FT,
+                       adaptive_close=False, split_merged=False):
     """Flood-filled room areas from label anchors (name, x_pt, y_pt).
 
     Per room: {area_sqft|None, status} with status one of
@@ -177,6 +274,13 @@ def measure_room_areas(pdf_path, page_index, anchors, pts_per_ft=None,
     Merged rooms share one region — the region's area is reported on the
     FIRST owner and None on joiners, with the group recorded, so aggregate
     consumers can sum groups without double counting.
+
+    v2 options (both default OFF so v1 callers are byte-identical):
+      adaptive_close: escalate the closing radius when the page's interior
+        fraction is degenerate (see _ADAPTIVE_CLOSE_LADDER).
+      split_merged: partition merged components among their anchors by
+        nearest-anchor distance; every group member reports its share as
+        status 'measured' (basis recorded as 'split').
     """
     if pts_per_ft is None:
         try:
@@ -187,12 +291,17 @@ def measure_room_areas(pdf_path, page_index, anchors, pts_per_ft=None,
         return {"rooms": {n: {"area_sqft": None, "status": "no_scale"}
                           for n, _, _ in anchors},
                 "pts_per_ft": None, "measured_n": 0, "groups": []}
-    free, interior, _outside, meta = build_enclosure_grid(
-        pdf_path, page_index, pts_per_ft, px_per_ft, close_ft)
+    if adaptive_close:
+        free, interior, _outside, meta = _adaptive_enclosure(
+            pdf_path, page_index, pts_per_ft, px_per_ft, close_ft)
+    else:
+        free, interior, _outside, meta = build_enclosure_grid(
+            pdf_path, page_index, pts_per_ft, px_per_ft, close_ft)
     px_per_pt = meta["px_per_pt"]
     h, w = meta["shape"]
     label = np.zeros((h, w), dtype=np.int32)
     out, owners, groups = {}, {}, {}
+    anchor_px = {}   # component id -> [(name, (cy, cx))] for merged splits
     snap = int(_SNAP_FT * px_per_ft)
     for idx, (name, xpt, ypt) in enumerate(anchors, start=1):
         cy = min(max(int(ypt * px_per_pt), 0), h - 1)
@@ -218,15 +327,52 @@ def measure_room_areas(pdf_path, page_index, anchors, pts_per_ft=None,
             owner = owners.get(rid)
             out[name] = {"area_sqft": None, "status": f"merged:{owner}"}
             groups.setdefault(rid, [owner]).append(name)
+            anchor_px.setdefault(rid, []).append((name, (cy, cx)))
             continue
         filled = _flood(interior, label, (cy, cx), idx)
         area = float(_binary_dilate(filled, _AREA_CORR_PX).sum()) \
             / (px_per_ft ** 2)
         owners[idx] = name
+        anchor_px.setdefault(idx, []).append((name, (cy, cx)))
         if area > _LEAK_MAX_SF:
             out[name] = {"area_sqft": None, "status": "leaked"}
         else:
             out[name] = {"area_sqft": round(area, 1), "status": "measured"}
+
+    if split_merged and groups:
+        for rid, members in groups.items():
+            owner = members[0]
+            owner_rec = out.get(owner) or {}
+            # A leaked component with a SINGLE anchor is untrusted (one
+            # label claiming a whole floor). A leaked component with
+            # several anchors is the opposite: the floor flooded as one
+            # blob because door openings connect the rooms, and the
+            # anchors are exactly the information that partitions it
+            # (homewood: 20+ rooms in one component). Split, then
+            # leak-check each share individually.
+            if owner_rec.get("status") == "leaked" and len(members) < 3:
+                continue
+            # Template-instance rosters give every sibling the SAME label
+            # bbox (homewood: 19 of 21 anchors at one point) — identical
+            # anchors are not separable, so only distinct-coordinate
+            # anchors participate; duplicates stay merged (their real fix
+            # is a template-unit basis, not a fake partition).
+            distinct, seen_px = [], set()
+            for name, (cy, cx) in anchor_px.get(rid) or []:
+                if (cy, cx) in seen_px:
+                    continue
+                seen_px.add((cy, cx))
+                distinct.append((name, (cy, cx)))
+            if len(distinct) < 2:
+                continue
+            shares = _split_merged_component(
+                label, rid, distinct, px_per_ft)
+            for member, _pt in distinct:
+                share = shares.get(member)
+                if share and 0 < share <= _LEAK_MAX_SF:
+                    out[member] = {"area_sqft": round(share, 1),
+                                   "status": "measured", "basis": "split"}
+
     return {"rooms": out, "pts_per_ft": pts_per_ft,
             "measured_n": sum(1 for v in out.values()
                               if v["status"] == "measured"),
@@ -409,12 +555,26 @@ def compute_room_geometry_shadow(pdf_paths, anchors_by_page=None):
             anchors = (anchors_by_page or {}).get((pdf, idx)) or []
             if anchors:
                 m = measure_room_areas(pdf, idx, anchors,
-                                       pts_per_ft=pts_per_ft)
+                                       pts_per_ft=pts_per_ft,
+                                       adaptive_close=_v2_enabled(),
+                                       split_merged=_v2_enabled())
                 rec["rooms"] = {
-                    n: {k: v[k] for k in ("area_sqft", "status")}
+                    n: {k: v[k] for k in ("area_sqft", "status", "basis")
+                        if k in v}
                     for n, v in m["rooms"].items()}
                 rec["rooms_measured"] = m["measured_n"]
         except Exception as exc:  # pragma: no cover
             rec["error"] = f"{type(exc).__name__}: {str(exc)[:80]}"
         pages.append(rec)
-    return {"engine": "room-geometry-shadow-v1", "pages": pages}
+    return {"engine": ("room-geometry-shadow-v2" if _v2_enabled()
+                       else "room-geometry-shadow-v1"),
+            "pages": pages}
+
+
+def _v2_enabled():
+    """NIGHTSHIFT_ROOM_GEOMETRY_V2 (default off): adaptive enclosure +
+    merged-component splitting. Read at call time; v1 output is
+    byte-identical with the flag off."""
+    import os
+    return os.environ.get(
+        "NIGHTSHIFT_ROOM_GEOMETRY_V2", "0").strip() in ("1", "true", "True")

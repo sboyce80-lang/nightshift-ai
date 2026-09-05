@@ -935,6 +935,58 @@ def _cache_dir_for(pdf_path):
     return d, ph
 
 
+# Runtime state the draw-median machinery threads through the environment.
+# These describe WHERE we are inside a job, not WHICH posture the job runs
+# under, so they stay out of the flag fingerprint (the checkpoint key already
+# hashes the draw tag separately).
+_FLAG_FINGERPRINT_EXCLUDE = {
+    "NIGHTSHIFT_JOB_DRAW_TAG",
+    "NIGHTSHIFT_JOB_DRAW_ACTIVE",
+    "NIGHTSHIFT_PROGRESS_FILE",
+}
+
+
+def _nightshift_flag_vector():
+    """The effective NIGHTSHIFT_* posture of this process, sorted k=v.
+
+    This is the record whose absence confounded every cross-run comparison
+    through 2026-09: the six Northwell runs executed at 56-66 flags and no
+    artifact said which. Read at call time so a per-job resolver posture is
+    captured as applied, not as booted.
+    """
+    return {
+        k: os.environ[k]
+        for k in sorted(os.environ)
+        if k.startswith("NIGHTSHIFT_") and k not in _FLAG_FINGERPRINT_EXCLUDE
+    }
+
+
+def _flag_fingerprint(vector=None):
+    """Short stable hash of the effective flag posture."""
+    vec = _nightshift_flag_vector() if vector is None else vector
+    blob = "\n".join(f"{k}={v}" for k, v in vec.items())
+    return hashlib.sha256(blob.encode("utf-8", "replace")).hexdigest()[:12]
+
+
+def _git_sha():
+    """Best-effort code revision: Render stamps RENDER_GIT_COMMIT; local
+    runs ask git. Returns "" rather than guessing."""
+    sha = os.environ.get("RENDER_GIT_COMMIT", "").strip()
+    if sha:
+        return sha[:12]
+    try:
+        import subprocess
+        out = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=os.path.dirname(os.path.abspath(__file__)),
+            capture_output=True, text=True, timeout=5)
+        if out.returncode == 0:
+            return out.stdout.strip()[:12]
+    except Exception:
+        pass
+    return ""
+
+
 def _cache_valid(cache_dir):
     """Check if cache exists and was generated with the current code version."""
     meta_path = cache_dir / "metadata.json"
@@ -1822,6 +1874,7 @@ def _extract_known_sheet_ids_from_index(pdf_path):
     try:
         scan_limit = min(len(doc), 3)
         for pg_0 in range(scan_limit):
+            txt = ""
             try:
                 txt = doc[pg_0].get_text() or ""
             except Exception:
@@ -4255,6 +4308,13 @@ def _sheet_checkpoint_key(static_prompt, sheet_context, verify_enabled):
     _draw_tag = os.environ.get("NIGHTSHIFT_JOB_DRAW_TAG", "").strip()
     if _draw_tag:
         h.update(b"|draw=%s" % _draw_tag.encode("utf-8", "replace"))
+    # Effective flag posture: a checkpoint written under one flag set must
+    # not replay under another. The R4 batch silently replayed max-merge-era
+    # checkpoints after the fill-only fix, and cross-posture replays made
+    # the 2026-09 Northwell series unattributable. Within a job (and its
+    # retries) the posture is constant, so resume still works; a posture
+    # change forces fresh extraction, which is the point.
+    h.update(b"|posture=%s" % _flag_fingerprint().encode())
     return h.hexdigest()[:16]
 
 
@@ -10702,6 +10762,7 @@ def _extract_building_inventory(client, pdf_path, index_page_indices, index_text
     # Create filtered PDF with only index pages
     # Try PDF first; if Claude can't process it, fall back to rendered images
     use_images = False
+    pdf_b64 = None
     try:
         filtered_pdf_bytes = _create_filtered_pdf(pdf_path, index_page_indices)
         # Check if the filtered PDF is too large (>5MB can cause issues)
@@ -12017,10 +12078,13 @@ def _apply_schedule_overrides(combined):
     sched_doors_frame = _num(ds.get("total_doors_frame_only", 0)) * schedule_scale
     sched_doors_total = sched_doors_fp + sched_doors_hm + sched_doors_frame
 
-    if sched_doors_total > 0:
-        room_doors_fp = _num(agg.get("total_doors_full_paint", 0))
-        room_doors_hm = _num(agg.get("total_doors_hm_panel", 0))
+    # Room-level counts captured BEFORE any schedule override writes into agg
+    # — the residential supplement below re-reads them and must see the
+    # pre-override values even when the override branch didn't run.
+    room_doors_fp = _num(agg.get("total_doors_full_paint", 0))
+    room_doors_hm = _num(agg.get("total_doors_hm_panel", 0))
 
+    if sched_doors_total > 0:
         # Schedule is authoritative — always use its values
         agg["total_doors_full_paint"] = sched_doors_fp
         agg["total_doors_hm_panel"] = sched_doors_hm
@@ -17040,6 +17104,155 @@ def _apply_sealed_concrete_allowance(analysis):
     return analysis
 
 
+def _vme_ceilings_enabled():
+    """NIGHTSHIFT_VME_CEILINGS (default off): measured room polygons own
+    painted-ceiling AREA. Ceilings ran +51%…+452% across the 2026-09
+    validation rounds because areas come from LLM L×W with assume-painted
+    heuristics; geometry fixes the area term while the schedule/ACT
+    evidence chain keeps owning the painted-vs-not classification."""
+    return os.environ.get("NIGHTSHIFT_VME_CEILINGS", "0").strip() in (
+        "1", "true", "True")
+
+
+_VME_CEIL_RATIO_BAND = (0.4, 2.5)
+_VME_CEIL_MIN_COVERAGE = 0.6
+
+
+def _apply_vme_ceilings(analysis):
+    """Replace painted-ceiling areas with measured room-polygon areas —
+    in BOTH directions (geometric completion above only fills zeros; the
+    only-increase asymmetry is how +452% ceiling rounds happen).
+
+    Discipline mirrors _apply_vme_authoritative_walls:
+      - classification is respected: only rooms the evidence chain left
+        ceiling_painted=True are touched; ACT/exposed/dryfall never move;
+      - coverage floor: measured polygons must carry >= 60% of the
+        resulting painted-ceiling area, else abstain;
+      - sanity band: geometric total within (0.4, 2.5) of the current
+        painted total, else abstain; a zero current total abstains too
+        (the dead-roster lesson — geometry x dead scope overbills);
+      - every abstain records a counterfactual in _vme_ceilings.
+
+    Applies per-room (dims.ceiling_area_sqft) so room data and aggregates
+    move together, then adjusts the aggregate by the same delta. Its own
+    failure can never fail the job.
+    """
+    if not _vme_ceilings_enabled():
+        return analysis
+    if analysis.get("_vme_ceilings") is not None:
+        return analysis
+
+    def _abstain_c(reason, extra=None):
+        rec = {"applied": False, "reason": reason}
+        if extra:
+            rec.update(extra)
+        analysis["_vme_ceilings"] = rec
+        return analysis
+
+    try:
+        shadow = analysis.get("_room_geometry_shadow")
+        if not isinstance(shadow, dict) or shadow.get("error"):
+            return _abstain_c("no room-geometry shadow")
+        geo = {}
+        for pg in shadow.get("pages", []):
+            for name, rec in (pg.get("rooms") or {}).items():
+                try:
+                    area = float(rec.get("area_sqft") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if rec.get("status") in ("ok", "measured") and area > 0:
+                    geo.setdefault(_norm_room_id(name), area)
+        if not geo:
+            return _abstain_c("no measured room polygons in shadow")
+
+        cur_painted = 0.0     # current painted-ceiling SF (room-level)
+        new_painted = 0.0     # same rooms, polygons where measured
+        measured_part = 0.0   # portion of new_painted from geometry
+        targets = []          # (room, mult, cur_sf, poly_sf)
+        for floor in analysis.get("floors") or []:
+            for rm in floor.get("rooms") or []:
+                if not rm.get("in_scope", True):
+                    continue
+                mats = rm.get("materials") or {}
+                if not mats.get("ceiling_painted"):
+                    continue
+                if "dryfall" in str(mats.get("ceiling", "")).lower():
+                    continue
+                dims = rm.get("dimensions") or {}
+                mult = _num(rm.get("unit_multiplier", 1)) or 1.0
+                cur = _num(dims.get("ceiling_area_sqft", 0)) * mult
+                cur_painted += cur
+                rid = _norm_room_id(str(rm.get("room_id")
+                                        or rm.get("room_name") or ""))
+                poly = geo.get(rid)
+                if poly and poly > 0:
+                    new_painted += poly * mult
+                    measured_part += poly * mult
+                    targets.append((rm, mult, cur, poly))
+                else:
+                    new_painted += cur
+
+        if cur_painted <= 0:
+            return _abstain_c(
+                "no painted ceilings in the roster — geometry has no "
+                "classified scope to measure (dead-roster rule)",
+                {"geo_rooms": len(geo)})
+        coverage = measured_part / new_painted if new_painted > 0 else 0.0
+        counterfactual = {
+            "geometric_painted_sf": round(new_painted, 1),
+            "current_painted_sf": round(cur_painted, 1),
+            "coverage": round(coverage, 3),
+            "rooms_measured": len(targets),
+        }
+        if coverage < _VME_CEIL_MIN_COVERAGE:
+            return _abstain_c(
+                f"measured polygons carry {coverage:.0%} of painted "
+                f"ceiling area (< {_VME_CEIL_MIN_COVERAGE:.0%})",
+                counterfactual)
+        ratio = new_painted / cur_painted
+        lo, hi = _VME_CEIL_RATIO_BAND
+        if not (lo <= ratio <= hi):
+            return _abstain_c(
+                f"geometric ceilings {new_painted:,.0f} SF vs extracted "
+                f"{cur_painted:,.0f} (x{ratio:.2f}) outside the sanity "
+                f"band", counterfactual)
+
+        for rm, mult, cur, poly in targets:
+            dims = rm.setdefault("dimensions", {})
+            dims["ceiling_area_sqft"] = round(poly, 2)
+            dims["ceiling_area_source"] = "polygon"
+        agg = analysis.get("aggregated_totals")
+        delta = new_painted - cur_painted
+        before = None
+        if isinstance(agg, dict):
+            before = _num(agg.get("total_paintable_ceiling_sqft", 0))
+            agg["total_paintable_ceiling_sqft"] = round(
+                max(0.0, before + delta), 2)
+        analysis["_vme_ceilings"] = {
+            "applied": True,
+            "rooms_replaced": len(targets),
+            "coverage": round(coverage, 3),
+            "ratio": round(ratio, 2),
+            "painted_sf_before": round(cur_painted, 1),
+            "painted_sf_after": round(new_painted, 1),
+            "agg_before": before,
+            "agg_after": (agg or {}).get("total_paintable_ceiling_sqft"),
+            "engine": "room-geometry polygons",
+        }
+        analysis.setdefault("notes", []).append(
+            f"[VME Ceilings] {len(targets)} painted rooms measured from "
+            f"floor-plan polygons: {cur_painted:,.0f} → {new_painted:,.0f} "
+            f"SF (coverage {coverage:.0%}). ACT/exposed/dryfall rooms "
+            f"untouched. source: geometry")
+    except Exception as e:
+        try:
+            analysis["_vme_ceilings"] = {"applied": False,
+                                         "error": str(e)[:200]}
+        except Exception:
+            pass
+    return analysis
+
+
 def _apply_geometric_room_completion(analysis):
     """Flag-gated (NIGHTSHIFT_GEOMETRIC_ROOM_COMPLETION, default off):
     starved rooms (extracted but with unreadable dimensions) get their
@@ -17943,6 +18156,104 @@ def _dedup_cross_sheet_stairs(analysis):
           f"removed {removed:.0f} (floor-plan duplicates)", flush=True)
     analysis["_stair_cross_sheet_dedup"] = {
         "kept_stair_sheet": kept, "removed_floor_plan": removed}
+    return analysis
+
+
+def _door_schedule_ledger_enabled():
+    """NIGHTSHIFT_DOOR_SCHEDULE_LEDGER (default off): doors come from a
+    parsed deterministic source when one exists. Doors were wrong on 6/6
+    validation jobs with all four door flags on; the one time a parsed
+    source drove the count (round-5 roster) they hit −3%. Spec:
+    docs/DOOR_LEDGER_SPEC_2026-09-03.md."""
+    return os.environ.get(
+        "NIGHTSHIFT_DOOR_SCHEDULE_LEDGER", "0").strip() in (
+        "1", "true", "True")
+
+
+def _apply_door_schedule_ledger(analysis):
+    """Ledger authority for door counts (flag-gated, never fails the job).
+
+    MODE A (text door schedule parsed, >=5 entries): the ledger count is
+    authoritative. Material split comes from the ledger when it read a
+    material column; otherwise the extraction's existing full-paint:HM
+    ratio classifies the ledger's count (spec: extraction supplies ONLY
+    classification when the ledger lacks materials). Delta > 25% vs the
+    priced doors raises an RFI line — never silent.
+
+    MODE B (plan-symbol count): DIAGNOSTIC ONLY. Harness 2026-09-04:
+    tag-marks read 12/29 Harlem, 14/78 Northwell, 53/26 ULUM — recorded in
+    provenance + an RFI on gross divergence, but it must not set counts
+    until harness_door_ledger.py hits its targets. Validated mode-A case:
+    Caris 79 parsed vs JW 75 (+5.3%).
+    """
+    if not _door_schedule_ledger_enabled():
+        return analysis
+    try:
+        paths = analysis.get("_vme_pdf_paths") or []
+        if not paths:
+            return analysis
+        from door_ledger import build_door_ledger
+        led = build_door_ledger(paths)
+        agg = analysis.get("aggregated_totals")
+        if not isinstance(agg, dict):
+            return analysis
+        cur_fp = _num(agg.get("total_doors_full_paint", 0))
+        cur_hm = _num(agg.get("total_doors_hm_panel", 0))
+        cur_total = cur_fp + cur_hm
+        analysis["_door_ledger"] = {
+            "mode": led.get("mode"), "count": led.get("count"),
+            "full_paint": led.get("full_paint"),
+            "hm_panel": led.get("hm_panel"),
+            "detector": led.get("detector"),
+            "sources": led.get("sources"),
+            "extraction_doors_at_gate": round(cur_total, 1),
+        }
+        if led.get("mode") == "schedule" and _num(led.get("count")) >= 5:
+            n = float(led["count"])
+            fp_led = _num(led.get("full_paint"))
+            hm_led = _num(led.get("hm_panel"))
+            classified = fp_led + hm_led
+            if classified >= n * 0.5:
+                # Ledger read materials: scale its split to the full count
+                # (unknown-material rows follow the classified ratio).
+                new_fp = n * (fp_led / classified)
+                new_hm = n * (hm_led / classified)
+            elif cur_total > 0:
+                new_fp = n * (cur_fp / cur_total)
+                new_hm = n * (cur_hm / cur_total)
+            else:
+                new_fp, new_hm = n, 0.0
+            agg["total_doors_full_paint"] = round(new_fp, 1)
+            agg["total_doors_hm_panel"] = round(new_hm, 1)
+            src = ", ".join(led.get("sources") or [])[:120]
+            analysis.setdefault("notes", []).append(
+                f"[Door Ledger] {n:.0f} doors from parsed door schedule "
+                f"({src}); extraction had {cur_total:.0f}. "
+                f"source: ledger")
+            if cur_total > 0 and abs(n - cur_total) / max(n, cur_total) \
+                    > 0.25:
+                analysis.setdefault("rfi_items", []).append({
+                    "category": "Door Count",
+                    "question": (
+                        f"The door schedule lists {n:.0f} doors but the "
+                        f"floor plans yielded {cur_total:.0f}. The bid "
+                        f"prices the schedule's {n:.0f}; please confirm "
+                        f"door count and any doors excluded from painting "
+                        f"scope.")})
+        elif led.get("mode") == "symbols" and cur_total > 0:
+            n_sym = _num(led.get("count"))
+            if n_sym >= 5 and abs(n_sym - cur_total) / max(
+                    n_sym, cur_total) > 0.5:
+                analysis.setdefault("notes", []).append(
+                    f"[Door Ledger] plan-symbol diagnostic read "
+                    f"{n_sym:.0f} drawn door marks vs {cur_total:.0f} "
+                    f"priced (diagnostic only — counts unchanged). "
+                    f"source: symbols")
+    except Exception as e:
+        try:
+            analysis["_door_ledger"] = {"error": str(e)[:200]}
+        except Exception:
+            pass
     return analysis
 
 
@@ -21025,9 +21336,9 @@ def _apply_vme_authoritative_walls(analysis):
     # clip where they don't, sibling-scale retry for no-scale pages. This is
     # what lets partial-scope jobs (renos, phased work) price from geometry
     # instead of abstaining.
+    scoped_why = "scoped measurement unavailable"
     if basis is None:
         scoped = analysis.get("_vme_scoped")
-        scoped_why = "scoped measurement unavailable"
         if scoped is None:
             paths = analysis.get("_vme_pdf_paths") or []
             if paths:
@@ -22328,6 +22639,110 @@ def _reconcile_scope_sweep(analysis):
     return analysis
 
 
+def _agg_drift_audit_enabled():
+    """Shadow audit of aggregate/room-data drift. Default ON: it changes no
+    prices and no scope — it only records. NIGHTSHIFT_AGG_DRIFT_AUDIT=0 is
+    the kill switch."""
+    return os.environ.get("NIGHTSHIFT_AGG_DRIFT_AUDIT", "1").strip() not in (
+        "0", "false", "False")
+
+
+def _agg_drift_review_enabled():
+    """Escalation: drift beyond the threshold holds the job for review.
+    Default OFF until the shadow data says what legitimate drift (aggregate-
+    level schedule overrides, WC deducts) looks like per class."""
+    return os.environ.get("NIGHTSHIFT_AGG_DRIFT_REVIEW", "0").strip() in (
+        "1", "true", "True")
+
+
+def _audit_aggregate_drift(analysis):
+    """Record how far the gate chain's hand-maintained aggregates have
+    drifted from a clean recompute off room data.
+
+    aggregated_totals and the room inventory are two sources of truth
+    reconciled by ~30 hand-written decrement blocks inside the gates, each
+    clamped with max(0, ...) so a mis-decrement fails silently to zero.
+    _recalculate_totals is never run after the chain because some passes
+    (schedule overrides, WC deducts) legitimately write aggregate-level
+    values that a room recompute would wipe — so drift is not always a bug,
+    but a NEW drift on a job class that had none is exactly how the
+    "dropped rooms kept getting billed" family announces itself.
+
+    This audit runs the recompute on a deep copy (the live analysis is
+    never touched), diffs every numeric key, and stores the result in
+    analysis["_agg_drift"]. With NIGHTSHIFT_AGG_DRIFT_REVIEW on, drift
+    beyond NIGHTSHIFT_AGG_DRIFT_REVIEW_PCT (default 10) also holds the job
+    for review. Failure of the audit itself can never fail the job.
+    """
+    if not _agg_drift_audit_enabled():
+        return analysis
+    try:
+        import contextlib
+        import copy
+        import io
+
+        agg = analysis.get("aggregated_totals")
+        if not isinstance(agg, dict):
+            return analysis
+        with contextlib.redirect_stdout(io.StringIO()):
+            shadow = copy.deepcopy(analysis)
+            recomputed = (_recalculate_totals(shadow) or {}).get(
+                "aggregated_totals") or {}
+
+        drifts = {}
+        max_abs = 0.0
+        for key in sorted(set(agg) | set(recomputed)):
+            try:
+                a = float(agg.get(key) or 0)
+                b = float(recomputed.get(key) or 0)
+            except (TypeError, ValueError):
+                continue
+            if a == b:
+                continue
+            base = max(abs(a), abs(b))
+            if base < 1.0:
+                continue
+            pct = round((a - b) / base * 100.0, 1)
+            if abs(pct) < 1.0:
+                continue
+            drifts[key] = {"chain": round(a, 2),
+                           "room_recompute": round(b, 2),
+                           "drift_pct": pct}
+            max_abs = max(max_abs, abs(pct))
+
+        analysis["_agg_drift"] = {
+            "keys": drifts,
+            "max_abs_drift_pct": round(max_abs, 1),
+            "n_keys_drifted": len(drifts),
+        }
+
+        threshold = float(os.environ.get(
+            "NIGHTSHIFT_AGG_DRIFT_REVIEW_PCT", "10"))
+        if _agg_drift_review_enabled() and max_abs >= threshold:
+            worst = sorted(drifts.items(),
+                           key=lambda kv: -abs(kv[1]["drift_pct"]))[:3]
+            detail = "; ".join(
+                f"{k} chain {v['chain']:,.0f} vs rooms "
+                f"{v['room_recompute']:,.0f} ({v['drift_pct']:+.1f}%)"
+                for k, v in worst)
+            analysis["manual_review_required"] = True
+            reason = ("Aggregate drift: priced totals diverge from room "
+                      f"data beyond {threshold:.0f}% — {detail}")
+            prior = analysis.get("manual_review_reason")
+            analysis["manual_review_reason"] = (
+                f"{prior} | {reason}" if prior else reason)
+            analysis.setdefault("notes", []).append(
+                f"[Aggregate Drift] {detail}. The gate chain's totals no "
+                f"longer match the room inventory; review before send.")
+    except Exception as e:
+        # The audit is a thermometer, never a tourniquet.
+        try:
+            analysis["_agg_drift"] = {"error": str(e)[:200]}
+        except Exception:
+            pass
+    return analysis
+
+
 def build_priced_takeoff(analysis, strict=None):
     """Single provenance choke point between aggregation and calculate_costs.
 
@@ -22379,6 +22794,13 @@ def build_priced_takeoff(analysis, strict=None):
     # G1 door-density reconcile: unit templates cannot carry more doors
     # than rooms+2 per unit. Flag-gated; no-op when off.
     analysis = _reconcile_door_density(analysis)
+
+    # Deterministic door ledger: doors from a PARSED source (text door
+    # schedule; plan symbols are diagnostic-only until the harness proves
+    # them). Runs AFTER the four door heuristics so a real ledger outranks
+    # every one of them — the spec's contract is that they collapse into
+    # it over time. Flag-gated; no-op when off.
+    analysis = _apply_door_schedule_ledger(analysis)
 
     # Stair cross-sheet dedup: a dedicated stairwell plans/sections sheet
     # and the floor plans describe the same flights — count them once.
@@ -22517,6 +22939,13 @@ def build_priced_takeoff(analysis, strict=None):
     # no-op when off.
     analysis = _apply_geometric_room_completion(analysis)
 
+    # VME ceilings: measured room polygons own painted-ceiling AREA in
+    # both directions (completion above only fills zeros); the schedule/
+    # ACT evidence chain, which already ran, keeps owning painted-vs-not.
+    # Mirrors the walls gate's discipline: coverage floor, sanity band,
+    # abstain with counterfactual. Flag-gated; no-op when off.
+    analysis = _apply_vme_ceilings(analysis)
+
     # Sealed-concrete allowance: utility-class rooms with undocumented
     # floor finish carry a strikeable slab-sealing allowance + RFI. Runs
     # after geometric completion so starved rooms have floor areas.
@@ -22588,6 +23017,11 @@ def build_priced_takeoff(analysis, strict=None):
                 f"under the provenance gate ({m:,.0f} measured priced). "
                 f"RFI REQUIRED: confirm this scope on the drawings before it "
                 f"is added to the bid.")
+    # Last step of the chain, after every gate has had its say: measure how
+    # far the hand-maintained aggregates sit from the room data they claim
+    # to summarize. Records only (see _audit_aggregate_drift).
+    analysis = _audit_aggregate_drift(analysis)
+
     analysis["_priced_takeoff_built"] = True
     return analysis
 
@@ -26313,6 +26747,7 @@ def calculate_costs(aggregated_totals, exterior=None, building_type="", project_
 
     _use_footprint_pricing = False
     _footprint_interior_total = 0
+    _fp_rate = 0.0  # set alongside _use_footprint_pricing below
 
     # HARD_NUMBERS_ONLY: never substitute a footprint × rate estimate for the
     # measured per-room line items. Footprint pricing discards extracted scope
@@ -28830,6 +29265,12 @@ def _run_job_draw_median(k, pdf_paths, run_kwargs):
             print("\n" + _line + f"  [K={k} draws]")
     except Exception:
         pass
+    # The draw-median layer's own checks (all-draws-implausible, subtotal
+    # spread) set the flag on `analysis` AFTER the child draw returned, so
+    # the child's top-level copy is stale by now. Re-sync before returning.
+    chosen["manual_review_required"] = bool(
+        analysis.get("manual_review_required"))
+    chosen["manual_review_reason"] = analysis.get("manual_review_reason")
     return chosen
 
 
@@ -29510,6 +29951,9 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             and _extraction_likely_incomplete(best_result[1])
         )
 
+        # Referenced by the extra-pass branches much further down even when
+        # the enhanced-rescue block never runs — must exist on every path.
+        painting_page_indices = None
         if not used_per_sheet and (
                 best_rooms == 0 or rooms_have_zero_dims or likely_incomplete):
             try:
@@ -29522,7 +29966,6 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                 # Check if any page in this PDF is large-format, and identify
                 # painting-relevant pages to avoid tiling structural/MEP sheets
                 has_large_pages = False
-                painting_page_indices = None
                 try:
                     import fitz as _fitz_check
                     _doc_check = _fitz_check.open(pdf_path)
@@ -29972,6 +30415,19 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
     # Normalize scope fields after merge (ensures every room has in_scope)
     _update_progress(5, TOTAL_STEPS, "Validating & Recalculating", "Applying guardrails and schedule overrides...")
     analysis = _normalize_scope_fields(analysis)
+
+    # --- Run fingerprint: which code, under which flags, produced this ---
+    # Stamped on every path (web, CLI, harness), unlike the jobs.py posture
+    # stamp which only web jobs get. Without this no two results are
+    # comparable: the 2026-09 Northwell series ran at 56/61/63/63/64/66
+    # flags and only shell history knew.
+    _fp_vector = _nightshift_flag_vector()
+    analysis["run_fingerprint"] = {
+        "flag_fingerprint": _flag_fingerprint(_fp_vector),
+        "flags": _fp_vector,
+        "git_sha": _git_sha(),
+        "code_hash": _code_hash()[:12],
+    }
 
     # --- Skipped files: block silent partial estimates ---
     # files_skipped used to be written into the result JSON and read by
@@ -31058,11 +31514,24 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         _basis_hi_label = ("gross floor area stated on the drawings"
                            if _basis_hi == _read_gsf and _read_gsf
                            else "building footprint")
-        if _basis_hi > 500 and _total_paintable > _basis_hi * _hi_max:
-            _r_hi = _total_paintable / _basis_hi
+        # Compute the guard's own total: the commercial-only sanity block
+        # above also builds a _total_paintable, but only for commercial
+        # building types — reusing it here crashed every non-commercial job
+        # that ran with this guard on (UnboundLocalError; killed board cells
+        # in rounds 4 AND 5 before being root-caused).
+        _agg_hi = analysis.get("aggregated_totals", {}) or {}
+        _ext_hi = analysis.get("exterior", {}) or {}
+        _total_paintable_hi = (
+            _num(_agg_hi.get("total_paintable_wall_sqft", 0))
+            + _num(_agg_hi.get("total_paintable_ceiling_sqft", 0))
+            + _num(_agg_hi.get("total_dryfall_ceiling_sqft", 0))
+            + _num(_ext_hi.get("exterior_paint_sqft", 0))
+            + _num(_ext_hi.get("hardie_siding_sqft", 0)))
+        if _basis_hi > 500 and _total_paintable_hi > _basis_hi * _hi_max:
+            _r_hi = _total_paintable_hi / _basis_hi
             _msg_hi = (
                 f"[MANUAL REVIEW REQUIRED] Total extracted paintable surface "
-                f"({_total_paintable:,.0f} sqft) is implausibly HIGH relative "
+                f"({_total_paintable_hi:,.0f} sqft) is implausibly HIGH relative "
                 f"to the {_basis_hi_label} ({_basis_hi:,.0f} sqft) — ratio is "
                 f"{_r_hi:.1f}x, expected 3-6x. This usually means rooms "
                 f"OUTSIDE the scope boundary were extracted (a full-floor or "
@@ -31074,7 +31543,7 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
             analysis["manual_review_reason"] = _msg_hi
             analysis.setdefault("notes", []).append(_msg_hi)
             analysis["_over_extraction_guard"] = {
-                "paintable": round(_total_paintable, 1),
+                "paintable": round(_total_paintable_hi, 1),
                 "basis": round(_basis_hi, 1),
                 "basis_label": _basis_hi_label,
                 "ratio": round(_r_hi, 2),
@@ -31082,7 +31551,7 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
                 "inferred_footprint": round(_fp_hi, 1),
                 "read_gsf": round(_read_gsf, 1)}
             print(f"\n🚨 OVER-EXTRACTION GUARD TRIPPED")
-            print(f"   Paintable: {_total_paintable:,.0f} sqft vs "
+            print(f"   Paintable: {_total_paintable_hi:,.0f} sqft vs "
                   f"{_basis_hi_label} {_basis_hi:,.0f} sqft "
                   f"({_r_hi:.1f}x, max {_hi_max:.0f}x)")
             if _fp_hi and _read_gsf and _fp_hi > _read_gsf * 1.5:
@@ -31374,6 +31843,11 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         "rfi_items": rfi_items,
         "adjustments_applied": adjustments_log if adjustments_log else None,
         "will_synthesis": will_result.get("will_synthesis"),
+        # The saved JSON promotes these to the top level; the in-memory
+        # return must match, or callers gating on them (jobs.py
+        # manual-review gate) read an absent key and ship flagged work.
+        "manual_review_required": bool(analysis.get("manual_review_required")),
+        "manual_review_reason": analysis.get("manual_review_reason"),
     }
 
 

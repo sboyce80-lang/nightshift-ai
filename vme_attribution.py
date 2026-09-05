@@ -347,6 +347,7 @@ def _sheet_index(pdf_paths):
             continue
         try:
             for i in range(len(doc)):
+                words = []
                 try:
                     if not _INDEX_HDR_RE.search(doc[i].get_text() or ""):
                         continue

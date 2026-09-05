@@ -1,0 +1,37 @@
+# Lint configuration. Correctness-only for now: the repo passes these rules
+# clean today, so CI can enforce them from day one with zero churn. They
+# catch the class that has actually burned us — undefined/duplicate names,
+# broken comparisons, syntax errors (the _total_paintable UnboundLocalError
+# crashed two separate validation boards before anything flagged it).
+# Style rules are deliberately excluded; turning them on across a 68k-line
+# codebase is churn, not safety.
+[tool.ruff]
+target-version = "py311"
+extend-exclude = [
+    "nsai_*",          # validation-run harness dirs (one-off scripts)
+    "*_local_run",     # local run scratch dirs
+]
+
+# mypy runs in CI for exactly ONE error class: possibly-undefined, the
+# static form of UnboundLocalError (a name assigned only inside a branch,
+# used outside it). ruff's rule set cannot see this flow-sensitively; mypy
+# can, and the repo-wide sweep on 2026-09-04 found 14 — including the
+# _total_paintable guard crash that killed board cells in rounds 4 AND 5,
+# and a VME abstain-path crash. All 14 fixed; CI greps mypy's output for
+# the code and fails on any hit, ignoring mypy's other complaints (the
+# untyped codebase produces ~250 that are churn to chase today).
+[tool.mypy]
+ignore_missing_imports = true
+check_untyped_defs = true
+enable_error_code = ["possibly-undefined"]
+exclude = '(nsai_|_local_run)'
+
+[tool.ruff.lint]
+select = [
+    "E9",    # syntax errors
+    "F63",   # invalid comparisons/prints
+    "F7",    # syntax-adjacent (return outside function, etc.)
+    "F82",   # undefined names
+    "F811",  # redefined-while-unused (shadowed defs)
+    "PLE",   # pylint error class
+]
