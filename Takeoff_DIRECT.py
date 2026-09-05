@@ -17104,6 +17104,155 @@ def _apply_sealed_concrete_allowance(analysis):
     return analysis
 
 
+def _vme_ceilings_enabled():
+    """NIGHTSHIFT_VME_CEILINGS (default off): measured room polygons own
+    painted-ceiling AREA. Ceilings ran +51%…+452% across the 2026-09
+    validation rounds because areas come from LLM L×W with assume-painted
+    heuristics; geometry fixes the area term while the schedule/ACT
+    evidence chain keeps owning the painted-vs-not classification."""
+    return os.environ.get("NIGHTSHIFT_VME_CEILINGS", "0").strip() in (
+        "1", "true", "True")
+
+
+_VME_CEIL_RATIO_BAND = (0.4, 2.5)
+_VME_CEIL_MIN_COVERAGE = 0.6
+
+
+def _apply_vme_ceilings(analysis):
+    """Replace painted-ceiling areas with measured room-polygon areas —
+    in BOTH directions (geometric completion above only fills zeros; the
+    only-increase asymmetry is how +452% ceiling rounds happen).
+
+    Discipline mirrors _apply_vme_authoritative_walls:
+      - classification is respected: only rooms the evidence chain left
+        ceiling_painted=True are touched; ACT/exposed/dryfall never move;
+      - coverage floor: measured polygons must carry >= 60% of the
+        resulting painted-ceiling area, else abstain;
+      - sanity band: geometric total within (0.4, 2.5) of the current
+        painted total, else abstain; a zero current total abstains too
+        (the dead-roster lesson — geometry x dead scope overbills);
+      - every abstain records a counterfactual in _vme_ceilings.
+
+    Applies per-room (dims.ceiling_area_sqft) so room data and aggregates
+    move together, then adjusts the aggregate by the same delta. Its own
+    failure can never fail the job.
+    """
+    if not _vme_ceilings_enabled():
+        return analysis
+    if analysis.get("_vme_ceilings") is not None:
+        return analysis
+
+    def _abstain_c(reason, extra=None):
+        rec = {"applied": False, "reason": reason}
+        if extra:
+            rec.update(extra)
+        analysis["_vme_ceilings"] = rec
+        return analysis
+
+    try:
+        shadow = analysis.get("_room_geometry_shadow")
+        if not isinstance(shadow, dict) or shadow.get("error"):
+            return _abstain_c("no room-geometry shadow")
+        geo = {}
+        for pg in shadow.get("pages", []):
+            for name, rec in (pg.get("rooms") or {}).items():
+                try:
+                    area = float(rec.get("area_sqft") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if rec.get("status") in ("ok", "measured") and area > 0:
+                    geo.setdefault(_norm_room_id(name), area)
+        if not geo:
+            return _abstain_c("no measured room polygons in shadow")
+
+        cur_painted = 0.0     # current painted-ceiling SF (room-level)
+        new_painted = 0.0     # same rooms, polygons where measured
+        measured_part = 0.0   # portion of new_painted from geometry
+        targets = []          # (room, mult, cur_sf, poly_sf)
+        for floor in analysis.get("floors") or []:
+            for rm in floor.get("rooms") or []:
+                if not rm.get("in_scope", True):
+                    continue
+                mats = rm.get("materials") or {}
+                if not mats.get("ceiling_painted"):
+                    continue
+                if "dryfall" in str(mats.get("ceiling", "")).lower():
+                    continue
+                dims = rm.get("dimensions") or {}
+                mult = _num(rm.get("unit_multiplier", 1)) or 1.0
+                cur = _num(dims.get("ceiling_area_sqft", 0)) * mult
+                cur_painted += cur
+                rid = _norm_room_id(str(rm.get("room_id")
+                                        or rm.get("room_name") or ""))
+                poly = geo.get(rid)
+                if poly and poly > 0:
+                    new_painted += poly * mult
+                    measured_part += poly * mult
+                    targets.append((rm, mult, cur, poly))
+                else:
+                    new_painted += cur
+
+        if cur_painted <= 0:
+            return _abstain_c(
+                "no painted ceilings in the roster — geometry has no "
+                "classified scope to measure (dead-roster rule)",
+                {"geo_rooms": len(geo)})
+        coverage = measured_part / new_painted if new_painted > 0 else 0.0
+        counterfactual = {
+            "geometric_painted_sf": round(new_painted, 1),
+            "current_painted_sf": round(cur_painted, 1),
+            "coverage": round(coverage, 3),
+            "rooms_measured": len(targets),
+        }
+        if coverage < _VME_CEIL_MIN_COVERAGE:
+            return _abstain_c(
+                f"measured polygons carry {coverage:.0%} of painted "
+                f"ceiling area (< {_VME_CEIL_MIN_COVERAGE:.0%})",
+                counterfactual)
+        ratio = new_painted / cur_painted
+        lo, hi = _VME_CEIL_RATIO_BAND
+        if not (lo <= ratio <= hi):
+            return _abstain_c(
+                f"geometric ceilings {new_painted:,.0f} SF vs extracted "
+                f"{cur_painted:,.0f} (x{ratio:.2f}) outside the sanity "
+                f"band", counterfactual)
+
+        for rm, mult, cur, poly in targets:
+            dims = rm.setdefault("dimensions", {})
+            dims["ceiling_area_sqft"] = round(poly, 2)
+            dims["ceiling_area_source"] = "polygon"
+        agg = analysis.get("aggregated_totals")
+        delta = new_painted - cur_painted
+        before = None
+        if isinstance(agg, dict):
+            before = _num(agg.get("total_paintable_ceiling_sqft", 0))
+            agg["total_paintable_ceiling_sqft"] = round(
+                max(0.0, before + delta), 2)
+        analysis["_vme_ceilings"] = {
+            "applied": True,
+            "rooms_replaced": len(targets),
+            "coverage": round(coverage, 3),
+            "ratio": round(ratio, 2),
+            "painted_sf_before": round(cur_painted, 1),
+            "painted_sf_after": round(new_painted, 1),
+            "agg_before": before,
+            "agg_after": (agg or {}).get("total_paintable_ceiling_sqft"),
+            "engine": "room-geometry polygons",
+        }
+        analysis.setdefault("notes", []).append(
+            f"[VME Ceilings] {len(targets)} painted rooms measured from "
+            f"floor-plan polygons: {cur_painted:,.0f} → {new_painted:,.0f} "
+            f"SF (coverage {coverage:.0%}). ACT/exposed/dryfall rooms "
+            f"untouched. source: geometry")
+    except Exception as e:
+        try:
+            analysis["_vme_ceilings"] = {"applied": False,
+                                         "error": str(e)[:200]}
+        except Exception:
+            pass
+    return analysis
+
+
 def _apply_geometric_room_completion(analysis):
     """Flag-gated (NIGHTSHIFT_GEOMETRIC_ROOM_COMPLETION, default off):
     starved rooms (extracted but with unreadable dimensions) get their
@@ -22789,6 +22938,13 @@ def build_priced_takeoff(analysis, strict=None):
     # starved-walls promotion). Requires the shadow above. Flag-gated;
     # no-op when off.
     analysis = _apply_geometric_room_completion(analysis)
+
+    # VME ceilings: measured room polygons own painted-ceiling AREA in
+    # both directions (completion above only fills zeros); the schedule/
+    # ACT evidence chain, which already ran, keeps owning painted-vs-not.
+    # Mirrors the walls gate's discipline: coverage floor, sanity band,
+    # abstain with counterfactual. Flag-gated; no-op when off.
+    analysis = _apply_vme_ceilings(analysis)
 
     # Sealed-concrete allowance: utility-class rooms with undocumented
     # floor finish carry a strikeable slab-sealing allowance + RFI. Runs
