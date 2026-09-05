@@ -629,9 +629,28 @@ PLG_BLOCK_FREE_EMAIL_AUTO_APPROVE = os.environ.get(
     "PLG_BLOCK_FREE_EMAIL_AUTO_APPROVE", "1").strip().lower() in ("1", "true", "yes", "on")
 
 # Where the paywall / exhausted email points the user. Shown verbatim in
-# customer-facing copy.
+# customer-facing copy, so it must be a mailbox that actually exists —
+# hello@ never did (Steven, 2026-09-04), so a customer who typed it in
+# bounced. The paywall's mailto CCs PLG_SALES_CONTACT_CC so pricing asks
+# land with the whole sales loop, not one inbox.
 PLG_SALES_CONTACT_EMAIL = os.environ.get(
-    "PLG_SALES_CONTACT_EMAIL", "hello@knightshiftai.com")
+    "PLG_SALES_CONTACT_EMAIL", "admin@knightshiftai.com")
+PLG_SALES_CONTACT_CC = tuple(
+    e.strip() for e in os.environ.get(
+        "PLG_SALES_CONTACT_CC",
+        "steve@knightshiftai.com,matt@knightshiftai.com").split(",")
+    if e.strip())
+
+# Reply-To on every outbound email. The From is a noreply@ address, so
+# without this a customer who does the natural thing — hits Reply on
+# "reply to this email with the details below" — writes to a mailbox
+# nobody reads. Ordered, not a set: mail clients show the list as given.
+RESEND_REPLY_TO_EMAILS = tuple(
+    e.strip() for e in os.environ.get(
+        "RESEND_REPLY_TO_EMAILS",
+        "admin@knightshiftai.com,steve@knightshiftai.com,"
+        "matt@knightshiftai.com").split(",")
+    if e.strip())
 
 # Customer-facing contact addresses printed in lifecycle emails. Kept here
 # (not inline in notifications.py) so the welcome email, the paywall page and

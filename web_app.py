@@ -59,6 +59,7 @@ from config import (
     PLG_SELF_SERVE_ENABLED, FREEMIUM_BID_LIMIT, TEST_WELCOME_MAX_RECIPIENTS,
     FREEMIUM_MAX_PDF_SIZE_MB, FREEMIUM_MAX_PDFS,
     PLG_BLOCK_FREE_EMAIL_AUTO_APPROVE, PLG_SALES_CONTACT_EMAIL,
+    PLG_SALES_CONTACT_CC,
     scale_timeout_for_consensus,
 )
 import storage
@@ -595,6 +596,7 @@ def index():
             org_name=snap["org_name"],
             bid_limit=snap["freemium_bid_limit"],
             sales_email=PLG_SALES_CONTACT_EMAIL,
+            sales_cc=",".join(PLG_SALES_CONTACT_CC),
             mailto_body=mailto_body,
         )
 
