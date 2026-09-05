@@ -18226,6 +18226,37 @@ def _apply_door_schedule_ledger(analysis):
             fp_led = _num(led.get("full_paint"))
             hm_led = _num(led.get("hm_panel"))
             classified = fp_led + hm_led
+            # Authority guard (flip-board catch, 2026-09-05): a 5-row table
+            # parse is not proof of a door schedule. On the Rider replays
+            # Mode A "claimed" from misparsed tables and cratered good
+            # counts (Fishkill 143 → 15, TSC 10 → 5) — sets the harness
+            # never covered. The ledger may OVERRIDE only when the parse
+            # read a material column (a real door schedule reads like
+            # one), or when it agrees with a live extraction count within
+            # the RFI threshold, or when extraction found nothing at all
+            # (the validated Caris case: 79 parsed vs 0 extracted). A
+            # weak parse contradicting a live count is evidence — it
+            # records and RFIs, it does not rule.
+            _strong = classified >= n * 0.5
+            _agrees = cur_total > 0 and \
+                abs(n - cur_total) / max(n, cur_total) <= 0.25
+            if not (_strong or _agrees or cur_total <= 0):
+                analysis["_door_ledger"]["demoted"] = (
+                    "weak parse (no materials) contradicting live "
+                    "extraction count")
+                analysis.setdefault("notes", []).append(
+                    f"[Door Ledger] a parsed table read {n:.0f} door "
+                    f"row(s) (no material column) against {cur_total:.0f} "
+                    f"extracted doors — kept the extraction count, RFI "
+                    f"raised. source: extraction")
+                analysis.setdefault("rfi_items", []).append({
+                    "category": "Door Count",
+                    "question": (
+                        f"A schedule-like table lists {n:.0f} door(s) but "
+                        f"the floor plans yielded {cur_total:.0f}. The bid "
+                        f"prices the plan count; please confirm the door "
+                        f"schedule and total door count.")})
+                return analysis
             if classified >= n * 0.5:
                 # Ledger read materials: scale its split to the full count
                 # (unknown-material rows follow the classified ratio).
