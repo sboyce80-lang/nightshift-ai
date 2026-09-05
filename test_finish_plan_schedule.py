@@ -24,6 +24,11 @@ for _k in ("NIGHTSHIFT_FINISH_PLAN_SCHEDULE",
            "NIGHTSHIFT_CEILING_ASSUME_PAINTED_ACT"):
     os.environ.pop(_k, None)
 os.environ.setdefault("CLAUDE_API_KEY", "test")
+# This suite tests the scope-boundary MECHANISMS with deliberately small
+# fixtures (4 rooms, half unscheduled) that the roster-fit guards would
+# refuse outright. The guards have their own suite
+# (test_roster_fit_guards.py); here they stand aside.
+os.environ["NIGHTSHIFT_ROSTER_FIT_GUARDS"] = "0"
 
 import Takeoff_DIRECT as T  # noqa: E402
 

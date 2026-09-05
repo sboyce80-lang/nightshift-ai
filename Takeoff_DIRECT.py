@@ -20745,6 +20745,118 @@ def _apply_schedule_room_scope(analysis):
     def _matched(room):
         return _match_key(room) is not None
 
+    # ── Roster-fit guards (Phase 1, 2026-09-05) ─────────────────────────
+    # The round-5 board regression was not a job-class problem but a
+    # schedule-to-roster FIT problem: Homewood's 51-row schedule clipped
+    # 88 of 191 rooms including the guest suites (46% drop, uncapped);
+    # Honey's null room numbers broke the join (doors 0/8); Hudson's
+    # control dropped 27/65 and wall recovery masked it. A roster may
+    # only bound scope when it demonstrably fits the building. Guards:
+    #   G1 matched-row coverage ≥ 50% (ported from the walls clip): if
+    #      most schedule rows match no room, the naming conventions
+    #      disagree and "absent from the schedule" is meaningless.
+    #   G2 NIGHTSHIFT_SCHEDULE_SCOPE_MAX_DROP (default 0.35) as a HARD
+    #      refusal — run_r4_child.py set this as the safety justification
+    #      for enabling the roster, but nothing ever read it (the dead-
+    #      flag class). Now it refuses, loudly, before any mutation.
+    #   G3 template units: rooms carrying unit_multiplier>1 (or on a
+    #      multiplied floor) are never dropped, and in a building that
+    #      uses multipliers at all, scope decisions accept numeric
+    #      identity only — name-token matching is many-to-one and folds
+    #      distinct template units.
+    #   G4 null-number roster: with >50% of rooms lacking a room number
+    #      the numeric join cannot work — stand down (the walls clip,
+    #      which is only-reduce, still runs separately).
+    #   G5 row floor: a schedule with fewer rows than half the in-scope
+    #      rooms is a fragment, not a roster.
+    # All stand-downs happen BEFORE any room is mutated. Kill switch
+    # NIGHTSHIFT_ROSTER_FIT_GUARDS=0.
+    _guards_on = os.environ.get(
+        "NIGHTSHIFT_ROSTER_FIT_GUARDS", "1").strip() not in (
+        "0", "false", "False")
+    _in_scope_pairs = []
+    for _fl in (analysis.get("floors") or []):
+        _gmf = max(1, int(_num(_fl.get("unit_multiplier", 1)) or 1))
+        for _rm in (_fl.get("rooms") or []):
+            if isinstance(_rm, dict) and _rm.get("in_scope", True):
+                _in_scope_pairs.append((_rm, _gmf * max(
+                    1, int(_num(_rm.get("unit_multiplier", 1)) or 1))))
+    _unit_mult_present = any(m > 1 for _, m in _in_scope_pairs)
+
+    def _scope_match_key(rm):
+        """Identity used for scope decisions: numeric-only in unit-
+        multiplied buildings (G3), full matching elsewhere."""
+        if _guards_on and _unit_mult_present:
+            return _match_key(rm, numeric_only=True)
+        return _match_key(rm)
+
+    if _guards_on and _in_scope_pairs:
+        def _stand_down(code, human):
+            analysis["_schedule_room_scope"] = {
+                "noop": code, "guard": human, "rows": len(rfs),
+                "in_scope_rooms": len(_in_scope_pairs)}
+            analysis.setdefault("notes", []).append(
+                f"[Schedule Room Scope] STOOD DOWN (roster-fit guard): "
+                f"{human} No rooms were excluded.")
+            _gate_add_rfi(
+                analysis, "Scope Boundary",
+                f"The finish schedule could not be used as a scope "
+                f"boundary: {human} Confirm the schedule covers the drawn "
+                f"rooms so the takeoff can be bounded to the scheduled "
+                f"areas.")
+            print(f"   🛡️ Schedule room scope: STOOD DOWN — {human}")
+            return analysis
+
+        _null_num = sum(
+            1 for _rm, _ in _in_scope_pairs
+            if not _room_num_token(_rm.get("room_number")))
+        if _null_num / len(_in_scope_pairs) > 0.5:
+            return _stand_down(
+                "null_room_numbers",
+                f"{_null_num} of {len(_in_scope_pairs)} extracted rooms "
+                f"carry no room number, so schedule rows cannot be joined "
+                f"to rooms reliably.")
+        if len(rfs) < 0.5 * len(_in_scope_pairs):
+            return _stand_down(
+                "schedule_row_floor",
+                f"the schedule reads {len(rfs)} row(s) against "
+                f"{len(_in_scope_pairs)} in-scope rooms — a fragment this "
+                f"small cannot define the scope boundary.")
+        _matched_keys = set()
+        _planned_drop = 0
+        for _rm, _m in _in_scope_pairs:
+            _k = _scope_match_key(_rm)
+            if _k is not None:
+                _matched_keys.add(_k)
+            elif _m <= 1:
+                _planned_drop += 1
+        if _matched_keys and len(rfs) and \
+                len(_matched_keys) / len(rfs) < 0.5:
+            return _stand_down(
+                "match_coverage",
+                f"only {len(_matched_keys)} of {len(rfs)} schedule rows "
+                f"matched any extracted room — the naming conventions "
+                f"disagree, so absence from the schedule is meaningless.")
+        if not _matched_keys:
+            return _stand_down(
+                "match_coverage",
+                f"none of the {len(rfs)} schedule rows matched any "
+                f"extracted room — the schedule and the roster do not "
+                f"join at all.")
+        try:
+            _max_drop = float(os.environ.get(
+                "NIGHTSHIFT_SCHEDULE_SCOPE_MAX_DROP", "0.35") or 0.35)
+        except (TypeError, ValueError):
+            _max_drop = 0.35
+        if _planned_drop / len(_in_scope_pairs) > _max_drop:
+            return _stand_down(
+                "max_drop",
+                f"the boundary would remove {_planned_drop} of "
+                f"{len(_in_scope_pairs)} rooms "
+                f"({_planned_drop / len(_in_scope_pairs):.0%}), beyond "
+                f"the {_max_drop:.0%} refusal line — a cut that deep is a "
+                f"schedule-read problem until proven otherwise.")
+
     # Element totals carried by the rooms we remove. Marking a room
     # out_of_scope is not enough: aggregated_totals is computed upstream and
     # several pricing paths read it directly, so a dropped room's doors and
@@ -20820,6 +20932,7 @@ def _apply_schedule_room_scope(analysis):
 
     dropped, kept = [], 0
     anchored_out = []
+    protected = 0
     for fl in (analysis.get("floors") or []):
         _floor_name_ok = (not _num_floors) or (id(fl) in _num_floors)
         _mf = max(1, int(_num(fl.get("unit_multiplier", 1)) or 1))
@@ -20842,10 +20955,18 @@ def _apply_schedule_room_scope(analysis):
                         removed_elems[_agg_key] = removed_elems.get(
                             _agg_key, 0.0) + _v
                 continue
-            _mk = _match_key(rm)
+            _mk = _scope_match_key(rm)
             if _mk is not None and (
                     _floor_name_ok
                     or _match_key(rm, numeric_only=True) is not None):
+                kept += 1
+                continue
+            if _guards_on and _mf * max(
+                    1, int(_num(rm.get("unit_multiplier", 1)) or 1)) > 1:
+                # G3: a template unit multiplied N× is load-bearing scope —
+                # dropping it on one failed join removes N rooms at once.
+                # It stays in scope; the RFI machinery owns the doubt.
+                protected += 1
                 kept += 1
                 continue
             rm["in_scope"] = False
@@ -20865,6 +20986,18 @@ def _apply_schedule_room_scope(analysis):
     rec = {"applied": bool(dropped or anchored_out),
            "rooms_dropped": len(dropped),
            "rooms_kept": kept, "schedule_rows": len(rfs)}
+    if protected:
+        rec["rooms_protected_template"] = protected
+        analysis.setdefault("notes", []).append(
+            f"[Schedule Room Scope] {protected} template unit(s) "
+            f"(unit_multiplier > 1) did not match the finish schedule but "
+            f"were KEPT in scope — a multiplied room is never dropped on a "
+            f"failed join.")
+        _gate_add_rfi(
+            analysis, "Scope Boundary",
+            f"{protected} template/typical unit(s) could not be matched to "
+            f"the finish schedule but remain priced. Confirm the typical "
+            f"units are in the bid scope.")
     if anchored_out:
         rec["rooms_anchored_out"] = len(anchored_out)
         analysis.setdefault("notes", []).append(
@@ -21482,16 +21615,33 @@ def _apply_vme_authoritative_walls(analysis):
     # paint scope. Deduct the recorded clip from the geometric total
     # (Honey: whole-floor VME billed full-height walls of unscheduled
     # BOH/storage rooms Rider's bid excludes).
+    #
+    # The SANITY BAND, however, must rule on PRE-clip values (roster-fit
+    # guard G6, 2026-09-05). Round-5 Honey: whole-floor geometry vs the
+    # clipped extraction was far outside the band, but deducting the clip
+    # from the geometric side pulled the ratio INTO the band — the clip
+    # manufactured the agreement the band exists to verify, the whole-
+    # floor override applied, and walls tripled (+195%). The band asks
+    # "do two independent measurements of the SAME thing agree?"; both
+    # sides must therefore be the same pre-clip quantity. Kill switch
+    # NIGHTSHIFT_VME_BAND_PRECLIP=0 restores the old post-clip ratio.
     _clip = _num((analysis.get("_schedule_scope_clip") or {}).get(
         "total_clip_sqft", 0))
+    _band_vme, _band_llm = vme_walls, llm_total
     if _clip > 0:
         vme_walls = max(0.0, round(vme_walls - _clip, 2))
         analysis.setdefault("notes", []).append(
             f"[VME] Geometric wall total reduced {_clip:,.0f} SF by the "
             f"schedule scope clip (wainscot bands / unscheduled rooms) — "
             f"finish-driven scope the geometry cannot see.")
-    if llm_total > 0:
-        ratio = vme_walls / llm_total
+        if os.environ.get(
+                "NIGHTSHIFT_VME_BAND_PRECLIP", "1").strip() in (
+                "0", "false", "False"):
+            _band_vme, _band_llm = vme_walls, llm_total
+        else:
+            _band_llm = llm_total + _clip
+    if _band_llm > 0:
+        ratio = _band_vme / _band_llm
         lo, hi = _VME_LLM_RATIO_BAND
         if not (lo <= ratio <= hi):
             # Starved-extraction promotion (flag NIGHTSHIFT_VME_STARVED_
