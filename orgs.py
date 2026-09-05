@@ -15,7 +15,6 @@ Rules:
                                              ships
 """
 
-import os
 from datetime import datetime, timezone
 from typing import Optional, Tuple
 
@@ -122,16 +121,6 @@ def is_free_email_domain(email: str) -> bool:
     return (not domain) or (domain in FREE_EMAIL_DOMAINS)
 
 
-def _blanket_review_on() -> bool:
-    """True when NIGHTSHIFT_MANDATORY_REVIEW holds every estimate.
-
-    Read at call time (not import) so tests and a mid-rollout flag flip
-    both take effect without a restart.
-    """
-    return os.environ.get(
-        "NIGHTSHIFT_MANDATORY_REVIEW", "0").strip() in ("1", "true", "True")
-
-
 def count_freemium_bids(session: Session, org_id: int) -> int:
     """Lifetime bid count for the freemium quota.
 
@@ -142,26 +131,19 @@ def count_freemium_bids(session: Session, org_id: int) -> int:
     same project, not a new one. The 24h daily cap still bounds revision
     volume.
 
-    HELD JOBS ARE FREE WHILE BLANKET REVIEW IS ON (Steven, 2026-09-01).
-    NIGHTSHIFT_MANDATORY_REVIEW holds EVERY estimate during the accuracy
-    rollout, so without this exemption a trial user burns all
-    FREEMIUM_BID_LIMIT credits and hits the paywall having never received
-    an automated estimate — their account holding nothing but
-    "in review" notices. Same principle as the failed-run exemption
-    above: the user did nothing wrong, we chose to hold the bid. A held
-    bid starts counting once a reviewer delivers it (status leaves
-    needs_review). When the blanket flag is off, needs_review means the
-    pipeline's own checks fired on THIS job and the credit stands.
+    needs_review COUNTS, even while NIGHTSHIFT_MANDATORY_REVIEW holds
+    every estimate (Steven, 2026-09-04, reversing the 2026-09-01
+    exemption): the job ran and is in the customer's hands, and the
+    exemption let a held bid temporarily release its credit — Profeta
+    reached 6/5 by submitting while an earlier bid sat in review. The
+    cap is a hard lifetime 5 on accepted submissions.
     """
-    excluded = ["failed", "cancelled"]
-    if _blanket_review_on():
-        excluded.append("needs_review")
     return (
         session.query(Submission)
         .filter(
             Submission.org_id == org_id,
             Submission.parent_submission_id.is_(None),
-            Submission.status.notin_(tuple(excluded)),
+            Submission.status.notin_(("failed", "cancelled")),
         )
         .count()
     )
