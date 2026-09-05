@@ -30,7 +30,7 @@ from config import (
     EMAIL_ADDRESS, EMAIL_APP_PASSWORD,
     EMAIL_SMTP_SERVER, EMAIL_SMTP_PORT,
     COMPANY_NAME, COMPANY_EMAIL, COMPANY_PHONE,
-    ADMIN_EMAILS,
+    ADMIN_EMAILS, PUBLIC_APP_BASE_URL,
     scale_timeout_for_consensus,
 )
 import storage
@@ -545,13 +545,79 @@ def reconcile_abandoned_submissions(redis_conn, queue_names):
     return rows_changed
 
 
-def _build_and_upload_annotated_drawings(submission_id, result, local_pdfs, workdir):
-    """Render an annotated copy of each source PDF with room bboxes drawn on
-    each referenced page, and upload as additional result file(s).
+def _job_page_url(submission_id):
+    """Absolute link to the customer-facing status page for one job."""
+    return f"{PUBLIC_APP_BASE_URL}/jobs/{submission_id}"
+
+
+def _email_edition_of_annotated_pdf(full_path, marked_pages, out_path,
+                                    budget_bytes):
+    """Cut an annotated-drawings PDF down until it fits an email.
+
+    Keeps only the marked sheets (still full vector); if that copy is still
+    over `budget_bytes` (dense CAD sheets), re-renders those sheets as JPEG
+    images at descending DPI. Returns the written path, or None if nothing
+    under budget could be produced.
+    """
+    import fitz
+
+    pages_0 = sorted({int(p) - 1 for p in (marked_pages or []) if int(p) >= 1})
+    if not pages_0 or budget_bytes <= 0:
+        return None
+
+    doc = fitz.open(full_path)
+    pages_0 = [p for p in pages_0 if p < len(doc)]
+    if not pages_0:
+        doc.close()
+        return None
+    doc.select(pages_0)
+    doc.save(out_path, deflate=True, garbage=3)
+    doc.close()
+    if os.path.getsize(out_path) <= budget_bytes:
+        return out_path
+
+    for dpi in (150, 110, 75):
+        src = fitz.open(full_path)
+        src.select(pages_0)
+        out = fitz.open()
+        for page in src:
+            # get_pixmap renders baked content AND markup annotations.
+            pix = page.get_pixmap(dpi=dpi)
+            new_page = out.new_page(width=page.rect.width,
+                                    height=page.rect.height)
+            new_page.insert_image(new_page.rect,
+                                  stream=pix.tobytes("jpg", jpg_quality=70))
+        out.save(out_path, deflate=True, garbage=3)
+        out.close()
+        src.close()
+        if os.path.getsize(out_path) <= budget_bytes:
+            return out_path
+
+    try:
+        os.unlink(out_path)
+    except OSError:
+        pass
+    return None
+
+
+def _build_and_upload_annotated_drawings(submission_id, result, local_pdfs,
+                                         workdir, reserved_bytes=0):
+    """Render an annotated copy of each source PDF with the takeoff markups
+    drawn on each referenced page, and upload as additional result file(s).
 
     One annotated PDF per source PDF, named `<original_basename>.annotated.pdf`.
     Skipped silently if no rooms have bbox info (e.g. bbox attachment failed
     upstream, or the result is from a code path that doesn't run it).
+
+    Returns (email_paths, email_notes). Annotated plan sets routinely dwarf
+    the Gmail attachment budget (21–60 MB on the 2026-09 jobs vs a ~16 MB
+    budget), so the size guard was silently omitting them from every estimate
+    email. When the full file can't ride along, a marked-sheets-only email
+    edition is cut to fit (`reserved_bytes` reserves room for the analysis +
+    estimate PDFs that must also attach), and a body note points at the full
+    set on the job page. The full-resolution file goes to R2 either way.
+    Kill switch: NIGHTSHIFT_EMAIL_ANNOTATED_FALLBACK=0 restores the old
+    attach-or-omit behavior.
 
     Best-effort — failures are logged but do NOT fail the submission.
     """
@@ -575,12 +641,16 @@ def _build_and_upload_annotated_drawings(submission_id, result, local_pdfs, work
         if not by_source:
             logger.info("Annotated drawings: no bbox info present, skipping for %s",
                         submission_id)
-            return []
+            return [], []
 
         # Build a basename → local-path map for fallback resolution
         local_by_basename = {os.path.basename(p): p for p in (local_pdfs or [])}
 
-        uploaded = []
+        fallback_on = os.environ.get(
+            "NIGHTSHIFT_EMAIL_ANNOTATED_FALLBACK", "1").strip() != "0"
+        email_budget = _ATTACH_BUDGET_RAW - int(reserved_bytes or 0)
+
+        email_paths, email_notes = [], []
         for src_path, room_count in by_source.items():
             resolved = src_path if os.path.exists(src_path) \
                 else local_by_basename.get(os.path.basename(src_path))
@@ -609,13 +679,48 @@ def _build_and_upload_annotated_drawings(submission_id, result, local_pdfs, work
             storage.upload_file(out_path, r2_key, content_type="application/pdf")
             _record_result_file(submission_id, out_filename, r2_key,
                                 os.path.getsize(out_path), "application/pdf")
-            uploaded.append(out_path)
 
-        return uploaded
+            full_size = os.path.getsize(out_path)
+            if not fallback_on or full_size <= email_budget:
+                email_paths.append(out_path)
+                email_budget = max(email_budget - full_size, 0)
+                continue
+
+            base = os.path.basename(resolved)
+            stem = base[:-4] if base.lower().endswith(".pdf") else base
+            edition_path = os.path.join(
+                workdir, f"{stem}.annotated.marked-sheets.pdf")
+            edition = _email_edition_of_annotated_pdf(
+                out_path, summary.get("marked_page_numbers") or [],
+                edition_path, email_budget)
+            if edition:
+                edition_size = os.path.getsize(edition)
+                logger.info(
+                    "Annotated drawings for %s/%s: full file is %.1f MB (over "
+                    "the %.1f MB email budget) — attaching a %.1f MB "
+                    "marked-sheets edition instead",
+                    submission_id, out_filename, full_size / 1024 / 1024,
+                    email_budget / 1024 / 1024, edition_size / 1024 / 1024)
+                email_paths.append(edition)
+                email_budget = max(email_budget - edition_size, 0)
+                email_notes.append(
+                    f"{os.path.basename(edition)} contains the marked-up "
+                    f"sheets only — the full annotated set ({out_filename}) "
+                    f"is on your job page.")
+            else:
+                logger.warning(
+                    "Annotated drawings for %s/%s: could not fit any email "
+                    "edition under the size budget — customer gets the "
+                    "job-page link only", submission_id, out_filename)
+                email_notes.append(
+                    f"The annotated drawings ({out_filename}) were too large "
+                    f"to attach — view or download them from your job page.")
+
+        return email_paths, email_notes
     except Exception as exc:
         logger.error("Annotated drawings generation failed for %s: %s",
                      submission_id, exc, exc_info=True)
-        return []
+        return [], []
 
 
 def _build_and_upload_estimate(submission_id, result, workdir):
@@ -976,12 +1081,19 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
             )
 
             # Fourth deliverable: Annotated Drawings PDF — each source page
-            # rendered with room bboxes drawn on top, so the contractor (and
-            # we) can visually confirm what was measured and spot missed
-            # sheets at a glance. Best-effort.
-            annotated_pdf_paths = _build_and_upload_annotated_drawings(
-                submission_id, result, local_pdfs, workdir,
-            )
+            # rendered with the takeoff markups drawn on top, so the
+            # contractor (and we) can visually confirm what was measured and
+            # spot missed sheets at a glance. Best-effort. Reserve email
+            # budget for the two PDFs that must always attach.
+            reserved = sum(
+                os.path.getsize(p)
+                for p in (result.get("output_pdf_path"), estimate_pdf_path)
+                if p and os.path.exists(p))
+            annotated_pdf_paths, annotated_notes = \
+                _build_and_upload_annotated_drawings(
+                    submission_id, result, local_pdfs, workdir,
+                    reserved_bytes=reserved,
+                )
 
             # MANUAL-REVIEW GATE
             # The extractor sets result["manual_review_required"] = True
@@ -1055,6 +1167,8 @@ def process_submission(submission_id, pdf_keys, contact_info, scope_notes,
                         contact_info, result,
                         extra_attachment_paths=annotated_pdf_paths,
                         estimate_pdf_path=estimate_pdf_path,
+                        submission_id=submission_id,
+                        extra_body_notes=annotated_notes,
                     )
                 except Exception as email_exc:
                     # The job is complete and results are stored — an email
@@ -1293,7 +1407,8 @@ def merge_submission(submission_id, parent_id, new_pdf_keys, contact_info,
 
             if claim_email_send(submission_id):
                 try:
-                    send_result_email(contact_info, result)
+                    send_result_email(contact_info, result,
+                                      submission_id=submission_id)
                 except Exception as email_exc:
                     release_email_claim(submission_id)
                     logger.error(
@@ -1429,7 +1544,8 @@ def _budget_attachments(paths):
 
 
 def send_result_email(contact_info, result, extra_attachment_paths=None,
-                      estimate_pdf_path=None):
+                      estimate_pdf_path=None, submission_id=None,
+                      extra_body_notes=None):
     """Email the contractor that their estimate is ready.
 
     Attaches the analysis PDF, the formal branded Estimate PDF (with the
@@ -1439,6 +1555,11 @@ def send_result_email(contact_info, result, extra_attachment_paths=None,
     The raw result JSON is intentionally *not* attached — end users don't
     know what to do with it. `send_result_json_to_admin` ships that
     separately to admin@knightshiftai.com so we still keep a copy.
+
+    `submission_id` (when known) adds a link to the job's status page —
+    where the full annotated set lives and where RFI answers can be fed
+    back via Rerun with Revisions. `extra_body_notes` are short
+    attachment caveats produced upstream (e.g. "marked sheets only").
 
     Raises on SMTP failure so the caller can release the email claim
     for a manual resend.
@@ -1462,18 +1583,28 @@ def send_result_email(contact_info, result, extra_attachment_paths=None,
     candidates = [result.get("output_pdf_path"), estimate_pdf_path]
     candidates += list(extra_attachment_paths or [])
     attach_paths, skipped_paths = _budget_attachments(candidates)
+    job_url = _job_page_url(submission_id) if submission_id else None
     if skipped_paths:
         skipped_names = ", ".join(
             os.path.basename(p) for p in skipped_paths)
         logger.warning(
             "Result email attachments exceed size budget — omitting: %s",
             skipped_names)
+        where = (f"You can view and download them on your job page:\n"
+                 f"{job_url}" if job_url
+                 else "They are archived and available on request.")
         omitted_note = (
             "\nNOTE: Some files were too large to attach"
-            f" ({skipped_names}). They are archived and available on"
-            " request.\n")
+            f" ({skipped_names}). {where}\n")
     else:
         omitted_note = ""
+
+    for note in (extra_body_notes or []):
+        omitted_note += f"\nNOTE: {note}\n"
+
+    job_link_line = (
+        f"\nView this job online (all files, open RFIs, rerun with "
+        f"revisions):\n{job_url}\n" if job_url else "")
 
     body = f"""Hi {contact_info['name']},
 
@@ -1501,7 +1632,7 @@ drawings. A formal proposal will follow after review.
 
 Attached: the detailed analysis PDF and a formal Estimate (PDF) you can
 forward directly to your client.
-{omitted_note}
+{omitted_note}{job_link_line}
 Best regards,
 {COMPANY_NAME}
 {COMPANY_PHONE}

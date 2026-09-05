@@ -715,6 +715,9 @@ def render_annotated_pdf(pdf_in: str, result_or_analysis: dict, pdf_out: str) ->
     return {
         "pages": n_pages,
         "referenced_pages": len(referenced),
+        # 1-indexed pages carrying measurements — the sheets worth keeping
+        # when a size-capped copy of this PDF has to be cut down.
+        "marked_page_numbers": sorted(referenced),
         "rooms_drawn": rooms_drawn,
         "misses_marked": misses_marked,
         "extraction_failures": extraction_failures,

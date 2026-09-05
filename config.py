@@ -665,6 +665,12 @@ SUPPORT_CONTACT_EMAIL = os.environ.get(
 FOUNDER_CONTACT_EMAIL = os.environ.get(
     "FOUNDER_CONTACT_EMAIL", "steve@knightshiftai.com")
 
+# Public origin of the customer-facing app, used to build absolute links in
+# emails and PDFs (job status pages, Rerun with Revisions). Workers have no
+# request context, so this cannot come from Flask.
+PUBLIC_APP_BASE_URL = os.environ.get(
+    "NIGHTSHIFT_PUBLIC_APP_BASE_URL", "https://knightshiftai.com").rstrip("/")
+
 # Auto-create a CRM account (+ primary contact + timeline note) when a PLG
 # signup is auto-approved onto freemium. Without this, the internal signup
 # email is the only trace a self-serve customer leaves — if nobody acts on
