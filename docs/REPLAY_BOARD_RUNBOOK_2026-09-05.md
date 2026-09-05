@@ -38,6 +38,14 @@ Main under the committed prod posture — the deterministic layer holds;
 the variance is upstream in extraction, which is the whole Phase 1 case.
 
 ## Missing stored results
-grenadier_danbury, route22_condo, fishkill_cenhud have no local stored
-result.json — they need one archived run each (golden-intake task), then
-the board covers 15/15.
+fishkill_cenhud is wired via ROSTER_EXTRA (rider_batch_durable/cenhud)
+— board covers 13/15. grenadier_danbury and route22_condo remain: their
+targets are review-only and UNVERIFIED ("no Rider Excel in hand");
+verifying them from the Rider Drive source is the blocking task, not a
+fresh run (task chip filed 2026-09-05).
+
+## CI determinism gate
+test_chain_determinism.py runs the fixture version of --determinism on
+every PR: build_priced_takeoff twice at default posture and twice at
+the Phase 1 flag set, byte-identical aggregates required. The stored-
+roster --determinism stays the local, deeper check.
