@@ -231,17 +231,7 @@ _HTML_TEMPLATE = Template("""<!DOCTYPE html>
                 {% if job_url %}<a href="{{ job_url }}">Rerun with Revisions</a>{% else %}Rerun with Revisions{% endif %}
                 on your job page (knightshiftai.com &rarr; Completed Jobs &rarr;
                 your job &rarr; View Status).</li>
-            <li>Review the items flagged below — each includes the reason it
-                was raised.</li>
         </ul>
-        {% if review.reasons %}
-        <div class="rb-body"><strong>Why this was flagged:</strong></div>
-        <ul>
-        {% for reason in review.reasons %}
-            <li>{{ reason }}</li>
-        {% endfor %}
-        </ul>
-        {% endif %}
     </div>
     {% endif %}
 
