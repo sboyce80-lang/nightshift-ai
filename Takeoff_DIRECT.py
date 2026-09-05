@@ -28830,6 +28830,12 @@ def _run_job_draw_median(k, pdf_paths, run_kwargs):
             print("\n" + _line + f"  [K={k} draws]")
     except Exception:
         pass
+    # The draw-median layer's own checks (all-draws-implausible, subtotal
+    # spread) set the flag on `analysis` AFTER the child draw returned, so
+    # the child's top-level copy is stale by now. Re-sync before returning.
+    chosen["manual_review_required"] = bool(
+        analysis.get("manual_review_required"))
+    chosen["manual_review_reason"] = analysis.get("manual_review_reason")
     return chosen
 
 
@@ -31374,6 +31380,11 @@ def run_analysis(pdf_paths, contact_name="", contact_email="", scope_notes="",
         "rfi_items": rfi_items,
         "adjustments_applied": adjustments_log if adjustments_log else None,
         "will_synthesis": will_result.get("will_synthesis"),
+        # The saved JSON promotes these to the top level; the in-memory
+        # return must match, or callers gating on them (jobs.py
+        # manual-review gate) read an absent key and ship flagged work.
+        "manual_review_required": bool(analysis.get("manual_review_required")),
+        "manual_review_reason": analysis.get("manual_review_reason"),
     }
 
 
