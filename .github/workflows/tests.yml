@@ -26,6 +26,16 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Lint (correctness rules only)
+        # Undefined names, shadowed defs, syntax errors, pylint error class —
+        # the _total_paintable UnboundLocalError crashed two validation
+        # boards before anything caught it; this catches that class in
+        # milliseconds. Rule set lives in pyproject.toml; the repo passes
+        # clean as of 2026-09-04, so any hit is a new defect.
+        run: |
+          pip install "ruff>=0.6"
+          ruff check .
+
       - name: Run offline test suites
         # Auto-discover every test_*.py at the repo root — a hardcoded list let
         # 13 committed suites (door-schedule scope, Beloit fixes, ceiling gate,
