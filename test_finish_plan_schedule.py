@@ -144,10 +144,16 @@ def _guard(paintable, footprint, gsf, flag="1", maxr=None):
         os.environ["NIGHTSHIFT_OVER_EXTRACTION_MAX_RATIO"] = maxr
     else:
         os.environ.pop("NIGHTSHIFT_OVER_EXTRACTION_MAX_RATIO", None)
+    # The guard computes its own paintable total from aggregated_totals —
+    # it must never depend on the commercial-only sanity block's local
+    # (_total_paintable), which crashed every non-commercial job that ran
+    # with the flag on (UnboundLocalError, board rounds 4 and 5).
     ns = {
         "project_info": {"footprint_sqft": footprint},
         "project_overview": {"gross_sqft": gsf},
-        "floors": [], "aggregated_totals": {}, "notes": [],
+        "floors": [],
+        "aggregated_totals": {"total_paintable_wall_sqft": float(paintable)},
+        "notes": [],
         "manual_review_required": False,
     }
     src = open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -157,7 +163,6 @@ def _guard(paintable, footprint, gsf, flag="1", maxr=None):
     block = "\n".join(l[4:] if l.startswith("    ") else l
                       for l in src[start:end].splitlines())
     g = {"os": os, "_num": T._num, "analysis": ns,
-         "_total_paintable": paintable,
          "_stated_gross_sqft": T._stated_gross_sqft,
          "_declared_work_area_sqft": T._declared_work_area_sqft}
     exec(compile(block, "<guard>", "exec"), g)

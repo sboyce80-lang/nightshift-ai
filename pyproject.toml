@@ -12,6 +12,20 @@ extend-exclude = [
     "*_local_run",     # local run scratch dirs
 ]
 
+# mypy runs in CI for exactly ONE error class: possibly-undefined, the
+# static form of UnboundLocalError (a name assigned only inside a branch,
+# used outside it). ruff's rule set cannot see this flow-sensitively; mypy
+# can, and the repo-wide sweep on 2026-09-04 found 14 — including the
+# _total_paintable guard crash that killed board cells in rounds 4 AND 5,
+# and a VME abstain-path crash. All 14 fixed; CI greps mypy's output for
+# the code and fails on any hit, ignoring mypy's other complaints (the
+# untyped codebase produces ~250 that are churn to chase today).
+[tool.mypy]
+ignore_missing_imports = true
+check_untyped_defs = true
+enable_error_code = ["possibly-undefined"]
+exclude = '(nsai_|_local_run)'
+
 [tool.ruff.lint]
 select = [
     "E9",    # syntax errors

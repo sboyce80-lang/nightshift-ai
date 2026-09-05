@@ -141,6 +141,7 @@ def test_lifecycle_idempotency():
         # Hot-lead threshold: fires internal alert once, no customer email.
         with session_scope() as session:
             org_id, user_id = _mk_org(session)
+            last = None
             for _ in range(config.FREEMIUM_HOT_LEAD_THRESHOLD):
                 last = _mk_sub(session, org_id, user_id, "completed")
         maybe_send_freemium_lifecycle_emails(last)
@@ -165,6 +166,7 @@ def test_lifecycle_idempotency():
         sent["exhausted"] = sent["milestone"] = 0
         with session_scope() as session:
             borg_id, buser_id = _mk_org(session, plan="beta")
+            blast = None
             for _ in range(config.FREEMIUM_BID_LIMIT + 2):
                 blast = _mk_sub(session, borg_id, buser_id, "completed")
         maybe_send_freemium_lifecycle_emails(blast)
@@ -175,6 +177,7 @@ def test_lifecycle_idempotency():
         config.PLG_SELF_SERVE_ENABLED = False
         with session_scope() as session:
             forg_id, fuser_id = _mk_org(session)
+            flast = None
             for _ in range(config.FREEMIUM_BID_LIMIT):
                 flast = _mk_sub(session, forg_id, fuser_id, "completed")
         maybe_send_freemium_lifecycle_emails(flast)
